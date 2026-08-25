@@ -330,3 +330,33 @@ def test_the_repo_matches_the_release_asset():
     )
     assert f'APP_NAME = "{updater.ASSET_NAME[:-4]}"' in spec
     assert updater.REPO == "s26016041/RO-Online-toolbox"
+
+
+def test_the_explicit_flag_stops_the_check(monkeypatch, qtbot):
+    """打包後的 exe 跑 --selftest 時平台是正常的，所以要有明確旗標。
+
+    只靠 QT_QPA_PLATFORM 判斷會漏掉那條路 —— 實際踩過：
+    冒煙測試以 0xC0000409（Qt 的「執行緒還在跑就被解構」）中止。
+    """
+    from PySide6.QtWidgets import QMainWindow
+
+    from ro_toolbox.ui.update_ui import UpdateManager
+
+    monkeypatch.setattr(updater, "is_frozen", lambda: True)
+    monkeypatch.delenv("QT_QPA_PLATFORM", raising=False)
+    monkeypatch.setenv(updater.NO_UPDATE_ENV, "1")
+    window = QMainWindow()
+    qtbot.addWidget(window)
+    manager = UpdateManager(window)
+    manager.start()
+    assert manager._check is None
+
+
+def test_selftest_sets_the_flag_before_building_the_window():
+    """旗標要在**建視窗之前**設，設晚了那一輪還是會起執行緒。"""
+    source = (Path(__file__).resolve().parents[1]
+              / "src" / "ro_toolbox" / "app.py").read_text(encoding="utf-8")
+    body = source[source.index("def selftest"):]
+    flag_at = body.index("NO_UPDATE_ENV] = ")
+    build_at = body.index("create_app([")
+    assert flag_at < build_at, "設旗標必須排在 create_app 之前"

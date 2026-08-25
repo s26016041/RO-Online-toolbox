@@ -95,9 +95,14 @@ class UpdateManager:
         QTimer.singleShot(_CLEAN_DELAY_MS, updater.clean_leftovers)
         if not updater.is_frozen():
             return
-        # 無頭模式（--selftest 會跑 offscreen）不要查：冒煙測試建好視窗就馬上結束，
-        # 這條執行緒還連著網路沒收完，Qt 會丟「Destroyed while running」並中止行程，
-        # 害冒煙測試誤判成打包失敗。
+        # 短命的無頭執行（`--selftest`、測試）一律不查：建好視窗就結束的話，
+        # 這條執行緒還連著網路沒收完，Qt 會以「Destroyed while thread is still
+        # running」中止行程（0xC0000409），害冒煙測試誤判成打包失敗。
+        #
+        # ⚠ 不能只看 QT_QPA_PLATFORM：打包後的 exe 跑 --selftest 時用的是
+        #   正常平台（offscreen 外掛不保證有收進去），所以要有一個明確的旗標。
+        if os.environ.get(updater.NO_UPDATE_ENV):
+            return
         if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
             return
         self._run_check()

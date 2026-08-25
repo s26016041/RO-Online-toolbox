@@ -40,6 +40,11 @@ API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 ASSET_NAME = "RO-Online-toolbox.exe"
 TIMEOUT = 15.0
 UA = {"User-Agent": "RO-Online-toolbox-Updater"}
+#: 設了這個環境變數就完全不查更新。`--selftest` 會設 ——
+#: 冒煙測試建好視窗就馬上結束，查更新的執行緒來不及收尾，
+#: Qt 會以「Destroyed while thread is still running」中止行程（0xC0000409），
+#: 害冒煙測試誤判成打包失敗。實際踩過。
+NO_UPDATE_ENV = "RO_TOOLBOX_NO_UPDATE"
 
 #: 上一次查詢失敗的原因。放在 list 裡是為了讓函式能改它（module 層級的可變狀態）。
 _last_error = [""]
