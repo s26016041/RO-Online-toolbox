@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from PySide6.QtGui import QIcon
 
 from ro_toolbox.ui.pages.farm_page import CharacterCard
 
@@ -127,10 +128,34 @@ def test_counts_update_without_rebuilding_the_list(card):
 
 
 def test_selected_item_shows_its_icon(card):
-    """選到的道具右邊要有小圖（解包出來的圖示）。"""
+    """選到的道具右邊要有小圖（解包出來的圖示）。
+
+    圖示來自 `RODATA/`（24 萬檔、18 GB），**不隨版發布**。所以沒有那份
+    解包資料的機器（乾淨 clone、CI）跳過這一項 —— 不是放水：
+    下一個測試會驗「沒有圖示時介面照樣正常」，那才是那些機器上的真實情境。
+    """
+    from ro_toolbox.services import icons
+
+    if icons.icon_path(RED) is None:
+        pytest.skip("本機沒有 RODATA 解包資料，沒有圖示可驗")
     card.set_slots(ROWS)
     card.hp_item.setCurrentIndex(card.hp_item.findData(RED))
     assert not card.hp_icon.pixmap().isNull(), "紅色藥水應該找得到圖示"
+
+
+def test_the_list_still_works_without_any_icons(card, monkeypatch):
+    """找不到圖示只是少一張圖，名稱與數量照樣要在（安全退化）。
+
+    這是**沒有 RODATA 的機器上的真實情境** —— 一定要正常，不能空白也不能爆。
+    """
+    from ro_toolbox.ui.pages import farm_page
+
+    monkeypatch.setattr(farm_page, "item_icon", lambda _item_id: QIcon())
+    card.set_slots(ROWS)
+    texts = dict((data, text) for text, data in _entries(card.hp_item))
+    assert texts[RED] == "紅色藥水 × 30"
+    card.hp_item.setCurrentIndex(card.hp_item.findData(RED))
+    assert card.potion_config().hp_item == RED
 
 
 def test_bot_stopping_unchecks_the_box(card):
