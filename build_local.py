@@ -57,8 +57,20 @@ def build(debug: bool = False) -> Path | None:
     if not ensure_pyinstaller():
         return None
 
+    # ⚠ 不用 ignore_errors=True：刪不掉幾乎都是「舊的 exe 還在跑」，
+    # 吞掉的話 PyInstaller 會在很後面才用 PermissionError 失敗，訊息完全看不懂。
+    # 而且 onefile 的 exe 會生**子行程**，關掉視窗不代表行程沒了。
     for folder in ("build", "dist"):
-        shutil.rmtree(ROOT / folder, ignore_errors=True)
+        target = ROOT / folder
+        try:
+            shutil.rmtree(target)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            print(f"✗ 清不掉舊的 {folder}/：{exc}")
+            print("  → 多半是上一顆 exe 還在跑。用工作管理員關掉 "
+                  f"{EXE_NAME}.exe（可能不只一個行程）再試。")
+            return None
 
     env = dict(os.environ)
     if debug:
@@ -88,8 +100,11 @@ def smoke(exe: Path, debug: bool = False) -> bool:
     """跑打包好的 exe 的 --selftest。這是唯一算數的驗收。"""
     print("\n=== 冒煙測試：exe --selftest ===")
     started = time.monotonic()
+    # encoding 要指定：預設會用 cp950 解，exe 印出中文以外的字元就會炸在
+    # 讀取執行緒裡（實際踩過）。errors="replace" 保證量測工具自己不會失敗。
     result = subprocess.run([str(exe), "--selftest"], cwd=ROOT,
-                            capture_output=True, text=True, check=False)
+                            capture_output=True, text=True, check=False,
+                            encoding="utf-8", errors="replace")
     elapsed = time.monotonic() - started
     print((result.stdout or "").strip() or "(沒有輸出)")
     if result.stderr.strip():

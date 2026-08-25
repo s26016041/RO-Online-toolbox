@@ -34,7 +34,10 @@ from build_local import EXE_NAME, build, smoke  # noqa: E402
 
 
 def cap(cmd: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False)
+    # encoding="utf-8" 是必要的：`gh auth status` 會印 `✓`，用預設的 cp950 解
+    # 會在讀取執行緒裡拋 UnicodeDecodeError（實際踩過，而且錯誤訊息離現場很遠）。
+    return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, check=False,
+                          encoding="utf-8", errors="replace")
 
 
 def die(message: str) -> None:
