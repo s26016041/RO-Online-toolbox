@@ -49,6 +49,11 @@ def _run() -> int:
 
 
 def main() -> int:
+    # 打包成 exe 之後沒有 venv 這回事：相依全都在 exe 裡面。
+    # （目前 frozen 時 VENV_PYTHON 剛好指到不存在的路徑所以不會觸發，
+    #   但那是巧合不是設計 —— 明講出來，別讓它哪天悄悄變成真。）
+    if getattr(sys, "frozen", False):
+        return _run()
     if VENV_PYTHON.exists() and not _running_in_venv():
         return _relaunch_in_venv()
     return _run()

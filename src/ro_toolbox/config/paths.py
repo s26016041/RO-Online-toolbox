@@ -3,13 +3,40 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 # src/ro_toolbox/
 PACKAGE_DIR = Path(__file__).resolve().parents[1]
-RESOURCES_DIR = PACKAGE_DIR / "ui" / "resources"
-# 專案根目錄下的 assets/（道具表、怪物表）
-ASSETS_DIR = PACKAGE_DIR.parents[1] / "assets"
+
+
+def _bundle_root() -> Path | None:
+    """PyInstaller 解壓資料檔的位置；不是打包執行就回 None。
+
+    打包成 exe 之後，程式碼跑在暫存解壓目錄裡，
+    `PACKAGE_DIR.parents[1] / "assets"` 會指到一個**不存在的地方** ——
+    而且 `gamedata` 讀不到表只會安靜地查不到道具名，選單變空白，
+    沒有任何錯誤訊息。所以打包路徑一定要另外算。
+    """
+    base = getattr(sys, "_MEIPASS", None)
+    return Path(base) if getattr(sys, "frozen", False) and base else None
+
+
+def _resources_dir() -> Path:
+    root = _bundle_root()
+    return root / "ro_toolbox" / "ui" / "resources" if root else (
+        PACKAGE_DIR / "ui" / "resources"
+    )
+
+
+def _assets_dir() -> Path:
+    """道具表／怪物表／傳點表。打包時放在解壓根目錄的 `assets/`。"""
+    root = _bundle_root()
+    return root / "assets" if root else PACKAGE_DIR.parents[1] / "assets"
+
+
+RESOURCES_DIR = _resources_dir()
+ASSETS_DIR = _assets_dir()
 STYLES_DIR = RESOURCES_DIR / "styles"
 
 _APP_FOLDER = "RO-Online-toolbox"

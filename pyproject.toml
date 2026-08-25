@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ro-toolbox"
-version = "0.1.1"
+version = "0.1.2"
 description = "RO Online 自動化工具箱"
 requires-python = ">=3.10"
 dependencies = [
@@ -47,6 +47,7 @@ dev = [
     "pytest>=8.0",
     "pytest-qt>=4.4",
     "ruff>=0.4",
+    "pyinstaller>=6.0",   # 打包 exe：build_local.py / release.py
 ]
 
 [project.scripts]

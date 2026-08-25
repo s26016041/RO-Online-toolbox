@@ -31,8 +31,13 @@ remote：`git@github.com:s26016041/RO-Online-toolbox.git`
 2. .\.venv\Scripts\python.exe -m pytest -q                          # 必須全過
 3. .\.venv\Scripts\python.exe -m ruff check src tests tools main.py # 必須全過
 4. git push origin main
-5. gh release create vX.Y.Z --title vX.Y.Z --notes "重點變更"
+5. .\.venv\Scripts\python.exe release.py                            # 編 exe → 冒煙 → 發布
 ```
+
+**第 5 步不要自己下 `gh release create`。** `release.py` 會：讀 `VERSION` 決定 tag →
+檢查 origin 有沒有這個 tag（發過就不重複發）→ 用 `RO-Online-toolbox.spec` 編 exe →
+**跑 `exe --selftest`** → 把 Release 標在 `origin/main` 上並上傳 exe。
+少了冒煙那一步，資料檔漏收的 exe 會安靜地發出去（見下方）。
 
 ### ⚠ 版號有三處，必須同步
 
@@ -69,15 +74,41 @@ remote：`git@github.com:s26016041/RO-Online-toolbox.git`
 - 用 heredoc 寫含 Windows 路徑的檔案時，反斜線會被吃掉（`\.` → `\.`、
   `\a` → BEL）。寫完務必回頭確認，或改用正斜線／`chr(92)` 組字串。
 
-## 打包成 exe（尚未驗證）
+## 打包成 exe
 
-`scripts\build.ps1` 是 PyInstaller 打包腳本，**目前還沒實際跑過**。
-第一次要發布含 exe 的 Release 時，先單獨把它跑通、確認產物能開，
-再寫進上面的流程，並把結果記進 GAMEDATA。
+三個檔案，**一份設定**（不要在別處再寫一份 PyInstaller 參數）：
 
-圖示已經接好：`--icon src\ro_toolbox\ui\resources\icon.ico`（7 種尺寸）。
-圖示是用 `tools\make_icon.py` 從 `assets\icon-source.png` 產的 ——
+| 檔案 | 做什麼 |
+|---|---|
+| `RO-Online-toolbox.spec` | 唯一一份 PyInstaller 設定 |
+| `build_local.py` | 本機編 ＋ 冒煙測試（不上傳） |
+| `release.py` | 編 ＋ 冒煙 ＋ 建 Release 上傳 |
+
+```powershell
+.\.venv\Scripts\python.exe build_local.py           # 編 ＋ 冒煙
+.\.venv\Scripts\python.exe build_local.py --debug   # 帶主控台版，看得到 traceback
+.\.venv\Scripts\python.exe build_local.py --run     # 通過後把 GUI 開起來看
+```
+
+實測（2026-08-25，v0.1.2）：**78 MB、編譯約 55 秒、啟動到自檢完成 3.8 秒**。
+
+### ⚠ 打包後最會出事的是資料檔，而且完全沒有徵兆
+
+`assets/*.json.gz` 漏收的話：道具名一律查不到、補水選單整個空白，
+程式**不會報錯**。所以 `app.py` 有 `--selftest`，會真的查一筆資料
+（`item_name(501)`、`mob_name(1002)`）並確認圖示與樣式表都在；
+`release.py` 沒過就中止發布。
+
+路徑要打包後才算得對：`config/paths.py` 的 `_bundle_root()` 讀 `sys._MEIPASS`，
+`tests/test_paths.py` 驗它跟 spec 裡的 datas 目的地一致。
+
+圖示：`--icon src\ro_toolbox\ui\resources\icon.ico`（7 種尺寸），
+用 `tools\make_icon.py` 從 `assets\icon-source.png` 產 ——
 **換圖要重跑那支腳本**，不要手工做 .ico。
+
+⚠ 冒煙測試的輸出一律用 ASCII 記號：主控台是 cp950，`✓` 印下去會拋
+`UnicodeEncodeError`（實際踩過 —— exe 自檢**全過**，卻在印成功訊息時掛掉，
+看起來像打包失敗）。
 
 ## 相關指令
 

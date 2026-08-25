@@ -74,7 +74,59 @@ def create_app(argv: list[str] | None = None) -> tuple[QApplication, MainWindow]
     return app, window
 
 
+def selftest() -> int:
+    """冒煙測試：把整個程式組起來但不進事件迴圈，回 0 代表沒問題。
+
+    這支存在的唯一理由是**驗證打包好的 exe**。`--windowed` 的 exe 出事時
+    不會有任何訊息，只會開出一個怪怪的視窗，而最容易漏的正是資料檔：
+    `assets/*.json.gz` 沒收進去的話，道具名一律查不到、補水選單整個空白，
+    程式本身完全不會報錯（見 `config/paths.py` 的 `_bundle_root`）。
+    所以這裡不只建視窗，還要**真的查一筆資料**。
+    """
+    from ro_toolbox.config.paths import icon_file, stylesheet_file
+    from ro_toolbox.services.gamedata import item_name, mob_name
+    from ro_toolbox.ui.main_window import PAGE_CLASSES
+
+    # 主控台是 cp950，`✓` 這種字元編不進去會直接拋 UnicodeEncodeError ——
+    # 冒煙測試自己因為印字而失敗是最蠢的失敗方式，所以輸出一律 ASCII 記號，
+    # 並且把 stdout 轉成不會因為編碼而炸的模式。
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(errors="replace")
+
+    problems: list[str] = []
+    try:
+        _app, window = create_app(["selftest"])
+    except Exception as exc:  # noqa: BLE001 - 冒煙測試要把任何失敗變成訊息
+        print(f"[NG] 組不起來：{exc}")
+        return 1
+
+    pages = window.stack.count()
+    if pages != len(PAGE_CLASSES):
+        problems.append(f"分頁只載入 {pages}/{len(PAGE_CLASSES)} 個")
+
+    # 資料表：查得到名字才算真的收進去了（501 紅色藥水、1002 波利）
+    if item_name(501) in ("", "501", None):
+        problems.append("道具表沒收進來（item_name(501) 查不到）")
+    if mob_name(1002) in ("", "1002", None):
+        problems.append("怪物表沒收進來（mob_name(1002) 查不到）")
+
+    if not icon_file().exists():
+        problems.append(f"圖示沒收進來：{icon_file()}")
+    if not stylesheet_file("light").exists():
+        problems.append(f"樣式表沒收進來：{stylesheet_file('light')}")
+
+    for line in problems:
+        print(f"[NG] {line}")
+    if problems:
+        return 1
+    print(f"[OK] 分頁 {pages} 個、道具表、怪物表、圖示、樣式表都在")
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
-    app, window = create_app(argv)
+    args = argv if argv is not None else sys.argv
+    if "--selftest" in args:
+        return selftest()
+    app, window = create_app(args)
     window.show()
     return app.exec()
