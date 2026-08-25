@@ -60,6 +60,13 @@ class MainWindow(QMainWindow):
         self.sidebar.setCurrentRow(0)
         log.info("%s 啟動完成", APP_NAME)
 
+        # 自動更新：**只在這裡查一次**，用到一半不重查（見 update_ui 檔頭）。
+        # 延後匯入是為了讓 update_ui 只在真的要開視窗時才被拉進來。
+        from ro_toolbox.ui.update_ui import UpdateManager
+
+        self._updater = UpdateManager(self)
+        self._updater.start()
+
     # ---- 組裝 -------------------------------------------------------
 
     def _build_body(self) -> None:
@@ -111,6 +118,10 @@ class MainWindow(QMainWindow):
     # ---- 生命週期 ---------------------------------------------------
 
     def closeEvent(self, event) -> None:
+        # 更新的背景執行緒要等它收完，否則 Qt 會在解構時抱怨
+        #「Destroyed while thread is still running」並中止行程。
+        self._updater.stop()
+
         for index in range(self.stack.count()):
             page = self.stack.widget(index)
             if isinstance(page, BasePage):
