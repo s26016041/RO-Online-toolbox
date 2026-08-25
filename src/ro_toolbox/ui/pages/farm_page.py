@@ -1,0 +1,850 @@
+"""自動掛機分頁。
+
+每個「已登入」的 RO 視窗對應一個子分頁，會自動跟著遊戲視窗增減：
+開新的就多一頁、關掉就少一頁、還沒登入的不會出現（AOB 定位不到就不建分頁，
+之後定期重試，玩家登入後自然會冒出來）。
+
+定位是 AOB 掃描（約 1 秒），放在背景執行緒做，不擋 UI；
+定位完成後每秒只做幾次 read_value，成本很低。
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QAbstractSpinBox,
+    QCheckBox,
+    QComboBox,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ro_toolbox.services import bag, icons, window_list
+from ro_toolbox.services.character import CharacterReader, CharacterStatus
+from ro_toolbox.services.farm_bot import FarmBot, FarmStats
+from ro_toolbox.services.gamedata import heals_hp, heals_sp, item_name
+from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
+from ro_toolbox.ui.pages.base_page import BasePage
+
+log = logging.getLogger(__name__)
+
+PROCESS_NAME = "ragexe.exe"
+
+_SCAN_INTERVAL_MS = 3000  # 多久重掃一次視窗清單
+_READ_INTERVAL_MS = 1000  # 多久更新一次數值
+_RETRY_AFTER_SEC = 10.0  # 定位失敗後隔多久重試（多半是還沒登入）
+_MAX_READ_FAILURES = 3  # 連續讀取失敗幾次就當它登出／關閉了
+
+
+class AttachWorker(QThread):
+    """在背景對一個行程做 AOB 定位，避免 1 秒的掃描卡住介面。"""
+
+    done = Signal(int, object)  # pid, CharacterReader 或 None
+
+    def __init__(self, pid: int) -> None:
+        super().__init__()
+        self._pid = pid
+
+    def run(self) -> None:
+        reader = CharacterReader()
+        try:
+            ok = reader.attach(self._pid, should_stop=self.isInterruptionRequested)
+        except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
+            log.debug("PID %s 定位時發生例外：%s", self._pid, exc)
+            ok = False
+        if not ok:
+            reader.close()
+            reader = None
+        self.done.emit(self._pid, reader)
+
+
+class BagWorker(QThread):
+    """在背景讀背包（AOB 定位約 0.1 秒），不要卡住介面。
+
+    讀出來的是 {格號: (道具編號, 數量)} —— 名字查表、數量即時，
+    完全不需要封包（見 GAMEDATA [MEM-028]）。
+    """
+
+    done = Signal(int, object)  # pid, {格號: (道具編號, 數量)}
+
+    def __init__(self, pid: int) -> None:
+        super().__init__()
+        self._pid = pid
+
+    def run(self) -> None:
+        try:
+            rows = bag.as_dict(self._pid)
+        except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
+            log.debug("PID %s 讀背包失敗：%s", self._pid, exc)
+            rows = {}
+        self.done.emit(self._pid, rows)
+
+
+_ICON_CACHE: dict[int, QIcon] = {}
+#: RO 的道具圖示用洋紅當透明色（實測 501 的左上角像素就是 #ff00ff）。
+_TRANSPARENT = "#ff00ff"
+
+
+def item_icon(item_id: int) -> QIcon:
+    """道具小圖。找不到就回空 QIcon（介面照樣顯示文字，不拿別的圖來頂）。"""
+    got = _ICON_CACHE.get(item_id)
+    if got is not None:
+        return got
+    path = icons.icon_path(item_id)
+    icon = QIcon()
+    if path is not None:
+        pixmap = QPixmap(str(path))
+        if not pixmap.isNull():
+            image = pixmap.toImage()
+            image.setAlphaChannel(image.createMaskFromColor(
+                QColor(_TRANSPARENT).rgb(), Qt.MaskMode.MaskOutColor
+            ))
+            icon = QIcon(QPixmap.fromImage(image))
+    _ICON_CACHE[item_id] = icon
+    return icon
+
+
+class CharacterCard(QWidget):
+    """單一角色的資訊卡。刻意做緊湊，掛機設定之後再往下加。"""
+
+    #: 卡片內容的最大寬度。資訊沒幾行，拉滿整頁只會讓進度條變得又長又空。
+    CONTENT_WIDTH = 380
+    #: 一列控制項的固定高度。**固定**是刻意的：之後再往下加功能時，
+    #: 上面的東西不會因為空間不夠被壓扁（不夠就整張卡片捲動）。
+    ROW_HEIGHT = 26
+    SPIN_WIDTH = 56
+    #: 道具小圖的邊長（解包出來的圖示是 24×24）。
+    ICON_PX = 24
+
+    #: 使用者勾選/取消「自動打怪」。參數：是否開啟。
+    farm_toggled = Signal(bool)
+    #: 背景 FarmBot 回報狀態（跨執行緒，用 signal 轉回 UI 執行緒才安全）。
+    farm_stats = Signal(object)
+    #: 使用者勾選/取消「自動補水」。參數：是否開啟。
+    potion_toggled = Signal(bool)
+    #: 補水設定（選了哪一格、百分比）有變動。
+    potion_changed = Signal()
+    #: 背景 PotionBot 回報狀態。
+    potion_stats = Signal(object)
+
+    def __init__(self) -> None:
+        super().__init__()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # 包進捲動區：**元件一律保持自然大小，空間不夠就捲動，不是壓扁**。
+        # 沒有這層的話每加一個新功能，上面的進度條就會被擠得越來越薄。
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+
+        holder = QWidget()
+        scroll.setWidget(holder)
+        board = QVBoxLayout(holder)
+        board.setContentsMargins(14, 12, 14, 12)
+        board.setSpacing(0)
+
+        inner = QWidget()
+        # 固定寬度而非上限：靠左對齊時 maximumWidth 會讓容器縮到內容寬度，
+        # 進度條就變得又細又短。
+        inner.setFixedWidth(self.CONTENT_WIDTH)
+        board.addWidget(inner, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        board.addStretch(1)
+
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        # 高度一律照元件自己要的來，不讓版面把它們拉長或壓扁
+        layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinAndMaxSize)
+
+        self.name_label = QLabel("—")
+        self.name_label.setObjectName("cardTitle")
+        layout.addWidget(self.name_label)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(7)
+        grid.setColumnStretch(1, 1)
+
+        # 經驗值：遊戲畫面只給百分比，這裡把實際數字讀出來。
+        # 條子做細的，數字放在條子上方 —— 6px 高的條塞不下文字。
+        base_block, self.base_head, self.base_value, self.base_bar = self._make_exp_block(
+            "Base", "baseBar"
+        )
+        job_block, self.job_head, self.job_value, self.job_bar = self._make_exp_block(
+            "Job", "jobBar"
+        )
+        layout.addWidget(base_block)
+        layout.addWidget(job_block)
+
+        self.hp_bar = self._make_bar("hpBar")
+        self.sp_bar = self._make_bar("spBar")
+        grid.addWidget(QLabel("HP"), 0, 0)
+        grid.addWidget(self.hp_bar, 0, 1)
+        grid.addWidget(QLabel("SP"), 1, 0)
+        grid.addWidget(self.sp_bar, 1, 1)
+        layout.addLayout(grid)
+
+        self.exp_label = QLabel("")
+        self.exp_label.setObjectName("pageSubtitle")
+        layout.addWidget(self.exp_label)
+
+        self.status_label = QLabel("定位中…")
+        self.status_label.setObjectName("pageSubtitle")
+        layout.addWidget(self.status_label)
+
+        # ---- 自動打怪 ----
+        self.auto_hunt = QCheckBox("自動打怪")
+        self.auto_hunt.setFixedHeight(self.ROW_HEIGHT)
+        self.auto_hunt.toggled.connect(self.farm_toggled)
+        layout.addWidget(self.auto_hunt)
+
+        self.farm_label = QLabel("")
+        self.farm_label.setObjectName("pageSubtitle")
+        self.farm_label.setWordWrap(True)
+        layout.addWidget(self.farm_label)
+
+        # ---- 自動補水 ----
+        layout.addWidget(self._build_potion_panel())
+
+        self.farm_stats.connect(self._apply_farm_stats)
+        self.potion_stats.connect(self._apply_potion_stats)
+
+    # ---- 自動補水 ---------------------------------------------------
+
+    def _build_potion_panel(self) -> QWidget:
+        """獨立執行緒跑，一拍 0.05 秒，低於門檻就連喝到過線為止。
+
+        下拉選單直接列背包裡的補血／補魔道具：名字查表、數量從記憶體即時讀
+        （[MEM-028]）。選單的值是**道具編號**不是格號 —— 格號會挪動。
+        """
+        panel = QWidget()
+        box = QVBoxLayout(panel)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+
+        head = QHBoxLayout()
+        self.auto_potion = QCheckBox("自動補水")
+        self.auto_potion.setFixedHeight(self.ROW_HEIGHT)
+        self.auto_potion.toggled.connect(self.potion_toggled)
+        head.addWidget(self.auto_potion)
+        head.addStretch(1)
+        box.addLayout(head)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        grid.setColumnStretch(3, 1)
+        self.hp_item, self.hp_threshold, self.hp_icon = self._make_potion_row(
+            grid, 0, "HP 低於"
+        )
+        self.sp_item, self.sp_threshold, self.sp_icon = self._make_potion_row(
+            grid, 1, "SP 低於"
+        )
+        box.addLayout(grid)
+
+        self.potion_label = QLabel("")
+        self.potion_label.setObjectName("pageSubtitle")
+        self.potion_label.setWordWrap(True)
+        box.addWidget(self.potion_label)
+        return panel
+
+    def _make_potion_row(self, grid: QGridLayout, row: int, title: str):
+        label = QLabel(title)
+        spin = QSpinBox()
+        # 直接打數字：不要上下箭頭，% 放在框外面。
+        # 範圍 0~100，超出的打不進去（QSpinBox 自己會夾住）；0 = 關閉這一項。
+        spin.setRange(0, 100)
+        spin.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spin.setAlignment(Qt.AlignmentFlag.AlignRight)
+        spin.setFixedSize(self.SPIN_WIDTH, self.ROW_HEIGHT)
+        spin.valueChanged.connect(self.potion_changed)
+        percent = QLabel("%")
+        combo = QComboBox()
+        combo.setFixedHeight(self.ROW_HEIGHT)
+        combo.setMinimumWidth(170)
+        combo.setIconSize(QSize(self.ICON_PX, self.ICON_PX))
+        preview = QLabel()
+        preview.setFixedSize(self.ICON_PX, self.ICON_PX)
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        combo.currentIndexChanged.connect(self.potion_changed)
+        combo.currentIndexChanged.connect(
+            lambda _i, c=combo, w=preview: self._show_icon(c, w)
+        )
+        grid.addWidget(label, row, 0)
+        grid.addWidget(spin, row, 1)
+        grid.addWidget(percent, row, 2)
+        grid.addWidget(combo, row, 3)
+        grid.addWidget(preview, row, 4)
+        return combo, spin, preview
+
+    @staticmethod
+    def _show_icon(combo: QComboBox, holder: QLabel) -> None:
+        """把選到的那個道具的小圖放在選單右邊。"""
+        icon = combo.itemIcon(combo.currentIndex())
+        holder.setPixmap(icon.pixmap(CharacterCard.ICON_PX, CharacterCard.ICON_PX))
+
+    def set_slots(self, rows: dict[int, tuple[int, int]]) -> None:
+        """把背包裡的補血／補魔道具填進兩個下拉選單。
+
+        道具名字查表（`assets/items.json.gz`），格號與數量從記憶體讀（[MEM-028]）。
+        **選單的值是道具編號不是格號** —— 格號會挪動，存格號遲早會喝錯東西。
+        同一組道具時只改文字不重建，避免每秒閃爍、也不會打斷正在挑的人。
+        """
+        for combo, wants in ((self.hp_item, heals_hp), (self.sp_item, heals_sp)):
+            wanted = [
+                (item_id, amount) for _slot, (item_id, amount) in sorted(rows.items())
+                if wants(item_id)
+            ]
+            current = [
+                (combo.itemData(i), combo.itemData(i, Qt.ItemDataRole.UserRole + 1))
+                for i in range(1, combo.count())
+            ]
+            if [c[0] for c in current] == [w[0] for w in wanted]:
+                for position, (item_id, amount) in enumerate(wanted, start=1):
+                    combo.setItemText(position, self._slot_text(item_id, amount))
+                    combo.setItemData(position, amount, Qt.ItemDataRole.UserRole + 1)
+                continue
+            if combo.view().isVisible():
+                continue  # 使用者正在挑，別把清單抽掉
+            keep = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("未選擇", None)
+            for item_id, amount in wanted:
+                combo.addItem(item_icon(item_id), self._slot_text(item_id, amount), item_id)
+                combo.setItemData(combo.count() - 1, amount, Qt.ItemDataRole.UserRole + 1)
+            position = combo.findData(keep)
+            combo.setCurrentIndex(position if position >= 0 else 0)
+            combo.blockSignals(False)
+        self._show_icon(self.hp_item, self.hp_icon)
+        self._show_icon(self.sp_item, self.sp_icon)
+
+    @staticmethod
+    def _slot_text(item_id: int, amount: int) -> str:
+        """只顯示名稱與數量 —— 格號是內部資料，使用者不需要看到。"""
+        return f"{item_name(item_id)} × {amount}"
+
+    def potion_config(self) -> PotionConfig:
+        return PotionConfig(
+            hp_item=self.hp_item.currentData(),
+            hp_percent=self.hp_threshold.value(),
+            sp_item=self.sp_item.currentData(),
+            sp_percent=self.sp_threshold.value(),
+        )
+
+    def _apply_potion_stats(self, stats: PotionStats) -> None:
+        if not stats.running:
+            self.potion_label.setText(stats.note)
+            if self.auto_potion.isChecked():
+                self.auto_potion.setChecked(False)
+            return
+        bits = [stats.note] if stats.note else []
+        if stats.hp_used:
+            bits.append(f"HP 藥 {stats.hp_used} 次")
+        if stats.sp_used:
+            bits.append(f"SP 藥 {stats.sp_used} 次")
+        self.potion_label.setText("｜".join(bits))
+
+    def _apply_farm_stats(self, stats: FarmStats) -> None:
+        if not stats.running:
+            self.farm_label.setText(stats.note)
+            # bot 自己停掉了（死亡／卡住／定位失敗）就把勾拿掉 ——
+            # 勾著卻沒在跑，看起來會像「還在掛機」，那是最糟的失效方式
+            if self.auto_hunt.isChecked():
+                self.auto_hunt.setChecked(False)
+            return
+        target = f"　目標 {stats.target}" if stats.target else ""
+        self.farm_label.setText(
+            f"擊殺 {stats.kills}　撿取 {stats.picked}　"
+            f"附近怪 {stats.monsters_near}{target}\n{stats.note}"
+        )
+
+    @staticmethod
+    def _make_bar(object_name: str) -> QProgressBar:
+        bar = QProgressBar()
+        bar.setObjectName(object_name)
+        bar.setRange(0, 100)
+        bar.setTextVisible(True)
+        bar.setFixedHeight(18)
+        return bar
+
+    @staticmethod
+    def _make_exp_block(title: str, bar_name: str):
+        """一個經驗值區塊：上面一行「等級 …… 數字」，下面一條細銀條。
+
+        高度與顏色在 qss（baseBar / jobBar）裡設定，這裡只管版面。
+        """
+        box = QWidget()
+        column = QVBoxLayout(box)
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(3)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        head = QLabel(title)
+        head.setObjectName("expHead")
+        value = QLabel("—")
+        value.setObjectName("expValue")
+        value.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(head)
+        row.addStretch(1)
+        row.addWidget(value)
+        column.addLayout(row)
+
+        bar = QProgressBar()
+        bar.setObjectName(bar_name)
+        bar.setRange(0, 100)
+        bar.setTextVisible(False)  # 條子太細，文字放在上面那行
+        column.addWidget(bar)
+        return box, head, value, bar
+
+    def update_status(self, status: CharacterStatus) -> None:
+        self.name_label.setText(status.name or "（讀不到名稱）")
+        self.base_head.setText(f"Base {status.base_level}")
+        self.job_head.setText(f"Job {status.job_level}")
+        self._fill_exp(self.base_bar, self.base_value, status.base_exp,
+                       status.base_exp_next, status.base_percent,
+                       status.base_maxed, status.has_exp)
+        self._fill_exp(self.job_bar, self.job_value, status.job_exp,
+                       status.job_exp_next, status.job_percent,
+                       status.job_maxed, status.has_exp)
+
+        self.hp_bar.setValue(int(status.hp_percent))
+        self.hp_bar.setFormat(f"{status.hp} / {status.max_hp}")
+        self.sp_bar.setValue(int(status.sp_percent))
+        self.sp_bar.setFormat(f"{status.sp} / {status.max_sp}")
+
+    @staticmethod
+    def _fill_exp(bar, label, exp: int, need: int, percent: float,
+                  maxed: bool, ok: bool) -> None:
+        """經驗條與旁邊的數字。讀不到就明說，不要顯示 0% 讓人以為真的是 0。"""
+        if not ok:
+            bar.setValue(0)
+            label.setText("經驗值讀取失敗")
+            return
+        if maxed:
+            bar.setValue(100)
+            label.setText(f"{exp:,}（已滿級）")
+            return
+        bar.setValue(int(percent))
+        # 遊戲畫面只給到小數一位且無條件捨去，這裡多給一位看得出有沒有在動
+        label.setText(f"{exp:,} / {need:,}　{percent:.2f}%")
+
+    def set_exp_gain(self, text: str) -> None:
+        self.exp_label.setText(text)
+
+    def set_note(self, text: str) -> None:
+        self.status_label.setText(text)
+
+
+class FarmPage(BasePage):
+    title = "自動掛機"
+    subtitle = "每個已登入的遊戲視窗一個分頁，會自動跟著增減。"
+    stretch_at_end = False
+
+    def __init__(self) -> None:
+        self._readers: dict[int, CharacterReader] = {}
+        self._cards: dict[int, CharacterCard] = {}
+        self._workers: dict[int, AttachWorker] = {}
+        self._bots: dict[int, FarmBot] = {}
+        self._potions: dict[int, PotionBot] = {}
+        self._bag_workers: dict[int, BagWorker] = {}
+        self._bag_loaded: set[int] = set()
+        # 每個角色最近一次讀到的背包 {格號: (道具編號, 數量)}
+        self._bags: dict[int, dict[int, tuple[int, int]]] = {}
+        self._names: dict[int, str] = {}
+        self._retry_at: dict[int, float] = {}
+        self._failures: dict[int, int] = {}
+        self._loot_shown: list[tuple[int, int]] = []
+        # 已停掉的掛機累計的道具。停掉掛機不該把『道具總攬』清空 ——
+        # 那是這隻角色撿到的東西，不是 bot 的內部狀態。
+        self._loot_totals: dict[int, dict[int, int]] = {}
+        # 掛機開始當下的 (時間, Base經驗, Job經驗)，用來算這次練了多少、每小時多少
+        self._exp_start: dict[int, tuple[float, int, int]] = {}
+        super().__init__()
+
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(_SCAN_INTERVAL_MS)
+        self._scan_timer.timeout.connect(self._scan)
+        self._scan_timer.start()
+
+        self._read_timer = QTimer(self)
+        self._read_timer.setInterval(_READ_INTERVAL_MS)
+        self._read_timer.timeout.connect(self._read_all)
+        self._read_timer.timeout.connect(self._refresh_loot)
+        self._read_timer.timeout.connect(self._refresh_current_bag)
+        self._read_timer.start()
+
+        self._scan()
+
+    # ---- 版面 -------------------------------------------------------
+
+    def build(self) -> None:
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("farmTabs")
+        self.tabs.setDocumentMode(True)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        self._layout.addWidget(self.tabs, 1)
+
+        self.empty_label = QLabel("找不到已登入的遊戲視窗。開好遊戲並登入後會自動出現。")
+        self.empty_label.setObjectName("placeholder")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._layout.addWidget(self.empty_label, 1)
+
+        self._build_loot_panel()
+        self._update_empty_state()
+
+    def _build_loot_panel(self) -> None:
+        """底部『道具總攬』：目前分頁角色撿到的道具，ID 一律查表顯示中文名。
+
+        撿到就自己更新（每秒），不必按按鈕 —— 掛機時人不在電腦前，
+        要能一眼看到現在撿了什麼。按鈕留著給「想立刻看」用。
+        """
+        header = QWidget()
+        row = QHBoxLayout(header)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(QLabel("道具總攬"))
+        self.loot_refresh = QPushButton("重新整理")
+        self.loot_refresh.clicked.connect(self._refresh_loot)
+        row.addWidget(self.loot_refresh)
+        self.loot_summary = QLabel("尚未撿到東西")
+        self.loot_summary.setObjectName("pageSubtitle")
+        row.addWidget(self.loot_summary)
+        row.addStretch(1)
+        self._layout.addWidget(header)
+
+        self.loot_table = QTableWidget(0, 2)
+        self.loot_table.setHorizontalHeaderLabels(["道具", "數量"])
+        self.loot_table.verticalHeader().setVisible(False)
+        self.loot_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.loot_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.loot_table.setMaximumHeight(160)
+        h = self.loot_table.horizontalHeader()
+        h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self._layout.addWidget(self.loot_table)
+
+    def _current_pid(self) -> int | None:
+        widget = self.tabs.currentWidget()
+        for pid, card in self._cards.items():
+            if card is widget:
+                return pid
+        return None
+
+    def _refresh_loot(self) -> None:
+        """把 {物品ID: 次數} 查表換成中文名列出來。
+
+        編號不顯示給使用者 —— 那是內部資料。只有查不到名字時才會退化成 `#編號`，
+        那種情況本來就該一眼看出「這個查不到」。
+        """
+        pid = self._current_pid()
+        loot = dict(self._loot_totals.get(pid, {})) if pid is not None else {}
+        bot = self._bots.get(pid) if pid is not None else None
+        if bot is not None:  # 正在跑的再疊上去
+            for item_id, count in bot.loot().items():
+                loot[item_id] = loot.get(item_id, 0) + count
+
+        rows = sorted(loot.items(), key=lambda kv: (-kv[1], kv[0]))
+        if rows != self._loot_shown:
+            self._loot_shown = rows
+            self.loot_table.setRowCount(len(rows))
+            for i, (item_id, count) in enumerate(rows):
+                self.loot_table.setItem(i, 0, QTableWidgetItem(item_name(item_id)))
+                self.loot_table.setItem(i, 1, QTableWidgetItem(str(count)))
+        total = sum(count for _id, count in rows)
+        self.loot_summary.setText(
+            f"{len(rows)} 種、共 {total} 個" if rows else "尚未撿到東西"
+        )
+
+    def _keep_loot(self, pid: int, bot: FarmBot) -> None:
+        """把要停掉的 bot 撿到的東西併進累計，這樣關掉掛機列表不會被清空。"""
+        totals = self._loot_totals.setdefault(pid, {})
+        for item_id, count in bot.loot().items():
+            totals[item_id] = totals.get(item_id, 0) + count
+
+    def _exp_gain_text(self, pid: int, status: CharacterStatus) -> str:
+        """這次掛機練了多少經驗、換算成每小時多少 —— 自動練等最想看的數字。"""
+        start = self._exp_start.get(pid)
+        if start is None or not status.has_exp:
+            return ""
+        began, base0, job0 = start
+        elapsed = max(time.monotonic() - began, 1.0)
+        base_gain = status.base_exp - base0
+        job_gain = status.job_exp - job0
+        if base_gain < 0 or job_gain < 0:
+            # 升級了，經驗歸零重算 —— 顯示不出正確累計就重新起算，不要報負數
+            self._exp_start[pid] = (time.monotonic(), status.base_exp, status.job_exp)
+            return "剛升級，重新起算"
+        per_hour = base_gain * 3600 / elapsed
+        minutes = elapsed / 60
+        left = ""
+        if per_hour > 0 and not status.base_maxed:
+            need = status.base_exp_next - status.base_exp
+            left = f"，約 {need / per_hour * 60:.0f} 分升級"
+        return (
+            f"本次 {minutes:.0f} 分：Base +{base_gain:,}　Job +{job_gain:,}"
+            f"（Base 每小時 {per_hour:,.0f}{left}）"
+        )
+
+    def _update_empty_state(self) -> None:
+        has_any = self.tabs.count() > 0
+        self.tabs.setVisible(has_any)
+        self.empty_label.setVisible(not has_any)
+
+    # ---- 視窗掃描 ---------------------------------------------------
+
+    def _scan(self) -> None:
+        """該加的加、該移的移。
+
+        ⚠ 移除的判斷**不能**用視窗列舉：遊戲在載入畫面／換地圖時視窗標題會
+        瞬間變空，`enumerate_windows()` 會跳過無標題的視窗，於是好端端的遊戲
+        看起來像「關掉了」，分頁就被無聲砍掉（實際踩過）。
+        行程死活改問 GetExitCodeProcess，那是明確事實。
+        視窗列舉只留著做一件事：發現還沒納入的新遊戲行程。
+        """
+        for pid in list(self._cards):
+            reader = self._readers.get(pid)
+            if reader is not None and not reader.alive():
+                self._remove(pid, "遊戲行程已結束")
+
+        now = time.monotonic()
+        for window in window_list.enumerate_windows():
+            if window.process_name.lower() != PROCESS_NAME:
+                continue
+            pid = window.pid
+            if pid in self._cards or pid in self._workers:
+                continue
+            if now < self._retry_at.get(pid, 0.0):
+                continue  # 還在重試冷卻中（多半是尚未登入）
+            self._start_attach(pid)
+
+    def _start_attach(self, pid: int) -> None:
+        worker = AttachWorker(pid)
+        worker.done.connect(self._on_attached)
+        worker.finished.connect(lambda p=pid: self._workers.pop(p, None))
+        self._workers[pid] = worker
+        worker.start()
+
+    def _on_attached(self, pid: int, reader: object) -> None:
+        if reader is None:
+            # 多半是還沒登入（角色結構還沒建立），等冷卻後再試一次
+            self._retry_at[pid] = time.monotonic() + _RETRY_AFTER_SEC
+            log.debug("PID %s 定位失敗，%.0f 秒後重試", pid, _RETRY_AFTER_SEC)
+            return
+
+        assert isinstance(reader, CharacterReader)
+        status = reader.read()
+        if status is None:
+            reader.close()
+            self._retry_at[pid] = time.monotonic() + _RETRY_AFTER_SEC
+            return
+
+        card = CharacterCard()
+        card.update_status(status)
+        card.set_note(f"PID {pid}")
+        card.farm_toggled.connect(lambda on, p=pid: self._toggle_farm(p, on))
+        card.potion_toggled.connect(lambda on, p=pid: self._toggle_potion(p, on))
+        card.potion_changed.connect(lambda p=pid: self._apply_potion_config(p))
+
+        self._readers[pid] = reader
+        self._cards[pid] = card
+        self._failures[pid] = 0
+        self._names[pid] = status.name
+        self.tabs.addTab(card, status.name or f"PID {pid}")
+        self._update_empty_state()
+        # 讀背包要全記憶體掃描（約 2 秒），三個視窗一起掃會很鈍 ——
+        # 只讀正在看的那一頁，切過去再讀。
+        if self._current_pid() == pid:
+            self._load_bag(pid)
+        log.info("自動掛機：加入 %s（PID %s）", status.name, pid)
+
+    def _remove(self, pid: int, reason: str) -> None:
+        bot = self._bots.pop(pid, None)
+        if bot is not None:
+            self._keep_loot(pid, bot)
+            bot.stop()
+
+        potion = self._potions.pop(pid, None)
+        if potion is not None:
+            potion.stop()
+        self._names.pop(pid, None)
+        self._bag_loaded.discard(pid)
+        self._bags.pop(pid, None)
+        worker = self._bag_workers.pop(pid, None)
+        if worker is not None:
+            worker.wait(3000)
+
+        card = self._cards.pop(pid, None)
+        if card is not None:
+            index = self.tabs.indexOf(card)
+            if index >= 0:
+                self.tabs.removeTab(index)
+            card.deleteLater()
+
+        reader = self._readers.pop(pid, None)
+        if reader is not None:
+            reader.close()
+
+        self._failures.pop(pid, None)
+        self._update_empty_state()
+        log.info("自動掛機：移除 PID %s（%s）", pid, reason)
+
+    # ---- 自動打怪 ---------------------------------------------------
+
+    def _toggle_farm(self, pid: int, on: bool) -> None:
+        card = self._cards.get(pid)
+        if on:
+            if pid in self._bots:
+                return
+            # 背景 FarmBot 的回報在它自己的執行緒，用 card 的 signal 轉回 UI 執行緒。
+            # start() 只起執行緒就返回（設定在背景做，UI 不卡）；成敗看回報的 note。
+            bot = FarmBot(pid, on_update=lambda s, c=card: c.farm_stats.emit(s))
+            self._bots[pid] = bot
+            reader = self._readers.get(pid)
+            status = reader.read() if reader is not None else None
+            if status is not None and status.has_exp:
+                self._exp_start[pid] = (time.monotonic(), status.base_exp, status.job_exp)
+            bot.start()
+        else:
+            bot = self._bots.pop(pid, None)
+            if bot is not None:
+                self._keep_loot(pid, bot)
+                bot.stop()
+            self._exp_start.pop(pid, None)
+            if card is not None:
+                card.set_exp_gain("")
+
+    # ---- 自動補水 ---------------------------------------------------
+
+    def _refresh_current_bag(self) -> None:
+        """每秒更新目前分頁的道具數量 —— 背景自己跑，不用按按鈕。"""
+        pid = self._current_pid()
+        if pid is not None:
+            self._refresh_bag(pid)
+
+    def _on_tab_changed(self) -> None:
+        """切到某個角色時才讀它的背包（之後由每秒的計時器自己更新）。"""
+        pid = self._current_pid()
+        if pid is not None and pid not in self._bag_loaded:
+            self._load_bag(pid)
+
+    def _load_bag(self, pid: int, again: bool = False) -> None:
+        """在背景讀背包（約 0.1 秒）。數量會自己一直更新，不需要任何按鈕。"""
+        if pid in self._bag_workers or (pid in self._bags and not again):
+            return
+        self._bag_loaded.add(pid)
+        worker = BagWorker(pid)
+        worker.done.connect(self._bag_ready)
+        worker.finished.connect(lambda p=pid: self._bag_workers.pop(p, None))
+        self._bag_workers[pid] = worker
+        worker.start()
+
+    def _bag_ready(self, pid: int, rows: object) -> None:
+        if pid in self._cards and rows:
+            self._bags[pid] = rows
+        self._apply_bag(pid)
+
+    def _apply_bag(self, pid: int) -> None:
+        """把讀到的背包填進選單。"""
+        card = self._cards.get(pid)
+        if card is None:
+            return
+        rows = self._bags.get(pid, {})
+        card.set_slots(rows)
+        if not rows:
+            card.potion_label.setText("⚠ 讀不到背包（AOB 定位失敗）")
+
+    def _refresh_bag(self, pid: int) -> None:
+        """重讀背包。一次約 0.1 秒，放在背景執行緒做。"""
+        self._load_bag(pid, again=True)
+
+    def _toggle_potion(self, pid: int, on: bool) -> None:
+        card = self._cards.get(pid)
+        if not on:
+            bot = self._potions.pop(pid, None)
+            if bot is not None:
+                bot.stop()
+            return
+        if pid in self._potions or card is None:
+            return
+        config = card.potion_config()
+        if not (config.wants_hp() or config.wants_sp()):
+            card.potion_label.setText("⚠ 還沒選道具或百分比是 0，沒有東西可以補")
+            card.auto_potion.setChecked(False)
+            return
+        bot = PotionBot(pid, config, on_update=lambda s, c=card: c.potion_stats.emit(s))
+        self._potions[pid] = bot
+        bot.start()
+
+    def _apply_potion_config(self, pid: int) -> None:
+        """設定改了就即時套用，不必關掉重開。"""
+        card = self._cards.get(pid)
+        bot = self._potions.get(pid)
+        if card is not None and bot is not None:
+            bot.configure(card.potion_config())
+
+    # ---- 數值更新 ---------------------------------------------------
+
+    def _read_all(self) -> None:
+        for pid in list(self._readers):
+            reader = self._readers.get(pid)
+            card = self._cards.get(pid)
+            if reader is None or card is None:
+                continue
+
+            status = reader.read()
+            if status is None:
+                self._failures[pid] = self._failures.get(pid, 0) + 1
+                if self._failures[pid] >= _MAX_READ_FAILURES:
+                    # 連續讀不到，多半是登出回到選角畫面，或遊戲關了
+                    self._remove(pid, "連續讀取失敗")
+                    self._retry_at[pid] = time.monotonic() + _RETRY_AFTER_SEC
+                else:
+                    card.set_note(f"PID {pid}　讀取失敗 {self._failures[pid]} 次")
+                continue
+
+            self._failures[pid] = 0
+            card.update_status(status)
+            card.set_exp_gain(self._exp_gain_text(pid, status))
+            index = self.tabs.indexOf(card)
+            if index >= 0 and status.name and self.tabs.tabText(index) != status.name:
+                self.tabs.setTabText(index, status.name)
+
+    # ---- 收尾 -------------------------------------------------------
+
+    def shutdown(self) -> None:
+        self._scan_timer.stop()
+        self._read_timer.stop()
+
+        for bot in list(self._bots.values()):
+            bot.stop()
+        self._bots.clear()
+
+        for worker in list(self._workers.values()):
+            worker.requestInterruption()
+            worker.wait(3000)
+        self._workers.clear()
+
+        for pid in list(self._cards):
+            self._remove(pid, "程式關閉")

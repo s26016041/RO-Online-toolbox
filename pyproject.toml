@@ -1,0 +1,84 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ro-toolbox"
+version = "0.1.0"
+description = "RO Online 自動化工具箱"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.6",
+]
+
+[project.optional-dependencies]
+# 封包攔截功能。注入遊戲行程 hook send，不需要 Npcap 或任何驅動。
+# pymem 讀寫記憶體、keystone 組譯 stub、pefile 解析匯入表、pywin32 列舉視窗。
+packet = [
+    "psutil>=5.9",
+    "scapy>=2.5",  # inbound 封包擷取（需搭配 Npcap 驅動）
+    "pymem>=1.13",
+    "keystone-engine>=0.9.2",
+    "pefile>=2023.2.7",
+    "pywin32>=306",
+]
+
+# 記憶體掃描。核心是純 ctypes，numpy 用來做向量化比對（掃描速度的關鍵）。
+memory = [
+    "numpy>=1.24",
+    "pywin32>=306",
+    "psutil>=5.9",
+]
+
+# 自動化功能實作時再裝：pip install -e .[automation]
+automation = [
+    "mss>=9.0",
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+    "pydirectinput>=1.0.4",
+]
+# 抽遊戲資料表用（只有 tools/build_*.py 需要，執行期不用）。
+# lupa 提供真的 Lua 5.1 直譯器，用來載入客戶端的 iteminfo_new.lub（見 [DAT-020]）。
+gamedata = [
+    "lupa>=2.0",
+]
+
+dev = [
+    "pytest>=8.0",
+    "pytest-qt>=4.4",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+ro-toolbox = "ro_toolbox.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+ro_toolbox = ["ui/resources/styles/*.qss", "ui/resources/icon.ico", "ui/resources/icon.png"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "DTZ"]
+ignore = [
+    # 封包時間刻意用本地時間顯示，加時區反而不好對照遊戲畫面
+    "DTZ006",
+    # Qt 的 model 介面規定 parent 預設值就是 QModelIndex()，不能改
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 從 Angels-Online-toolbox 原樣移植，刻意不改以便日後跟上游比對。
+# N801 是 Win32 結構名稱（MEMORY_BASIC_INFORMATION 等），本來就該長那樣。
+"src/ro_toolbox/services/memory_scan.py" = ["B905", "N801", "N818", "UP037"]
+# ctypes 結構沿用 libpcap 的命名（pcap_if 等），保留小寫
+"src/ro_toolbox/services/pcap_capture.py" = ["N801"]
+# 覆寫 Qt 的方法必須沿用框架的駝峰命名（closeEvent、rowCount…）
+"src/ro_toolbox/ui/**" = ["N802"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

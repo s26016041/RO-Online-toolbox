@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+*.log
+logs/
+config.local.json
+
+# RO 客戶端解包資料（24 萬檔案，只在本機分析用，不進版控）
+RODATA/
+
+# 診斷產出（verify_sigs、farm_test 等工具寫的報告與快照，只在本機看）
+reports/
