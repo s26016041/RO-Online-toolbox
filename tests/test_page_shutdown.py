@@ -68,3 +68,32 @@ def test_the_real_pages_call_super(qtbot):
             f"{cls.__name__}.shutdown() 沒呼叫 super() —— "
             "漏收的執行緒會讓 Qt 中止整個行程"
         )
+
+
+class _Stubborn(Worker):
+    """叫不停的工作 —— 模擬卡在 GameGuard 擋住的系統呼叫上。"""
+
+    def run(self) -> None:
+        import time
+
+        time.sleep(1.5)          # 不理會 request_stop
+
+
+def test_a_thread_that_will_not_stop_is_kept_alive_not_destroyed(qtbot):
+    """⚠ 停不下來的執行緒**殺不得**，唯一安全的做法是留著引用到行程結束。
+
+    不留的話 Qt 會喊「Destroyed while thread is still running」並用
+    0xC0000409 中止整個行程 —— 寧可洩漏一條，也不要把程式打掉（[ENV-005]）。
+    """
+    from ro_toolbox.core import worker as mod
+
+    before = len(mod._STUCK)
+    thread = WorkerThread(_Stubborn())
+    thread.start()
+    qtbot.waitUntil(lambda: thread.is_running, timeout=3000)
+    thread.stop(timeout_ms=100)          # 故意等不到
+    assert len(mod._STUCK) == before + 1, "停不下來的要被留著"
+    kept_thread, kept_worker = mod._STUCK[-1]
+    assert kept_thread is thread.thread
+    assert kept_worker is thread.worker, "worker 也要留 —— 它在那條執行緒上"
+    qtbot.waitUntil(lambda: not thread.is_running, timeout=5000)

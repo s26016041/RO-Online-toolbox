@@ -45,6 +45,11 @@ class Worker(QObject):
             self.finished.emit()
 
 
+#: 叫不停的背景執行緒。**故意不放掉引用** —— 見 `WorkerThread.stop()`。
+#: 只會在收尾時長大，行程結束就跟著消失。
+_STUCK: list = []
+
+
 class WorkerThread:
     """把 Worker 搬到 QThread 上跑，並負責收尾。"""
 
@@ -59,10 +64,25 @@ class WorkerThread:
         self.thread.start()
 
     def stop(self, timeout_ms: int = 3000) -> None:
+        """叫停並等它結束。**等不到也絕不讓它被解構。**
+
+        ⚠ 停不下來是真的會發生的：讀遊戲記憶體的工作可能卡在 GameGuard 擋住的
+        系統呼叫上（列舉模組實測會卡 3 秒以上，[MEM-030]）。那種執行緒**殺不得**
+        —— 唯一安全的做法是**留著它的引用**到行程結束。
+
+        不留的話：Python 這邊沒人引用 → QThread 被解構 → Qt 喊
+        「Destroyed while thread is still running」→ 用 0xC0000409
+        **中止整個行程**。實際踩過（[ENV-005]）：exe 自檢每一項都通過，
+        卻在收尾時無聲崩掉，看起來像打包壞掉。
+
+        寧可洩漏一條執行緒（行程反正要結束了），也不要把整個程式打掉。
+        """
         self.worker.request_stop()
         self.thread.quit()
         if not self.thread.wait(timeout_ms):
-            log.warning("背景執行緒未在 %sms 內結束", timeout_ms)
+            log.warning("背景執行緒未在 %sms 內結束，留著它直到行程結束", timeout_ms)
+            # ⚠ worker 也要一起留：它被 moveToThread 到那條執行緒上。
+            _STUCK.append((self.thread, self.worker))
 
     @property
     def is_running(self) -> bool:
