@@ -35,6 +35,8 @@ def _relaunch_in_venv() -> int:
 
 
 def _run() -> int:
+    # 打包之後 `src/` 不存在（程式碼已經在 exe 裡），插進去是無害的沒用功；
+    # 沒打包時它是唯一能找到 ro_toolbox 的方法。
     sys.path.insert(0, str(ROOT / "src"))
     try:
         from ro_toolbox.app import run
@@ -48,11 +50,20 @@ def _run() -> int:
     return run(sys.argv)
 
 
+def _packaged() -> bool:
+    """已經打包成 exe 了嗎？
+
+    ⚠ 兩種打包工具的旗標不一樣，**兩個都要認**：
+    PyInstaller 設 `sys.frozen`，Nuitka 設模組層級的 `__compiled__`。
+    只認 `sys.frozen` 的話，Nuitka 編出來的 exe 會以為自己是原始碼，
+    跑去找 `.venv` 重新啟動自己 —— 那個路徑在使用者的電腦上不存在。
+    """
+    return bool(getattr(sys, "frozen", False) or globals().get("__compiled__"))
+
+
 def main() -> int:
     # 打包成 exe 之後沒有 venv 這回事：相依全都在 exe 裡面。
-    # （目前 frozen 時 VENV_PYTHON 剛好指到不存在的路徑所以不會觸發，
-    #   但那是巧合不是設計 —— 明講出來，別讓它哪天悄悄變成真。）
-    if getattr(sys, "frozen", False):
+    if _packaged():
         return _run()
     if VENV_PYTHON.exists() and not _running_in_venv():
         return _relaunch_in_venv()

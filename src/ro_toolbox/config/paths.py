@@ -11,7 +11,11 @@ PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
 
 def _bundle_root() -> Path | None:
-    """PyInstaller 解壓資料檔的位置；不是打包執行就回 None。
+    """打包後資料檔的位置；不是打包執行就回 None。
+
+    ⚠ **兩種打包工具要分開處理**：PyInstaller 解壓到暫存目錄（`sys._MEIPASS`），
+    Nuitka 則是把資料檔放在 exe 旁邊（沒有解壓）。只認其中一種的話，
+    另一種編出來的程式會安靜地查不到道具名、選單全空。
 
     打包成 exe 之後，程式碼跑在暫存解壓目錄裡，
     `PACKAGE_DIR.parents[1] / "assets"` 會指到一個**不存在的地方** ——
@@ -19,7 +23,12 @@ def _bundle_root() -> Path | None:
     沒有任何錯誤訊息。所以打包路徑一定要另外算。
     """
     base = getattr(sys, "_MEIPASS", None)
-    return Path(base) if getattr(sys, "frozen", False) and base else None
+    if getattr(sys, "frozen", False) and base:
+        return Path(base)                      # PyInstaller：解壓到暫存目錄
+    if "__compiled__" in globals() or getattr(sys, "__compiled__", None):
+        # Nuitka：資料檔就放在 exe 旁邊，沒有解壓這回事。
+        return Path(sys.executable).parent
+    return None
 
 
 def _resources_dir() -> Path:
