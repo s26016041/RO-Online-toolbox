@@ -803,6 +803,7 @@ class MemoryPage(BasePage):
         self._on_scan_type_changed()
 
     def shutdown(self) -> None:
+        super().shutdown()
         self._watch_timer.stop()
         worker = self._worker
         if worker is not None and worker.isRunning():

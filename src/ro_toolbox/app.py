@@ -92,10 +92,7 @@ def selftest() -> int:
     """
     import os
 
-    from ro_toolbox.config.paths import icon_file, stylesheet_file
-    from ro_toolbox.services.gamedata import item_name, mob_name
     from ro_toolbox.services.updater import NO_UPDATE_ENV
-    from ro_toolbox.ui.main_window import PAGE_CLASSES
 
     # 自檢是短命的無頭執行：建好視窗就結束，查更新的執行緒來不及收尾
     # 會讓 Qt 直接中止行程。一定要在建視窗**之前**設。
@@ -113,6 +110,22 @@ def selftest() -> int:
     except Exception as exc:  # noqa: BLE001 - 冒煙測試要把任何失敗變成訊息
         print(f"[NG] 組不起來：{exc}")
         return 1
+    try:
+        return _check(window, problems)
+    finally:
+        # ⚠ **一定要走正常的關閉流程。** 分頁在建構時就會起背景執行緒
+        #（掃遊戲視窗、讀背包、對時…），直接 return 的話那些執行緒還活著，
+        # Qt 解構時會喊「Destroyed while thread is still running」並用
+        # 0xC0000409 中止行程 —— 自檢每一項都通過了，卻回報失敗。
+        # 實際踩過：打包出來的 exe 一個字都沒印就崩，看起來像打包壞掉，
+        # 其實原始碼版本一模一樣崩（2026-08-27）。
+        window.close()
+
+
+def _check(window, problems: list[str]) -> int:
+    from ro_toolbox.config.paths import icon_file, stylesheet_file
+    from ro_toolbox.services.gamedata import item_name, mob_name
+    from ro_toolbox.ui.main_window import PAGE_CLASSES
 
     pages = window.stack.count()
     if pages != len(PAGE_CLASSES):

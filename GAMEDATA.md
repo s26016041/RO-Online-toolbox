@@ -3010,6 +3010,39 @@ A1  <全域>        mov  eax, [某全域]
   `ui/pages/farm_page.py`（`_watch_connections`／`snapshot_for`／`restore_into`／
   `_ReconnectWorker`）、`ui/pages/account_page.py`（勾選）、`config/settings.py`。
 
+### [ENV-005] ★★★ exe 崩在 0xC0000409、一個字都沒印 —— **不是打包的問題**
+
+- **狀態**：已修（實測 exit 0）
+- **日期**：2026-08-27
+- **症狀**：`build_local.py` 編出來的 exe 跑 `--selftest`，
+  **完全沒有輸出**、return code **3221226505（0xC0000409）**。
+  連「帶主控台的除錯版」也一個字都沒印 —— 看起來像打包壞掉。
+- **⛔ 別急著怪 PyInstaller。決定性的一步是：跑原始碼版本。**
+
+      .\.venv\Scripts\python.exe main.py --selftest
+
+  原始碼版本**一模一樣崩**，而且自檢的每一項都印了 `[OK]`。
+  所以問題在程式的**收尾**，跟打包無關。（PowerShell 跑才看得到 Qt 的
+  錯誤訊息；Git Bash 那邊只拿得到 exit 127，什麼都看不到。）
+- **真正的原因**：`QThread: Destroyed while thread '' is still running`。
+  有背景執行緒還活著，Qt 在解構時**中止整個行程**。
+  兩個獨立的漏洞加在一起：
+  1. `selftest()` **直接 return**，從來沒走 `closeEvent` → `page.shutdown()`
+     那條收尾路徑；
+  2. `AccountPage.shutdown()` 只收 `_offset_thread` 與 `_login_thread`，
+     **漏了 `_link_thread`**（那條在建構時就起來了）。
+- **修法**：
+  - `selftest()` 用 `try/finally` 呼叫 `window.close()`，走正常收尾。
+  - `BasePage.shutdown()` 改成**掃描自己身上所有 `WorkerThread` 並停掉**，
+    子類別覆寫時要呼叫 `super().shutdown()`。
+    **清單會漏，掃描不會** —— 這條漏掉的代價是整個行程被中止。
+  - 測試 `tests/test_page_shutdown.py` 釘住「所有分頁的 shutdown 都有
+    呼叫 super()」。
+- **順便抓到的**：`farm_page` 的自動回連寫成 `WorkerThread(worker, self)`，
+  但那個建構子**只吃一個參數** —— 開了自動回連就會 TypeError。已修。
+- **一般化的教訓**：打包後的怪症狀，**先跑原始碼版本**。一樣壞就不是打包，
+  是程式；不一樣才是打包。這一步花 5 秒，省掉整輪 Nuitka 的評估。
+
 ### [PKT-069] ★★ 只通一個地方的 NPC：選單是「確定嗎」，不是「選去哪」
 
 - **狀態**：已驗證（使用者實測回報的選單內容，2026-08-27）

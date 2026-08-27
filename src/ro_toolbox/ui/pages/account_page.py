@@ -819,6 +819,7 @@ class AccountPage(BasePage):
     # ---- 收尾 -------------------------------------------------------
 
     def shutdown(self) -> None:
+        super().shutdown()
         self._timer.stop()
         for thread in (self._offset_thread, self._login_thread):
             if thread is not None:

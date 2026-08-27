@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+
+log = logging.getLogger(__name__)
 
 
 class BasePage(QWidget):
@@ -38,4 +42,21 @@ class BasePage(QWidget):
         self._layout.addWidget(widget)
 
     def shutdown(self) -> None:
-        """關閉程式前的收尾，需要停止背景工作的分頁覆寫這個方法。"""
+        """關閉程式前的收尾。覆寫的子類別**要記得呼叫 `super().shutdown()`**。
+
+        預設會把這個分頁身上**所有還在跑的 `WorkerThread` 都停掉**。
+
+        ⚠ 為什麼要這道全面掃描，而不是各自列一份清單：漏掉一條的後果是
+        Qt 在解構時喊「Destroyed while thread is still running」並用
+        0xC0000409 **中止整個行程**。實際踩過（2026-08-27）：
+        `AccountPage.shutdown()` 收了 `_offset_thread` 與 `_login_thread`，
+        **漏了 `_link_thread`** —— 打包出來的 exe 自檢每一項都通過，
+        卻在收尾時崩掉、一個字都沒印，看起來像打包壞掉。
+        清單會漏，掃描不會。
+        """
+        from ro_toolbox.core.worker import WorkerThread
+
+        for name, value in list(vars(self).items()):
+            if isinstance(value, WorkerThread) and value.is_running:
+                log.info("%s：停掉還在跑的 %s", type(self).__name__, name)
+                value.stop()

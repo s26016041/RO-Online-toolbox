@@ -1065,9 +1065,9 @@ class FarmPage(BasePage):
             log.warning("「%s」斷線了，但沒有斷線前的快照，先不自動回連", who)
             return
         worker = _ReconnectWorker(pid, who, snap)
-        thread = WorkerThread(worker, self)
+        thread = WorkerThread(worker)   # ⚠ 只吃一個參數，沒有 parent
         worker.done.connect(self._reconnect_done)
-        thread.finished.connect(lambda: setattr(self, "_reconnecting", False))
+        worker.finished.connect(lambda: setattr(self, "_reconnecting", False))
         self._reconnecting = True
         self._reconnect_thread = thread
         self._reconnect_decider = decider
@@ -1335,6 +1335,7 @@ class FarmPage(BasePage):
     # ---- 收尾 -------------------------------------------------------
 
     def shutdown(self) -> None:
+        super().shutdown()
         self._scan_timer.stop()
         self._read_timer.stop()
 

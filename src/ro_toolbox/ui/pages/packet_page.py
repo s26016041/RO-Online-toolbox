@@ -301,6 +301,7 @@ class PacketPage(BasePage):
         self._reset_stats()
 
     def shutdown(self) -> None:
+        super().shutdown()
         self._stats_timer.stop()
         if self._capture is not None:
             self._stop()
