@@ -97,3 +97,43 @@ def test_a_thread_that_will_not_stop_is_kept_alive_not_destroyed(qtbot):
     assert kept_thread is thread.thread
     assert kept_worker is thread.worker, "worker 也要留 —— 它在那條執行緒上"
     qtbot.waitUntil(lambda: not thread.is_running, timeout=5000)
+
+
+# ---- 自檢不准去附加遊戲行程 ----------------------------------------------
+
+
+def test_selftest_flag_stops_the_farm_page_from_scanning(qtbot, monkeypatch):
+    """⚠ 自檢要驗的是「東西有沒有收進來」，不是「能不能操作遊戲」。
+
+    附加遊戲的工作會卡在 GameGuard 擋住的系統呼叫上（列舉模組實測卡 3 秒
+    以上），那條執行緒叫不停 —— 行程收尾時 DLL 開始卸載，它醒來就踩到已釋放
+    的程式碼，整個行程被以 0xC0000409 中止（[ENV-005]）。
+    **留著引用救不了：問題是它存在，不是它被解構。**
+    """
+    from ro_toolbox.config.paths import SELFTEST_ENV
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.setenv(SELFTEST_ENV, "1")
+    scanned = []
+    monkeypatch.setattr(mod.FarmPage, "_scan", lambda self: scanned.append(1))
+    page = mod.FarmPage()
+    qtbot.addWidget(page)
+    assert scanned == [], "自檢時不該去掃遊戲視窗"
+    assert page._scan_timer.isActive() is False
+    assert page._read_timer.isActive() is False
+    page.shutdown()
+
+
+def test_without_the_flag_it_scans_as_usual(qtbot, monkeypatch):
+    """一般啟動要照舊掃 —— 這道閘門只准影響自檢。"""
+    from ro_toolbox.config.paths import SELFTEST_ENV
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.delenv(SELFTEST_ENV, raising=False)
+    scanned = []
+    monkeypatch.setattr(mod.FarmPage, "_scan", lambda self: scanned.append(1))
+    page = mod.FarmPage()
+    qtbot.addWidget(page)
+    assert scanned == [1]
+    assert page._scan_timer.isActive() is True
+    page.shutdown()

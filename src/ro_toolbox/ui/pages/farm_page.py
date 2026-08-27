@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ro_toolbox.config.paths import in_selftest
 from ro_toolbox.config.settings import current_settings
 from ro_toolbox.core.worker import Worker, WorkerThread
 from ro_toolbox.services import bag, icons, potion_store, window_list
@@ -790,9 +791,13 @@ class FarmPage(BasePage):
         self._read_timer.timeout.connect(self._refresh_loot)
         self._read_timer.timeout.connect(self._refresh_current_bag)
         self._read_timer.timeout.connect(self._watch_connections)
-        self._read_timer.start()
-
-        self._scan()
+        if in_selftest():
+            # 自檢只驗「東西有沒有收進來」，不附加遊戲行程（[ENV-005]）。
+            self._scan_timer.stop()
+            self._read_timer.stop()
+        else:
+            self._read_timer.start()
+            self._scan()
 
     # ---- 版面 -------------------------------------------------------
 

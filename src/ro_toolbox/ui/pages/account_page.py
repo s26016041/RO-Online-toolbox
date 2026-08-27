@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ro_toolbox.config.paths import in_selftest
 from ro_toolbox.config.settings import current_settings, save_settings
 from ro_toolbox.core.worker import Worker, WorkerThread
 from ro_toolbox.services import accounts as account_store
@@ -329,7 +330,9 @@ class AccountPage(BasePage):
         self.add(self._build_buttons())
 
         self._load()
-        self._check_time()
+        if not in_selftest():
+            # 自檢不對時（那要連外，而且會起背景執行緒）—— 只驗東西在不在。
+            self._check_time()
 
         # 200ms 而不是 1s：碼是在整秒邊界跳的，用秒級輪詢看起來會慢半拍。
         self._timer = QTimer(self)

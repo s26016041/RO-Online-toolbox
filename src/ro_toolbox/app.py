@@ -92,11 +92,15 @@ def selftest() -> int:
     """
     import os
 
+    from ro_toolbox.config.paths import SELFTEST_ENV
     from ro_toolbox.services.updater import NO_UPDATE_ENV
 
     # 自檢是短命的無頭執行：建好視窗就結束，查更新的執行緒來不及收尾
     # 會讓 Qt 直接中止行程。一定要在建視窗**之前**設。
     os.environ[NO_UPDATE_ENV] = "1"
+    # ⚠ 同理：自檢不准去附加遊戲行程。卡在 GameGuard 的執行緒叫不停，
+    # 行程收尾時會把整個程式打掉（[ENV-005]）。
+    os.environ[SELFTEST_ENV] = "1"
 
     # 主控台是 cp950，`✓` 這種字元編不進去會直接拋 UnicodeEncodeError ——
     # 冒煙測試自己因為印字而失敗是最蠢的失敗方式，所以輸出一律 ASCII 記號，
