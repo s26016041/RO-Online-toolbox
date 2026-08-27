@@ -203,3 +203,35 @@ def test_nothing_more_is_sent_after_it_failed():
     talk.feed(nd.ZC_MENU_LIST, MENU)
     talk.feed(nd.ZC_WAIT_DIALOG, WAIT)      # 失敗之後再餵也不該有動作
     assert _drain(talk) == []
+
+
+# ---- 實體封包：認出「哪一隻是 NPC」---------------------------------------
+#
+# 版面與 objtype 的值來自實機登入擷取（`封包/全整登入.txt`，2026-08-27）：
+#   objtype 0 = 其他玩家（GID 兩千多萬、外觀是職業編號）
+#   objtype 6 = NPC（GID 只有兩三位數）
+# 進圖時伺服器會把那張圖的實體**全部**送一次 —— 所以只要跟 NPC 講話前有過圖，
+# GID 一定拿得到；站在他旁邊才按按鈕才會漏掉（那一包早就送完了）。
+
+
+def test_entity_layout_matches_the_login_capture():
+    from ro_toolbox.core.ro_protocol import unpack_position
+    from ro_toolbox.services import travel_bot as mod
+
+    # 實機那 23 筆裡的一筆 NPC：objtype=6、外觀=105、GID=170、(29,200)
+    payload = bytearray(70)
+    payload[0:2] = (70).to_bytes(2, "little")
+    payload[mod._ENT_OBJTYPE] = 6
+    payload[mod._ENT_GID:mod._ENT_GID + 4] = (170).to_bytes(4, "little")
+    payload[mod._ENT_CLASS:mod._ENT_CLASS + 2] = (105).to_bytes(2, "little")
+    # 3-byte 打包（unpack_position 的反運算）：x 佔 10 bit、y 佔 10 bit、方向 4 bit
+    x, y = 29, 200
+    payload[mod._ENT_POS:mod._ENT_POS + 3] = bytes([
+        x >> 2, ((x & 0x03) << 6) | ((y >> 4) & 0x3F), (y & 0x0F) << 4,
+    ])
+
+    assert payload[mod._ENT_OBJTYPE] == mod._OBJTYPE_NPC
+    assert int.from_bytes(payload[mod._ENT_GID:mod._ENT_GID + 4], "little") == 170
+    assert int.from_bytes(payload[mod._ENT_CLASS:mod._ENT_CLASS + 2], "little") == 105
+    x, y, _d = unpack_position(bytes(payload[mod._ENT_POS:mod._ENT_POS + 3]))
+    assert (x, y) == (29, 200)

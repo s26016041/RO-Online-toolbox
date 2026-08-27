@@ -41,17 +41,19 @@ _RESYNC_SEC = 2.0  # 多久檢查一次「連線有沒有換掉」
 _OP_MOVE_ACK = 0x0087  # 伺服器確認「我」要移動：payload[4:10] = 起點+終點
 #: 實體進入視野的封包（版面見 services/world.py 的欄位表）
 _OP_ENTITY = (0x09FF, 0x09FE, 0x09FD)
+#: 走多遠才確定出了 NPC 的視野。RO 的視野約 14 格，抓 22 有餘裕。
+_OUT_OF_VIEW = 22
+#: 「走遠再走回來」最多做幾輪。做不到就跳警告交給人，不要一直來回踱步。
+_SHAKE_ROUNDS = 2
+#: 每一步的逾時：走不到就當這一輪失敗。只是放棄的上限。
+_SHAKE_STEP_SEC = 30.0
+_ENT_OBJTYPE = 2    # 1 byte：0=其他玩家、6=NPC（實測登入擷取確認）
+_OBJTYPE_NPC = 6
 _ENT_GID = 3        # uint32
 _ENT_CLASS = 21     # uint16 外觀編號
 _ENT_POS = 61       # 3-byte 壓縮座標
 #: NPC 座標容許差幾格。Navi_Npc 給的是他站的格，實際可能差一點。
 _NPC_SNAP = 3
-#: 走多遠才確定出了 NPC 的視野。RO 的視野約 14 格，抓 22 有餘裕。
-_OUT_OF_VIEW = 22
-#: 「走遠再走回來」最多做幾輪。做不到就交給人，不要一直來回踱步。
-_SHAKE_ROUNDS = 2
-#: 每一步的逾時：走不到就當這一輪失敗。只是放棄的上限。
-_SHAKE_STEP_SEC = 30.0
 
 
 @dataclass
@@ -98,6 +100,8 @@ class TravelBot:
         self._shake_round = 0
         self._shake_since = 0.0
         self._shake_cell: tuple[int, int] | None = None
+        #: 已經提醒過哪一段要人手動（避免每拍洗版）
+        self._asked: tuple[str, int, int] | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._walker = Walker(self._send_move)
@@ -245,6 +249,9 @@ class TravelBot:
         want = self._npc_want
         if want is None or len(payload) < _ENT_POS + 3:
             return
+        # objtype 6 = NPC（實測登入擷取：0=其他玩家、6=NPC、GID 只有兩三位數）
+        if payload[_ENT_OBJTYPE] != _OBJTYPE_NPC:
+            return
         class_id = int.from_bytes(payload[_ENT_CLASS:_ENT_CLASS + 2], "little")
         if class_id != want[0]:
             return
@@ -350,6 +357,27 @@ class TravelBot:
         if far <= _NPC_SNAP:
             self._shake = None              # 回到他旁邊了，這時應該收得到封包
 
+    def _ask_for_help(self, hop) -> None:  # noqa: ANN001 - travel.Hop
+        """認不出那隻 NPC —— 講清楚要你做什麼，而且**講出要選哪張地圖**。
+
+        什麼時候會這樣：按下自動尋路時人**已經站在他視野內**（約 14 格），
+        那一包早就送完了。實體只在「進入視野」時送一次（[PKT-061]），
+        而 GID 只有那一包給得起 —— RODATA 沒有（實測 `Navi_Npc` 給 18518、
+        實際封包用 91），怪物掃描器也看不到 NPC（[MEM-047]）。
+
+        ⚠ **只講一次**，不要每拍洗版；到了（地圖名一變）就自動接手。
+        """
+        if self._asked == (hop.from_map, hop.x, hop.y):
+            return
+        self._asked = (hop.from_map, hop.x, hop.y)
+        where = map_display_name(hop.to_map) or hop.to_map
+        log.warning(
+            "⚠ 認不出「%s」（你按下按鈕時已經站在他旁邊，進視野那一包早就送完了）。"
+            "請自己跟他講話，選「%s」—— 到了我就自動繼續走。"
+            "（下次先站遠一點再按，或先過一張圖，我就能自己講。）",
+            hop.npc, where,
+        )
+
     def _watch_next_npc(self) -> None:
         """路線上**下一段**如果要跟 NPC 講話，現在就開始留意他的實體封包。
 
@@ -367,6 +395,9 @@ class TravelBot:
             self._npc_want = want
             self._npc_gid = None
             self._talk = None
+            self._asked = None
+            self._shake = None
+            self._shake_round = 0
             if want is not None:
                 log.info("留意「%s」（外觀 %s，在 %s,%s）的實體封包",
                          hop.npc, want[0], want[1], want[2])
@@ -383,9 +414,12 @@ class TravelBot:
             return
         if self._talk is None:
             if self._npc_gid is None:
-                # 認不出來多半是「按下按鈕時人就站在他旁邊」，那一包早就送完了。
-                # 走遠再走回來逼他重新進視野 —— 這是唯一不必猜的辦法。
-                self._shake_view(hop)
+                # 先自己想辦法：走遠再走回來，逼他重新進一次視野。
+                # 兩輪都不行才跳警告叫人 —— 能自己做的不要麻煩使用者。
+                if self._shake_round < _SHAKE_ROUNDS or self._shake is not None:
+                    self._shake_view(hop)
+                else:
+                    self._ask_for_help(hop)
                 return
             want = map_display_name(hop.to_map)
             self._talk = npc_dialog.NpcTalk(self._npc_gid, want)
