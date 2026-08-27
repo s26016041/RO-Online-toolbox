@@ -230,6 +230,18 @@ def probe() -> int:
         status = reader.read()
         print(f"[探針] 讀到角色 = {status and status.name}"
               f" @ {status and status.map_name} {reader.read_position()}")
+    # 直接跑一次特徵掃描，看命中幾個、幾個通過驗證 ——
+    # 「attach 回 True 但 read() 回 None」就是這一步挑錯了候選。
+    if ok:
+        from ro_toolbox.services.aob import scan as aob_scan
+        from ro_toolbox.services.signatures import CHAR_STATUS
+
+        hits = aob_scan(reader._scanner, CHAR_STATUS,  # noqa: SLF001 - 診斷
+                        writable_only=True, limit=64)
+        good = [h for h in hits if reader.probe(h) is not None]
+        print(f"[探針] 角色特徵命中 {len(hits)} 個，通過數值驗證 {len(good)} 個")
+        print(f"[探針]   命中：{[hex(h) for h in hits[:8]]}")
+        print(f"[探針]   驗過：{[hex(h) for h in good[:8]]}")
     reader.close()
     return 0
 
