@@ -138,7 +138,6 @@ def test_entity_without_render_object_is_rejected():
 # ---- 快路徑：記住位址，之後只讀那個位址 ------------------------------------
 
 
-import struct  # noqa: E402
 
 from ro_toolbox.services import entities as ent  # noqa: E402
 
@@ -162,7 +161,7 @@ def _scanner_with(monkeypatch, payload):
     return scanner
 
 
-class _always_true_lut:
+class _always_true_lut:  # noqa: N801 - 假的查表物件，不是型別
     def __getitem__(self, _i):
         return True
 

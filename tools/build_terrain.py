@@ -40,15 +40,15 @@ sys.path.insert(0, str(ROOT / "src"))
 import numpy as np  # noqa: E402
 
 from ro_toolbox.services.mapdata import (  # noqa: E402
+    _CELL_SIZE,
+    _HEADER_SIZE,
+    _MAGIC,
+    _TYPE_OFFSET_IN_CELL,
     RODATA_DIRS,
     TERRAIN_ASSET,
     TERRAIN_MAGIC,
     TERRAIN_VERSION,
     WALKABLE_TYPES,
-    _CELL_SIZE,
-    _HEADER_SIZE,
-    _MAGIC,
-    _TYPE_OFFSET_IN_CELL,
 )
 
 

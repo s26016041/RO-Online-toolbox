@@ -118,7 +118,7 @@ _TCPIP_OWNING_MODULE_SIZE = 16
 _MIB_STATE_ESTABLISHED = 5
 
 
-class _MIB_TCPROW_OWNER_MODULE(ctypes.Structure):
+class _MIB_TCPROW_OWNER_MODULE(ctypes.Structure):  # noqa: N801 - 跟 Win32 SDK 同名
     _fields_ = [
         ("dwState", ctypes.c_uint32),
         ("dwLocalAddr", ctypes.c_uint32),

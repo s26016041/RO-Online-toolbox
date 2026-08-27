@@ -77,7 +77,8 @@ def cmd_scan() -> int:
     span = image_size(scanner, _PROCESS)
     if base is None or span is None:
         sys.exit("讀不到模組範圍")
-    print(f"pid={pid}  {_PROCESS}+{0:#x}..{span:#x}  地圖 {map_name} {terrain.width}x{terrain.height}")
+    print(f"pid={pid}  {_PROCESS}+{0:#x}..{span:#x}  "
+          f"地圖 {map_name} {terrain.width}x{terrain.height}")
 
     found: list[list[int]] = []
     for region, size in scanner.regions(writable_only=False):
