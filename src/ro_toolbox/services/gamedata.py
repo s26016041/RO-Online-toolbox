@@ -28,7 +28,26 @@ _WARP_TABLE = ASSETS_DIR / "warps.json.gz"
 _MAP_NAME_TABLE = ASSETS_DIR / "mapnames.json.gz"
 
 
+#: 讀成功的表就留在記憶體裡，見 `_load()`。
+_LOADED: dict[str, dict[str, dict]] = {}
+
+
 def _load(path) -> dict[str, dict]:
+    r"""讀一張表。**成功的結果留著，失敗的不留。**
+
+    留著的理由有兩個，第二個才是重點：
+
+    1. `is_boss()` 這種每一拍都會呼叫的函式，不該每次都去解壓 90 KB 的 gz。
+    2. onefile 的解壓目錄**會在執行中被挖空**：另一支 PyInstaller 程式開場清理
+       `%TEMP%\_MEI*` 時，會把我們正在用的目錄裡刪得掉的檔案全刪掉（鎖住的 DLL
+       留著，所以我們不會當，只是資料表憑空消失 —— [ENV-007]）。開場讀進來的
+       內容留在記憶體裡，那之後再怎麼被挖都不影響。
+
+    失敗**不留**：一次暫時性的讀取失敗不該讓整張表空一輩子，下次呼叫要能重試。
+    """
+    cached = _LOADED.get(str(path))
+    if cached is not None:
+        return cached
     try:
         with gzip.open(path, "rt", encoding="utf-8") as handle:
             table = json.load(handle)
@@ -36,6 +55,7 @@ def _load(path) -> dict[str, dict]:
         log.warning("載入 %s 失敗：%s", path.name, exc)
         return {}
     table.pop("_meta", None)
+    _LOADED[str(path)] = table
     return table
 
 

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import io
+import os
 import sys
 from pathlib import Path
 
@@ -240,24 +241,88 @@ def test_cleanup_removes_the_old_exe(monkeypatch, tmp_path):
     assert not old.exists()
 
 
+def _fake_bundle(root, name, *, alive=False):
+    """做一個像 onefile 解壓目錄的東西：一顆 python3XX.dll ＋ 一份資料檔。"""
+    entry = root / name
+    (entry / "assets").mkdir(parents=True)
+    (entry / "python312.dll").write_bytes(b"MZ")
+    (entry / "assets" / "mobs.json.gz").write_bytes(b"data")
+    if alive:
+        (entry / "python3.dll").write_bytes(b"MZ")
+    return entry
+
+
 def test_cleanup_never_removes_its_own_extraction_dir(monkeypatch, tmp_path):
-    mine = tmp_path / "_MEI_mine"
-    other = tmp_path / "_MEI_other"
-    mine.mkdir()
-    other.mkdir()
+    mine = _fake_bundle(tmp_path, "_MEI_mine")
+    other = _fake_bundle(tmp_path, "_MEI_other")
     monkeypatch.setenv("TEMP", str(tmp_path))
     monkeypatch.setattr(sys, "_MEIPASS", str(mine), raising=False)
     monkeypatch.delenv("_PYI_APPLICATION_HOME_DIR", raising=False)
+    monkeypatch.setattr(updater, "_live_bundle_dirs", set)
     updater._clean_stale_mei()
     assert mine.exists(), "把自己的解壓目錄刪了會當場自殺"
     assert not other.exists()
 
 
-def test_cleanup_survives_a_locked_directory(monkeypatch, tmp_path):
-    """刪不掉（還被別的行程開著）就跳過，不能讓啟動失敗。"""
-    (tmp_path / "_MEI_busy").mkdir()
+def test_cleanup_skips_directories_a_live_process_claims(monkeypatch, tmp_path):
+    """別的行程說「這是我的家」就整個不准碰（[ENV-007]）。"""
+    other = _fake_bundle(tmp_path, "_MEI_other")
     monkeypatch.setenv("TEMP", str(tmp_path))
     monkeypatch.delenv("_PYI_APPLICATION_HOME_DIR", raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", "", raising=False)
+    monkeypatch.setattr(
+        updater, "_live_bundle_dirs",
+        lambda: {os.path.normcase(os.path.normpath(str(other)))},
+    )
+    updater._clean_stale_mei()
+    assert (other / "assets" / "mobs.json.gz").exists(), "別人的資料檔被挖掉了"
+
+
+def test_cleanup_leaves_a_running_bundle_completely_untouched(monkeypatch, tmp_path):
+    """[ENV-007] 的回歸測試：DLL 鎖著就代表有人在跑，資料檔一個都不准少。
+
+    舊版直接 `rmtree`，鎖住的 DLL 讓它最後拋例外 —— 但那時 `assets/*.gz`
+    早就被刪光了，被害的程式不會當，只會安靜地讀不到自己的資料表。
+    """
+    victim = _fake_bundle(tmp_path, "_MEI_running")
+    monkeypatch.setenv("TEMP", str(tmp_path))
+    monkeypatch.delenv("_PYI_APPLICATION_HOME_DIR", raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", "", raising=False)
+    monkeypatch.setattr(updater, "_live_bundle_dirs", set)   # psutil 幫不上忙
+
+    real_unlink = Path.unlink
+
+    def locked(self, *args, **kwargs):
+        if self.suffix == ".dll":
+            msg = "in use"
+            raise PermissionError(msg)
+        return real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", locked)
+    updater._clean_stale_mei()
+    assert (victim / "assets" / "mobs.json.gz").exists(), "還在跑的程式被挖空了"
+
+
+def test_cleanup_ignores_directories_that_are_not_bundles(monkeypatch, tmp_path):
+    """沒有 python3XX.dll 的就不是 onefile 解壓目錄（或已被清到一半）—— 別碰。"""
+    stranger = tmp_path / "_MEI_stranger"
+    (stranger / "assets").mkdir(parents=True)
+    (stranger / "assets" / "keep.me").write_bytes(b"x")
+    monkeypatch.setenv("TEMP", str(tmp_path))
+    monkeypatch.delenv("_PYI_APPLICATION_HOME_DIR", raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", "", raising=False)
+    monkeypatch.setattr(updater, "_live_bundle_dirs", set)
+    updater._clean_stale_mei()
+    assert (stranger / "assets" / "keep.me").exists()
+
+
+def test_cleanup_survives_a_locked_directory(monkeypatch, tmp_path):
+    """刪不掉（還被別的行程開著）就跳過，不能讓啟動失敗。"""
+    _fake_bundle(tmp_path, "_MEI_busy")
+    monkeypatch.setenv("TEMP", str(tmp_path))
+    monkeypatch.delenv("_PYI_APPLICATION_HOME_DIR", raising=False)
+    monkeypatch.setattr(sys, "_MEIPASS", "", raising=False)
+    monkeypatch.setattr(updater, "_live_bundle_dirs", set)
 
     def denied(*_a, **_k):
         msg = "in use"
@@ -265,6 +330,21 @@ def test_cleanup_survives_a_locked_directory(monkeypatch, tmp_path):
 
     monkeypatch.setattr(updater.shutil, "rmtree", denied)
     updater._clean_stale_mei()          # 不該拋例外
+
+
+def test_live_bundle_dirs_finds_this_very_process(monkeypatch):
+    """環境變數是「有沒有人在用」的來源，這裡驗它真的讀得到別的行程。"""
+    psutil = pytest.importorskip("psutil")
+    home = str(Path(os.environ.get("TEMP", ".")) / "_MEI_probe")
+    monkeypatch.setenv("_PYI_APPLICATION_HOME_DIR", home)
+
+    class FakeProc:
+        def environ(self):
+            return dict(os.environ)
+
+    monkeypatch.setattr(psutil, "process_iter", lambda *a, **k: [FakeProc()])
+    found = updater._live_bundle_dirs()
+    assert os.path.normcase(os.path.normpath(home)) in found
 
 
 # ---- 介面層 ------------------------------------------------------------

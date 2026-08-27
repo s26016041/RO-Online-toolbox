@@ -18,6 +18,7 @@
 - 要讓角色動作 → **送封包**。複製遊戲 socket（DUP_HANDLE 沒被剝），全程不碰記憶體（[PKT-012]、[PKT-014]）。
 - 客戶端有 WinLicense/Themida 加殼：**靜態匯入表是假的**，要看執行時的 IAT（[PKT-008]、[PKT-009]）。
 - 換地圖／換頻道之後 socket、地形、封包擷取**全部失效**，要主動重綁 —— 不重綁會**安靜地全瞎**（[PKT-038]、[PKT-040]）。
+- **不准 `rmtree` 別人的 `%TEMP%\_MEI*`**：`rmtree` 會先刪光刪得掉的才報錯，等於把還在跑的程式**挖空**（DLL 留著所以它不會當，只是資料表消失）。動手前要有行程認領檢查＋`python3XX.dll` 刪除探測（[ENV-007]）。
 
 ### 背包（這一輪最貴的教訓）
 
@@ -3009,6 +3010,88 @@ A1  <全域>        mov  eax, [某全域]
 - **影響**：`services/reconnect_bot.py`（新，全部靠注入所以測得起來）、
   `ui/pages/farm_page.py`（`_watch_connections`／`snapshot_for`／`restore_into`／
   `_ReconnectWorker`）、`ui/pages/account_page.py`（勾選）、`config/settings.py`。
+
+### [ENV-007] ★★★ 另一支 onefile 程式開場清 `%TEMP%\_MEI*`，**把我們正在用的解壓目錄挖空**
+
+- **狀態**：已驗證（實機，兩支程式的 PID 與環境變數都對得起來）＋ 已修
+- **日期**：2026-08-28
+- **症狀**：跑最新版 exe，一切正常，過了九分鐘突然開始噴
+
+      載入 mobs.json.gz 失敗：[Errno 2] No such file or directory:
+      'C:\Users\...\Temp\_MEI000081e02\assets\mobs.json.gz'
+      怪物表沒有 iz_dun02 的出沒資料，改用全表過濾（誤判會變多）
+
+  程式**沒有當**，只是怪物過濾從此退化。exe 本身沒問題 ——
+  `assets/` 有進 spec，開場也讀得到。
+
+- **實際發生的事**（時間軸全部有檔案 mtime 與行程環境變數佐證）：
+
+  | 時間 | 事件 |
+  |---|---|
+  | 01:40 | RO-Online-toolbox.exe 啟動 → 解壓到 `_MEI000081e02` |
+  | 01:49 | **AngelsOnlineToolbox.exe** 啟動 → 解壓到 `_MEI487642` |
+  | 01:49 | 它的 `clean_leftovers()` → `_clean_stale_mei()` → `shutil.rmtree('_MEI000081e02')` |
+  | 01:49:58 | RO 這邊讀 `assets/mobs.json.gz` → 檔案不見了 |
+
+  驗證方法（psutil 讀得到同使用者行程的環境變數）：
+
+      for p in psutil.process_iter(["name"]):
+          p.environ().get("_PYI_APPLICATION_HOME_DIR")
+      # 33248/48080 RO-Online-toolbox.exe   -> ...\_MEI000081e02
+      #  6932/48764 AngelsOnlineToolbox.exe -> ...\_MEI487642
+
+  現場殘骸也對得上：`_MEI000081e02` 底下 913 個檔案，`.dll`／`.pyd` 全在
+  （mtime 01:40），`assets/` 是**空目錄**（mtime 01:49）。
+
+- **⛔ 關鍵誤解：「還在用的目錄刪不掉，所以 `rmtree` 失敗就等於安全」——錯。**
+  `rmtree` 是**一路刪下去**的：它把每個刪得掉的檔案都刪掉，最後才因為刪不掉的
+  那些拋例外。對一個**還在跑**的 onefile 解壓目錄來說，結果是：
+
+  - 被映射的 `.dll`／`.pyd` 留著 → **被害的程式不會當**（所以沒人發現）
+  - `assets/*.gz`、`capstone/` 這種沒被開著的純資料檔 → **全部被刪光**
+
+  也就是最糟的那種失效：**安靜地少一塊功能**。舊版註解寫「還被別的行程開著 →
+  那個行程結束後自己會清」，那句話從頭到尾就是錯的。
+
+- **⛔ 兩個直覺的探測法實測都不成立**（都試過，別再試）：
+
+  | 探測 | 對「載入中的 DLL」的實測結果 |
+  |---|---|
+  | 目錄 `rename` 得動嗎 | **改得動**（`LoadLibrary` 開檔時帶 `FILE_SHARE_DELETE`）→ 不能當探測 |
+  | 檔案獨佔開啟（`CreateFileW`, share=0）得開嗎 | **開得起來**（回傳有效 handle）→ 不能當探測 |
+  | 檔案 `unlink` 刪得掉嗎 | **刪不掉**（映射中的映像檔不准刪）→ ✅ 只有這個有效 |
+
+  註：`open(f,'rb')` 這種**一般的開檔**倒是會擋住整個目錄改名（Python 不帶
+  `FILE_SHARE_DELETE`，實測 `PermissionError` WinError 5）—— 所以
+  「rename 失敗」只證明有人開著檔案，「rename 成功」什麼都不證明。
+  第一個實驗就是這樣騙過人的，別再上當。
+
+- **修法（`services/updater.py`）：動手前要過兩道獨立的關卡，兩道都過才 `rmtree`。**
+
+  1. `_live_bundle_dirs()` —— 掃**全部**行程的環境變數，把
+     `_PYI_APPLICATION_HOME_DIR`／`_MEIPASS2` 撈出來。有人認領的目錄一律不碰。
+     掃全部而不是只掃自己，是因為要保護的正是**別人**的目錄。
+     psutil 讀不到某個行程（系統／提權）就跳過那一個。
+  2. `_looks_abandoned()` —— **先刪 `python3XX.dll`**，刪得掉才繼續。
+     挑這個檔案的理由：行程活著就一定映射著它。`python3.dll`（穩定 ABI 轉送層）
+     不保證被載入，不能拿來探測。沒有 `python3XX.dll` 的目錄一律不碰
+     （不是 onefile 解壓目錄，或已經被清到一半）。
+
+  探測本身是破壞性的，但它是整個流程動的**第一個**檔案：不通過＝什麼都沒發生。
+
+- **同時做的第二層保險（`services/gamedata.py`）**：`_load()` 把**讀成功**的表
+  留在記憶體裡（失敗不留，下次要能重試）。開場讀進來之後目錄再被挖也不影響，
+  順便讓每拍都會呼叫的 `is_boss()` 不用重解壓 90 KB 的 gz。
+  但這救不了「還沒讀過就被挖掉」的表 —— 這次的 `mobs.json.gz` 就是那種，
+  所以根治只能靠上面那兩道關卡。
+
+- **⚠ 姊妹專案要一起修**：`s26016041/Angels-Online-toolbox` 的
+  `app/core/updater.py` 有同一份 `_clean_stale_mei()`（本專案的 updater 就是從
+  它移植過來的）。這次挖空我們的正是它 —— 只修這邊，症狀還會再發生。
+
+- **影響**：`services/updater.py`（`_live_bundle_dirs`／`_looks_abandoned`／
+  `_clean_stale_mei`）、`services/gamedata.py`（`_load` 快取）、
+  `tests/test_updater.py`（回歸測試：還在跑的目錄，資料檔一個都不准少）。
 
 ### [ENV-006] ★★★ GameGuard **擋打包後的 exe 做大量記憶體讀取**（錯誤碼 5）
 

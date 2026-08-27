@@ -293,12 +293,80 @@ def clean_leftovers() -> None:
     _clean_stale_mei()
 
 
+def _live_bundle_dirs() -> set[str]:
+    r"""現在**還有行程在用**的 onefile 解壓目錄。
+
+    onefile 的啟動器把自己解壓到 `%TEMP%\_MEIxxxxxx` 之後，會把位置寫進自己的
+    環境變數 `_PYI_APPLICATION_HOME_DIR`（舊版叫 `_MEIPASS2`），而且**父子行程
+    都有**。所以「這個目錄有沒有人在用」是讀得到的訊號，不必用時間或檔案鎖去猜：
+    把所有行程的環境變數掃一遍，撈出來的那些就是不能碰的。
+
+    掃的是**全部**行程，不是只有我們自己的 —— 姊妹專案（Angels-Online-toolbox）
+    也是 onefile，它的解壓目錄同樣不能被我們清掉（[ENV-007] 就是反過來被它清掉）。
+
+    讀不到某個行程的環境（系統行程、提權的行程）就跳過那一個；psutil 沒收進來
+    就回空集合 —— 這時全靠 `_looks_abandoned()` 那道關卡把關。
+    """
+    try:
+        import psutil
+    except ImportError:                    # 開發環境沒裝就退回只靠刪除探測
+        return set()
+    live: set[str] = set()
+    try:
+        procs = list(psutil.process_iter())
+    except Exception:                      # noqa: BLE001 - 清理失敗不值得打擾使用者
+        return live
+    for proc in procs:
+        try:
+            env = proc.environ()
+        except Exception:                  # noqa: BLE001 - 讀不到就跳過這個行程
+            continue
+        home = env.get("_PYI_APPLICATION_HOME_DIR") or env.get("_MEIPASS2")
+        if home:
+            live.add(os.path.normcase(os.path.normpath(home)))
+    return live
+
+
+def _looks_abandoned(entry: Path) -> bool:
+    r"""第二道關卡：**先刪掉 `python3XX.dll`**，刪得掉才算真的沒人在用。
+
+    為什麼要這樣做，而不是直接 `rmtree` 看它成不成功：
+    `rmtree` 是**一路刪下去**的，遇到刪不掉的檔案只會在最後拋例外 ——
+    在那之前它已經把所有刪得掉的東西刪光了。對一個**還在執行**的解壓目錄來說，
+    被鎖住的 `.dll`／`.pyd` 會留著（所以那個程式不會當場死），
+    但 `assets/*.gz` 這種純資料檔會被刪乾淨，於是那支程式從此讀不到自己的資料表，
+    而且**沒有任何錯誤**，只會安靜地少一塊功能（[ENV-007] 實際踩到的就是這個）。
+
+    所以要有一個「刪得掉嗎」的探測，而且它必須挑**一定被載入**的檔案：
+    行程活著就一定映射著自己的 `python3XX.dll`，映射中的檔案刪不掉
+    （改名可以、獨佔開啟也可以，只有刪除會失敗 —— 兩種都試過了，見 [ENV-007]）。
+    `python3.dll`（穩定 ABI 的轉送層）不保證被載入，不能拿來探測。
+
+    探測本身是破壞性的，但破壞的是「探測通過＝馬上要整個刪掉」的目錄，
+    而且它是整個清理流程動的**第一個**檔案：不通過就等於什麼都沒發生。
+    """
+    probes = sorted(entry.glob("python3[0-9][0-9].dll"))
+    if not probes:
+        # 不像 onefile 的解壓目錄（或已經被清到一半）→ 不歸我們處理，別碰。
+        return False
+    for dll in probes:
+        try:
+            dll.unlink()
+        except OSError:
+            return False                   # 還映射著 → 有人在跑 → 收手
+    return True
+
+
 def _clean_stale_mei() -> None:
-    r"""清掉 `%TEMP%` 裡殘留的 `_MEIxxxxxx` 解壓目錄。
+    r"""清掉 `%TEMP%` 裡**已經沒人在用**的 `_MEIxxxxxx` 解壓目錄。
 
     onefile 的 exe 沒能正常收尾（更新換檔、當掉、被工作管理員砍掉）就會留下
     這種目錄，這支程式一個約 78 MB，累積起來很可觀。
-    正在使用中的會刪失敗，直接跳過；自己這次的解壓目錄也不能刪。
+
+    ⚠ 「刪不掉的自然會失敗」**不是**安全網（[ENV-007]）：`rmtree` 會先把刪得掉的
+    刪光才報錯，等於把還在跑的程式的資料檔挖掉。所以動手前要先過兩道關卡 ——
+    `_live_bundle_dirs()`（有沒有行程說這是它的家）與 `_looks_abandoned()`
+    （鎖住的 DLL 刪不刪得掉）。兩道都過才 `rmtree`。
     """
     mine = os.environ.get("_PYI_APPLICATION_HOME_DIR") or getattr(sys, "_MEIPASS", "")
     temp = os.environ.get("TEMP") or os.environ.get("TMP")
@@ -308,12 +376,17 @@ def _clean_stale_mei() -> None:
         entries = list(Path(temp).glob("_MEI*"))
     except OSError:
         return
+    busy = _live_bundle_dirs()
+    if mine:
+        busy.add(os.path.normcase(os.path.normpath(str(mine))))
     for entry in entries:
         if not entry.is_dir():
             continue
-        if mine and os.path.normcase(str(entry)) == os.path.normcase(str(mine)):
-            continue
+        if os.path.normcase(os.path.normpath(str(entry))) in busy:
+            continue                       # 有行程正拿它當家
+        if not _looks_abandoned(entry):
+            continue                       # 檔案還鎖著 → 有人在跑
         try:
             shutil.rmtree(entry)
         except OSError:
-            pass          # 還被別的行程開著 → 那個行程結束後自己會清
+            pass          # 剩下的下次再清，清理失敗不值得打擾使用者
