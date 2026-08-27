@@ -69,6 +69,10 @@ DEBUG_CONSOLE = os.environ.get("ROT_CONSOLE", "0") == "1"
 #: onefile 每次啟動都把 78 MB 解到暫存再從那裡跑，GameGuard 對這種樣子敏感。
 #: 資料夾版能跑而單檔版不能 → 就是那個行為的問題。
 ONEDIR = os.environ.get("ROT_ONEDIR", "0") == "1"
+#: 設 ROT_NOUPX=1 關掉 UPX 壓縮。
+#: ⚠ UPX 壓過的執行檔是防作弊軟體的經典紅旗 —— GameGuard 可能因此擋掉
+#: 我們對遊戲的記憶體讀取（實測：exe 連掃三次是 1→0→0，原始碼 10 次全穩）。
+NO_UPX = os.environ.get("ROT_NOUPX", "0") == "1"
 APP_NAME = "RO-Online-toolbox" + ("-debug" if DEBUG_CONSOLE else "")
 
 
@@ -98,7 +102,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=not NO_UPX,
     upx_exclude=[],
     runtime_tmpdir=None,
     # 檔案總管／桌面／捷徑上看到的圖示（嵌進 exe）。
@@ -121,7 +125,7 @@ if ONEDIR:
         a.binaries,
         a.datas,
         strip=False,
-        upx=True,
+        upx=not NO_UPX,
         upx_exclude=[],
         name=APP_NAME,
     )

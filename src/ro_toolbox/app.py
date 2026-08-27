@@ -259,6 +259,15 @@ def probe() -> int:
         total = sum(size for _base, size in regions)
         say(f"[探針] numpy {numpy.__version__}")
         say(f"[探針] 可寫區段 {len(regions)} 個，共 {total / 1024 / 1024:.0f} MB")
+        # 大區段讀得到嗎？小量讀取正常但掃描抓不到東西 —— 差別就在這裡。
+        biggest = sorted(regions, key=lambda r: -r[1])[:3]
+        for base_addr, size in biggest:
+            ctypes.set_last_error(0)
+            raw = sc.read_region(base_addr, size)
+            got = len(raw) if raw else 0
+            say(f"[探針]   讀 {base_addr:#x} 的 {size / 1024 / 1024:.1f} MB → "
+                f"拿到 {got / 1024 / 1024:.1f} MB"
+                f"　錯誤碼 {ctypes.get_last_error()}")
         # 連掃三次：分辨「穩定掃不到」與「時好時壞」
         for round_no in (1, 2, 3):
             hits = aob_scan(sc, CHAR_STATUS, writable_only=True, limit=64)
