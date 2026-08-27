@@ -347,3 +347,59 @@ def test_a_kafra_menu_without_our_destination_stops(caplog):
     talk.feed(nd.ZC_MENU_LIST, KAFRA_MENU2)
     assert _drain(talk) == []
     assert talk.failed is True
+
+
+# ---- 名字對不起來：兩邊都可能比較長 --------------------------------------
+#
+# 使用者實測炸過：我們的表把 prontera 叫「盧恩 米德加茲王國  首都普隆德拉」，
+# 取空格後的主名是「首都普隆德拉」，而卡普拉的選單寫「普隆德拉 -> 120 z」——
+# 多了「首都」兩個字（中間沒空格），所以怎麼比都對不上。
+
+
+@pytest.mark.parametrize(
+    ("ours", "options", "want"),
+    [
+        # 我們的比較長（主名還黏著「首都」）—— 實機那一份
+        ("盧恩 米德加茲王國  首都普隆德拉",
+         ["普隆德拉 -> 120 z", "艾爾帕蘭 -> 120 z", "獸人洞窟 -> 170 z", "取消"], 1),
+        # 選單的比較長（多了「港口」）
+        ("港都 艾爾貝塔",
+         ["柏伊亞嵐島 -> 150 金幣", "艾爾貝塔 港口-> 500金幣", "結束"], 2),
+        # 一模一樣
+        ("柏伊亞嵐島",
+         ["柏伊亞嵐島 -> 150 金幣", "艾爾貝塔 港口-> 500金幣", "結束"], 1),
+        # 我們有前綴、選單沒有
+        ("魔法之都 吉芬",
+         ["吉芬        -> 120 z", "斐揚     -> 120 z", "取消"], 1),
+        ("運河之都 艾爾帕蘭",
+         ["普隆德拉 -> 120 z", "艾爾帕蘭 -> 120 z", "取消"], 2),
+        ("獸人村",
+         ["普隆德拉 -> 120 z", "艾爾帕蘭 -> 120 z", "獸人村 -> 170 z", "取消"], 3),
+    ],
+)
+def test_real_menus_all_match(ours, options, want):
+    index, why = nd.pick_option(options, ours)
+    assert index == want, why
+
+
+def test_an_exact_match_beats_a_longer_lookalike():
+    """⚠ 選單同時有「吉芬」跟「吉芬地城」時要挑**完全相同**的那個。"""
+    index, why = nd.pick_option(
+        ["吉芬地城 -> 400 z", "吉芬 -> 120 z", "取消"], "魔法之都 吉芬"
+    )
+    assert index == 2, why
+
+
+def test_two_lookalikes_with_no_exact_match_stop():
+    """兩個都只是「包含」而且沒有完全相同的 —— 分不出來就不賭。"""
+    index, why = nd.pick_option(
+        ["吉芬地城 -> 400 z", "吉芬野外 -> 120 z", "取消"], "魔法之都 吉芬"
+    )
+    assert index is None
+    assert "分不出來" in why
+
+
+def test_place_of_strips_the_price():
+    assert nd.place_of("普隆德拉 -> 120 z") == "普隆德拉"
+    assert nd.place_of("艾爾貝塔 港口-> 500金幣") == "艾爾貝塔港口"
+    assert nd.place_of("取消") == "取消"

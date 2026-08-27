@@ -160,21 +160,56 @@ def _squash(text: str) -> str:
     return text.replace("　", "").replace(" ", "")
 
 
+def place_of(option: str) -> str:
+    """選項裡的**地名部分**：`->` 之前那一段，空白去掉。
+
+    實機看過的長相（船員／卡普拉）：
+
+        '普隆德拉 -> 120 z'      → '普隆德拉'
+        '吉芬        -> 120 z'   → '吉芬'
+        '艾爾貝塔 港口-> 500金幣' → '艾爾貝塔港口'
+        '柏伊亞嵐島 -> 150 金幣'  → '柏伊亞嵐島'
+        '取消'                   → '取消'
+    """
+    return _squash(option.split("->")[0])
+
+
 def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]:
     """挑出通往 `display_name` 的選項。回 (編號從 1 開始, 說明)。
 
     **剛好一個對得上才回編號**；0 個或 2 個以上回 None —— 分不出來就不賭
     （猜錯是把人傳到別的島或花掉他的錢）。
+
+    ## 為什麼要兩個方向都比
+
+    我們的地圖名跟 NPC 選單寫的**不會一模一樣**，而且差在哪兩邊都有可能：
+
+    | 地圖 | 我們的表 | 選單寫的 |
+    |---|---|---|
+    | prontera | `盧恩 米德加茲王國  首都普隆德拉` | `普隆德拉 -> 120 z` |
+    | alberta | `港都 艾爾貝塔` | `艾爾貝塔 港口-> 500金幣` |
+
+    prontera 是**我們的比較長**（主名還黏著「首都」），alberta 是**選單的比較長**。
+    所以先試精確相等，再試「誰包含誰」——但**兩層都要求剛好一個**，
+    對到兩個就停手（例如選單同時有「吉芬」跟「吉芬地城」那種）。
     """
+    full = _squash(display_name)
     core = _squash(core_name(display_name))
     if not core:
         return None, "沒有可比對的地圖中文名"
-    hits = [i for i, opt in enumerate(options, start=1) if core in _squash(opt)]
-    if len(hits) == 1:
-        return hits[0], f"第 {hits[0]} 項「{options[hits[0] - 1]}」對上「{core}」"
-    if not hits:
-        return None, f"選單裡沒有「{core}」：{options}"
-    return None, f"「{core}」對到 {len(hits)} 個選項，分不出來：{options}"
+    places = [place_of(opt) for opt in options]
+
+    exact = [i for i, place in enumerate(places, start=1) if place in (full, core)]
+    loose = [
+        i for i, place in enumerate(places, start=1)
+        if place and (core in place or place in full)
+    ]
+    for hits, how in ((exact, "完全相同"), (loose, "包含")):
+        if len(hits) == 1:
+            return hits[0], f"第 {hits[0]} 項「{options[hits[0] - 1]}」{how}於「{core}」"
+        if len(hits) > 1:
+            return None, f"「{core}」對到 {len(hits)} 個選項，分不出來：{options}"
+    return None, f"選單裡沒有「{core}」：{options}"
 
 
 def pick_submenu(options: list[str]) -> tuple[int | None, str]:

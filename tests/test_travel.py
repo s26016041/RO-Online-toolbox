@@ -585,23 +585,67 @@ def test_the_shake_walks_all_the_way_out_then_back(monkeypatch):
     bot._traveler._terrain = open_terrain("t", side=200)
     bot._sock = 42
     monkeypatch.setattr(mod.game_socket, "send_on_socket", lambda *a: 8)
+    # 目標固定、Walker 一律回「還在走」—— 這條測的是**判斷分支**，
+    # 不是 Walker（它自己有 test_walker.py）。不固定的話結果會隨機。
+    monkeypatch.setattr(mod.random, "choice", lambda seq: seq[0])
+    monkeypatch.setattr(bot, "_walk_to",
+                        lambda _s, _g: True)      # 路怎麼算不是這條在測
+    monkeypatch.setattr(bot._walker, "update", lambda _pos: "walking")
     hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
 
     bot._shake_view(hop)
     assert bot._shake == "away"
-    path = list(bot._walker._path)
-    assert path, "應該規劃出一條往外走的路"
 
-    # 沿著**真的路徑**一格一格走（跳著走的話 Walker 會判定脫離路線）
-    for cell in path:
-        bot._reader.pos = cell
+    for step in (5, 10, mod._OUT_OF_VIEW - 1):
+        bot._reader.pos = (108 + step, 27)
         bot._shake_view(hop)
-        far = max(abs(cell[0] - 108), abs(cell[1] - 27))
-        if bot._shake == "back":
-            assert far >= mod._OUT_OF_VIEW, f"才 {far} 格就說出視野了"
-            break
-    assert bot._shake == "back", "走完整條路都沒判定出視野"
+        assert bot._shake == "away", f"才 {step} 格就說出視野了"
+
+    bot._reader.pos = (108 + mod._OUT_OF_VIEW, 27)    # 出去了
+    bot._shake_view(hop)
+    assert bot._shake == "back"
 
     bot._reader.pos = (109, 27)                       # 回來了
     bot._shake_view(hop)
     assert bot._shake is None
+
+
+def test_a_failed_dialog_does_not_loop_back_to_cannot_see_him(monkeypatch, caplog):
+    """⚠ 實測踩過：看不懂選單之後，下一拍又走「認不出他」那條路，
+    印出「你按下按鈕時已經站在他旁邊」—— 完全不對的原因，而且會一直來回走位。
+
+    認人是成功的，失敗的是「看不懂選單」。兩件事不能混。
+    """
+    import logging
+
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234)
+    bot._sock = 42
+    monkeypatch.setattr(mod.game_socket, "send_on_socket", lambda *a: 8)
+    bot._reader = FakeReader((120, 63))
+    bot._traveler._terrain = open_terrain("t", side=200)
+    bot._traveler._route_map = "t"
+    hop = Hop("t", 120, 62, "prontera", 1, 1, "卡普拉 職員", 115)
+    bot._traveler._npc_wait = hop
+    bot._traveler._route = [hop]
+    bot._watch_next_npc()
+    bot._npc_gid = 145
+    bot._run_dialog()                      # 開始對話
+    assert bot._talk is not None
+
+    # 伺服器丟一個我們看不懂的選單
+    bad = "記憶點:結束:".encode("cp950") + b"\x00"
+    bot._talk.feed(
+        mod.npc_dialog.ZC_MENU_LIST,
+        b"\x14\x00" + (145).to_bytes(4, "little") + bad,
+    )
+    bot._run_dialog()
+    assert bot._talk is None and bot._dialog_dead is not None
+
+    with caplog.at_level(logging.WARNING, logger="ro_toolbox.services.travel_bot"):
+        for _ in range(20):
+            bot._run_dialog()
+    said = " ".join(r.getMessage() for r in caplog.records)
+    assert "站在他旁邊" not in said, "不該再講認不出他"
+    assert bot._shake is None, "不該再來回走位"

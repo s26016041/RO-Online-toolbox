@@ -102,6 +102,8 @@ class TravelBot:
         self._shake_round = 0
         self._shake_since = 0.0
         self._shake_cell: tuple[int, int] | None = None
+        #: 這一段的對話已經談不下去了（看不懂選單），別再重試
+        self._dialog_dead: tuple | None = None
         #: 已經提醒過哪一段要人手動（避免每拍洗版）
         self._asked: tuple[str, int, int] | None = None
         self._thread: threading.Thread | None = None
@@ -420,6 +422,7 @@ class TravelBot:
             self._npc_gid = None
             self._talk = None
             self._asked = None
+            self._dialog_dead = None
             self._shake = None
             self._shake_round = 0
             if want is not None:
@@ -435,6 +438,12 @@ class TravelBot:
         """
         hop = self._traveler.npc_hop
         if hop is None or not hop.npc_id:
+            return
+        key = (hop.from_map, hop.x, hop.y)
+        if self._dialog_dead == key:
+            # 已經跟他講過而且講不下去了（看不懂選單之類）。**不要再回頭**
+            # 走「認不出他」那條路 —— 那會印出「你站在他旁邊」這種完全不對的話，
+            # 而且會一直來回走位。已經跟人講清楚了，就安靜等他處理。
             return
         if self._talk is None:
             if self._npc_gid is None:
@@ -453,9 +462,11 @@ class TravelBot:
         while (data := talk.next_packet()) is not None:
             self._send(data)
         if talk.failed:
+            # ⚠ 保留 `_npc_want` 與 `_npc_gid`：認人是成功的，失敗的是「看不懂選單」。
+            # 清掉的話下一拍會重新走「認不出他」那條路，講出完全不對的原因。
             self._note(f"{talk.note} —— 請自己跟「{hop.npc}」講話，我在這裡等")
             self._talk = None
-            self._npc_want = None      # 別一直重試，交給人
+            self._dialog_dead = key
         elif talk.done:
             self._note(f"{talk.note}；等換圖…")
 
