@@ -47,6 +47,8 @@ _OUT_OF_VIEW = 22
 _SHAKE_ROUNDS = 2
 #: 每一步的逾時：走不到就當這一輪失敗。只是放棄的上限。
 _SHAKE_STEP_SEC = 30.0
+#: 走遠／走回來算路徑的節點上限。只走幾十格，不該花時間。
+_NEAR_BUDGET = 8000
 _ENT_OBJTYPE = 2    # 1 byte：0=其他玩家、6=NPC（實測登入擷取確認）
 _OBJTYPE_NPC = 6
 _ENT_GID = 3        # uint32
@@ -311,11 +313,14 @@ class TravelBot:
 
         ⚠ 為什麼非這樣不可：接觸 NPC 的封包要 **GID**，而
         - GID 是**伺服器執行時**給的：RODATA 沒有（實測 `Navi_Npc` 給 izlude
-          船員的編號是 18518，實際封包用的是 **91**，整份表裡也沒有 91）；
+          船員的編號是 18518，實際封包用的是 **91**）；
         - 記憶體的怪物掃描器**看不到 NPC**（靠 `alive==1` 當錨，[MEM-047]）；
         - 實體只在**進入視野**時送一次封包（[PKT-061]）。
 
-        所以位置知道也沒用 —— 只能讓他**重新進一次視野**。
+        ⚠ **一定要走 `Walker`，不能自己送一個很遠的走路封包**：
+        單次移動有距離上限，**超過 17 格伺服器直接忽略**（[PKT-030]）——
+        實測踩過，人就站在卡普拉旁邊發呆，一個錯誤訊息都沒有。
+        `Walker` 會把路徑切成 14 格一段送。
 
         每一步都等**讀得到的訊號**（自己的座標到了沒），不是等秒數；
         逾時只是放棄的上限。做滿 `_SHAKE_ROUNDS` 輪還認不出來就交給人。
@@ -329,33 +334,52 @@ class TravelBot:
         far = max(abs(pos[0] - npc[0]), abs(pos[1] - npc[1]))
 
         if self._shake is None:
-            if self._shake_round >= _SHAKE_ROUNDS:
-                return                      # 試過了，停著等人
             cell = terrain.random_walkable(
-                random, near=npc, radius=_OUT_OF_VIEW + 6, min_radius=_OUT_OF_VIEW
+                random, near=npc, radius=_OUT_OF_VIEW + 8, min_radius=_OUT_OF_VIEW
             )
-            if cell is None:
+            if cell is None or not self._walk_to(pos, cell):
                 return
             self._shake_round += 1
-            self._shake, self._shake_cell, self._shake_since = "away", cell, now
+            self._shake, self._shake_since = "away", now
             self._note(f"認不出「{hop.npc}」，先走遠一點讓他重新進視野"
-                       f"（第 {self._shake_round} 次）")
-            self._send_move(*cell)
+                       f"（第 {self._shake_round} 次，往 {cell[0]},{cell[1]}）")
             return
 
+        state = self._walker.update(pos)
         if now - self._shake_since > _SHAKE_STEP_SEC:
-            self._shake = None              # 這一輪走不到，重來或放棄
+            log.info("走遠／走回來這一段超時（目前離 %s 有 %d 格），重來", hop.npc, far)
+            self._shake = None
+            self._walker.clear()
             return
+
         if self._shake == "away":
             if far >= _OUT_OF_VIEW:
                 self._shake, self._shake_since = "back", now
-                self._note(f"走回「{hop.npc}」那裡")
-                self._send_move(*npc)
-            elif self._shake_cell is not None:
-                self._send_move(*self._shake_cell)
+                self._note(f"出了「{hop.npc}」的視野，走回去")
+                self._walk_to(pos, npc)
+            elif state in ("arrived", "blocked"):
+                self._shake = None          # 走到了卻還不夠遠 → 換個目標重來
+                self._walker.clear()
             return
-        if far <= _NPC_SNAP:
-            self._shake = None              # 回到他旁邊了，這時應該收得到封包
+
+        if far <= _NPC_SNAP or state == "arrived":
+            # 回到他旁邊了。他重新進視野時那一包就會到，`_note_entity` 會接住。
+            self._shake = None
+            self._walker.clear()
+            log.info("回到「%s」旁邊了，等他的實體封包", hop.npc)
+
+    def _walk_to(self, start: tuple[int, int], goal: tuple[int, int]) -> bool:
+        """把一條路交給 `Walker` 去走。算不出路回 False。"""
+        terrain = self._traveler.terrain
+        if terrain is None:
+            return False
+        path = terrain.find_path(start, goal, node_budget=_NEAR_BUDGET)
+        if not path:
+            log.info("走不到 %s，這一輪放棄", goal)
+            return False
+        self._walker.set_path(path)
+        self._walker.update(start)
+        return True
 
     def _ask_for_help(self, hop) -> None:  # noqa: ANN001 - travel.Hop
         """認不出那隻 NPC —— 講清楚要你做什麼，而且**講出要選哪張地圖**。

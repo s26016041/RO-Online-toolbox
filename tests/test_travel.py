@@ -542,3 +542,66 @@ def test_an_entity_packet_teaches_us_the_npc_gid(monkeypatch):
     bot._npc_gid = None
     bot._on_packet(Pkt(bytes(other)))
     assert bot._npc_gid is None, "objtype 不對就不能認"
+
+
+def test_the_shake_never_sends_a_move_the_server_will_ignore(monkeypatch):
+    """⚠ 單次移動超過 17 格伺服器直接忽略（[PKT-030]）。
+
+    實測踩過：`_shake_view` 自己送一個 22 格的走路封包 → 石沉大海 →
+    人站在卡普拉旁邊發呆，**一個錯誤訊息都沒有**。所以一定要走 Walker，
+    它會把路徑切成 14 格一段。
+    """
+    from ro_toolbox.services import travel_bot as mod
+    from ro_toolbox.services.walker import MAX_STEP
+
+    bot = mod.TravelBot(1234)
+    bot._sock = 42
+    bot._reader = FakeReader((109, 27))
+    bot._traveler._terrain = open_terrain("t", side=200)
+    # ⚠ 要攔在**真正送出去**的那一層：Walker 建構時就抓走了 _send_move 的
+    # 綁定方法，改 bot 的屬性攔不到（這個坑差點讓這條測試變成假的）。
+    from ro_toolbox.core.ro_protocol import unpack_position
+
+    sent = []
+    monkeypatch.setattr(
+        mod.game_socket, "send_on_socket",
+        lambda _sock, data: (sent.append(data), len(data))[1],
+    )
+    hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
+    bot._shake_view(hop)
+    assert sent, "應該有送出走路封包"
+    for data in sent:
+        x, y, _d = unpack_position(data[2:5])
+        step = max(abs(x - 109), abs(y - 27))
+        assert step <= MAX_STEP, f"送了 {step} 格，伺服器會忽略"
+
+
+def test_the_shake_walks_all_the_way_out_then_back(monkeypatch):
+    """出視野看**真的座標**，不是等秒數；回來也是。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234)
+    bot._reader = FakeReader((109, 27))
+    bot._traveler._terrain = open_terrain("t", side=200)
+    bot._sock = 42
+    monkeypatch.setattr(mod.game_socket, "send_on_socket", lambda *a: 8)
+    hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
+
+    bot._shake_view(hop)
+    assert bot._shake == "away"
+    path = list(bot._walker._path)
+    assert path, "應該規劃出一條往外走的路"
+
+    # 沿著**真的路徑**一格一格走（跳著走的話 Walker 會判定脫離路線）
+    for cell in path:
+        bot._reader.pos = cell
+        bot._shake_view(hop)
+        far = max(abs(cell[0] - 108), abs(cell[1] - 27))
+        if bot._shake == "back":
+            assert far >= mod._OUT_OF_VIEW, f"才 {far} 格就說出視野了"
+            break
+    assert bot._shake == "back", "走完整條路都沒判定出視野"
+
+    bot._reader.pos = (109, 27)                       # 回來了
+    bot._shake_view(hop)
+    assert bot._shake is None
