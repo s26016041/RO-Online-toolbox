@@ -118,6 +118,8 @@ _NEAR_BUDGET = 3000
 #: 傳點資料（`navi_link_tw.lub` → `assets/warps.json.gz`）只給一格，
 #: 但實際的傳點是一片區域，所以要留餘裕。
 _WARP_KEEP_OUT = 3
+#: 脫離禁區時，最遠往外找幾格。禁區半徑之外再留一點，免得剛好停在邊界上。
+_ESCAPE_MARGIN = 4
 _MISS_SKIP_SEC = 20.0  # 打到空氣的目標冷卻多久（座標過時，等它重新出現）
 #: 要不要把記憶體掃到的怪也算進來。**開著。**
 #:
@@ -214,6 +216,10 @@ class FarmBot:
         self._map = ""  # 目前綁定的地圖，換圖要重新載地形
         #: 這張圖上「不准踩」的格子：傳點與它周圍 `_WARP_KEEP_OUT` 格。
         self._warp_zone: frozenset[tuple[int, int]] = frozenset()
+        #: 傳點**本體**（踩到就被傳走）。禁區是本體再加周圍。
+        self._warp_cells: frozenset[tuple[int, int]] = frozenset()
+        #: 正在往哪裡脫離禁區（None = 沒在脫離）
+        self._escape_goal: tuple[int, int] | None = None
         self._server: tuple[str, int] | None = None  # 目前綁定的伺服器端點
         self._resync_at = 0.0
         # 傷害封包分析：學到自己的 GID 後，就能認出「正在打我的怪」優先反擊
@@ -400,6 +406,13 @@ class FarmBot:
                 # 漏收 0x0080 會留下永遠打不到的幽靈怪，會害 bot 一直鎖它
                 self._world.forget_far(pos, _VIEW_RANGE)
 
+            # ⚠ 站在傳點禁區裡的話，這一拍只做一件事：走出去。
+            # 不是停下來 —— 叫你別靠近傳點，不是叫你關掉自動戰鬥。
+            if self._escape_warp(pos):
+                self._emit()
+                self._stop.wait(_TICK)
+                continue
+
             # 腳邊的掉落物永遠先撿：怪死在腳邊，等打完下一隻就走開撿不到了
             self._grab_nearby(pos)
             self._update_aim(now, pos)
@@ -470,6 +483,7 @@ class FarmBot:
             self._world.clear()
             self._walker.clear()
             self._roam_goal = None
+            self._escape_goal = None
             self._aim = None
             self._skip.clear()
             self._skip_at.clear()
@@ -644,7 +658,8 @@ class FarmBot:
         # 用上一拍的位置判斷「夠不夠近」就會在它走開之後對著空地打。
         mob = self._world.get(aim.gid)
         distance = mob.distance_from(pos) if (mob is not None and pos is not None) else None
-        if distance is not None and pos is not None and not self._close_enough(pos, mob.pos, distance):
+        if (distance is not None and pos is not None
+                and not self._close_enough(pos, mob.pos, distance)):
             if self._approach(pos, mob.pos):
                 return  # 還太遠（或中間有牆要繞），先走近一點
         # 貼到了（或算不出路，那就直接打，打不到會被放棄計時器換掉）
@@ -907,12 +922,76 @@ class FarmBot:
         查不到就是空的 —— 安全退化成「跟以前一樣會踩到」，不會因此不能走路。
         """
         zone: set[tuple[int, int]] = set()
+        cells: set[tuple[int, int]] = set()
         for x, y, _dest, _dx, _dy in warps_on_map(map_name):
+            cells.add((x, y))
             for dx in range(-_WARP_KEEP_OUT, _WARP_KEEP_OUT + 1):
                 for dy in range(-_WARP_KEEP_OUT, _WARP_KEEP_OUT + 1):
                     zone.add((x + dx, y + dy))
         self._warp_zone = frozenset(zone)
-        log.info("%s 的傳點禁區 %d 格", map_name, len(self._warp_zone))
+        # 傳點**本體**那一格。禁區是「不想去」，本體是「踩到就被傳走」——
+        # 從禁區裡面往外走時只避開本體，避開整片禁區的話就永遠走不出來。
+        self._warp_cells = frozenset(cells)
+        log.info("%s 的傳點 %d 個、禁區 %d 格",
+                 map_name, len(self._warp_cells), len(self._warp_zone))
+
+    def _escape_warp(self, pos: tuple[int, int] | None) -> bool:
+        """人在傳點禁區裡就先走出去。回 True 代表這一拍在脫離，別做其他事。
+
+        ⚠ **這是「走開」，不是「停下來」。** 使用者講得很明確：叫你別靠近
+        傳點，不是叫你關掉自動戰鬥。
+
+        為什麼要專門一步：禁區是半徑 `_WARP_KEEP_OUT` 的一片，站在中間時
+        A* 的每個鄰居都被擋住（起點自己雖然豁免），等於算不出任何路 ——
+        然後 45 秒沒進展就被當成卡住，`_fail()` 把自動打怪關掉。
+        使用者看到的就是「自己偷偷關閉」。
+        """
+        terrain = self._terrain
+        if terrain is None or pos is None:
+            return False
+        if self._escape_goal is not None:
+            # 已經在往外走了就讓它走完，別每一拍重算一條新路狂送走路封包。
+            if self._walker.update(pos) == "walking":
+                return True
+            self._escape_goal = None
+        if not self._near_warp(pos):
+            return False
+        goal = self._nearest_outside(pos)
+        if goal is None:
+            return False
+        # 只擋傳點本體，不擋整片禁區 —— 不然從裡面出不來。
+        path = terrain.find_path(
+            pos, goal, node_budget=_NEAR_BUDGET, blocked=self._warp_cells
+        )
+        if not path:
+            return False
+        self._escape_goal = goal
+        self._walker.set_path(path)
+        self._walker.update(pos)
+        self._note(f"太靠近傳點，先走開（往 {goal[0]},{goal[1]}）")
+        return True
+
+    def _nearest_outside(self, pos: tuple[int, int]) -> tuple[int, int] | None:
+        """離 `pos` 最近、又在禁區外面的可走格。由近而遠一圈一圈找。"""
+        terrain = self._terrain
+        if terrain is None:
+            return None
+        for radius in range(1, _WARP_KEEP_OUT + _ESCAPE_MARGIN + 1):
+            best = None
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy)) != radius:
+                        continue        # 只看這一圈的外環
+                    cell = (pos[0] + dx, pos[1] + dy)
+                    if cell in self._warp_zone or not terrain.is_walkable(*cell):
+                        continue
+                    best = cell
+                    break
+                if best is not None:
+                    break
+            if best is not None:
+                return best
+        return None
 
     def _near_warp(self, cell: tuple[int, int] | None) -> bool:
         return cell is not None and cell in self._warp_zone

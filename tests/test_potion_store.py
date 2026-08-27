@@ -87,3 +87,27 @@ def test_forget_removes_only_that_character():
     potion_store.forget("狐狐狸")
     assert potion_store.get("狐狐狸") is None
     assert potion_store.get("商狐").hp_item == 502
+
+
+def test_go_home_settings_survive_a_restart():
+    """「水用完回程」的開關與道具也要記住 —— 使用者要求除了自動戰鬥全都存。"""
+    potion_store.save("狐狐狸", PotionSaved(
+        hp_item=501, hp_percent=60, go_home=True, home_item=602,
+    ))
+    back = potion_store.get("狐狐狸")
+    assert back.go_home is True
+    assert back.home_item == 602
+
+
+def test_a_bad_home_item_falls_back_to_nothing():
+    """檔案被手改壞就退回「沒選」—— 亂猜一個道具編號會用錯東西。"""
+    potion_store.save("狐狐狸", PotionSaved(hp_item=501, hp_percent=60))
+    path = potion_store._path()
+    path.write_text(
+        '{"狐狐狸": {"hp_item": 501, "hp_percent": 60, '
+        '"go_home": true, "home_item": "蝴蝶翅膀"}}', encoding="utf-8"
+    )
+    back = potion_store.get("狐狐狸")
+    assert back.home_item is None
+    assert back.go_home is True
+

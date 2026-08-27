@@ -38,11 +38,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ro_toolbox.services import bag, icons, window_list
+from ro_toolbox.services import bag, icons, potion_store, window_list
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
 from ro_toolbox.services.gamedata import heals_hp, heals_sp, item_name
-from ro_toolbox.services import potion_store
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel_bot import TravelBot
@@ -168,7 +167,7 @@ class CharacterCard(QWidget):
         #: 這張卡是哪一隻角色（補水設定用它當鍵，不是 PID —— PID 每次開遊戲都變）
         self.character = ""
         #: 想選但清單裡還沒出現的道具（背包是非同步讀的，選單填好才選得到）
-        self._want_item: dict[str, int | None] = {"hp": None, "sp": None}
+        self._want_item: dict[str, int | None] = {"hp": None, "sp": None, "home": None}
         #: True = 現在是**程式自己**在改 UI，不是使用者的意思 —— 這種變動不存檔。
         #: 少了這道閘門，bot 啟動失敗時自動取消勾選會把使用者的設定覆蓋成「關閉」。
         self.quiet = False
@@ -322,15 +321,18 @@ class CharacterCard(QWidget):
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(6)
 
-        self.travel_label = QLabel("先在遊戲的尋路視窗設好目的地，再按「自動尋路」。")
+        # 常駐提示拿掉了（同樣的話在「自動尋路」按鈕的 tooltip 上）；
+        # 這個標籤只在趕路中與出事時才出現。
+        self.travel_label = QLabel("")
         self.travel_label.setObjectName("pageSubtitle")
         self.travel_label.setWordWrap(True)
+        self.travel_label.hide()
         box.addWidget(self.travel_label)
         return panel
 
     def _apply_travel_stats(self, stats) -> None:  # noqa: ANN001 - TravelStats
         if not stats.running:
-            self.travel_label.setText(stats.note)
+            self._say(self.travel_label, stats.note)
             # 走完（或失敗）就把按鈕彈起來 —— 按鈕壓著卻沒在走，
             # 看起來會像「還在趕路」，那是最糟的失效方式。
             if self.auto_travel.isChecked():
@@ -340,7 +342,7 @@ class CharacterCard(QWidget):
         head = f"前往 {where}" if where else "讀取導航目標…"
         if stats.hops_left:
             head += f"　還要換 {stats.hops_left} 張圖"
-        self.travel_label.setText(f"{head}\n{stats.note}")
+        self._say(self.travel_label, f"{head}\n{stats.note}")
 
     def set_travel_busy(self, busy: bool) -> None:
         """趕路途中不讓人再去勾自動打怪 —— 兩個都在送走路封包會互相打架。"""
@@ -377,13 +379,45 @@ class CharacterCard(QWidget):
         self.sp_item, self.sp_threshold, self.sp_icon = self._make_potion_row(
             grid, 1, "SP 低於"
         )
+        self.go_home, self.home_item, self.home_icon = self._make_home_row(grid, 2)
         box.addLayout(grid)
 
+        # ⚠ 這個標籤**平常是隱藏的**，只在出事時才冒出來。
+        # 使用者要求把 SP 那列下面到「道具總攬」之間的提示文字全部拿掉，
+        # 但「大聲停用」不能一起拿掉（CLAUDE.md：失效只准大聲或安全退化）——
+        # 所以留著當警示欄，沒事的時候不佔版面。
         self.potion_label = QLabel("")
         self.potion_label.setObjectName("pageSubtitle")
         self.potion_label.setWordWrap(True)
+        self.potion_label.hide()
         box.addWidget(self.potion_label)
         return panel
+
+    def _make_home_row(self, grid: QGridLayout, row: int):
+        """「水用完回程」：HP 或 SP 的藥水**任一種**用完就用選的道具回程。
+
+        下拉列**整個背包**，不過濾。道具表裡認不出哪個是回程道具 ——
+        蝴蝶翅膀的描述寫「移動至儲存的位置」、蒼蠅翅膀寫「移動至任意的位置」，
+        差別只在那句話。靠關鍵字猜就是規範說的「很有自信的錯」，所以讓人自己挑。
+        """
+        check = QCheckBox("水用完回程")
+        check.setFixedHeight(self.ROW_HEIGHT)
+        check.toggled.connect(self.potion_changed)
+        combo = QComboBox()
+        combo.setFixedHeight(self.ROW_HEIGHT)
+        combo.setMinimumWidth(170)
+        combo.setIconSize(QSize(self.ICON_PX, self.ICON_PX))
+        preview = QLabel()
+        preview.setFixedSize(self.ICON_PX, self.ICON_PX)
+        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        combo.currentIndexChanged.connect(self.potion_changed)
+        combo.currentIndexChanged.connect(
+            lambda _i, c=combo, w=preview: self._show_icon(c, w)
+        )
+        grid.addWidget(check, row, 0, 1, 3)
+        grid.addWidget(combo, row, 3)
+        grid.addWidget(preview, row, 4)
+        return check, combo, preview
 
     def _make_potion_row(self, grid: QGridLayout, row: int, title: str):
         label = QLabel(title)
@@ -428,7 +462,9 @@ class CharacterCard(QWidget):
         同一組道具時只改文字不重建，避免每秒閃爍、也不會打斷正在挑的人。
         """
         for key, combo, wants in (
-            ("hp", self.hp_item, heals_hp), ("sp", self.sp_item, heals_sp)
+            ("hp", self.hp_item, heals_hp), ("sp", self.sp_item, heals_sp),
+            # 回程那個**不過濾**：道具表認不出哪個是回程道具，讓人自己挑。
+            ("home", self.home_item, lambda _item_id: True),
         ):
             wanted = [
                 (item_id, amount) for _slot, (item_id, amount) in sorted(rows.items())
@@ -461,6 +497,7 @@ class CharacterCard(QWidget):
                 self._want_item[key] = None      # 還原成功，不必再等了
         self._show_icon(self.hp_item, self.hp_icon)
         self._show_icon(self.sp_item, self.sp_icon)
+        self._show_icon(self.home_item, self.home_icon)
 
     @staticmethod
     def _slot_text(item_id: int, amount: int) -> str:
@@ -476,10 +513,15 @@ class CharacterCard(QWidget):
         """
         self.quiet = True
         try:
-            self._want_item = {"hp": saved.hp_item, "sp": saved.sp_item}
+            self._want_item = {
+                "hp": saved.hp_item, "sp": saved.sp_item, "home": saved.home_item,
+            }
             self.hp_threshold.setValue(saved.hp_percent)
             self.sp_threshold.setValue(saved.sp_percent)
-            for key, combo in (("hp", self.hp_item), ("sp", self.sp_item)):
+            self.go_home.setChecked(bool(saved.go_home))
+            for key, combo in (
+                ("hp", self.hp_item), ("sp", self.sp_item), ("home", self.home_item)
+            ):
                 position = combo.findData(self._want_item[key])
                 if position >= 0:
                     combo.setCurrentIndex(position)
@@ -498,6 +540,8 @@ class CharacterCard(QWidget):
             sp_item=self.sp_item.currentData(),
             sp_percent=self.sp_threshold.value(),
             enabled=self.auto_potion.isChecked(),
+            go_home=self.go_home.isChecked(),
+            home_item=self.home_item.currentData(),
         )
 
     def potion_config(self) -> PotionConfig:
@@ -506,11 +550,23 @@ class CharacterCard(QWidget):
             hp_percent=self.hp_threshold.value(),
             sp_item=self.sp_item.currentData(),
             sp_percent=self.sp_threshold.value(),
+            # 沒勾就不帶道具進去 —— 沒勾卻回程是「安靜地做錯事」
+            home_item=self.home_item.currentData() if self.go_home.isChecked() else None,
         )
+
+    def _say(self, label: QLabel, text: str) -> None:
+        """有話才顯示。使用者要求把常駐的提示文字拿掉，但**警示不能一起拿掉**
+        （CLAUDE.md：失效只准大聲停用或安全退化）—— 所以沒事就整個收起來。"""
+        label.setText(text)
+        label.setVisible(bool(text))
 
     def _apply_potion_stats(self, stats: PotionStats) -> None:
         if not stats.running:
-            self.potion_label.setText(stats.note)
+            self._say(self.potion_label, stats.note)
+            if stats.went_home and self.auto_hunt.isChecked():
+                # 已經用回程道具回城了。沒水又沒怪還勾著自動打怪，
+                # 只會站在城裡空轉 —— 而且看起來像「還在掛機」。
+                self.auto_hunt.setChecked(False)
             if self.auto_potion.isChecked():
                 # ⚠ 這是 bot 自己停掉（沒登入、定位失敗…），**不是使用者關的**。
                 # 不加這道閘門，一次啟動失敗就會把使用者存的「開啟」覆蓋成「關閉」。
@@ -520,12 +576,9 @@ class CharacterCard(QWidget):
                 finally:
                     self.quiet = False
             return
-        bits = [stats.note] if stats.note else []
-        if stats.hp_used:
-            bits.append(f"HP 藥 {stats.hp_used} 次")
-        if stats.sp_used:
-            bits.append(f"SP 藥 {stats.sp_used} 次")
-        self.potion_label.setText("｜".join(bits))
+        # 跑起來之後不再叨唸喝了幾瓶 —— 使用者要求把這塊提示文字拿掉。
+        # 只有帶「⚠」的才留下來（例如連續喝不到、格號對不上）。
+        self._say(self.potion_label, stats.note if "⚠" in stats.note else "")
 
     def _apply_farm_stats(self, stats: FarmStats) -> None:
         if not stats.running:
@@ -939,7 +992,7 @@ class FarmPage(BasePage):
         if pid in self._bots and card is not None and card.auto_hunt.isChecked():
             # 先讓 UI 走正常的關閉流程（_toggle_farm 會停 bot、保留戰利品）
             card.auto_hunt.setChecked(False)
-            card.travel_label.setText("已先關掉自動打怪（趕路途中不打怪）")
+            card._say(card.travel_label, "已先關掉自動打怪（趕路途中不打怪）")
         if card is None:
             return  # 沒有卡片就沒有回報去處，別讓它在背景默默走
         card.set_travel_busy(True)
@@ -975,7 +1028,7 @@ class FarmPage(BasePage):
         if find_server(pid) is None:
             card = self._cards.get(pid)
             if card is not None:
-                card.potion_label.setText("尚未登入（回到選角畫面？）—— 暫停讀背包")
+                card._say(card.potion_label, "尚未登入（回到選角畫面？）—— 暫停讀背包")
             return
         self._bag_loaded.add(pid)
         worker = BagWorker(pid)
@@ -997,7 +1050,7 @@ class FarmPage(BasePage):
         rows = self._bags.get(pid, {})
         card.set_slots(rows)
         if not rows:
-            card.potion_label.setText("⚠ 讀不到背包（AOB 定位失敗）")
+            card._say(card.potion_label, "⚠ 讀不到背包（AOB 定位失敗）")
 
     def _refresh_bag(self, pid: int) -> None:
         """重讀背包。一次約 0.1 秒，放在背景執行緒做。"""
@@ -1015,7 +1068,7 @@ class FarmPage(BasePage):
             return
         config = card.potion_config()
         if not (config.wants_hp() or config.wants_sp()):
-            card.potion_label.setText("⚠ 還沒選道具或百分比是 0，沒有東西可以補")
+            card._say(card.potion_label, "⚠ 還沒選道具或百分比是 0，沒有東西可以補")
             card.auto_potion.setChecked(False)
             return
         bot = PotionBot(pid, config, on_update=lambda s, c=card: c.potion_stats.emit(s))

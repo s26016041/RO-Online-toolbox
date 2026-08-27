@@ -76,6 +76,11 @@ class PotionConfig:
     hp_percent: int = 0
     sp_item: int | None = None
     sp_percent: int = 0
+    #: 水用完回程：HP 或 SP 的藥水**任何一種**用完，就用 `home_item` 回程。
+    #: 道具由使用者自己從整個背包挑 —— 道具表裡認不出「哪個是回程道具」
+    #: （蝴蝶翅膀寫「移動至儲存的位置」、蒼蠅翅膀寫「移動至任意的位置」，
+    #: 差別只在描述文字），靠關鍵字猜就是 CLAUDE.md 禁止的「很有自信的錯」。
+    home_item: int | None = None
 
     def __post_init__(self) -> None:
         self.hp_percent = min(max(int(self.hp_percent), 0), _MAX_PERCENT)
@@ -86,6 +91,9 @@ class PotionConfig:
 
     def wants_sp(self) -> bool:
         return self.sp_item is not None and self.sp_percent > 0
+
+    def wants_home(self) -> bool:
+        return self.home_item is not None
 
 
 @dataclass
@@ -99,6 +107,9 @@ class PotionStats:
     sp_percent: float = 0.0
     note: str = ""
     failed: bool = False
+    #: 已經用回程道具回去了。UI 看到這個要把自動打怪也關掉 ——
+    #: 人已經在城裡，繼續掛著打怪只會站在原地耗。
+    went_home: bool = False
     counts: dict[int, int] = field(default_factory=dict)
 
 
@@ -510,17 +521,50 @@ class PotionBot:
         self._note(f"{kind} {percent:.0f}% → 喝了第 {index} 格，剩 {left} 個")
 
     def _exhausted(self, kind: str, item_id: int) -> bool:
-        """那個道具用完了（背包裡找不到了）。關掉這一項；另一項還有設定就繼續跑。"""
+        """那個道具用完了（背包裡找不到了）。
+
+        勾了「水用完回程」就先回程 —— **HP 或 SP 任一種用完就算**，不必等到
+        兩種都用完。沒水了還留在原地，下一波怪就是送死。
+        沒勾的話照舊：關掉這一項，另一項還有設定就繼續跑。
+        """
+        text = f"{item_name(item_id)} 用完了"
+        if self._cfg.wants_home():
+            return self._go_home(text)
         if kind == "HP":
             self._cfg.hp_item = None
         else:
             self._cfg.sp_item = None
         still = self._cfg.wants_hp() or self._cfg.wants_sp()
-        text = f"{item_name(item_id)} 用完了，已關閉{kind}補充"
+        text += f"，已關閉{kind}補充"
         if still:
             self._note(text)
             return True
         self._fail(f"{text}；沒有其他設定，自動補水停止")
+        return False
+
+    def _go_home(self, why: str) -> bool:
+        """用選好的道具回程，然後停掉自動補水。一律回 False（迴圈要結束）。
+
+        ⚠ **格號現查**（[MEM-028]），而且要**確認真的用掉了**才算回程成功 ——
+        「送了封包就當作回去了」是安靜地做錯事：人還在野外，UI 卻顯示已回程。
+        確認手法跟喝水同一套：那一格的數量有沒有少一個。
+        """
+        item_id = self._cfg.home_item
+        self._refresh_bag(force=True)
+        slot = self._slot_of(item_id)
+        if slot is None:
+            self._fail(f"{why}，但回程道具 {item_name(item_id)} 也沒有了，已停止")
+            return False
+        before = self._bag[slot][1]
+        self._send(build_use_item(slot, self._aid))
+        if not self._wait_used(slot, before):
+            self._fail(
+                f"{why}，送了回程道具 {item_name(item_id)} 但沒有用掉（第 {slot} 格），"
+                "已停止 —— 請自己確認人在哪裡"
+            )
+            return False
+        self._stats.went_home = True
+        self._fail(f"{why} → 已用 {item_name(item_id)} 回程，自動補水停止")
         return False
 
     # ---- 雜項 -------------------------------------------------------

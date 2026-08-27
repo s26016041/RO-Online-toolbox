@@ -1,6 +1,10 @@
 """補水設定：**依角色名**存在使用者本機，下次開程式自動帶回來。
 
-存什麼：補血／補魔各挑了哪個**道具編號**、百分比門檻、有沒有開啟。
+存什麼：補血／補魔各挑了哪個**道具編號**、百分比門檻、有沒有開啟，
+以及「水用完回程」的開關與它要用哪個道具。
+
+⚠ **自動打怪的開關刻意不存**（使用者指定）。開著程式回來就繼續打怪
+太容易變成意外掛機；其他設定存回來只是「填好表單」，不會自己動作。
 
 ⚠ **存道具編號不存格號**（CLAUDE.md：存身分，不存位置）。
 格號會挪動 —— 丟東西、賣東西、用完一整疊，後面的都會往前遞補（[MEM-028]）。
@@ -37,6 +41,9 @@ class PotionSaved:
     sp_item: int | None = None
     sp_percent: int = 0
     enabled: bool = False
+    #: 水用完回程：有沒有勾、用哪個道具回程（一樣存**編號**不存格號）
+    go_home: bool = False
+    home_item: int | None = None
 
 
 def _path():
@@ -75,6 +82,8 @@ def _clean(data: dict) -> PotionSaved:
         sp_item=item(data.get("sp_item")),
         sp_percent=percent(data.get("sp_percent")),
         enabled=bool(data.get("enabled")),
+        go_home=bool(data.get("go_home")),
+        home_item=item(data.get("home_item")),
     )
 
 

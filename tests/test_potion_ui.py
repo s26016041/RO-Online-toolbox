@@ -219,3 +219,76 @@ def test_wanted_item_is_selected_once_the_bag_finally_loads(card):
 
     card.set_slots({44: (501, 10)})
     assert card.hp_item.currentData() == 501, "清單填好之後要把存檔選的那個選起來"
+
+
+# ---- 水用完回程 --------------------------------------------------------
+
+
+def test_home_combo_lists_the_whole_bag(card):
+    """回程那個下拉**不過濾** —— 道具表認不出哪個是回程道具
+    （蝴蝶翅膀寫「移動至儲存的位置」、蒼蠅翅膀寫「移動至任意的位置」，
+    差別只在描述文字），靠關鍵字猜就是很有自信的錯。所以讓人自己挑。"""
+    card.set_slots(ROWS)
+    ids = [data for _text, data in _entries(card.home_item)]
+    for item_id in (RED, BLUE, LEG, KNIFE):
+        assert item_id in ids, f"{item_id} 應該也列出來"
+
+
+def test_unchecked_means_no_return_item_in_the_config(card):
+    """沒勾就不能把道具帶進設定 —— 沒勾卻回程是安靜地做錯事。"""
+    card.set_slots(ROWS)
+    card.home_item.setCurrentIndex(card.home_item.findData(LEG))
+    card.go_home.setChecked(False)
+    assert card.potion_config().home_item is None
+    card.go_home.setChecked(True)
+    assert card.potion_config().home_item == LEG
+
+
+def test_go_home_settings_are_saved_and_restored(card):
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    card.set_slots(ROWS)
+    card.apply_saved_potion(PotionSaved(
+        hp_item=RED, hp_percent=50, go_home=True, home_item=LEG,
+    ))
+    assert card.go_home.isChecked() is True
+    assert card.home_item.currentData() == LEG
+    saved = card.saved_potion()
+    assert saved.go_home is True
+    assert saved.home_item == LEG
+
+
+def test_auto_hunt_is_deliberately_not_saved(card):
+    """⚠ 只有自動戰鬥不記錄（使用者指定）。開著程式回來就繼續打怪
+    太容易變成意外掛機；其他設定存回來只是填好表單，不會自己動作。"""
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    card.auto_hunt.setChecked(True)
+    assert not hasattr(card.saved_potion(), "auto_hunt")
+    card.apply_saved_potion(PotionSaved(hp_item=RED, hp_percent=50))
+    assert card.auto_hunt.isChecked() is True, "還原設定不該去動自動戰鬥"
+
+
+def test_going_home_also_stops_auto_hunt(card):
+    """已經回城了還勾著自動打怪，只會站在城裡空轉 —— 而且看起來像還在掛機。"""
+    from ro_toolbox.services.potion import PotionStats
+
+    card.auto_hunt.setChecked(True)
+    card._apply_potion_stats(
+        PotionStats(running=False, went_home=True, note="已用蝴蝶翅膀回程")
+    )
+    assert card.auto_hunt.isChecked() is False
+
+
+def test_routine_chatter_is_hidden_but_warnings_are_not(card):
+    """使用者要求把 SP 那列下面的提示文字拿掉，但**警示不能一起拿掉**。"""
+    from ro_toolbox.services.potion import PotionStats
+
+    # 用 text() 判斷，不用 isVisible() —— 沒 show() 過的 widget 永遠是 False，
+    # 那種斷言看起來有測到，其實永遠會過。
+    card._apply_potion_stats(PotionStats(running=True, note="HP 60% → 喝了第 6 格"))
+    assert card.potion_label.text() == "", "跑起來的例行訊息不該顯示"
+
+    card._apply_potion_stats(PotionStats(running=True, note="⚠ 連續喝不到"))
+    assert card.potion_label.text() == "⚠ 連續喝不到"
+

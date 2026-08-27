@@ -45,17 +45,24 @@ def use_ack(index: int, item_id: int, left: int, result: int = 1, aid: int = AID
 class FakeReader:
     """血量會隨著「喝掉幾瓶」上升，模擬伺服器回補。"""
 
-    def __init__(self, bag, start: float = 30.0, per_potion: float = 10.0):
+    def __init__(self, bag, start: float = 30.0, per_potion: float = 10.0,
+                 sp_start: float = 100.0):
         self.bag = bag
         self.start = start
         self.per_potion = per_potion
+        self.sp_start = sp_start
         self.closed = False
 
     def attach(self, pid, should_stop=None):  # noqa: ARG002
         return True
 
     def read(self):
-        return FakeStatus(min(self.start + self.per_potion * self.bag.drunk, 100.0))
+        # 兩條都跟著「喝掉幾瓶」走 —— 假裝伺服器回補（分不出是哪一種藥，
+        # 測 SP 時只設一種就好）。
+        gain = self.per_potion * self.bag.drunk
+        return FakeStatus(
+            min(self.start + gain, 100.0), min(self.sp_start + gain, 100.0)
+        )
 
     def close(self):
         self.closed = True
@@ -183,10 +190,10 @@ def wired(monkeypatch):
     """把 PotionBot 的外部相依全部換成假的。"""
     FakeCapture.latest = None
 
-    def build(rows, *, server=("1.2.3.4", 10000), start=30.0,
+    def build(rows, *, server=("1.2.3.4", 10000), start=30.0, sp_start=100.0,
               readable=True, shuffle=False, **socket_kwargs):
         fake_bag = FakeBag(rows, readable=readable, shuffle=shuffle)
-        reader = FakeReader(fake_bag, start=start)
+        reader = FakeReader(fake_bag, start=start, sp_start=sp_start)
         sock = FakeSocket(fake_bag, **socket_kwargs)
         monkeypatch.setattr(potion, "find_server", lambda pid: server)  # noqa: ARG005
         monkeypatch.setattr(potion, "CharacterReader", lambda: reader)
@@ -524,4 +531,81 @@ def test_relocating_is_throttled(wired):
     bot.stop()
     # 1.5 秒 ÷ _RELOCATE_SEC 上限約 2~3 次；沒有限流會是幾十次
     assert len(fake_bag.watches) <= 4, f"重新定位了 {len(fake_bag.watches)} 次"
+
+
+# ---- 水用完回程 --------------------------------------------------------
+
+WING = 602          # 蝴蝶翅膀
+
+
+def test_going_home_when_the_hp_potion_runs_out(wired):
+    """HP 藥喝完就用選好的道具回程 —— 沒水還留在原地，下一波怪就是送死。"""
+    fake_bag, _reader, sock = wired(
+        {6: (RED_POTION, 1), 7: (WING, 5), 8: (909, 3)}, start=10.0
+    )
+    bot = PotionBot(
+        1, PotionConfig(hp_item=RED_POTION, hp_percent=99, home_item=WING)
+    )
+    _run(bot, 5.0)
+    slots = [int.from_bytes(p[2:4], "little") for p in sock.sent]
+    assert slots == [6, 7], f"應該喝掉最後一瓶再用翅膀，實際 {slots}"
+    assert bot.stats.went_home is True
+    assert fake_bag.rows[7][1] == 4, "翅膀要真的用掉一個"
+
+
+def test_going_home_also_triggers_on_sp(wired):
+    """**HP 或 SP 任一種**用完就回程，不必等兩種都用完。"""
+    _bag, _reader, sock = wired(
+        {6: (RED_POTION, 9), 7: (BLUE_POTION, 1), 8: (WING, 5)},
+        start=100.0, sp_start=10.0,
+    )
+    bot = PotionBot(
+        1, PotionConfig(hp_item=RED_POTION, hp_percent=50,
+                        sp_item=BLUE_POTION, sp_percent=99, home_item=WING)
+    )
+    _run(bot, 5.0)
+    slots = [int.from_bytes(p[2:4], "little") for p in sock.sent]
+    assert slots == [7, 8]
+    assert bot.stats.went_home is True
+
+
+def test_no_return_item_means_the_old_behaviour(wired):
+    """沒勾回程就照舊：關掉那一項，沒別的設定才停 —— 不准自己回程。"""
+    _bag, _reader, sock = wired(
+        {6: (RED_POTION, 1), 7: (WING, 5), 8: (909, 3)}, start=10.0
+    )
+    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=99))
+    _run(bot, 5.0)
+    slots = [int.from_bytes(p[2:4], "little") for p in sock.sent]
+    assert slots == [6], "沒勾回程就不該去動翅膀"
+    assert bot.stats.went_home is False
+    assert "用完" in bot.stats.note
+
+
+def test_missing_return_item_fails_loudly(wired):
+    """回程道具也沒了 —— 大聲停用，不准安靜地留在野外。"""
+    _bag, _reader, sock = wired(
+        {6: (RED_POTION, 1), 8: (909, 3), 9: (910, 2)}, start=10.0
+    )
+    bot = PotionBot(
+        1, PotionConfig(hp_item=RED_POTION, hp_percent=99, home_item=WING)
+    )
+    _run(bot, 5.0)
+    assert bot.stats.failed is True
+    assert bot.stats.went_home is False
+    assert "回程道具" in bot.stats.note
+
+
+def test_unconfirmed_return_is_not_reported_as_home(wired):
+    """⚠ 送了封包不等於回去了。沒看到數量少一個就**不准**說已回程 ——
+    那會讓人以為安全了，實際人還在野外。"""
+    _bag, _reader, _sock = wired(
+        {6: (RED_POTION, 1), 7: (WING, 5), 8: (909, 3)}, start=10.0, dies_after=1
+    )
+    bot = PotionBot(
+        1, PotionConfig(hp_item=RED_POTION, hp_percent=99, home_item=WING)
+    )
+    _run(bot, 6.0)
+    assert bot.stats.went_home is False
+    assert bot.stats.failed is True
 

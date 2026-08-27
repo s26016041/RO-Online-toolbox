@@ -353,7 +353,6 @@ def test_close_enough_rejects_a_monster_behind_a_wall(monkeypatch):
 
     只看直線的話會判成「貼到了」→ 送出攻擊 → 站著打空氣（使用者實測回報）。
     """
-    from ro_toolbox.services import farm_bot as mod
 
     wall = [(11, y) for y in range(0, 60)]      # 一整排牆，只能繞地圖邊
     bot = _bot_with_terrain(monkeypatch, blocked=wall)
@@ -367,7 +366,6 @@ def test_adjacent_never_needs_a_path_check(monkeypatch):
 
 
 def test_far_targets_are_rejected_before_any_pathfinding(monkeypatch):
-    from ro_toolbox.services import farm_bot as mod
 
     bot = _bot_with_terrain(monkeypatch)
     assert bot._close_enough((10, 10), (40, 40), 30) is False
@@ -433,3 +431,60 @@ def test_standing_on_a_warp_can_still_walk_out(monkeypatch):
     bot._warp_zone = frozenset({(5, 5)})
     path = bot._plan_path((5, 5), (10, 10))
     assert path, "站在傳點上也要算得出離開的路"
+
+
+def _bot_in_warp_zone(monkeypatch, *, warp=(30, 30)):
+    """把角色放在傳點正中央 —— 禁區把它整個包起來的那種情況。"""
+    from ro_toolbox.services import farm_bot as mod
+
+    bot = _bot_with_terrain(monkeypatch)
+    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [(*warp, "x", 0, 0)])
+    bot._load_warps("t")
+    return bot
+
+
+def test_standing_in_a_warp_walks_out_instead_of_stalling(monkeypatch):
+    """⚠ 站在禁區裡要**走出去**，不是站著等到被判定卡住而自動關閉。
+
+    使用者講得很明確：叫你別靠近傳點，不是叫你關掉自動戰鬥。
+    禁區是一整片，站在中間時 A* 的每個鄰居都被擋住（起點自己雖然豁免），
+    所以非得有一條「只避開傳點本體」的脫離路線不可。
+    """
+    bot = _bot_in_warp_zone(monkeypatch)
+    sent = []
+    monkeypatch.setattr(bot, "_send_move", lambda x, y: sent.append((x, y)))
+    assert bot._escape_warp((30, 30)) is True
+    assert bot._escape_goal is not None
+    assert bot._escape_goal not in bot._warp_zone, "目標要在禁區外面"
+    assert bot._walker._path, "應該規劃出一條往外走的路"
+
+
+def test_the_escape_route_never_steps_on_the_warp_itself(monkeypatch):
+    """禁區可以借道，傳點**本體**不行 —— 踩到就被傳到別張地圖。"""
+    bot = _bot_in_warp_zone(monkeypatch, warp=(30, 30))
+    bot._escape_warp((31, 30))
+    assert (30, 30) not in bot._walker._path
+
+
+def test_escape_is_not_replanned_every_tick(monkeypatch):
+    """已經在往外走就別重算 —— 每拍一條新路等於狂送走路封包。"""
+    bot = _bot_in_warp_zone(monkeypatch)
+    assert bot._escape_warp((30, 30)) is True
+    first = bot._escape_goal
+    assert bot._escape_warp((30, 31)) is True, "還在禁區裡，應該繼續走原本那條"
+    assert bot._escape_goal == first
+
+
+def test_leaving_the_zone_ends_the_escape(monkeypatch):
+    """出了禁區就把脫離狀態清掉，回去正常打怪。"""
+    bot = _bot_in_warp_zone(monkeypatch)
+    bot._escape_warp((30, 30))
+    bot._walker.clear()
+    assert bot._escape_warp((50, 50)) is False
+    assert bot._escape_goal is None
+
+
+def test_escape_does_nothing_outside_the_zone(monkeypatch):
+    bot = _bot_in_warp_zone(monkeypatch)
+    assert bot._escape_warp((10, 10)) is False
+
