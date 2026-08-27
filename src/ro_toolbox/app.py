@@ -180,6 +180,60 @@ def _check(window, problems: list[str]) -> int:
     return 0
 
 
+def probe() -> int:
+    """診斷：這台機器上，這顆執行檔到底讀不讀得到遊戲？
+
+    存在的理由：使用者回報「exe 一直噴讀不到 ragexe.exe 的程式碼區段」，
+    而同一份原始碼用 `python main.py` 跑卻完全正常。要分辨是權限、是
+    GameGuard、還是打包，**必須從 exe 自己的行程裡問**，不能從外面猜。
+
+    只讀不寫，不送任何封包（CLAUDE.md：RO 掛 GameGuard，只讀）。
+    """
+    import ctypes
+    import os
+
+    from ro_toolbox.services.character import CharacterReader
+    from ro_toolbox.services.memory_scan import MemoryScanner
+    from ro_toolbox.services.process_monitor import is_admin
+    from ro_toolbox.services.window_list import enumerate_windows
+
+    frozen = getattr(sys, "frozen", False)
+    print(f"[探針] 執行檔 = {sys.executable}")
+    print(f"[探針] 打包過的嗎 = {frozen}　64 位元 = {sys.maxsize > 2**32}")
+    print(f"[探針] 管理員 = {is_admin()}　PID = {os.getpid()}")
+
+    pids = [w.pid for w in enumerate_windows() if w.process_name.lower() == "ragexe.exe"]
+    print(f"[探針] 找到的 Ragexe = {pids}")
+    if not pids:
+        print("[探針] 遊戲沒開，到此為止")
+        return 0
+    pid = pids[0]
+
+    scanner = MemoryScanner()
+    scanner.open(pid)
+    print(f"[探針] 附加成功 = {scanner.attached}　可寫 = {scanner.can_write}")
+    if not scanner.attached:
+        print(f"[探針] OpenProcess 失敗，GetLastError = {ctypes.get_last_error()}")
+        return 1
+
+    head = scanner._read_bytes(0x400000, 2)  # noqa: SLF001 - 診斷
+    print(f"[探針] 讀 0x400000 的頭兩個 byte = {head!r}"
+          f"（應該是 b'MZ'；讀不到代表 ReadProcessMemory 被擋）")
+    base = scanner.image_base_by_scan()
+    print(f"[探針] 掃描找映像基底 = {base and hex(base)}")
+    scanner.close()
+
+    reader = CharacterReader()
+    ok = reader.attach(pid)
+    print(f"[探針] 角色定位 = {ok}")
+    if ok:
+        status = reader.read()
+        print(f"[探針] 讀到角色 = {status and status.name}"
+              f" @ {status and status.map_name} {reader.read_position()}")
+    reader.close()
+    return 0
+
+
 def run(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv
     # ⚠ 這一支要在**建 Qt 之前**攔下來：所有送進遊戲的輸入都由它執行。
@@ -189,6 +243,8 @@ def run(argv: list[str] | None = None) -> int:
         return input_helper.run_helper(args)
     if "--selftest" in args:
         return selftest()
+    if "--probe" in args:
+        return probe()
     app, window = create_app(args)
     window.show()
     return app.exec()
