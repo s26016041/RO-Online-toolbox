@@ -158,14 +158,20 @@ def test_the_list_still_works_without_any_icons(card, monkeypatch):
     assert card.potion_config().hp_item == RED
 
 
-def test_bot_stopping_unchecks_the_box(card):
-    """bot 自己停掉（藥水喝完／喝不到）就要把勾拿掉，不能勾著卻沒在跑。"""
+def test_bot_stopping_unchecks_the_box(card, caplog):
+    """bot 自己停掉（藥水喝完／喝不到）就要把勾拿掉，不能勾著卻沒在跑。
+
+    原因寫進**執行日誌**，不放介面（使用者指定）—— 但不准安靜地消失。
+    """
+    import logging
+
     from ro_toolbox.services.potion import PotionStats
 
     card.auto_potion.setChecked(True)
-    card._apply_potion_stats(PotionStats(running=False, note="⚠ 藥水用完了"))
+    with caplog.at_level(logging.WARNING):
+        card._apply_potion_stats(PotionStats(running=False, note="⚠ 藥水用完了"))
     assert card.auto_potion.isChecked() is False
-    assert card.status_label.text() == "⚠ 藥水用完了"
+    assert any("藥水用完了" in r.getMessage() for r in caplog.records), "停用原因要進日誌"
 
 
 # ---- 存檔還原：程式改 UI 不算使用者的意思 ---------------------------------
@@ -280,20 +286,13 @@ def test_going_home_also_stops_auto_hunt(card):
     assert card.auto_hunt.isChecked() is False
 
 
-def test_routine_chatter_is_hidden_but_warnings_are_not(card):
-    """使用者要求把 SP 那列下面的提示文字拿掉，但**警示不能一起拿掉**。"""
+def test_the_card_only_ever_shows_the_pid(card):
+    """⚠ 卡片上唯一的那行字是 PID。提示字一律進執行日誌，不放介面。"""
     from ro_toolbox.services.potion import PotionStats
 
-    # 用 text() 判斷，不用 isVisible() —— 沒 show() 過的 widget 永遠是 False，
-    # 那種斷言看起來有測到，其實永遠會過。
     card.set_note("PID 1234")
     card._apply_potion_stats(PotionStats(running=True, note="HP 60% → 喝了第 6 格"))
-    assert card.status_label.text() == "PID 1234", "例行訊息不該佔著狀態行"
-
-    card._apply_potion_stats(PotionStats(running=True, note="⚠ 連續喝不到"))
-    assert card.status_label.text() == "⚠ 連續喝不到", "警示要蓋過平常那行"
-
-    # 解除之後平常那行要回來 —— 警示不能永久佔著
-    card._apply_potion_stats(PotionStats(running=True, note="HP 70% → 喝了第 6 格"))
     assert card.status_label.text() == "PID 1234"
+    card._apply_potion_stats(PotionStats(running=True, note="⚠ 連續喝不到"))
+    assert card.status_label.text() == "PID 1234", "連警示都不上介面"
 

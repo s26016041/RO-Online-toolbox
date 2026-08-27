@@ -42,6 +42,12 @@ WARP_RING = 3
 WARP_SETTLE_SEC = 1.5
 #: 同一個傳點試多久還過不去就放棄它（放棄的上限，不是成功的依據）。
 WARP_GIVEUP_SEC = 15.0
+#: 停在 NPC 前面等人手動做完，最多等多久。
+#:
+#: ⚠ 這是**放棄的上限，不是成功的依據**（CLAUDE.md：不准拿「等幾秒」當機制）。
+#: 判定「過去了」只看一件事：記憶體裡的地圖名真的變成目的地那一張。
+#: 逾時只是免得無限掛著，逾時要**大聲停止**，不准假裝成功往下走。
+NPC_GIVEUP_SEC = 600.0
 #: 重新規劃幾次還到不了就大聲放棄（防止兩張圖之間來回鬼打牆）。
 MAX_REPLANS = 40
 #: 目標座標不可走時，在這個半徑內找最近的可走格代替（NPC 站的格子常常不可走）。
@@ -64,6 +70,9 @@ class Hop:
     to_map: str
     to_x: int
     to_y: int
+    #: 這一段要**跟 NPC 講話**才過得去時，NPC 的名字（船員、傳送師…）。
+    #: 空字串 = 走過去就會傳送。我們不會跟 NPC 對話，所以這種段落要停下來等人。
+    npc: str = ""
 
     @property
     def cell(self) -> tuple[int, int]:
@@ -80,6 +89,7 @@ def plan_route(
     goal_map: str,
     avoid: set[tuple[str, int, int]] | None = None,
     max_maps: int = 4000,
+    allow_npc: bool = False,
 ) -> list[Hop] | None:
     """從 `start_map` 走到 `goal_map` 要經過哪些傳點。走不到回 None。
 
@@ -88,6 +98,11 @@ def plan_route(
     先求走得到、走得對；要跟遊戲完全一致再換成加權版。
 
     `avoid` 是踩不過去的傳點（`Hop.key`）—— 規劃時就繞開，不會一直撞同一道牆。
+
+    `allow_npc=True` 會把「要跟 NPC 講話」的連結也算進來（船夫、傳送師…），
+    那些 `Hop.npc` 不是空的。**呼叫端必須自己處理**：走到那一格什麼都不會發生，
+    要停下來等人手動做完（見 `Traveler._wait_for_npc`）。
+    預設關著 —— 純走路走得到就別麻煩人。
     """
     if start_map == goal_map:
         return []
@@ -97,10 +112,13 @@ def plan_route(
     queue: deque[str] = deque([start_map])
     while queue and len(seen) < max_maps:
         current = queue.popleft()
-        for x, y, dest, dx, dy in warps_on_map(current):
+        links = [(x, y, d, dx, dy, "") for x, y, d, dx, dy in warps_on_map(current)]
+        if allow_npc:
+            links += list(npc_links_on_map(current))
+        for x, y, dest, dx, dy, who in links:
             if dest in seen or (current, x, y) in avoid:
                 continue
-            came[dest] = Hop(current, x, y, dest, dx, dy)
+            came[dest] = Hop(current, x, y, dest, dx, dy, who)
             if dest == goal_map:
                 return _trace(came, start_map, goal_map)
             seen.add(dest)
@@ -227,6 +245,8 @@ class Traveler:
         self._warp_since = 0.0  # 開始踩這個傳點的時間
         self._warp_try = 0  # 換過幾格
         self._warp_cell: tuple[int, int] | None = None
+        self._npc_wait: Hop | None = None   # 正在等人跟這個 NPC 講話
+        self._npc_since = 0.0
         self._stale_since = 0.0  # 座標還停在上一張圖的起算時間（[MEM-022]）
         self.note = ""
 
@@ -284,6 +304,7 @@ class Traveler:
         self._goal_cell = None
         self._route = []
         self._route_map = ""
+        self._npc_wait = None
         self._clear_warp()
         self._walker.clear()
 
@@ -331,6 +352,11 @@ class Traveler:
             self.note = self._progress_note()
         pos = here
 
+        # 正在等人跟 NPC 講話：什麼都不做，連走路封包都不送。
+        # 換圖了的話上面那段早就重新規劃、把這個狀態清掉了。
+        if self._npc_wait is not None:
+            return self._wait_for_npc()
+
         # 正在踩傳點：成功與否只看地圖名（上面已判斷），這裡只負責換格再踩。
         if self._warp_cell is not None:
             return self._push_warp(pos)
@@ -351,7 +377,11 @@ class Traveler:
         if self._replans > MAX_REPLANS:
             self.note = f"⚠ 重新規劃 {MAX_REPLANS} 次仍到不了 {self._goal_map}，已放棄"
             return False
+        # 先試**純走路**走得到的路線。走得到就別麻煩人 ——
+        # BFS 只看換圖次數，不擋的話它會為了少換一張圖就叫你去搭船。
         route = plan_route(map_name, self._goal_map, self._avoid)
+        if route is None:
+            route = plan_route(map_name, self._goal_map, self._avoid, allow_npc=True)
         if route is None:
             self.note = _no_route_note(map_name, self._goal_map)
             return False
@@ -360,6 +390,7 @@ class Traveler:
         self._terrain = None
         self._terrain_map = ""
         self._stale_since = 0.0  # 新地圖重新起算「等座標更新」
+        self._npc_wait = None    # 換圖了 = 那一段過去了（或人自己走去別的地方）
         self._clear_warp()
         self._walker.clear()
         if route:
@@ -416,11 +447,44 @@ class Traveler:
             self.note = f"已抵達 {self._goal_map}"
             self.clear()
             return "arrived"
-        self._warp_cell = self._route[0].cell
+        hop = self._route[0]
+        if hop.npc:
+            # 這一段要跟 NPC 講話才過得去，我們不會對話 —— 走到他面前停下來等人。
+            self._npc_wait = hop
+            self._npc_since = self._now()
+            self._walker.clear()          # 站住，別再往前走
+            return self._wait_for_npc()
+        self._warp_cell = hop.cell
         self._warp_since = self._now()
         self._warp_try = 0
-        self.note = f"踩傳點前往 {self._route[0].to_map}"
+        self.note = f"踩傳點前往 {hop.to_map}"
         return self._push_warp(pos)
+
+    def _wait_for_npc(self) -> str:
+        """停在 NPC 前面等人手動做完（搭船、傳送師、告示牌）。
+
+        ⚠ **「過去了」的唯一依據是地圖名真的變成目的地那一張**
+        （`update()` 開頭就會抓到並自動重新規劃）—— 不是等幾秒、也不是
+        「應該講完了吧」。CLAUDE.md：逾時只能當放棄的上限，不能當成功的依據。
+
+        期間完全不送走路封包：人在跟 NPC 對話時被拉著走，選單會被打斷。
+        """
+        hop = self._npc_wait
+        if hop is None:
+            return "walking"
+        left = NPC_GIVEUP_SEC - (self._now() - self._npc_since)
+        if left <= 0:
+            self._npc_wait = None
+            self.note = (
+                f"⚠ 等了 {NPC_GIVEUP_SEC / 60:.0f} 分鐘還沒到 {hop.to_map}，已停止"
+            )
+            return "blocked"
+        self.note = (
+            f"⏸ 停在 {hop.from_map} ({hop.x},{hop.y})：請自己跟「{hop.npc}」"
+            f"講話到 {hop.to_map}\n"
+            f"到了我就自動繼續（還等 {left / 60:.0f} 分鐘）"
+        )
+        return "waiting"
 
     def _push_warp(self, pos: tuple[int, int]) -> str:
         """站上傳點格，等地圖名變 —— 換圖成功會在 update() 開頭被抓到。

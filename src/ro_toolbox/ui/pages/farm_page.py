@@ -269,7 +269,7 @@ class CharacterCard(QWidget):
         layout.addWidget(self.exp_label)
 
         self._note_text = "定位中…"
-        self._alert_text = ""
+        self._last_alert = ""
         self.status_label = QLabel(self._note_text)
         self.status_label.setObjectName("pageSubtitle")
         layout.addWidget(self.status_label)
@@ -279,11 +279,6 @@ class CharacterCard(QWidget):
         self.auto_hunt.setFixedHeight(self.ROW_HEIGHT)
         self.auto_hunt.toggled.connect(self.farm_toggled)
         layout.addWidget(self.auto_hunt)
-
-        self.farm_label = QLabel("")
-        self.farm_label.setObjectName("pageSubtitle")
-        self.farm_label.setWordWrap(True)
-        layout.addWidget(self.farm_label)
 
         # ---- 自動補水 ----
         layout.addWidget(self._build_potion_panel())
@@ -552,18 +547,12 @@ class CharacterCard(QWidget):
         self.set_alert(stats.note if "⚠" in stats.note else "")
 
     def _apply_farm_stats(self, stats: FarmStats) -> None:
-        if not stats.running:
-            self.farm_label.setText(stats.note)
-            # bot 自己停掉了（死亡／卡住／定位失敗）就把勾拿掉 ——
+        """⚠ 這裡**不寫任何介面文字**（使用者指定：提示字一律進執行日誌）。
+        擊殺／撿取／目標與 bot 自己的 note 都由 `FarmBot._note()` 記進日誌。
+        介面上唯一的表現是：bot 停了，勾勾就彈起來。"""
+        if not stats.running and self.auto_hunt.isChecked():
             # 勾著卻沒在跑，看起來會像「還在掛機」，那是最糟的失效方式
-            if self.auto_hunt.isChecked():
-                self.auto_hunt.setChecked(False)
-            return
-        target = f"　目標 {stats.target}" if stats.target else ""
-        self.farm_label.setText(
-            f"擊殺 {stats.kills}　撿取 {stats.picked}　"
-            f"附近怪 {stats.monsters_near}{target}\n{stats.note}"
-        )
+            self.auto_hunt.setChecked(False)
 
     @staticmethod
     def _make_bar(object_name: str) -> QProgressBar:
@@ -640,22 +629,20 @@ class CharacterCard(QWidget):
         self.exp_label.setText(text)
 
     def set_note(self, text: str) -> None:
-        """平常的那行（現在只有 PID）。被警示蓋住時先收著，等警示解除再露出來。"""
+        """卡片上唯一的那行字：這是哪一個遊戲視窗（PID）。不放提示、不放進度。"""
         self._note_text = text
-        self._paint_status()
+        self.status_label.setText(text)
 
     def set_alert(self, text: str) -> None:
-        """現在需要被看到的一句話：功能停用的原因，或趕路進度。
+        """功能出事或有進度要講 —— **寫進「執行日誌」面板，不放介面**（使用者指定）。
 
-        ⚠ **優先蓋過平常那行。** 設定區裡不放文字，所以這是唯一的出口 ——
-        失效只准大聲停用或安全退化（CLAUDE.md），不准安靜地什麼都不說。
-        空字串 = 解除。
+        ⚠ 這仍然滿足 CLAUDE.md 的「大聲停用」：日誌面板就在主視窗底下，
+        而且勾勾會自己彈起來。安靜地什麼都不說才是被禁止的那種。
+        同樣的話連續講不重複記，不然每拍一筆會把日誌洗掉。
         """
-        self._alert_text = text
-        self._paint_status()
-
-    def _paint_status(self) -> None:
-        self.status_label.setText(self._alert_text or self._note_text)
+        if text and text != self._last_alert:
+            log.warning("%s：%s", self.character or "—", text)
+        self._last_alert = text
 
 
 class FarmPage(BasePage):

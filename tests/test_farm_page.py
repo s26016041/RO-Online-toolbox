@@ -109,14 +109,30 @@ def test_travel_button_pops_up_when_the_bot_stops(qtbot):
         FakeTravelStats(running=False, note="⚠ 讀不到導航目標 —— 請先在遊戲的尋路視窗設定目的地")
     )
     assert card.auto_travel.isChecked() is False
-    assert "讀不到導航目標" in card.status_label.text()
 
 
-def test_travel_progress_shows_where_and_how_far(qtbot):
+def test_travel_failure_goes_to_the_log_not_the_card(qtbot, caplog):
+    """⚠ 提示字一律進**執行日誌**（使用者指定），但不准安靜地消失。"""
+    import logging
+
     card = make_card(qtbot)
-    card._apply_travel_stats(
-        FakeTravelStats(hops_left=2, note="前往 prt_fild08：還要換 2 張圖")
-    )
-    text = card.status_label.text()
+    card.set_note("PID 1234")
+    with caplog.at_level(logging.WARNING):
+        card._apply_travel_stats(
+            FakeTravelStats(running=False, note="⚠ 讀不到導航目標")
+        )
+    assert card.status_label.text() == "PID 1234", "卡片上只放 PID"
+    assert any("讀不到導航目標" in r.getMessage() for r in caplog.records)
+
+
+def test_travel_progress_goes_to_the_log(qtbot, caplog):
+    import logging
+
+    card = make_card(qtbot)
+    with caplog.at_level(logging.WARNING):
+        card._apply_travel_stats(
+            FakeTravelStats(hops_left=2, note="前往 prt_fild08：還要換 2 張圖")
+        )
+    text = " ".join(r.getMessage() for r in caplog.records)
     assert "普隆德拉原野" in text
     assert "還要換 2 張圖" in text

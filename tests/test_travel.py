@@ -312,3 +312,85 @@ def test_izlu2dun_to_geffen_explains_the_boat():
     note = mod._no_route_note("izlu2dun", "geffen")
     assert "船員" in note and "izlude" in note
 
+
+# ---- 停在 NPC 前面等人手動做完 --------------------------------------------
+
+
+def _npc_world(monkeypatch):
+    """izlu2dun 只能靠「船員」回 izlude，izlude 走一個傳點到 geffen。"""
+    from ro_toolbox.services import travel as mod
+
+    walk = {"izlude": [(50, 50, "geffen", 100, 100)]}
+    npc = {"izlu2dun": [(108, 27, "izlude", 195, 210, "船員")]}
+    monkeypatch.setattr(mod, "warps_on_map", lambda m: walk.get(m, []))
+    monkeypatch.setattr(mod, "npc_links_on_map", lambda m: npc.get(m, []))
+    return mod
+
+
+def test_walking_route_wins_over_the_npc_one(monkeypatch):
+    """⚠ 走得到就別麻煩人。BFS 只看換圖次數，不擋的話它會為了少換一張圖
+    就叫你去搭船（甚至去付錢搭卡普拉）。"""
+    from ro_toolbox.services import travel as mod
+
+    monkeypatch.setattr(mod, "warps_on_map",
+                        lambda m: [(9, 9, "izlude", 1, 1)] if m == "izlu2dun" else [])
+    monkeypatch.setattr(mod, "npc_links_on_map",
+                        lambda m: [(108, 27, "izlude", 195, 210, "船員")]
+                        if m == "izlu2dun" else [])
+    route = mod.plan_route("izlu2dun", "izlude")
+    assert route and route[0].npc == "", "純走路走得到就不該挑 NPC 那條"
+
+
+def test_npc_hops_carry_the_name(monkeypatch):
+    mod = _npc_world(monkeypatch)
+    route = mod.plan_route("izlu2dun", "geffen", allow_npc=True)
+    assert [h.npc for h in route] == ["船員", ""]
+
+
+def _npc_traveler(goal):
+    """全可走的地形。要 200x200 —— NPC 在 (108,27)，100x100 裝不下會被夾到邊界。"""
+    traveler, walker, clock = make(loader=lambda name: open_terrain(name, side=200))
+    traveler.set_goal(goal)
+    return traveler, walker, clock
+
+
+def test_traveler_stops_and_waits_at_the_npc(monkeypatch):
+    """走到 NPC 面前就**停住等人**，而且不再送走路封包 ——
+    人在跟 NPC 對話時被拉著走，選單會被打斷。"""
+    _npc_world(monkeypatch)
+    t, walker, _clock = _npc_traveler("geffen")
+    assert t.update("izlu2dun", (5, 5)) == "walking"      # 先規劃、往 NPC 走
+    assert walker.paths[-1][-1] == (108, 27), "第一段的目標就是 NPC 那一格"
+    walker.state = "arrived"
+    assert t.update("izlu2dun", (108, 27)) == "waiting"
+    assert "船員" in t.note and "izlude" in t.note
+    assert walker.state == "idle", "等待期間不准還有走路路徑"
+
+
+def test_the_map_changing_is_the_only_resume_signal(monkeypatch):
+    """⚠ 不是等幾秒，是**地圖真的變成那一張**（記憶體讀得到）才繼續。"""
+    _npc_world(monkeypatch)
+    t, walker, clock = _npc_traveler("geffen")
+    t.update("izlu2dun", (5, 5))
+    walker.state = "arrived"
+    assert t.update("izlu2dun", (108, 27)) == "waiting"
+    # 時間過去但地圖沒變 → 還是等，不准自己往下走
+    clock.now += 300.0
+    assert t.update("izlu2dun", (108, 27)) == "waiting"
+    # 地圖變了 → 自動重新規劃並繼續
+    walker.state = "idle"
+    assert t.update("izlude", (60, 60)) in {"walking", "arrived"}
+    assert t._npc_wait is None
+
+
+def test_waiting_gives_up_loudly_not_silently(monkeypatch):
+    """逾時只能當放棄的上限，不能當成功的依據 —— 逾時要停，不准假裝過去了。"""
+    _npc_world(monkeypatch)
+    t, walker, clock = _npc_traveler("geffen")
+    t.update("izlu2dun", (5, 5))
+    walker.state = "arrived"
+    assert t.update("izlu2dun", (108, 27)) == "waiting"
+    clock.now += 10_000.0
+    assert t.update("izlu2dun", (108, 27)) == "blocked"
+    assert "已停止" in t.note
+

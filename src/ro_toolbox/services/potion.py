@@ -616,6 +616,10 @@ class PotionBot:
             self._resync_at = 0.0
 
     def _note(self, text: str) -> None:
+        # 提示字一律進**執行日誌**，不放介面（使用者指定）。
+        # 只在內容變動時記一筆 —— 這支每拍都會被呼叫，照記會把日誌洗成幾百行一樣的字。
+        if text and text != self._stats.note:
+            log.info("%s", text)
         self._stats.note = text
         self._push()
 
