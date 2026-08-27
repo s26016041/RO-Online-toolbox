@@ -192,43 +192,59 @@ def probe() -> int:
     import ctypes
     import os
 
+    from ro_toolbox.config.paths import log_dir
     from ro_toolbox.services.character import CharacterReader
     from ro_toolbox.services.memory_scan import MemoryScanner
     from ro_toolbox.services.process_monitor import is_admin
     from ro_toolbox.services.window_list import enumerate_windows
 
+    # ⚠ **同時寫進檔案。** 無主控台的版本 `stdout` 是 PyInstaller 的
+    # NullWriter，`print` 全部進黑洞（[ENV-005] 踩過）——
+    # 使用者跑 `--probe` 會「沒反應」，等於這支診斷在最需要它的地方沒用。
+    report = log_dir() / "probe.txt"
+    lines: list[str] = []
+
+    def say(text: str) -> None:
+        lines.append(text)
+        print(text)
+        try:
+            report.write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            pass
+
     frozen = getattr(sys, "frozen", False)
-    print(f"[探針] 執行檔 = {sys.executable}")
-    print(f"[探針] 打包過的嗎 = {frozen}　64 位元 = {sys.maxsize > 2**32}")
-    print(f"[探針] 管理員 = {is_admin()}　PID = {os.getpid()}")
+    say(f"[探針] 報告寫到 {report}")
+    say(f"[探針] 執行檔 = {sys.executable}")
+    say(f"[探針] 打包過的嗎 = {frozen}　64 位元 = {sys.maxsize > 2**32}")
+    say(f"[探針] 管理員 = {is_admin()}　PID = {os.getpid()}")
 
     pids = [w.pid for w in enumerate_windows() if w.process_name.lower() == "ragexe.exe"]
-    print(f"[探針] 找到的 Ragexe = {pids}")
+    say(f"[探針] 找到的 Ragexe = {pids}")
     if not pids:
-        print("[探針] 遊戲沒開，到此為止")
+        say("[探針] 遊戲沒開，到此為止")
         return 0
     pid = pids[0]
 
     scanner = MemoryScanner()
     scanner.open(pid)
-    print(f"[探針] 附加成功 = {scanner.attached}　可寫 = {scanner.can_write}")
+    say(f"[探針] 附加成功 = {scanner.attached}　可寫 = {scanner.can_write}")
     if not scanner.attached:
-        print(f"[探針] OpenProcess 失敗，GetLastError = {ctypes.get_last_error()}")
+        say(f"[探針] OpenProcess 失敗，GetLastError = {ctypes.get_last_error()}")
         return 1
 
     head = scanner._read_bytes(0x400000, 2)  # noqa: SLF001 - 診斷
-    print(f"[探針] 讀 0x400000 的頭兩個 byte = {head!r}"
+    say(f"[探針] 讀 0x400000 的頭兩個 byte = {head!r}"
           f"（應該是 b'MZ'；讀不到代表 ReadProcessMemory 被擋）")
     base = scanner.image_base_by_scan()
-    print(f"[探針] 掃描找映像基底 = {base and hex(base)}")
+    say(f"[探針] 掃描找映像基底 = {base and hex(base)}")
     scanner.close()
 
     reader = CharacterReader()
     ok = reader.attach(pid)
-    print(f"[探針] 角色定位 = {ok}")
+    say(f"[探針] 角色定位 = {ok}")
     if ok:
         status = reader.read()
-        print(f"[探針] 讀到角色 = {status and status.name}"
+        say(f"[探針] 讀到角色 = {status and status.name}"
               f" @ {status and status.map_name} {reader.read_position()}")
     # 直接跑一次特徵掃描，看命中幾個、幾個通過驗證 ——
     # 「attach 回 True 但 read() 回 None」就是這一步挑錯了候選。
@@ -239,9 +255,9 @@ def probe() -> int:
         hits = aob_scan(reader._scanner, CHAR_STATUS,  # noqa: SLF001 - 診斷
                         writable_only=True, limit=64)
         good = [h for h in hits if reader.probe(h) is not None]
-        print(f"[探針] 角色特徵命中 {len(hits)} 個，通過數值驗證 {len(good)} 個")
-        print(f"[探針]   命中：{[hex(h) for h in hits[:8]]}")
-        print(f"[探針]   驗過：{[hex(h) for h in good[:8]]}")
+        say(f"[探針] 角色特徵命中 {len(hits)} 個，通過數值驗證 {len(good)} 個")
+        say(f"[探針]   命中：{[hex(h) for h in hits[:8]]}")
+        say(f"[探針]   驗過：{[hex(h) for h in good[:8]]}")
     reader.close()
     return 0
 

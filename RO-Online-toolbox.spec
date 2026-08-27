@@ -65,6 +65,10 @@ hiddenimports += [
 ]
 
 DEBUG_CONSOLE = os.environ.get("ROT_CONSOLE", "0") == "1"
+#: 設 ROT_ONEDIR=1 編成資料夾版（不自解壓）。**只用來診斷**：
+#: onefile 每次啟動都把 78 MB 解到暫存再從那裡跑，GameGuard 對這種樣子敏感。
+#: 資料夾版能跑而單檔版不能 → 就是那個行為的問題。
+ONEDIR = os.environ.get("ROT_ONEDIR", "0") == "1"
 APP_NAME = "RO-Online-toolbox" + ("-debug" if DEBUG_CONSOLE else "")
 
 
@@ -83,13 +87,14 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
+_bundle = [] if ONEDIR else [a.binaries, a.datas]
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
+    *_bundle,
     [],
     name=APP_NAME,
+    exclude_binaries=ONEDIR,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -107,3 +112,17 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
 )
+
+
+if ONEDIR:
+    # 資料夾版：exe 旁邊放一堆檔案，啟動時不解壓。診斷用。
+    COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name=APP_NAME,
+    )
+
