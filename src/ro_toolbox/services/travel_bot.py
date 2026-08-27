@@ -482,6 +482,15 @@ class TravelBot:
             self._reader.close()
             self._reader = None
 
+    @property
+    def destination(self) -> str | None:
+        """已經解析出來的目的地地圖。還沒讀到回 None。
+
+        自動回連要用它做快照 —— 重連之後遊戲的導航目標不一定還在，
+        所以要把**答案本身**記下來，不是記「回來再去問遊戲」。
+        """
+        return self._destination
+
     def _note(self, text: str) -> None:
         # 提示字一律進**執行日誌**，不放介面（使用者指定）。
         # 只在內容變動時記一筆 —— 這支每拍都會被呼叫，照記會把日誌洗成幾百行一樣的字。

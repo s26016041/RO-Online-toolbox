@@ -39,6 +39,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ro_toolbox.config.settings import current_settings
+from ro_toolbox.core.worker import Worker, WorkerThread
 from ro_toolbox.services import bag, icons, potion_store, window_list
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
@@ -46,9 +48,12 @@ from ro_toolbox.services.gamedata import (
     heals_hp,
     heals_sp,
     item_name,
+    map_display_name,
     map_name_table,
 )
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
+from ro_toolbox.services.process_monitor import local_network_up
+from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel_bot import TravelBot
 from ro_toolbox.ui.pages.base_page import BasePage
@@ -677,6 +682,61 @@ class CharacterCard(QWidget):
         self._last_alert = text
 
 
+class _ReconnectWorker(Worker):
+    """在背景把一個斷線的實例救回來：關掉 → 重開 → 重新登入。
+
+    ⚠ **一定要跑在 worker 執行緒**：這三步加起來三十秒級，放 UI 執行緒
+    等於整個程式凍住。跟批次登入是同一條規則（見 account_page）。
+
+    ⚠ 接續一個斷在半途的客戶端是賭博，關掉重開是確定的。
+    """
+
+    #: (新的 pid, 角色名, 快照, 失敗原因)。pid <= 0 代表失敗。
+    done = Signal(int, str, object, str)
+
+    def __init__(self, pid: int, who: str, snap) -> None:
+        super().__init__()
+        self._pid = pid
+        self._who = who
+        self._snap = snap
+
+    def run(self) -> None:
+        from ro_toolbox.services import accounts as account_store
+        from ro_toolbox.services import game_census, game_launcher
+        from ro_toolbox.services.auto_login import AutoLogin
+
+        try:
+            account = self._find_account(account_store)
+            if account is None:
+                self.done.emit(0, self._who, self._snap,
+                               f"帳號設定裡找不到角色「{self._who}」")
+                return
+            game_census.close_idle()
+            paths = game_launcher.GamePaths(current_settings().game_path)
+            if paths.problem:
+                self.done.emit(0, self._who, self._snap, paths.problem)
+                return
+            pid = game_launcher.launch_game_directly(paths)
+            progress = AutoLogin(account, pid, lambda t: log.info("回連：%s", t)).run()
+            if not getattr(progress, "ok", True):
+                self.done.emit(0, self._who, self._snap, "重新登入沒有完成")
+                return
+            self.done.emit(pid, self._who, self._snap, "")
+        except Exception as exc:  # noqa: BLE001 - 背景失敗要回報，不能吞掉
+            log.exception("自動回連失敗")
+            self.done.emit(0, self._who, self._snap, str(exc))
+
+    def _find_account(self, account_store):
+        """用**角色名**找帳號（身分），不是用 pid（位置）。"""
+        try:
+            for account in account_store.load().accounts:
+                if account.character == self._who:
+                    return account
+        except Exception as exc:  # noqa: BLE001
+            log.warning("讀不到帳號設定：%s", exc)
+        return None
+
+
 class FarmPage(BasePage):
     title = "自動掛機"
     subtitle = "每個已登入的遊戲視窗一個分頁，會自動跟著增減。"
@@ -689,6 +749,12 @@ class FarmPage(BasePage):
         self._bots: dict[int, FarmBot] = {}
         self._potions: dict[int, PotionBot] = {}
         self._travelers: dict[int, TravelBot] = {}
+        #: 自動回連：角色名 → 斷線前在跑什麼／目前的判斷狀態
+        self._snaps: dict = {}
+        self._deciders: dict = {}
+        self._reconnecting = False
+        self._reconnect_thread = None
+        self._reconnect_decider = None
         self._bag_workers: dict[int, BagWorker] = {}
         self._bag_loaded: set[int] = set()
         # 每個角色最近一次讀到的背包 {格號: (道具編號, 數量)}
@@ -714,6 +780,7 @@ class FarmPage(BasePage):
         self._read_timer.timeout.connect(self._read_all)
         self._read_timer.timeout.connect(self._refresh_loot)
         self._read_timer.timeout.connect(self._refresh_current_bag)
+        self._read_timer.timeout.connect(self._watch_connections)
         self._read_timer.start()
 
         self._scan()
@@ -951,6 +1018,111 @@ class FarmPage(BasePage):
         log.info("自動掛機：移除 PID %s（%s）", pid, reason)
 
     # ---- 自動打怪 ---------------------------------------------------
+
+    # ---- 自動回連 ---------------------------------------------------
+
+    def _watch_connections(self) -> None:
+        """每拍檢查一次連線。真的要重連時把工作丟到背景執行緒。
+
+        ⚠ **重連會關掉並重開遊戲**，所以只有使用者在帳號頁勾了「自動回連」
+        才會動作。`ReconnectDecider` 負責分辨「你的網路斷了」「換地圖的過渡」
+        「真的斷線」——這裡只負責照著做。
+
+        ⚠ 關遊戲＋重新登入要三十秒級，**絕不能放在 UI 執行緒**。
+        """
+        if not current_settings().auto_reconnect or self._reconnecting:
+            return
+        now = time.monotonic()
+        for pid, card in list(self._cards.items()):
+            who = card.character
+            if not who:
+                continue
+            # 只在連線正常時更新快照 —— 斷線當下什麼都停了，那時候拍等於忘光
+            if find_server(pid) is not None:
+                self._snaps[who] = self.snapshot_for(pid)
+                self._deciders.pop(who, None)
+                continue
+            decider = self._deciders.setdefault(who, ReconnectDecider())
+            state = decider.decide(False, local_network_up(), now)
+            if state == RECONNECT:
+                self._begin_reconnect(pid, who, decider)
+                return
+            log.info("「%s」%s", who, decider.note)
+
+    def _begin_reconnect(self, pid: int, who: str, decider) -> None:
+        """把「關遊戲→重開→登入」丟到背景，完成後回 UI 執行緒接回設定。"""
+        snap = self._snaps.get(who)
+        if snap is None:
+            log.warning("「%s」斷線了，但沒有斷線前的快照，先不自動回連", who)
+            return
+        worker = _ReconnectWorker(pid, who, snap)
+        thread = WorkerThread(worker, self)
+        worker.done.connect(self._reconnect_done)
+        thread.finished.connect(lambda: setattr(self, "_reconnecting", False))
+        self._reconnecting = True
+        self._reconnect_thread = thread
+        self._reconnect_decider = decider
+        thread.start()
+
+    def _reconnect_done(self, new_pid: int, who: str, snap, why: str) -> None:
+        if new_pid <= 0:
+            # ⚠ 失敗要退避，不能無腦一直重開（伺服器維修時我們分不出來）
+            self._reconnect_decider.note_attempt_failed(time.monotonic())
+            log.warning("「%s」自動回連失敗：%s；%s", who, why,
+                        self._reconnect_decider.note)
+            return
+        self._deciders.pop(who, None)
+        self._scan()                      # 讓新的遊戲視窗長出分頁
+        QTimer.singleShot(3000, lambda: self.restore_into(new_pid, snap))
+
+    # ---- 拍下現在在跑什麼，回來之後接回去 -----------------------------
+
+    def snapshot_for(self, pid: int):
+        """這個遊戲視窗現在在跑什麼。**存身分不存位置**（[DAT-026] 同一條規矩）。
+
+        重新登入之後角色多半在存檔點，不會在斷線的地方 —— 所以存的是
+        「目的地是哪張圖」而不是「路線走到第幾段」，回來重算就好。
+        """
+        from ro_toolbox.services.reconnect_bot import Snapshot
+
+        card = self._cards.get(pid)
+        if card is None:
+            return Snapshot()
+        labels = []
+        farming = card.auto_hunt.isChecked()
+        if farming:
+            labels.append("自動打怪")
+        potion = card.potion_config() if card.auto_potion.isChecked() else None
+        if potion is not None:
+            labels.append("自動補水")
+        travel = self._travelers.get(pid)
+        # 目的地取**已經解析出來的那個地圖**：可能是使用者自己選的，
+        # 也可能是當初從遊戲導航讀來的 —— 重連之後遊戲那個值不一定還在，
+        # 所以這裡把答案本身記下來，不是記「去問遊戲」。
+        dest = travel.destination if travel is not None else None
+        if dest:
+            labels.append(f"前往 {map_display_name(dest) or dest}")
+        return Snapshot(farming=farming, potion=potion,
+                        destination=dest, labels=labels)
+
+    def restore_into(self, pid: int, snap) -> None:
+        """把快照接回**新開的**那個遊戲視窗上。"""
+        card = self._cards.get(pid)
+        if card is None:
+            log.warning("回連後找不到 PID %s 的分頁，接不回去", pid)
+            return
+        if snap.potion is not None and not card.auto_potion.isChecked():
+            card.auto_potion.setChecked(True)
+        if snap.destination:
+            position = card.destination.findData(snap.destination)
+            if position >= 0:
+                card.destination.setCurrentIndex(position)
+            card.auto_travel.setChecked(True)     # 這會觸發 _toggle_travel
+        elif snap.farming and not card.auto_hunt.isChecked():
+            # 趕路途中不打怪（兩個都在送走路封包會互相打架），所以只有
+            # 「沒有要趕路」時才把自動打怪接回去；到站之後使用者自己開。
+            card.auto_hunt.setChecked(True)
+        log.warning("已接回 PID %s：%s", pid, "、".join(snap.labels) or "（無）")
 
     def _toggle_farm(self, pid: int, on: bool) -> None:
         card = self._cards.get(pid)

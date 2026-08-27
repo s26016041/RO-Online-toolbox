@@ -75,6 +75,21 @@ def make_card(qtbot):
     return card
 
 
+def _page(qtbot, monkeypatch=None):
+    """一個不會去掃遊戲視窗的 FarmPage（計時器全停）。"""
+    import pytest as _pytest
+
+    from ro_toolbox.services import window_list
+    from ro_toolbox.ui.pages.farm_page import FarmPage
+    mp = monkeypatch or _pytest.MonkeyPatch()
+    mp.setattr(window_list, "enumerate_windows", lambda *a, **k: [])
+    page = FarmPage()
+    qtbot.addWidget(page)
+    page._scan_timer.stop()
+    page._read_timer.stop()
+    return page
+
+
 class FakeTravelStats:
     def __init__(self, **kw) -> None:
         self.running = kw.get("running", True)
@@ -183,3 +198,78 @@ def test_a_junk_saved_destination_falls_back_to_reading_the_game(qtbot):
     card = make_card(qtbot)
     card.apply_saved_potion(PotionSaved(travel_dest="不存在的圖"))
     assert card.chosen_destination() is None
+
+
+# ---- 自動回連 ------------------------------------------------------------
+
+
+def test_snapshot_keeps_identity_not_position(qtbot, monkeypatch):
+    """⚠ 存的是**目的地是哪張圖**，不是「路線走到第幾段」。
+
+    重新登入之後角色多半在存檔點，不會在斷線的地方 —— 存位置回來就是錯的。
+    """
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    card.auto_hunt.setChecked(True)
+
+    class FakeTravel:
+        destination = "geffen"
+
+    page._travelers[1234] = FakeTravel()
+    snap = page.snapshot_for(1234)
+    assert snap.farming is True
+    assert snap.destination == "geffen"
+    assert any("geffen" in label or "吉芬" in label for label in snap.labels)
+
+
+def test_watching_does_nothing_when_the_switch_is_off(qtbot, monkeypatch):
+    """⚠ 自動回連會**關掉並重開遊戲** —— 沒勾就一步都不准做。"""
+    from ro_toolbox.config.settings import AppSettings
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    monkeypatch.setattr(mod, "current_settings", lambda: AppSettings(auto_reconnect=False))
+    monkeypatch.setattr(mod, "find_server", lambda _pid: None)
+    called = []
+    monkeypatch.setattr(page, "_begin_reconnect", lambda *a: called.append(a))
+    for _ in range(50):
+        page._watch_connections()
+    assert called == []
+
+
+def test_my_network_being_down_never_reconnects(qtbot, monkeypatch):
+    """你自己的網路斷了 —— 關遊戲重開是幫倒忙（重開照樣連不上，人還被登出）。"""
+    from ro_toolbox.config.settings import AppSettings
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    monkeypatch.setattr(mod, "current_settings", lambda: AppSettings(auto_reconnect=True))
+    monkeypatch.setattr(mod, "find_server", lambda _pid: None)
+    monkeypatch.setattr(mod, "local_network_up", lambda: False)
+    called = []
+    monkeypatch.setattr(page, "_begin_reconnect", lambda *a: called.append(a))
+    for _ in range(50):
+        page._watch_connections()
+    assert called == []
+
+
+def test_it_will_not_reconnect_without_a_snapshot(qtbot, monkeypatch, caplog):
+    """沒有斷線前的快照就不知道要接回什麼 —— 不如不動，交給人。"""
+    import logging
+
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    with caplog.at_level(logging.WARNING, logger="ro_toolbox.ui.pages.farm_page"):
+        page._begin_reconnect(1234, "狐狐狸", None)
+    assert page._reconnecting is False
+    assert any("快照" in r.getMessage() for r in caplog.records)

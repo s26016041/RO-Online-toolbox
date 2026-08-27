@@ -32,6 +32,7 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -360,6 +361,19 @@ class AccountPage(BasePage):
         self.login_btn.setObjectName("primaryButton")
         self.login_btn.clicked.connect(self._login)
 
+        # 自動回連：斷線就關遊戲、重開、重新登入，再把斷線前在跑的東西接回去。
+        # ⚠ 分得出「你的網路斷了」跟「遊戲斷線」——前者什麼都不做
+        #   （關遊戲重開是幫倒忙，重開照樣連不上，人還被登出了）。
+        self.auto_reconnect = QCheckBox("自動回連")
+        self.auto_reconnect.setToolTip(
+            "斷線就自動關遊戲、重開、重新登入，並把斷線前在跑的\n"
+            "自動打怪／自動補水／自動尋路接回去。\n"
+            "⚠ 你自己的網路斷線時不會動遊戲，只會等它回來。\n"
+            "重連失敗會退避（間隔越來越長），不會無腦一直重開。"
+        )
+        self.auto_reconnect.setChecked(bool(self._settings.auto_reconnect))
+        self.auto_reconnect.toggled.connect(self._on_auto_reconnect)
+
         for button in (
             self.add_btn,
             self.edit_btn,
@@ -370,11 +384,18 @@ class AccountPage(BasePage):
         ):
             row.addWidget(button)
         row.addStretch(1)
+        row.addWidget(self.auto_reconnect)
         row.addWidget(self.login_btn)
 
         box = QWidget()
         box.setLayout(row)
         return box
+
+    def _on_auto_reconnect(self, on: bool) -> None:
+        """開關記在設定檔（跟著程式走，不是跟著角色）。"""
+        self._settings.auto_reconnect = bool(on)
+        save_settings(self._settings)
+        log.info("自動回連：%s", "開啟" if on else "關閉")
 
     def _build_game_path(self) -> QWidget:
         """遊戲路徑。指到**啟動器**（Ragnarok.exe），遊戲本體從同一層推出來。"""

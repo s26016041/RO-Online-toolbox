@@ -43,6 +43,12 @@ class AppSettings:
     #: **然後把他按的位置學起來**（見 auto_login._learn_agree_button）。
     #: 空的代表還沒學過，用內建預設值。
     agree_button: list[float] | None = None
+    #: 自動回連：斷線就關遊戲、重開、重新登入，再把斷線前在跑的東西接回去。
+    #:
+    #: 預設**關閉** —— 它會關掉並重開你的遊戲，那種事不該預設發生。
+    #: ⚠ 只在「你的網路正常但遊戲沒有連線」時才動作；你自己的網路斷了
+    #: 一律什麼都不做（見 services/reconnect.py）。
+    auto_reconnect: bool = False
     window: WindowSettings = field(default_factory=WindowSettings)
 
     def to_dict(self) -> dict[str, Any]:
