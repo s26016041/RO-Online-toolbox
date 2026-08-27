@@ -285,6 +285,11 @@ class Traveler:
         return self._goal_map
 
     @property
+    def here_map(self) -> str:
+        """目前這條路線是從哪張圖算出來的（＝角色現在在哪）。"""
+        return self._route_map
+
+    @property
     def npc_hop(self):
         """正在等人（或等程式）跟哪個 NPC 講話。沒有回 None。"""
         return self._npc_wait

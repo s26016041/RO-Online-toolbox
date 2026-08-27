@@ -45,6 +45,8 @@ _ENT_CLASS = 21     # uint16 外觀編號
 _ENT_POS = 61       # 3-byte 壓縮座標
 #: NPC 座標容許差幾格。Navi_Npc 給的是他站的格，實際可能差一點。
 _NPC_SNAP = 3
+#: 找 NPC 時掃自己周圍幾格。走到他面前才會用到，不必大。
+_NPC_VIEW = 20
 
 
 @dataclass
@@ -263,6 +265,7 @@ class TravelBot:
                 continue
 
             self._stats.here = status.map_name
+            self._watch_next_npc()
             state = self._traveler.update(status.map_name, pos)
             if state == "waiting":
                 # 走到 NPC 面前了。有外觀編號就自己跟他講話；
@@ -286,6 +289,27 @@ class TravelBot:
 
     # ---- 自己跟 NPC 講話 --------------------------------------------
 
+    def _watch_next_npc(self) -> None:
+        """路線上**下一段**如果要跟 NPC 講話，現在就開始留意他的實體封包。
+
+        ⚠ 為什麼不能等走到才開始盯：**實體只在「進入視野」時送一次封包**
+        （[PKT-061]）。那一包是**走路途中**送來的，等站到他面前才開始看
+        就永遠等不到 —— 實測就是這樣，走到船員面前卻不開口。
+
+        （記憶體那條走不通：怪物掃描器靠 `alive==1` 當錨，那是怪物專用的旗標，
+        實測掃 40 輪一個 NPC 都看不到，見 [MEM-047]。）
+        """
+        route = self._traveler.route
+        hop = route[0] if route else None
+        want = (hop.npc_id, hop.x, hop.y) if hop is not None and hop.npc_id else None
+        if want != self._npc_want:
+            self._npc_want = want
+            self._npc_gid = None
+            self._talk = None
+            if want is not None:
+                log.info("留意「%s」（外觀 %s，在 %s,%s）的實體封包",
+                         hop.npc, want[0], want[1], want[2])
+
     def _run_dialog(self) -> None:
         """把 `Traveler` 停下來等的那一段 NPC 對話走完。
 
@@ -296,14 +320,9 @@ class TravelBot:
         hop = self._traveler.npc_hop
         if hop is None or not hop.npc_id:
             return
-        if self._npc_want != (hop.npc_id, hop.x, hop.y):
-            # 換了一段 NPC：重新開始認人
-            self._npc_want = (hop.npc_id, hop.x, hop.y)
-            self._npc_gid = None
-            self._talk = None
         if self._talk is None:
             if self._npc_gid is None:
-                return       # 還沒認出那隻 NPC（等他進視野的封包）
+                return       # 還認不出那隻 NPC —— 就停著等人，不亂送封包
             want = map_display_name(hop.to_map)
             self._talk = npc_dialog.NpcTalk(self._npc_gid, want)
             log.info("開始跟「%s」(GID %s) 對話，想去 %s",

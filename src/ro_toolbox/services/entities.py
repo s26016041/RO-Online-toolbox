@@ -101,6 +101,7 @@ class EntityScanner:
         map_name: str,
         view: int = 30,
         now=time.monotonic,
+        extra_classes=(),
     ) -> None:
         self._terrain = terrain
         self._view = view
@@ -110,7 +111,7 @@ class EntityScanner:
         self._sweep: list[tuple[int, int]] = []
         self._sweep_index = 0
         self._last_full = 0.0
-        self._lut, self.map_filtered = self._build_lut(map_name)
+        self._lut, self.map_filtered = self._build_lut(map_name, extra_classes)
         #: 診斷用：最近一次掃描花多少秒、掃了幾個區段
         self.last_cost = 0.0
         self.last_regions = 0
@@ -124,12 +125,19 @@ class EntityScanner:
         self.discovered = 0
 
     @staticmethod
-    def _build_lut(map_name: str) -> tuple[np.ndarray, bool]:
-        """做 class ID 的查表陣列。優先只收這張圖會出的怪 —— 這是最強的過濾。"""
+    def _build_lut(map_name: str, extra_classes=()) -> tuple[np.ndarray, bool]:
+        """做 class ID 的查表陣列。優先只收這張圖會出的怪 —— 這是最強的過濾。
+
+        `extra_classes` 是額外要放行的外觀編號（例如某隻 NPC 的 100）。
+        NPC 不在怪物表裡，不明確放行就會被這道過濾擋掉。
+        """
         lut = np.zeros(65536, dtype=bool)
         on_map = mobs_on_map(map_name)
         source = on_map or mob_names()
         for class_id in source:
+            if 0 < class_id < 65536:
+                lut[class_id] = True
+        for class_id in extra_classes:
             if 0 < class_id < 65536:
                 lut[class_id] = True
         if not on_map:

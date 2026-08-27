@@ -158,20 +158,31 @@ def test_the_list_still_works_without_any_icons(card, monkeypatch):
     assert card.potion_config().hp_item == RED
 
 
-def test_bot_stopping_unchecks_the_box(card, caplog):
+def test_bot_stopping_unchecks_the_box(card):
     """bot 自己停掉（藥水喝完／喝不到）就要把勾拿掉，不能勾著卻沒在跑。
 
-    原因寫進**執行日誌**，不放介面（使用者指定）—— 但不准安靜地消失。
+    原因由 `PotionBot._note()` 記進執行日誌 —— 這裡**不能再記一次**，
+    兩邊都記會把同一句話印兩遍。
     """
-    import logging
-
     from ro_toolbox.services.potion import PotionStats
 
+    card.set_note("PID 1234")
     card.auto_potion.setChecked(True)
-    with caplog.at_level(logging.WARNING):
-        card._apply_potion_stats(PotionStats(running=False, note="⚠ 藥水用完了"))
+    card._apply_potion_stats(PotionStats(running=False, note="⚠ 藥水用完了"))
     assert card.auto_potion.isChecked() is False
-    assert any("藥水用完了" in r.getMessage() for r in caplog.records), "停用原因要進日誌"
+    assert card.status_label.text() == "PID 1234", "卡片上只放 PID"
+
+
+def test_the_potion_bot_logs_it_once(caplog):
+    import logging
+
+    from ro_toolbox.services.potion import PotionBot, PotionConfig
+
+    bot = PotionBot(1234, PotionConfig())
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.services.potion"):
+        bot._note("⚠ 藥水用完了")
+        bot._note("⚠ 藥水用完了")
+    assert [r.getMessage() for r in caplog.records] == ["⚠ 藥水用完了"]
 
 
 # ---- 存檔還原：程式改 UI 不算使用者的意思 ---------------------------------

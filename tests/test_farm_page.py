@@ -111,31 +111,33 @@ def test_travel_button_pops_up_when_the_bot_stops(qtbot):
     assert card.auto_travel.isChecked() is False
 
 
-def test_travel_failure_goes_to_the_log_not_the_card(qtbot, caplog):
-    """⚠ 提示字一律進**執行日誌**（使用者指定），但不准安靜地消失。"""
-    import logging
+def test_travel_failure_only_pops_the_button(qtbot):
+    """⚠ 卡片上不放字（提示字進執行日誌），介面唯一的表現是按鈕彈起來。
 
+    日誌是 `TravelBot._note()` 記的，**這裡不能再記一次** ——
+    兩邊都記的症狀是同一句話印兩次（實測：「前往 依斯魯得島　前往 izlude」）。
+    """
     card = make_card(qtbot)
     card.set_note("PID 1234")
-    with caplog.at_level(logging.WARNING):
-        card._apply_travel_stats(
-            FakeTravelStats(running=False, note="⚠ 讀不到導航目標")
-        )
-    assert card.status_label.text() == "PID 1234", "卡片上只放 PID"
-    assert any("讀不到導航目標" in r.getMessage() for r in caplog.records)
+    card.auto_travel.setChecked(True)
+    card._apply_travel_stats(FakeTravelStats(running=False, note="⚠ 讀不到導航目標"))
+    assert card.auto_travel.isChecked() is False
+    assert card.status_label.text() == "PID 1234"
 
 
-def test_travel_progress_goes_to_the_log(qtbot, caplog):
+def test_the_bot_is_the_one_that_logs(caplog):
+    """提示字只由 bot 記一次，而且**同一句話不重複記**（每拍都會呼叫）。"""
     import logging
 
-    card = make_card(qtbot)
-    with caplog.at_level(logging.WARNING):
-        card._apply_travel_stats(
-            FakeTravelStats(hops_left=2, note="前往 prt_fild08：還要換 2 張圖")
-        )
-    text = " ".join(r.getMessage() for r in caplog.records)
-    assert "普隆德拉原野" in text
-    assert "還要換 2 張圖" in text
+    from ro_toolbox.services.travel_bot import TravelBot
+
+    bot = TravelBot(1234)
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.services.travel_bot"):
+        bot._note("前往 izlude：還要換 1 張圖")
+        bot._note("前往 izlude：還要換 1 張圖")
+        bot._note("⚠ 讀不到導航目標")
+    said = [r.getMessage() for r in caplog.records]
+    assert said == ["前往 izlude：還要換 1 張圖", "⚠ 讀不到導航目標"], said
 
 
 # ---- 目的地選單（中文／地圖代碼都能搜）------------------------------------

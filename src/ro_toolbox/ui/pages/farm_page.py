@@ -346,18 +346,14 @@ class CharacterCard(QWidget):
         return data if isinstance(data, str) else None
 
     def _apply_travel_stats(self, stats) -> None:  # noqa: ANN001 - TravelStats
+        """⚠ 這裡**不記日誌** —— `TravelBot._note()` 已經記過了。
+        兩邊都記的症狀是同一句話印兩次（實測：「前往 依斯魯得島　前往 izlude」）。
+        介面上唯一的表現是：bot 停了，按鈕就彈起來。"""
         if not stats.running:
-            self.set_alert(stats.note)
             # 走完（或失敗）就把按鈕彈起來 —— 按鈕壓著卻沒在走，
             # 看起來會像「還在趕路」，那是最糟的失效方式。
             if self.auto_travel.isChecked():
                 self.auto_travel.setChecked(False)
-            return
-        where = stats.goal_label or stats.goal
-        head = f"前往 {where}" if where else "讀取導航目標…"
-        if stats.hops_left:
-            head += f"　還要換 {stats.hops_left} 張圖"
-        self.set_alert(f"{head}　{stats.note}")
 
     def set_travel_busy(self, busy: bool) -> None:
         """趕路途中不讓人再去勾自動打怪 —— 兩個都在送走路封包會互相打架。"""
@@ -567,7 +563,6 @@ class CharacterCard(QWidget):
 
     def _apply_potion_stats(self, stats: PotionStats) -> None:
         if not stats.running:
-            self.set_alert(stats.note)
             if stats.went_home and self.auto_hunt.isChecked():
                 # 已經用回程道具回城了。沒水又沒怪還勾著自動打怪，
                 # 只會站在城裡空轉 —— 而且看起來像「還在掛機」。
@@ -581,10 +576,7 @@ class CharacterCard(QWidget):
                 finally:
                     self.quiet = False
             return
-        # 跑起來之後不再叨唸喝了幾瓶 —— 使用者要求把這塊提示文字拿掉。
-        # 只有帶「⚠」的才留下來（例如連續喝不到、格號對不上）。
-        # 跑順的時候不佔著狀態行 —— 只有帶「⚠」的才留下來。
-        self.set_alert(stats.note if "⚠" in stats.note else "")
+        # ⚠ 這裡不記日誌 —— `PotionBot._note()` 已經記過了，兩邊都記會印兩次。
 
     def _apply_farm_stats(self, stats: FarmStats) -> None:
         """⚠ 這裡**不寫任何介面文字**（使用者指定：提示字一律進執行日誌）。
