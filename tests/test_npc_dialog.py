@@ -248,11 +248,6 @@ def _menu(gid: int, *options: str) -> bytes:
 
 def test_a_second_menu_is_still_listened_to():
     """⚠ 選完**不能關耳朵** —— 卡普拉的第二層在第一層之後才來。"""
-    talk = nd.NpcTalk(BOAT_GID, "魔法之都 吉芬", now=Clock())
-    _drain(talk)
-    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "傳送服務", "結束"))
-    assert talk.failed is True, "第一層對不上就該停手（不准亂點）"
-
     talk2 = nd.NpcTalk(BOAT_GID, "魔法之都 吉芬", now=Clock())
     _drain(talk2)
     talk2.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "普隆德拉", "吉芬 1200z", "結束"))
@@ -275,12 +270,80 @@ def test_it_stops_after_too_many_menus():
 
 
 def test_it_never_clicks_an_option_it_cannot_match():
-    """⛔ 這是最重要的一條：對不上就**一個封包都不送**。
+    """⛔ 這是最重要的一條：對不上、又不在白名單裡，就**一個封包都不送**。
 
-    亂點的代價是花掉玩家的錢、或被傳到別的地方 —— 而且是安靜地發生。
+    亂點的代價是花掉玩家的錢、或改掉他的存檔點 —— 而且是安靜地發生。
     """
     talk = nd.NpcTalk(BOAT_GID, "魔法之都 吉芬", now=Clock())
     _drain(talk)
-    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "傳送服務", "存放物品", "結束"))
+    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "記憶點", "倉庫服務", "結束"))
+    assert _drain(talk) == [], "記憶點會改掉玩家的重生點，絕對不能點"
+    assert talk.failed is True
+
+
+# ---- 卡普拉：兩層選單（測資是實機 `封包/卡普拉傳送到吉芬.txt`）------------
+
+KAFRA_GID = 145
+
+#: 第一層：記憶點 / 倉庫服務 / 傳送服務 / 手推車服務 / 查詢其他資訊 / 結束
+KAFRA_MENU1 = bytes.fromhex(
+    "3F0091000000B04FBED0C2493AADDCAE77AA41B0C83AB6C7B065AA41"
+    "B0C83AA4E2B1C0A8AEAA41B0C83AAC64B8DFA8E4A54CB8EAB0543AB5"
+    "B2A7F43A00"
+)
+#: 第二層：吉芬 / 斐揚 / 夢羅克 / 艾爾帕蘭 / 取消
+KAFRA_MENU2 = bytes.fromhex(
+    "5C0091000000A64EAAE220202020202020202D3E20313230207A3AB4"
+    "B4B4AD20202020202D3E20313230207A3AB9DAC3B9A74A2020202020"
+    "2D3E20313230207A3AA6E3BAB8A9ACC4F520202D3E20313830207A3A"
+    "A8FAAEF83A00"
+)
+
+
+def test_the_two_kafra_menus_decode():
+    assert nd.parse_menu(KAFRA_MENU1)[1] == [
+        "記憶點", "倉庫服務", "傳送服務", "手推車服務", "查詢其他資訊", "結束",
+    ]
+    assert nd.parse_menu(KAFRA_MENU2)[1][0].startswith("吉芬")
+
+
+def test_kafra_two_level_warp_end_to_end():
+    """第一層沒有目的地 → 點「傳送服務」；第二層才選吉芬。"""
+    talk = nd.NpcTalk(KAFRA_GID, "魔法之都 吉芬", npc="卡普拉職員", now=Clock())
+    _drain(talk)                                   # 接觸
+    talk.feed(nd.ZC_MENU_LIST, KAFRA_MENU1)
+    assert [p.hex() for p in _drain(talk)] == ["b80091000000" + "03"], "第 3 項＝傳送服務"
+    talk.feed(nd.ZC_MENU_LIST, KAFRA_MENU2)
+    assert [p.hex() for p in _drain(talk)] == ["b80091000000" + "01"], "第 1 項＝吉芬"
+    assert talk.done is True
+    assert "120" in talk.cost
+
+
+def test_the_note_says_who_where_and_how_much():
+    """付錢是這趟路本來就要的花費，不是警告 —— 講清楚「找誰、去哪、多少」。"""
+    talk = nd.NpcTalk(KAFRA_GID, "魔法之都 吉芬", npc="卡普拉職員", now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, KAFRA_MENU1)
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, KAFRA_MENU2)
+    _drain(talk)
+    assert "卡普拉職員" in talk.note
+    assert "魔法之都 吉芬" in talk.note
+    assert "120" in talk.note
+
+
+def test_the_whitelist_never_contains_the_dangerous_ones():
+    """⛔ 白名單是這整套的安全根據 —— 這幾個永遠不准進去。"""
+    for danger in ("記憶點", "倉庫服務", "手推車服務", "結束", "取消"):
+        assert not any(danger in key for key in nd.SUBMENU_OPTIONS), danger
+
+
+def test_a_kafra_menu_without_our_destination_stops(caplog):
+    """第二層沒有我們要去的城市 → 停手。已經點開子選單無所謂，那不花錢。"""
+    talk = nd.NpcTalk(KAFRA_GID, "首都 普隆德拉", npc="卡普拉職員", now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, KAFRA_MENU1)
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, KAFRA_MENU2)
     assert _drain(talk) == []
     assert talk.failed is True

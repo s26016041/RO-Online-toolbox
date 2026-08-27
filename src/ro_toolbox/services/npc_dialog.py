@@ -60,6 +60,21 @@ TEXT_ENCODING = "cp950"
 #: 接觸 NPC 的型別。實測擷取就是 1。
 _CONTACT_TYPE = 1
 
+#: **允許在「這一層沒有目的地」時點下去的選項**（多層選單用）。
+#:
+#: ⚠ 這張表**只准放實機擷取看過的文字**，不准憑印象加。
+#: 目前的來源：`封包/卡普拉傳送到吉芬.txt`（2026-08-27）——
+#: 卡普拉第一層是
+#:
+#:     記憶點 : 倉庫服務 : 傳送服務 : 手推車服務 : 查詢其他資訊 : 結束
+#:
+#: 選「傳送服務」才會進到第二層的城市清單（那一層就有目的地名了）。
+#:
+#: ⛔ **絕對不能放進來的**：「記憶點」（會改掉玩家的重生點）、「倉庫服務」、
+#: 「手推車服務」（要錢）。這張表是白名單，沒列的一律不點 ——
+#: 亂點的代價是花掉玩家的錢或改掉他的存檔點，而且是安靜地發生。
+SUBMENU_OPTIONS = ("傳送服務",)
+
 #: 一次對話最多回答幾層選單。
 #:
 #: 船員是**一層**（實測）。卡普拉那種「先選傳送服務、再選城市」是兩層以上，
@@ -162,6 +177,24 @@ def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]
     return None, f"「{core}」對到 {len(hits)} 個選項，分不出來：{options}"
 
 
+def pick_submenu(options: list[str]) -> tuple[int | None, str]:
+    """這一層沒有目的地時，挑一個「往下一層」的選項。回 (編號從 1 開始, 說明)。
+
+    **只認 `SUBMENU_OPTIONS` 白名單**（實機擷取看過的文字），而且**只准剛好
+    一個對上**。沒列的一律不點 —— 卡普拉第一層還有「記憶點」（會改掉玩家的
+    重生點）、「倉庫服務」、「手推車服務」（要錢），亂點的代價很實在。
+    """
+    hits = [
+        i for i, opt in enumerate(options, start=1)
+        if any(key in _squash(opt) for key in SUBMENU_OPTIONS)
+    ]
+    if len(hits) == 1:
+        return hits[0], f"第 {hits[0]} 項「{options[hits[0] - 1]}」"
+    if not hits:
+        return None, "也沒有可以往下點的選項"
+    return None, f"可以往下點的有 {len(hits)} 個，分不出來"
+
+
 def cost_of(option: str) -> str:
     """選項裡寫的代價（`150 金幣`）。看不出來回空字串 —— 只是拿來提醒人。"""
     import re
@@ -185,11 +218,12 @@ class NpcTalk:
     #: 送出之後多久沒有任何回應就放棄。只是放棄的上限，不是成功的依據。
     TIMEOUT = 15.0
 
-    def __init__(self, gid: int, want: str, now=None) -> None:
+    def __init__(self, gid: int, want: str, npc: str = "", now=None) -> None:
         import time as _time
 
         self._gid = gid
         self._want = want
+        self._npc = npc or f"NPC #{gid}"
         self._now = now or _time.monotonic
         self._queue: list[bytes] = [build_contact(gid)]
         self._since = self._now()
@@ -230,15 +264,24 @@ class NpcTalk:
     def _on_menu(self, options: list[str]) -> None:
         index, why = pick_option(options, self._want)
         if index is None:
+            # 這一層沒有目的地：可能是多層選單的第一層（卡普拉那種）。
+            # **只准點白名單裡的選項**，而且只准剛好一個對上。
+            index, sub_why = pick_submenu(options)
+            if index is not None:
+                self.note = f"跟「{self._npc}」問路：{sub_why}"
+                log.info("%s", self.note)
+                self._push(build_choose(self._gid, index))
+                return
             # ⛔ 分不出來就**不准賭**：猜錯是把人傳到別的島、或花掉他的錢。
             self.failed = True
-            self.note = f"⚠ 看不懂 NPC 的選單，沒有動作：{why}"
+            self.note = f"⚠ 看不懂 NPC 的選單，沒有動作：{why}；{sub_why}"
             log.warning("%s", self.note)
             return
+        # 付錢是這趟路本來就要的花費，不是警告 —— 講清楚「找誰、去哪、多少」就好。
         self.cost = cost_of(options[index - 1])
-        money = f"（要付 {self.cost}）" if self.cost else ""
-        self.note = f"選了{why}{money}"
-        log.info("%s", self.note)
+        money = f"，{self.cost}" if self.cost else ""
+        self.note = f"找「{self._npc}」傳送到 {self._want}{money}"
+        log.info("%s（%s）", self.note, why)
         self._push(build_choose(self._gid, index))
         self.done = True        # 該送的都送了，剩下等地圖變
 

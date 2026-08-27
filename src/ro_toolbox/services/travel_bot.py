@@ -422,7 +422,7 @@ class TravelBot:
                     self._ask_for_help(hop)
                 return
             want = map_display_name(hop.to_map)
-            self._talk = npc_dialog.NpcTalk(self._npc_gid, want)
+            self._talk = npc_dialog.NpcTalk(self._npc_gid, want, npc=hop.npc)
             log.info("開始跟「%s」(GID %s) 對話，想去 %s",
                      hop.npc, self._npc_gid, want)
         talk = self._talk
