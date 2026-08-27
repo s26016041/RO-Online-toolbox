@@ -15,12 +15,14 @@
      （沒特別說就 patch +1）。
    - 本地版號已經比 Release 新（上次改了沒發）→ 不用再改，直接用它。
    - 版號變更要 commit（訊息慣例：`chore: 版號 X.Y.Z`）。
-3. **建置＋驗證**：先跑過專案的測試／建置腳本。
-   **驗證沒過就停下來回報，不准 push 也不准發 Release。**
-4. **Push**：`git push origin main`。
-5. **建 Release**：`gh release create v<版號> --title v<版號> --notes <重點變更>`，
+3. **驗證**：跑專案的測試／lint。**沒過就停下來回報，不准 push 也不准發 Release。**
+4. **先 Push**：`git push origin main`，並確認工作區乾淨、與 origin 同步。
+   ⚠ **打包 exe 之前就要推完。** 編一次要一分半，中途發現要改東西的話，
+   已經編出來的那顆就跟 repo 對不起來了 —— 發出去的版本要能對回一個 commit。
+5. **建置**：編 exe 並跑冒煙測試。**編出來的東西沒過就停，不要發。**
+6. **建 Release**：`gh release create v<版號> --title v<版號> --notes <重點變更>`，
    有建置產物就一併上傳。
-6. **收尾回報**：Release 網址＋這版包含哪些 commit。
+7. **收尾回報**：Release 網址＋這版包含哪些 commit。
 
 ## 本專案（RO-Online-toolbox）的具體指令
 
@@ -30,11 +32,12 @@ remote：`git@github.com:s26016041/RO-Online-toolbox.git`
 1. 版號改三處（見下方警告）→ git commit -m "chore: 版號 X.Y.Z"
 2. .\.venv\Scripts\python.exe -m pytest -q                          # 必須全過
 3. .\.venv\Scripts\python.exe -m ruff check src tests tools main.py # 必須全過
-4. git push origin main
-5. .\.venv\Scripts\python.exe release.py                            # 編 exe → 冒煙 → 發布
+4. git push origin main            # ⚠ 一定要在編 exe 之前，且要推乾淨
+5. git status --short && git status -sb | head -1   # 確認乾淨且同步再往下
+6. .\.venv\Scripts\python.exe release.py                            # 編 exe → 冒煙 → 發布
 ```
 
-**第 5 步不要自己下 `gh release create`。** `release.py` 會：讀 `VERSION` 決定 tag →
+**第 6 步不要自己下 `gh release create`。** `release.py` 會：讀 `VERSION` 決定 tag →
 檢查 origin 有沒有這個 tag（發過就不重複發）→ 用 `RO-Online-toolbox.spec` 編 exe →
 **跑 `exe --selftest`** → 把 Release 標在 `origin/main` 上並上傳 exe。
 少了冒煙那一步，資料檔漏收的 exe 會安靜地發出去（見下方）。
