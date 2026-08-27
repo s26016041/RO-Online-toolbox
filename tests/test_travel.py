@@ -446,3 +446,99 @@ def test_a_different_leg_asks_again(caplog):
         bot._ask_for_help(Hop("izlu2dun", 108, 27, "izlude", 1, 1, "船員", 100))
         bot._ask_for_help(Hop("izlude", 128, 148, "geffen", 1, 1, "卡普拉職員", 117))
     assert len(caplog.records) == 2
+
+
+# ---- 送封包的那條路真的存在嗎 --------------------------------------------
+
+
+def test_the_bot_can_send_any_packet_not_just_moves():
+    """⚠ 實測炸過：`_run_dialog` 呼叫 `self._send(data)`，但 TravelBot 只有
+    `_send_move` —— 走到卡普拉旁邊時整條執行緒 AttributeError 掛掉，人卡在原地。
+
+    這條測的不是「送得出去」（那要遊戲），是**那個方法存在而且吃 bytes**。
+    """
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234)
+    assert hasattr(bot, "_send"), "對話封包沒有出口"
+    assert bot._send(b"\x90\x00\x01\x00\x00\x00\x01") is False, "沒有 socket 要安全回 False"
+    bot._send_move(10, 20)          # 不該炸
+
+
+def test_every_packet_the_dialog_makes_can_be_sent(monkeypatch):
+    """把對話會產生的每一種封包都餵一次，確認送出那條路吃得下。"""
+    from ro_toolbox.services import npc_dialog as nd
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234)
+    sent = []
+    bot._sock = 42
+    monkeypatch.setattr(
+        mod.game_socket, "send_on_socket",
+        lambda _sock, data: (sent.append(data), len(data))[1],
+    )
+    for data in (nd.build_contact(91), nd.build_next(91), nd.build_choose(91, 1)):
+        assert bot._send(data) is True
+    assert len(sent) == 3
+
+
+def test_the_whole_dialog_step_runs_without_exploding(monkeypatch):
+    """⚠ 這條擋的是實測炸掉的那種：`_run_dialog` 用到不存在的屬性。
+
+    把整個「停在 NPC 前面」那一步真的跑一遍（socket、記憶體全是假的），
+    任何 AttributeError 都會在這裡炸出來，而不是在使用者的角色卡在卡普拉旁邊時。
+    """
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234)
+    bot._sock = 42
+    monkeypatch.setattr(mod.game_socket, "send_on_socket", lambda *a: 8)
+    bot._reader = FakeReader((109, 27))
+    bot._traveler._terrain = open_terrain("t", side=200)
+    bot._traveler._route_map = "t"
+    hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
+    bot._traveler._npc_wait = hop
+    bot._traveler._route = [hop]
+
+    bot._watch_next_npc()          # 開始盯那隻 NPC
+    bot._run_dialog()              # 還認不出來 → 走遠再走回來
+    bot._npc_gid = 91              # 假裝收到他的實體封包
+    bot._run_dialog()              # 這一步會真的組對話封包送出去
+    assert bot._talk is not None, "應該已經開始對話"
+
+
+def test_an_entity_packet_teaches_us_the_npc_gid(monkeypatch):
+    """實體封包進來要真的認出 NPC —— 這是整條自動對話的入口。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    class Pkt:
+        outbound = False
+        opcode = 0x09FF
+
+        def __init__(self, payload):
+            self.payload = payload
+
+    bot = mod.TravelBot(1234)
+    hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
+    bot._traveler._route = [hop]
+    bot._watch_next_npc()
+
+    payload = bytearray(70)
+    payload[0:2] = (70).to_bytes(2, "little")
+    payload[mod._ENT_OBJTYPE] = mod._OBJTYPE_NPC
+    payload[mod._ENT_GID:mod._ENT_GID + 4] = (91).to_bytes(4, "little")
+    payload[mod._ENT_CLASS:mod._ENT_CLASS + 2] = (100).to_bytes(2, "little")
+    x, y = 108, 27
+    payload[mod._ENT_POS:mod._ENT_POS + 3] = bytes([
+        x >> 2, ((x & 0x03) << 6) | ((y >> 4) & 0x3F), (y & 0x0F) << 4,
+    ])
+    bot._on_packet(Pkt(bytes(payload)))
+    assert bot._npc_gid == 91
+
+    # 別人（其他玩家 objtype 0）不能被當成那隻 NPC
+    other = bytearray(payload)
+    other[mod._ENT_OBJTYPE] = 0
+    other[mod._ENT_GID:mod._ENT_GID + 4] = (777).to_bytes(4, "little")
+    bot._npc_gid = None
+    bot._on_packet(Pkt(bytes(other)))
+    assert bot._npc_gid is None, "objtype 不對就不能認"

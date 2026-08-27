@@ -463,13 +463,23 @@ class TravelBot:
 
     # ---- 雜項 -------------------------------------------------------
 
-    def _send_move(self, x: int, y: int) -> None:
+    def _send(self, data: bytes) -> bool:
+        """送一個封包（走路、對話都走這裡）。回 False 代表 socket 可能失效了。
+
+        走**複製出來的遊戲 socket**，全程不碰記憶體（CLAUDE.md：RO 掛
+        GameGuard，寫記憶體會被反制）。
+        """
         if self._sock is None:
-            return
-        if game_socket.send_on_socket(self._sock, build_move(x, y)) < 0:
+            return False
+        if game_socket.send_on_socket(self._sock, data) < 0:
             log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
             self._server = None
             self._resync_at = 0.0
+            return False
+        return True
+
+    def _send_move(self, x: int, y: int) -> None:
+        self._send(build_move(x, y))
 
     def _cleanup(self) -> None:
         if self._capture is not None:
