@@ -181,9 +181,52 @@ def download(info: dict, dest: Path, progress=None) -> bool:
     if ok:
         with dest.open("rb") as handle:
             ok = handle.read(2) == b"MZ"      # 確定是 Windows 執行檔
+    if ok and not has_signature(dest):
+        # ⚠ 沒簽章的版本讀不到遊戲（[ENV-006]）。寧可不更新，也不要
+        # 把一顆「開得起來但什麼都讀不到」的 exe 換上去。
+        sys.stderr.write("[update] 新版沒有簽章 —— 那種版本讀不到遊戲，不更新\n")
+        _last_error[0] = "新版沒有簽章（讀不到遊戲），已略過這次更新"
+        ok = False
     if not ok:
         dest.unlink(missing_ok=True)
     return ok
+
+
+def has_signature(path: Path) -> bool:
+    """這顆 exe 帶著 Authenticode 簽章嗎？（只看有沒有，不驗信任鏈）
+
+    ⚠ **為什麼非檢查不可**：未簽章的 exe 會被 GameGuard 擋掉對遊戲的大量
+    記憶體讀取（`ERROR_ACCESS_DENIED`，見 GAMEDATA [ENV-006]）。
+    程式看起來會動、視窗也開得起來，但讀不到角色、讀不到背包 ——
+    而那個症狀完全不像「忘了簽」，會被當成別的問題追很久（實際追了兩小時）。
+
+    自動更新如果把一顆沒簽的 exe 推給所有人，每個人都會踩到那個坑。
+    所以**寧可不更新，也不要換成沒簽的**。
+
+    做法：讀 PE 的資料目錄第 4 項（`IMAGE_DIRECTORY_ENTRY_SECURITY`），
+    大小不為 0 就代表有憑證表。純讀位元組，不叫外部工具。
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return False
+    if len(raw) < 0x40 or raw[:2] != b"MZ":
+        return False
+    pe = int.from_bytes(raw[0x3C:0x40], "little")
+    if len(raw) < pe + 0x18 or raw[pe:pe + 4] != b"PE\x00\x00":
+        return False
+    magic = int.from_bytes(raw[pe + 0x18:pe + 0x1A], "little")
+    if magic == 0x10B:          # PE32
+        dirs = pe + 0x18 + 96
+    elif magic == 0x20B:        # PE32+（64 位元）
+        dirs = pe + 0x18 + 112
+    else:
+        return False
+    entry = dirs + 4 * 8        # 第 4 項：憑證表
+    if len(raw) < entry + 8:
+        return False
+    size = int.from_bytes(raw[entry + 4:entry + 8], "little")
+    return size > 0
 
 
 def _child_env() -> dict:

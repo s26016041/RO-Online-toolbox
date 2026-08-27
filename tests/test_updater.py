@@ -121,6 +121,9 @@ def _info(size: int) -> dict:
 def test_a_good_download_is_accepted(monkeypatch, tmp_path):
     payload = b"MZ" + b"\x00" * 2_000_000
     _serve(monkeypatch, payload)
+    # 假 payload 不是真的簽過的 PE —— 這條測的是「下載完整性」，
+    # 簽章那道閘門另外有測（見檔尾）。
+    monkeypatch.setattr(updater, "has_signature", lambda _p: True)
     dest = tmp_path / "new.exe"
     assert updater.download(_info(len(payload)), dest) is True
     assert dest.exists()
