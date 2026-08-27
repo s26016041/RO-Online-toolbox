@@ -776,6 +776,11 @@ class FarmPage(BasePage):
         #: 自動回連：角色名 → 斷線前在跑什麼／目前的判斷狀態
         self._snaps: dict = {}
         self._deciders: dict = {}
+        #: 上次看畫面找斷線對話框的時間（每個角色一份）。抓圖＋比對要一百多毫秒，
+        #: 而且是在 UI 執行緒上，所以要節流 —— 見 `_disconnect_dialog`。
+        self._dialog_looked: dict = {}
+        #: 已經講過「沒有快照」的角色。那條路每拍都會走到，不擋會洗版。
+        self._no_snapshot_said: set = set()
         #: 勾了自動補水、但背包還沒讀到 —— 等背包回來再啟動
         self._pending_potion: set[int] = set()
         self._reconnecting = False
@@ -1071,19 +1076,55 @@ class FarmPage(BasePage):
             if find_server(pid) is not None:
                 self._snaps[who] = self.snapshot_for(pid)
                 self._deciders.pop(who, None)
+                self._no_snapshot_said.discard(who)
                 continue
             decider = self._deciders.setdefault(who, ReconnectDecider())
-            state = decider.decide(False, local_network_up(), now)
+            state = decider.decide(
+                False, local_network_up(), now, self._disconnect_dialog(pid, who, now)
+            )
             if state == RECONNECT:
                 self._begin_reconnect(pid, who, decider)
                 return
             log.info("「%s」%s", who, decider.note)
 
+    #: 兩次「看畫面」至少隔這麼久。20 秒觀察期內還是會看好幾次，
+    #: 但不會每拍都卡住 UI 一百多毫秒。
+    DIALOG_LOOK_SEC = 3.0
+
+    def _disconnect_dialog(self, pid: int, who: str, now: float) -> bool | None:
+        """畫面上有沒有「與伺服器斷線」。回 None＝這一拍沒去看／看不了。
+
+        ⚠ 回 None **不等於** False。看不了的時候要讓 `ReconnectDecider`
+        退回 20 秒觀察期，而不是當成「沒斷線」—— 那會讓真的斷線永遠等不到重連。
+        """
+        from ro_toolbox.services import game_screen
+
+        last = self._dialog_looked.get(who, 0.0)
+        if now - last < self.DIALOG_LOOK_SEC:
+            return None
+        self._dialog_looked[who] = now
+        hwnd = game_screen.find_window(pid)
+        if hwnd is None:
+            return None
+        try:
+            return game_screen.disconnected_by_look(hwnd)
+        except Exception as exc:  # noqa: BLE001 - 看畫面失敗不該擋住回連
+            log.debug("看不了「%s」的畫面，這一拍改走觀察期：%s", who, exc)
+            return None
+
     def _begin_reconnect(self, pid: int, who: str, decider) -> None:
         """把「關遊戲→重開→登入」丟到背景，完成後回 UI 執行緒接回設定。"""
         snap = self._snaps.get(who)
         if snap is None:
-            log.warning("「%s」斷線了，但沒有斷線前的快照，先不自動回連", who)
+            # 沒有斷線前的快照就不知道要接回什麼 —— 不如不動，交給人。
+            # （只有「程式開起來時就已經斷線」或「斷線後才勾自動回連」會走到這裡；
+            #  正常情況連線正常的每一拍都在更新快照。）
+            #
+            # ⚠ **只講一次。** 這個判斷每拍都會走到一次，照講會變成每秒一行洗版
+            # —— 而且真正的訊息會被自己洗掉。
+            if who not in self._no_snapshot_said:
+                self._no_snapshot_said.add(who)
+                log.warning("「%s」斷線了，但沒有斷線前的快照，先不自動回連", who)
             return
         worker = _ReconnectWorker(pid, who, snap)
         thread = WorkerThread(worker)   # ⚠ 只吃一個參數，沒有 parent
@@ -1102,6 +1143,7 @@ class FarmPage(BasePage):
                         self._reconnect_decider.note)
             return
         self._deciders.pop(who, None)
+        self._dialog_looked.pop(who, None)
         self._scan()                      # 讓新的遊戲視窗長出分頁
         QTimer.singleShot(3000, lambda: self.restore_into(new_pid, snap))
 

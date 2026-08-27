@@ -206,3 +206,60 @@ def test_backoff_grows_so_it_does_not_hammer(world):
         now += waits[-1] + 1
     assert waits == sorted(waits), f"間隔要越來越長，實際 {waits}"
     assert waits[0] < waits[-1]
+
+
+# ---- 畫面上的「與伺服器斷線」-------------------------------------------
+
+
+def test_the_dialog_skips_the_grace_window(world):
+    """看到框就當場重連，不用等 20 秒（GAMEDATA [INP-012]）。"""
+    bot = ReconnectSupervisor(
+        "狐狐狸",
+        find_pid=lambda: world.pid,
+        connected=lambda _pid: world.online,
+        network_up=lambda: world.network,
+        close_game=world._close,
+        relaunch=world._relaunch,
+        login=world._login,
+        snapshot=lambda _pid: world.state,
+        restore=lambda pid, snap: world.restored.append((pid, snap)),
+        see_dialog=lambda _pid: True,
+    )
+    assert bot.tick(0.0) == OK
+    _drop(world)
+    assert bot.tick(1.0) == OK, "看到框就重連完了，不必等觀察期"
+    assert world.closed and world.logins == 1
+
+
+def test_the_screen_is_not_looked_at_while_connected(world):
+    """連線正常時不准去抓圖比對 —— 那要一百多毫秒，而且什麼也不會改變。"""
+    looks: list[int] = []
+    bot = ReconnectSupervisor(
+        "狐狐狸",
+        find_pid=lambda: world.pid,
+        connected=lambda _pid: world.online,
+        network_up=lambda: world.network,
+        close_game=world._close,
+        relaunch=world._relaunch,
+        login=world._login,
+        snapshot=lambda _pid: world.state,
+        restore=lambda pid, snap: world.restored.append((pid, snap)),
+        see_dialog=lambda pid: looks.append(pid) or None,
+    )
+    for i in range(5):
+        bot.tick(float(i))
+    assert looks == [], "連線正常時不該看畫面"
+    _drop(world)
+    bot.tick(10.0)
+    assert looks, "斷線之後才該去看畫面"
+
+
+def test_without_a_dialog_hook_nothing_changes(world):
+    """沒接畫面判定的呼叫端（預設）行為要跟以前完全一樣：走 20 秒觀察期。"""
+    bot = world.build()
+    assert bot.tick(0.0) == OK
+    _drop(world)
+    assert bot.tick(1.0) == WATCHING
+    assert bot.tick(10.0) == WATCHING
+    assert bot.tick(30.0) == OK      # 觀察期滿了才重連，而且重連成功
+    assert world.logins == 1

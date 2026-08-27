@@ -19,6 +19,18 @@
 連線短暫消失是正常的：換地圖時伺服器會把連線移到另一台 map server
 （[PKT-038]），那個瞬間 `find_server()` 就是 None。看到一次就重開遊戲，
 等於每次換地圖都把自己踢掉。所以要**連續一段時間都沒有**才算斷線。
+
+## 第二個來源：畫面上的「與伺服器斷線」
+
+連線表只知道「現在沒連線」，分不出是斷線還是換圖，所以只能等。
+但遊戲斷線時會跳一個自己畫的訊息框寫著**「與伺服器斷線」**
+（2026-08-28 實機採證，GAMEDATA [INP-012]），換地圖**不會**跳 ——
+看到它就當場確認，不必等滿觀察期。
+
+⚠ 它是**加速**用的，不是必要條件：看不到（視窗最小化、樣板載不到、
+別台機器的畫面認不出來）就退回原本的觀察期，功能照樣會動。
+所以 `decide()` 的 `dialog` 分成三種值：True＝看到了、False＝看了沒有、
+**None＝沒去看／看不了**。後兩者一律走觀察期。
 """
 
 from __future__ import annotations
@@ -67,8 +79,21 @@ class ReconnectDecider:
         self.note = f"重連失敗第 {self._failures} 次，{wait:.0f} 秒後再試"
         log.warning("%s", self.note)
 
-    def decide(self, has_server: bool, network_up: bool, now: float) -> str:
-        """回傳目前該做什麼。**這是唯一的決策入口。**"""
+    def decide(
+        self,
+        has_server: bool,
+        network_up: bool,
+        now: float,
+        dialog: bool | None = None,
+    ) -> str:
+        """回傳目前該做什麼。**這是唯一的決策入口。**
+
+        `dialog`：畫面上有沒有「與伺服器斷線」那個訊息框。
+        **True＝看到了**（當場確認，不必等觀察期）；
+        **False＝看了但沒有**；**None＝沒去看／看不了**。
+        後兩者都走原本的觀察期 —— 畫面判定只會**加快**確認，
+        壞掉的時候不會讓功能停擺（安全退化）。
+        """
         if has_server:
             if self._lost_at is not None or self._failures:
                 self.note = "連線正常"
@@ -86,6 +111,14 @@ class ReconnectDecider:
             left = self._next_try - now
             self.note = f"上次重連失敗，還要等 {left:.0f} 秒"
             return BACKOFF
+
+        if dialog:
+            # 遊戲自己說了「與伺服器斷線」—— 這比等 20 秒可靠，換圖不會跳這個框。
+            # ⚠ 還是要排在退避後面：維修時畫面上一樣會有這個框，
+            # 無腦立刻重試就等於把退避繞過去了。
+            self._lost_at = now
+            self.note = "畫面上寫著「與伺服器斷線」，確認斷線"
+            return RECONNECT
 
         if self._lost_at is None:
             self._lost_at = now

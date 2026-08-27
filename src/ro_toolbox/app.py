@@ -156,6 +156,16 @@ def _check(window, problems: list[str]) -> int:
     if not (RESOURCES_DIR / AGREE_TEMPLATE_FILE).exists():
         problems.append(f"合約書按鈕樣板沒收進來：{RESOURCES_DIR / AGREE_TEMPLATE_FILE}")
 
+    # 斷線對話框的樣板。漏收的話自動回連會退回「連線消失 20 秒」的觀察期 ——
+    # 還是會動，只是慢，而且**不會有任何錯誤訊息**（見 [INP-012]）。
+    from ro_toolbox.services.game_screen import (
+        DISCONNECT_BOX_FILE,
+        DISCONNECT_TEXT_FILE,
+    )
+    for template in (DISCONNECT_BOX_FILE, DISCONNECT_TEXT_FILE):
+        if not (RESOURCES_DIR / template).exists():
+            problems.append(f"斷線對話框樣板沒收進來：{RESOURCES_DIR / template}")
+
     # WinDivert 的驅動檔漏收的話，抓封包整個不能用（自動登入的二次密碼、
     # 角色清單全靠它），而錯誤訊息會長得像「相依沒裝好」，很難查。
     from ro_toolbox.services import packet_capture
