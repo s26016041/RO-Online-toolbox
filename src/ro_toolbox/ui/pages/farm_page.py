@@ -345,6 +345,13 @@ class CharacterCard(QWidget):
         self.destination = combo
         return combo
 
+    def pending_items(self):
+        """還原存檔時選了、但**下拉裡還沒有**的道具編號（背包還沒讀到）。
+
+        有東西在等 = 「現在配置看起來是空的」只是暫時的，不是使用者沒設定。
+        """
+        return [v for v in self._want_item.values() if v]
+
     def chosen_destination(self) -> str | None:
         """使用者在這裡挑的地圖代碼。沒挑回 None（＝讀遊戲的尋路目標）。"""
         data = self.destination.currentData()
@@ -752,6 +759,8 @@ class FarmPage(BasePage):
         #: 自動回連：角色名 → 斷線前在跑什麼／目前的判斷狀態
         self._snaps: dict = {}
         self._deciders: dict = {}
+        #: 勾了自動補水、但背包還沒讀到 —— 等背包回來再啟動
+        self._pending_potion: set[int] = set()
         self._reconnecting = False
         self._reconnect_thread = None
         self._reconnect_decider = None
@@ -1233,6 +1242,10 @@ class FarmPage(BasePage):
         card.set_slots(rows)
         if not rows:
             card.set_alert("⚠ 讀不到背包（AOB 定位失敗）")
+            return
+        if pid in self._pending_potion and card.auto_potion.isChecked():
+            # 背包回來了，剛才被擱著的「自動補水」現在可以真的啟動
+            self._toggle_potion(pid, True)
 
     def _refresh_bag(self, pid: int) -> None:
         """重讀背包。一次實測 22 ms，放在背景執行緒做。"""
@@ -1250,9 +1263,23 @@ class FarmPage(BasePage):
             return
         config = card.potion_config()
         if not (config.wants_hp() or config.wants_sp()):
+            if any(card.pending_items()):
+                # ⚠ 還原存檔時**背包通常還沒讀到**（那是背景執行緒在做），
+                # 下拉是空的、道具還在等著被選起來 —— 這時候取消勾選，
+                # 使用者看到的就是「我上次明明有開，怎麼沒記住」。
+                # 勾著等背包回來，`_apply_bag()` 會再啟動一次。
+                self._pending_potion.add(pid)
+                log.info("自動補水先等背包讀到再啟動（PID %s）", pid)
+                return
             card.set_alert("⚠ 還沒選道具或百分比是 0，沒有東西可以補")
-            card.auto_potion.setChecked(False)
+            card.quiet = True
+            try:
+                # ⚠ 這是**程式**判定開不起來，不是使用者關的 —— 不能覆蓋掉存檔。
+                card.auto_potion.setChecked(False)
+            finally:
+                card.quiet = False
             return
+        self._pending_potion.discard(pid)
         bot = PotionBot(pid, config, on_update=lambda s, c=card: c.potion_stats.emit(s))
         self._potions[pid] = bot
         bot.start()

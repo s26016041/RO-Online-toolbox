@@ -307,3 +307,39 @@ def test_the_card_only_ever_shows_the_pid(card):
     card._apply_potion_stats(PotionStats(running=True, note="⚠ 連續喝不到"))
     assert card.status_label.text() == "PID 1234", "連警示都不上介面"
 
+
+
+# ---- 「有沒有開自動補水」要真的記得住 ------------------------------------
+
+
+def test_enabled_survives_a_restart(card):
+    """使用者：「是否使用藥水的那個選擇要記錄」。"""
+
+    card.set_slots(ROWS)
+    card.hp_item.setCurrentIndex(card.hp_item.findData(RED))
+    card.hp_threshold.setValue(60)
+    card.auto_potion.setChecked(True)
+    saved = card.saved_potion()
+    assert saved.enabled is True
+
+    back = CharacterCard()
+    back.set_slots(ROWS)
+    back.apply_saved_potion(saved)
+    assert back.auto_potion.isChecked() is True
+    assert back.hp_item.currentData() == RED
+
+
+def test_pending_items_means_the_bag_has_not_arrived_yet(card):
+    """⚠ 開程式時背包是**背景**讀的，還原存檔時下拉通常還是空的。
+
+    這時候「看起來沒選道具」只是暫時的 —— 不能拿它當作「使用者沒設定」。
+    """
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    card.apply_saved_potion(PotionSaved(hp_item=RED, hp_percent=60, enabled=True))
+    assert card.pending_items() == [RED], "應該記著還在等哪個道具"
+    assert card.auto_potion.isChecked() is True
+
+    card.set_slots(ROWS)                       # 背包回來了
+    assert card.pending_items() == []
+    assert card.hp_item.currentData() == RED

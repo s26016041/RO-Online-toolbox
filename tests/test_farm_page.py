@@ -273,3 +273,47 @@ def test_it_will_not_reconnect_without_a_snapshot(qtbot, monkeypatch, caplog):
         page._begin_reconnect(1234, "狐狐狸", None)
     assert page._reconnecting is False
     assert any("快照" in r.getMessage() for r in caplog.records)
+
+
+def test_a_saved_potion_setting_is_not_cancelled_by_a_slow_bag(qtbot, monkeypatch):
+    """⚠ 實測抱怨：「是否使用藥水的那個選擇要記錄」。
+
+    真正的原因不是沒存 —— 是**還原的時機**。開程式時背包是背景讀的，
+    還原當下下拉是空的，舊版就判定「還沒選道具」把勾取消掉。
+    """
+    from ro_toolbox.services.potion_store import PotionSaved
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    page = _page(qtbot)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    card.apply_saved_potion(PotionSaved(hp_item=501, hp_percent=60, enabled=True))
+
+    page._toggle_potion(1234, True)            # 背包還沒到
+    assert card.auto_potion.isChecked() is True, "不能因為背包慢就把設定取消掉"
+    assert 1234 in page._pending_potion
+    assert 1234 not in page._potions, "也不該用空設定去啟動"
+
+    started = []
+    monkeypatch.setattr(page, "_toggle_potion",
+                        lambda pid, on: started.append((pid, on)))
+    page._bags[1234] = {6: (501, 99)}
+    page._apply_bag(1234)
+    assert started == [(1234, True)], "背包回來就要接著啟動"
+
+
+def test_a_genuinely_empty_setting_still_says_so(qtbot):
+    """真的什麼都沒選（也沒有在等的道具）才准取消勾選並講原因。"""
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    page = _page(qtbot)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    card.auto_potion.setChecked(True)
+    page._toggle_potion(1234, True)
+    assert card.auto_potion.isChecked() is False
+    assert 1234 not in page._pending_potion
