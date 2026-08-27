@@ -34,7 +34,7 @@ izlu2dun（拜倫島）就是這樣：只有一條往地城的傳點，回 izlud
 
     {"version": 2,
      "walk": {"prt_fild00": [[165, 18, "prt_fild04", 158, 384], ...]},
-     "npc":  {"izlu2dun":   [[108, 27, "izlude", 195, 210, "船員"], ...]}}
+     "npc":  {"izlu2dun": [[108, 27, "izlude", 195, 210, "船員", 100], ...]}}
 
 `walk` 給自動尋路走；`npc` 只用來**講清楚為什麼過不去**（我們不會跟 NPC 對話）。
 
@@ -125,9 +125,11 @@ def main() -> int:
         if row[3] == _NO_NPC:
             walk.setdefault(source, []).append(entry)
         else:
-            # NPC 名字給使用者看（「去找 izlu2dun 的船員」），不是拿來自動化的
+            # NPC 名字給使用者看（「去找 izlu2dun 的船員」）；
+            # 外觀編號是**認人**用的 —— 進了遊戲要靠「外觀 ＋ 座標」兩個欄位
+            # 同時對上才敢送對話封包，不是猜一個 GID（[DAT-027]）。
             name = row[4] if isinstance(row[4], str) else ""
-            npc.setdefault(source, []).append([*entry, name])
+            npc.setdefault(source, []).append([*entry, name, int(row[3])])
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(OUT, "wt", encoding="utf-8") as handle:

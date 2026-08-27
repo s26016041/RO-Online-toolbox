@@ -44,6 +44,8 @@ class PotionSaved:
     #: 水用完回程：有沒有勾、用哪個道具回程（一樣存**編號**不存格號）
     go_home: bool = False
     home_item: int | None = None
+    #: 自動尋路的目的地（地圖代碼）。None = 讀遊戲自己的尋路目標。
+    travel_dest: str | None = None
 
 
 def _path():
@@ -71,6 +73,15 @@ def _clean(data: dict) -> PotionSaved:
     def item(value) -> int | None:
         return int(value) if isinstance(value, int) and value > 0 else None
 
+    def where(value) -> str | None:
+        # 只收看起來像地圖代碼的（檔案可能被手改過）。不像就當沒設定 ——
+        # 亂猜一個地圖名會把人送去完全不相干的地方。
+        if not isinstance(value, str):
+            return None
+        text = value.strip().lower()
+        return text if 0 < len(text) <= 20 and text.replace("_", "").replace(
+            "@", "").isalnum() else None
+
     def percent(value) -> int:
         if not isinstance(value, int):
             return 0
@@ -84,6 +95,7 @@ def _clean(data: dict) -> PotionSaved:
         enabled=bool(data.get("enabled")),
         go_home=bool(data.get("go_home")),
         home_item=item(data.get("home_item")),
+        travel_dest=where(data.get("travel_dest")),
     )
 
 

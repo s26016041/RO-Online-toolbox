@@ -261,7 +261,7 @@ def test_npc_links_are_not_walkable_routes(monkeypatch):
     monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
     monkeypatch.setattr(
         mod, "npc_links_on_map",
-        lambda m: [(108, 27, "izlude", 195, 210, "船員")] if m == "izlu2dun" else [],
+        lambda m: [(108, 27, "izlude", 195, 210, "船員", 100)] if m == "izlu2dun" else [],
     )
     assert mod.plan_route("izlu2dun", "izlude") is None
 
@@ -274,7 +274,7 @@ def test_why_no_route_names_the_npc(monkeypatch):
     monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
     monkeypatch.setattr(
         mod, "npc_links_on_map",
-        lambda m: [(108, 27, "izlude", 195, 210, "船員")] if m == "izlu2dun" else [],
+        lambda m: [(108, 27, "izlude", 195, 210, "船員", 100)] if m == "izlu2dun" else [],
     )
     assert mod.why_no_route("izlu2dun", "izlude") == (
         "izlu2dun", 108, 27, "izlude", "船員"
@@ -321,7 +321,7 @@ def _npc_world(monkeypatch):
     from ro_toolbox.services import travel as mod
 
     walk = {"izlude": [(50, 50, "geffen", 100, 100)]}
-    npc = {"izlu2dun": [(108, 27, "izlude", 195, 210, "船員")]}
+    npc = {"izlu2dun": [(108, 27, "izlude", 195, 210, "船員", 100)]}
     monkeypatch.setattr(mod, "warps_on_map", lambda m: walk.get(m, []))
     monkeypatch.setattr(mod, "npc_links_on_map", lambda m: npc.get(m, []))
     return mod
@@ -335,7 +335,7 @@ def test_walking_route_wins_over_the_npc_one(monkeypatch):
     monkeypatch.setattr(mod, "warps_on_map",
                         lambda m: [(9, 9, "izlude", 1, 1)] if m == "izlu2dun" else [])
     monkeypatch.setattr(mod, "npc_links_on_map",
-                        lambda m: [(108, 27, "izlude", 195, 210, "船員")]
+                        lambda m: [(108, 27, "izlude", 195, 210, "船員", 100)]
                         if m == "izlu2dun" else [])
     route = mod.plan_route("izlu2dun", "izlude")
     assert route and route[0].npc == "", "純走路走得到就不該挑 NPC 那條"

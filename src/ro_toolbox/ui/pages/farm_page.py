@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -41,7 +42,12 @@ from PySide6.QtWidgets import (
 from ro_toolbox.services import bag, icons, potion_store, window_list
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
-from ro_toolbox.services.gamedata import heals_hp, heals_sp, item_name
+from ro_toolbox.services.gamedata import (
+    heals_hp,
+    heals_sp,
+    item_name,
+    map_name_table,
+)
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel_bot import TravelBot
@@ -207,6 +213,7 @@ class CharacterCard(QWidget):
         # 往下推一行，讓按鈕大致對齊 Base 區塊而不是角色名字那一行
         side_box.addSpacing(self.ROW_HEIGHT)
         side_box.addWidget(self._make_travel_button())
+        side_box.addWidget(self._make_destination_box())
         side_box.addStretch(1)
 
         top = QWidget()
@@ -307,6 +314,36 @@ class CharacterCard(QWidget):
         )
         self.auto_travel.toggled.connect(self.travel_toggled)
         return self.auto_travel
+
+    def _make_destination_box(self) -> QComboBox:
+        """目的地選單：**打中文或地圖代碼都能搜**。
+
+        沒選（留在第一項）就照舊讀**遊戲自己的尋路目標**；選了就以這裡為準。
+        為什麼要它：遊戲的目標讀得到但不是每種情況都有（例如根本還沒去設），
+        而我們手上就有完整的地圖表，讓人直接挑最直接。
+        """
+        combo = QComboBox()
+        combo.setEditable(True)                    # 可以打字搜尋
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.setFixedHeight(self.ROW_HEIGHT)
+        combo.setMinimumWidth(self.TRAVEL_BUTTON_MIN_W)
+        combo.addItem("（讀遊戲的尋路目標）", None)
+        for code, name in sorted(map_name_table().items(), key=lambda kv: kv[1]):
+            # 中文名跟地圖代碼都放進同一行，兩種打法都搜得到
+            combo.addItem(f"{name}（{code}）", code)
+        completer = QCompleter([combo.itemText(i) for i in range(combo.count())], combo)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)   # 打中間的字也搜得到
+        combo.setCompleter(completer)
+        combo.setCurrentIndex(0)
+        combo.currentIndexChanged.connect(self.potion_changed)  # 設定變了要存
+        self.destination = combo
+        return combo
+
+    def chosen_destination(self) -> str | None:
+        """使用者在這裡挑的地圖代碼。沒挑回 None（＝讀遊戲的尋路目標）。"""
+        data = self.destination.currentData()
+        return data if isinstance(data, str) else None
 
     def _apply_travel_stats(self, stats) -> None:  # noqa: ANN001 - TravelStats
         if not stats.running:
@@ -490,6 +527,8 @@ class CharacterCard(QWidget):
             self.hp_threshold.setValue(saved.hp_percent)
             self.sp_threshold.setValue(saved.sp_percent)
             self.go_home.setChecked(bool(saved.go_home))
+            position = self.destination.findData(saved.travel_dest)
+            self.destination.setCurrentIndex(position if position >= 0 else 0)
             for key, combo in (
                 ("hp", self.hp_item), ("sp", self.sp_item), ("home", self.home_item)
             ):
@@ -513,6 +552,7 @@ class CharacterCard(QWidget):
             enabled=self.auto_potion.isChecked(),
             go_home=self.go_home.isChecked(),
             home_item=self.home_item.currentData(),
+            travel_dest=self.chosen_destination(),
         )
 
     def potion_config(self) -> PotionConfig:
@@ -970,7 +1010,12 @@ class FarmPage(BasePage):
             return  # 沒有卡片就沒有回報去處，別讓它在背景默默走
         card.set_travel_busy(True)
 
-        traveler = TravelBot(pid, on_update=lambda s, c=card: c.travel_stats.emit(s))
+        # 選單有挑就以它為準，沒挑（None）才去讀遊戲自己的尋路目標。
+        traveler = TravelBot(
+            pid,
+            destination=card.chosen_destination(),
+            on_update=lambda s, c=card: c.travel_stats.emit(s),
+        )
         self._travelers[pid] = traveler
         traveler.start()
 

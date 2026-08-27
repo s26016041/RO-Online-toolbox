@@ -136,3 +136,48 @@ def test_travel_progress_goes_to_the_log(qtbot, caplog):
     text = " ".join(r.getMessage() for r in caplog.records)
     assert "普隆德拉原野" in text
     assert "還要換 2 張圖" in text
+
+
+# ---- 目的地選單（中文／地圖代碼都能搜）------------------------------------
+
+
+def test_destination_defaults_to_reading_the_game(qtbot):
+    """沒挑就是 None ＝ 照舊讀遊戲自己的尋路目標。"""
+    card = make_card(qtbot)
+    assert card.chosen_destination() is None
+    assert card.destination.itemData(0) is None
+
+
+def test_destination_lists_chinese_and_code(qtbot):
+    """兩種打法都要搜得到，所以同一行同時放中文名與地圖代碼。"""
+    card = make_card(qtbot)
+    texts = [card.destination.itemText(i) for i in range(card.destination.count())]
+    joined = "\n".join(texts)
+    assert "geffen" in joined
+    assert "吉芬" in joined
+    assert card.destination.findData("geffen") > 0
+
+
+def test_choosing_a_destination_wins_over_the_game(qtbot):
+    card = make_card(qtbot)
+    card.destination.setCurrentIndex(card.destination.findData("geffen"))
+    assert card.chosen_destination() == "geffen"
+
+
+def test_destination_is_remembered_per_character(qtbot):
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    card = make_card(qtbot)
+    card.destination.setCurrentIndex(card.destination.findData("prontera"))
+    assert card.saved_potion().travel_dest == "prontera"
+    card.apply_saved_potion(PotionSaved(travel_dest="geffen"))
+    assert card.chosen_destination() == "geffen"
+
+
+def test_a_junk_saved_destination_falls_back_to_reading_the_game(qtbot):
+    """檔案被手改壞就退回「讀遊戲」—— 亂猜一個地圖會把人送去不相干的地方。"""
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    card = make_card(qtbot)
+    card.apply_saved_potion(PotionSaved(travel_dest="不存在的圖"))
+    assert card.chosen_destination() is None

@@ -23,8 +23,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ro_toolbox.core.ro_protocol import build_move, unpack_move
-from ro_toolbox.services import game_socket
+from ro_toolbox.core.ro_protocol import build_move, unpack_move, unpack_position
+from ro_toolbox.services import game_socket, npc_dialog
 from ro_toolbox.services.character import CharacterReader
 from ro_toolbox.services.gamedata import map_display_name
 from ro_toolbox.services.navigation import NavigationReader
@@ -38,6 +38,13 @@ log = logging.getLogger(__name__)
 _TICK = 0.2
 _RESYNC_SEC = 2.0  # 多久檢查一次「連線有沒有換掉」
 _OP_MOVE_ACK = 0x0087  # 伺服器確認「我」要移動：payload[4:10] = 起點+終點
+#: 實體進入視野的封包（版面見 services/world.py 的欄位表）
+_OP_ENTITY = (0x09FF, 0x09FE, 0x09FD)
+_ENT_GID = 3        # uint32
+_ENT_CLASS = 21     # uint16 外觀編號
+_ENT_POS = 61       # 3-byte 壓縮座標
+#: NPC 座標容許差幾格。Navi_Npc 給的是他站的格，實際可能差一點。
+_NPC_SNAP = 3
 
 
 @dataclass
@@ -74,6 +81,11 @@ class TravelBot:
         self._server: tuple[str, int] | None = None
         self._reader: CharacterReader | None = None
         self._capture: PacketCapture | None = None
+        #: 正在跟哪隻 NPC 講話（None = 沒有）
+        self._talk: npc_dialog.NpcTalk | None = None
+        #: 要找的 NPC：(外觀編號, x, y)。認人要兩個欄位同時對上。
+        self._npc_want: tuple[int, int, int] | None = None
+        self._npc_gid: int | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._walker = Walker(self._send_move)
@@ -201,10 +213,36 @@ class TravelBot:
         return False
 
     def _on_packet(self, packet) -> None:  # noqa: ANN001 - RoPacket，避免循環匯入
-        if packet.outbound or packet.opcode != _OP_MOVE_ACK or len(packet.payload) < 10:
+        if packet.outbound:
             return
-        _start, dest = unpack_move(packet.payload[4:10])
-        self._walker.note_move_ack(dest)
+        if packet.opcode == _OP_MOVE_ACK and len(packet.payload) >= 10:
+            _start, dest = unpack_move(packet.payload[4:10])
+            self._walker.note_move_ack(dest)
+            return
+        talk = self._talk
+        if talk is not None:
+            talk.feed(packet.opcode, packet.payload)
+            return
+        # 還沒開始對話：實體進入視野時把「那隻 NPC」的 GID 記下來。
+        # 認人靠**兩個欄位同時對上**（外觀編號 ＋ 座標，都來自 RODATA 的
+        # Navi_Npc，見 [DAT-027]），不是靠猜一個編號。
+        if packet.opcode in _OP_ENTITY and self._npc_want is not None:
+            self._note_entity(packet.payload)
+
+    def _note_entity(self, payload: bytes) -> None:
+        want = self._npc_want
+        if want is None or len(payload) < _ENT_POS + 3:
+            return
+        class_id = int.from_bytes(payload[_ENT_CLASS:_ENT_CLASS + 2], "little")
+        if class_id != want[0]:
+            return
+        x, y, _dir = unpack_position(payload[_ENT_POS:_ENT_POS + 3])
+        if max(abs(x - want[1]), abs(y - want[2])) > _NPC_SNAP:
+            return
+        gid = int.from_bytes(payload[_ENT_GID:_ENT_GID + 4], "little")
+        if gid and self._npc_gid != gid:
+            self._npc_gid = gid
+            log.info("認出 NPC：外觀 %s 在 (%s,%s)，GID=%s", class_id, x, y, gid)
 
     # ---- 主迴圈 -----------------------------------------------------
 
@@ -226,6 +264,10 @@ class TravelBot:
 
             self._stats.here = status.map_name
             state = self._traveler.update(status.map_name, pos)
+            if state == "waiting":
+                # 走到 NPC 面前了。有外觀編號就自己跟他講話；
+                # 對話走不完（看不懂選單、沒回應）就退回「等你手動做」。
+                self._run_dialog()
             self._stats.hops_left = len(self._traveler.route)
             self._stats.note = self._traveler.note
 
@@ -241,6 +283,40 @@ class TravelBot:
 
             self._emit()
             self._stop.wait(_TICK)
+
+    # ---- 自己跟 NPC 講話 --------------------------------------------
+
+    def _run_dialog(self) -> None:
+        """把 `Traveler` 停下來等的那一段 NPC 對話走完。
+
+        ⚠ **只送封包、不碰記憶體**，而且**不判定「過去了」** ——
+        真的到了沒有一律看地圖名有沒有變（`Traveler` 負責，[DAT-026]）。
+        對話失敗不當成致命：退回「停著等你手動做」，那條路本來就是好的。
+        """
+        hop = self._traveler.npc_hop
+        if hop is None or not hop.npc_id:
+            return
+        if self._npc_want != (hop.npc_id, hop.x, hop.y):
+            # 換了一段 NPC：重新開始認人
+            self._npc_want = (hop.npc_id, hop.x, hop.y)
+            self._npc_gid = None
+            self._talk = None
+        if self._talk is None:
+            if self._npc_gid is None:
+                return       # 還沒認出那隻 NPC（等他進視野的封包）
+            want = map_display_name(hop.to_map)
+            self._talk = npc_dialog.NpcTalk(self._npc_gid, want)
+            log.info("開始跟「%s」(GID %s) 對話，想去 %s",
+                     hop.npc, self._npc_gid, want)
+        talk = self._talk
+        while (data := talk.next_packet()) is not None:
+            self._send(data)
+        if talk.failed:
+            self._note(f"{talk.note} —— 請自己跟「{hop.npc}」講話，我在這裡等")
+            self._talk = None
+            self._npc_want = None      # 別一直重試，交給人
+        elif talk.done:
+            self._note(f"{talk.note}；等換圖…")
 
     def _keep_in_sync(self, now: float) -> bool:
         """換頻道／換地圖伺服器之後要重綁 socket，否則封包全部石沉大海。

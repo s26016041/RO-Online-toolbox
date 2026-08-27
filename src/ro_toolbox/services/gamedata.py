@@ -151,7 +151,9 @@ def warps_on_map(map_name: str) -> list[tuple[int, int, str, int, int]]:
     ]
 
 
-def npc_links_on_map(map_name: str) -> list[tuple[int, int, str, int, int, str]]:
+def npc_links_on_map(
+    map_name: str,
+) -> list[tuple[int, int, str, int, int, str, int]]:
     """這張地圖上**要跟 NPC 講話**才過得去的連結，最後一欄是 NPC 名字。
 
     ⚠ 這些**不能拿去自動走** —— 走到那一格不會發生任何事，要對話（船夫、
@@ -160,7 +162,7 @@ def npc_links_on_map(map_name: str) -> list[tuple[int, int, str, int, int, str]]
     """
     return [
         (int(r[0]), int(r[1]), str(r[2]), int(r[3]), int(r[4]),
-         str(r[5]) if len(r) > 5 else "")
+         str(r[5]) if len(r) > 5 else "", int(r[6]) if len(r) > 6 else 0)
         for r in _npc_table().get(map_name, [])
         if len(r) >= 5
     ]
@@ -174,6 +176,11 @@ def _map_name_table() -> dict[str, str]:
     except (OSError, ValueError) as exc:
         log.warning("載入 %s 失敗：%s", _MAP_NAME_TABLE.name, exc)
         return {}
+
+
+def map_name_table() -> dict[str, str]:
+    """{地圖代碼: 中文名}。給目的地選單用（中文與代碼都要能搜）。"""
+    return dict(_map_name_table())
 
 
 def map_display_name(map_name: str) -> str:

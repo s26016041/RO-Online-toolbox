@@ -71,8 +71,11 @@ class Hop:
     to_x: int
     to_y: int
     #: 這一段要**跟 NPC 講話**才過得去時，NPC 的名字（船員、傳送師…）。
-    #: 空字串 = 走過去就會傳送。我們不會跟 NPC 對話，所以這種段落要停下來等人。
+    #: 空字串 = 走過去就會傳送。
     npc: str = ""
+    #: 那隻 NPC 的**外觀編號**。認人要「外觀 ＋ 座標」兩個欄位同時對上，
+    #: 不是猜一個 GID（[DAT-027]）。0 = 不知道，那就只能停下來等人。
+    npc_id: int = 0
 
     @property
     def cell(self) -> tuple[int, int]:
@@ -112,13 +115,13 @@ def plan_route(
     queue: deque[str] = deque([start_map])
     while queue and len(seen) < max_maps:
         current = queue.popleft()
-        links = [(x, y, d, dx, dy, "") for x, y, d, dx, dy in warps_on_map(current)]
+        links = [(x, y, d, dx, dy, "", 0) for x, y, d, dx, dy in warps_on_map(current)]
         if allow_npc:
             links += list(npc_links_on_map(current))
-        for x, y, dest, dx, dy, who in links:
+        for x, y, dest, dx, dy, who, who_id in links:
             if dest in seen or (current, x, y) in avoid:
                 continue
-            came[dest] = Hop(current, x, y, dest, dx, dy, who)
+            came[dest] = Hop(current, x, y, dest, dx, dy, who, who_id)
             if dest == goal_map:
                 return _trace(came, start_map, goal_map)
             seen.add(dest)
@@ -144,8 +147,8 @@ def why_no_route(start_map: str, goal_map: str) -> tuple[str, int, int, str, str
     queue: deque[str] = deque([start_map])
     while queue and len(seen) < 4000:
         current = queue.popleft()
-        walk = [(x, y, d, dx, dy, "") for x, y, d, dx, dy in warps_on_map(current)]
-        for x, y, dest, dx, dy, who in walk + list(npc_links_on_map(current)):
+        walk = [(x, y, d, dx, dy, "", 0) for x, y, d, dx, dy in warps_on_map(current)]
+        for x, y, dest, dx, dy, who, _id in walk + list(npc_links_on_map(current)):
             if dest in seen:
                 continue
             gate = (current, x, y, dest, who) if who else None
@@ -280,6 +283,11 @@ class Traveler:
     @property
     def goal_map(self) -> str:
         return self._goal_map
+
+    @property
+    def npc_hop(self):
+        """正在等人（或等程式）跟哪個 NPC 講話。沒有回 None。"""
+        return self._npc_wait
 
     @property
     def route(self) -> list[Hop]:
