@@ -268,7 +268,9 @@ class CharacterCard(QWidget):
         self.exp_label.setObjectName("pageSubtitle")
         layout.addWidget(self.exp_label)
 
-        self.status_label = QLabel("定位中…")
+        self._note_text = "定位中…"
+        self._alert_text = ""
+        self.status_label = QLabel(self._note_text)
         self.status_label.setObjectName("pageSubtitle")
         layout.addWidget(self.status_label)
 
@@ -285,9 +287,6 @@ class CharacterCard(QWidget):
 
         # ---- 自動補水 ----
         layout.addWidget(self._build_potion_panel())
-
-        # ---- 自動尋路 ----
-        layout.addWidget(self._build_travel_panel())
 
         self.farm_stats.connect(self._apply_farm_stats)
         self.potion_stats.connect(self._apply_potion_stats)
@@ -314,25 +313,9 @@ class CharacterCard(QWidget):
         self.auto_travel.toggled.connect(self.travel_toggled)
         return self.auto_travel
 
-    def _build_travel_panel(self) -> QWidget:
-        """自動尋路的狀態列。按鈕本身在上面 Base 那一行。"""
-        panel = QWidget()
-        box = QVBoxLayout(panel)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(6)
-
-        # 常駐提示拿掉了（同樣的話在「自動尋路」按鈕的 tooltip 上）；
-        # 這個標籤只在趕路中與出事時才出現。
-        self.travel_label = QLabel("")
-        self.travel_label.setObjectName("pageSubtitle")
-        self.travel_label.setWordWrap(True)
-        self.travel_label.hide()
-        box.addWidget(self.travel_label)
-        return panel
-
     def _apply_travel_stats(self, stats) -> None:  # noqa: ANN001 - TravelStats
         if not stats.running:
-            self._say(self.travel_label, stats.note)
+            self.set_alert(stats.note)
             # 走完（或失敗）就把按鈕彈起來 —— 按鈕壓著卻沒在走，
             # 看起來會像「還在趕路」，那是最糟的失效方式。
             if self.auto_travel.isChecked():
@@ -342,7 +325,7 @@ class CharacterCard(QWidget):
         head = f"前往 {where}" if where else "讀取導航目標…"
         if stats.hops_left:
             head += f"　還要換 {stats.hops_left} 張圖"
-        self._say(self.travel_label, f"{head}\n{stats.note}")
+        self.set_alert(f"{head}　{stats.note}")
 
     def set_travel_busy(self, busy: bool) -> None:
         """趕路途中不讓人再去勾自動打怪 —— 兩個都在送走路封包會互相打架。"""
@@ -381,16 +364,9 @@ class CharacterCard(QWidget):
         )
         self.go_home, self.home_item, self.home_icon = self._make_home_row(grid, 2)
         box.addLayout(grid)
-
-        # ⚠ 這個標籤**平常是隱藏的**，只在出事時才冒出來。
-        # 使用者要求把 SP 那列下面到「道具總攬」之間的提示文字全部拿掉，
-        # 但「大聲停用」不能一起拿掉（CLAUDE.md：失效只准大聲或安全退化）——
-        # 所以留著當警示欄，沒事的時候不佔版面。
-        self.potion_label = QLabel("")
-        self.potion_label.setObjectName("pageSubtitle")
-        self.potion_label.setWordWrap(True)
-        self.potion_label.hide()
-        box.addWidget(self.potion_label)
+        # ⚠ 設定區裡**不放任何文字**（使用者：「不要配置說明文字，很怪」）。
+        # 但「大聲停用」不能一起消失（CLAUDE.md：失效只准大聲或安全退化），
+        # 所以警示改走卡片最上面那行 `set_alert()`。
         return panel
 
     def _make_home_row(self, grid: QGridLayout, row: int):
@@ -554,15 +530,9 @@ class CharacterCard(QWidget):
             home_item=self.home_item.currentData() if self.go_home.isChecked() else None,
         )
 
-    def _say(self, label: QLabel, text: str) -> None:
-        """有話才顯示。使用者要求把常駐的提示文字拿掉，但**警示不能一起拿掉**
-        （CLAUDE.md：失效只准大聲停用或安全退化）—— 所以沒事就整個收起來。"""
-        label.setText(text)
-        label.setVisible(bool(text))
-
     def _apply_potion_stats(self, stats: PotionStats) -> None:
         if not stats.running:
-            self._say(self.potion_label, stats.note)
+            self.set_alert(stats.note)
             if stats.went_home and self.auto_hunt.isChecked():
                 # 已經用回程道具回城了。沒水又沒怪還勾著自動打怪，
                 # 只會站在城裡空轉 —— 而且看起來像「還在掛機」。
@@ -578,7 +548,8 @@ class CharacterCard(QWidget):
             return
         # 跑起來之後不再叨唸喝了幾瓶 —— 使用者要求把這塊提示文字拿掉。
         # 只有帶「⚠」的才留下來（例如連續喝不到、格號對不上）。
-        self._say(self.potion_label, stats.note if "⚠" in stats.note else "")
+        # 跑順的時候不佔著狀態行 —— 只有帶「⚠」的才留下來。
+        self.set_alert(stats.note if "⚠" in stats.note else "")
 
     def _apply_farm_stats(self, stats: FarmStats) -> None:
         if not stats.running:
@@ -669,7 +640,22 @@ class CharacterCard(QWidget):
         self.exp_label.setText(text)
 
     def set_note(self, text: str) -> None:
-        self.status_label.setText(text)
+        """平常的那行（現在只有 PID）。被警示蓋住時先收著，等警示解除再露出來。"""
+        self._note_text = text
+        self._paint_status()
+
+    def set_alert(self, text: str) -> None:
+        """現在需要被看到的一句話：功能停用的原因，或趕路進度。
+
+        ⚠ **優先蓋過平常那行。** 設定區裡不放文字，所以這是唯一的出口 ——
+        失效只准大聲停用或安全退化（CLAUDE.md），不准安靜地什麼都不說。
+        空字串 = 解除。
+        """
+        self._alert_text = text
+        self._paint_status()
+
+    def _paint_status(self) -> None:
+        self.status_label.setText(self._alert_text or self._note_text)
 
 
 class FarmPage(BasePage):
@@ -992,7 +978,7 @@ class FarmPage(BasePage):
         if pid in self._bots and card is not None and card.auto_hunt.isChecked():
             # 先讓 UI 走正常的關閉流程（_toggle_farm 會停 bot、保留戰利品）
             card.auto_hunt.setChecked(False)
-            card._say(card.travel_label, "已先關掉自動打怪（趕路途中不打怪）")
+            card.set_alert("已先關掉自動打怪（趕路途中不打怪）")
         if card is None:
             return  # 沒有卡片就沒有回報去處，別讓它在背景默默走
         card.set_travel_busy(True)
@@ -1028,7 +1014,7 @@ class FarmPage(BasePage):
         if find_server(pid) is None:
             card = self._cards.get(pid)
             if card is not None:
-                card._say(card.potion_label, "尚未登入（回到選角畫面？）—— 暫停讀背包")
+                card.set_alert("尚未登入（回到選角畫面？）—— 暫停讀背包")
             return
         self._bag_loaded.add(pid)
         worker = BagWorker(pid)
@@ -1050,7 +1036,7 @@ class FarmPage(BasePage):
         rows = self._bags.get(pid, {})
         card.set_slots(rows)
         if not rows:
-            card._say(card.potion_label, "⚠ 讀不到背包（AOB 定位失敗）")
+            card.set_alert("⚠ 讀不到背包（AOB 定位失敗）")
 
     def _refresh_bag(self, pid: int) -> None:
         """重讀背包。一次約 0.1 秒，放在背景執行緒做。"""
@@ -1068,7 +1054,7 @@ class FarmPage(BasePage):
             return
         config = card.potion_config()
         if not (config.wants_hp() or config.wants_sp()):
-            card._say(card.potion_label, "⚠ 還沒選道具或百分比是 0，沒有東西可以補")
+            card.set_alert("⚠ 還沒選道具或百分比是 0，沒有東西可以補")
             card.auto_potion.setChecked(False)
             return
         bot = PotionBot(pid, config, on_update=lambda s, c=card: c.potion_stats.emit(s))

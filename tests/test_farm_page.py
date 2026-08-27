@@ -109,14 +109,14 @@ def test_travel_button_pops_up_when_the_bot_stops(qtbot):
         FakeTravelStats(running=False, note="⚠ 讀不到導航目標 —— 請先在遊戲的尋路視窗設定目的地")
     )
     assert card.auto_travel.isChecked() is False
-    assert "讀不到導航目標" in card.travel_label.text()
+    assert "讀不到導航目標" in card.status_label.text()
 
 
-def test_travel_label_shows_where_and_how_far(qtbot):
+def test_travel_progress_shows_where_and_how_far(qtbot):
     card = make_card(qtbot)
     card._apply_travel_stats(
         FakeTravelStats(hops_left=2, note="前往 prt_fild08：還要換 2 張圖")
     )
-    text = card.travel_label.text()
+    text = card.status_label.text()
     assert "普隆德拉原野" in text
     assert "還要換 2 張圖" in text

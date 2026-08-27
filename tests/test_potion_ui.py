@@ -165,7 +165,7 @@ def test_bot_stopping_unchecks_the_box(card):
     card.auto_potion.setChecked(True)
     card._apply_potion_stats(PotionStats(running=False, note="⚠ 藥水用完了"))
     assert card.auto_potion.isChecked() is False
-    assert card.potion_label.text() == "⚠ 藥水用完了"
+    assert card.status_label.text() == "⚠ 藥水用完了"
 
 
 # ---- 存檔還原：程式改 UI 不算使用者的意思 ---------------------------------
@@ -286,9 +286,14 @@ def test_routine_chatter_is_hidden_but_warnings_are_not(card):
 
     # 用 text() 判斷，不用 isVisible() —— 沒 show() 過的 widget 永遠是 False，
     # 那種斷言看起來有測到，其實永遠會過。
+    card.set_note("PID 1234")
     card._apply_potion_stats(PotionStats(running=True, note="HP 60% → 喝了第 6 格"))
-    assert card.potion_label.text() == "", "跑起來的例行訊息不該顯示"
+    assert card.status_label.text() == "PID 1234", "例行訊息不該佔著狀態行"
 
     card._apply_potion_stats(PotionStats(running=True, note="⚠ 連續喝不到"))
-    assert card.potion_label.text() == "⚠ 連續喝不到"
+    assert card.status_label.text() == "⚠ 連續喝不到", "警示要蓋過平常那行"
+
+    # 解除之後平常那行要回來 —— 警示不能永久佔著
+    card._apply_potion_stats(PotionStats(running=True, note="HP 70% → 喝了第 6 格"))
+    assert card.status_label.text() == "PID 1234"
 
