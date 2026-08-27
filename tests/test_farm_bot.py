@@ -488,3 +488,87 @@ def test_escape_does_nothing_outside_the_zone(monkeypatch):
     bot = _bot_in_warp_zone(monkeypatch)
     assert bot._escape_warp((10, 10)) is False
 
+
+# ---- 傳點：資料只給取樣點，真正的傳點是一片 --------------------------------
+
+
+def test_sampled_warp_strip_is_filled_in():
+    """`navi_link` 對一條傳點帶只取樣幾個點 —— 實測 moc_fild01 往 moc_fild02
+    是 (301,16)/(321,16)/(341,16) **三筆指向同一個目的地格**。
+    只擋取樣點周圍 3 格的話，中間留了兩個 14 格寬的洞，走過去照樣被傳走。"""
+    from ro_toolbox.services.farm_bot import _warp_strips
+
+    strip = _warp_strips({"moc_fild02": [(301, 16), (321, 16), (341, 16)]})
+    assert (311, 16) in strip, "取樣點之間那一段也是傳點"
+    assert (301, 16) in strip and (341, 16) in strip
+    assert (311, 17) not in strip, "只補同一條線，不亂擴張"
+
+
+def test_two_far_apart_portals_are_not_joined():
+    """相隔很遠、剛好通往同一張圖的兩個傳點是**各自獨立**的
+    （實測 ayo_dun02 有兩個相隔 252 格的）。連起來會擋掉一整條沒事的路。"""
+    from ro_toolbox.services.farm_bot import _warp_strips
+
+    assert _warp_strips({"ayo_dun01": [(24, 22), (276, 22)]}) == set()
+
+
+def test_getting_warped_teaches_the_cell(monkeypatch):
+    """地圖名變了就是**真的**被傳走了 —— 那是量到的事實，要學起來。
+
+    資料永遠會有漏網的（傳點是一片、只取樣幾點），所以踩到就記住，
+    這次開著的期間都不再走那一段。"""
+    bot = FarmBot(1234)
+    bot._recent.extend([(10, 10), (12, 10), (14, 10)])
+    monkeypatch.setattr(type(bot._walker), "target",
+                        property(lambda _self: (20, 10)))
+    bot._learn_warp("prt_fild08")
+    learned = bot._learned["prt_fild08"]
+    assert (14, 10) in learned and (20, 10) in learned
+    assert (17, 10) in learned, "中間那段是伺服器走的，也要記"
+
+
+def test_learned_cells_go_into_the_no_go_zone(monkeypatch):
+    from ro_toolbox.services import farm_bot as mod
+
+    bot = FarmBot(1234)
+    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
+    bot._learned["prt_fild08"] = {(100, 100)}
+    bot._load_warps("prt_fild08")
+    assert (100, 100) in bot._warp_cells
+    assert (102, 101) in bot._warp_zone, "學到的格子也要有禁區"
+
+
+# ---- 被傳走 → 走回原本那張圖 ----------------------------------------------
+
+
+def test_being_warped_starts_a_trip_home():
+    """使用者選的是「走回原本那張圖繼續打」。"""
+    bot = FarmBot(1234)
+    bot._home_map = "prt_fild08"
+    assert bot._go_home_start("moc_fild01", T0) is True
+    assert bot._traveler is not None
+    assert bot._traveler.goal_map == "prt_fild08"
+    assert bot._aim is None and bot._roam_goal is None
+
+
+def test_coming_home_is_not_treated_as_getting_warped():
+    bot = FarmBot(1234)
+    bot._home_map = "prt_fild08"
+    assert bot._go_home_start("prt_fild08", T0) is True
+    assert bot._traveler is None
+
+
+def test_endless_ping_pong_stops_loudly():
+    """怪站在傳點上時「追過去被傳走 → 走回來 → 又看到牠」會無限來回。
+    學到的禁區通常一次就斷了，這是最後一道保險：停下來喊人。"""
+    from ro_toolbox.services.farm_bot import _RETURN_MAX
+
+    bot = FarmBot(1234)
+    bot._home_map = "prt_fild08"
+    for _ in range(_RETURN_MAX):
+        bot._traveler = None
+        assert bot._go_home_start("moc_fild01", T0) is True
+    bot._traveler = None
+    assert bot._go_home_start("moc_fild01", T0) is False
+    assert bot._traveler is None
+    assert "輪迴" in bot._stats.note

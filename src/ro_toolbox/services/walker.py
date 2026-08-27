@@ -50,6 +50,31 @@ STUCK_SEC = 2.0
 OFF_PATH = 5
 
 
+def line_cells(a: tuple[int, int], b: tuple[int, int]) -> list[tuple[int, int]]:
+    """a→b 的直線經過哪些格（含兩端）。Bresenham。
+
+    用途見 `Walker._clear_line`：我們送出去的是「走到這一格」，
+    **中間那段路是伺服器自己算的**，不會照我們的 A* 走。
+    直線是伺服器路徑最好的近似。
+    """
+    (x0, y0), (x1, y1) = a, b
+    dx, dy = abs(x1 - x0), abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    err = dx - dy
+    out = [(x0, y0)]
+    while (x0, y0) != (x1, y1):
+        err2 = err * 2
+        if err2 > -dy:
+            err -= dy
+            x0 += sx
+        if err2 < dx:
+            err += dx
+            y0 += sy
+        out.append((x0, y0))
+    return out
+
+
 class Walker:
     """把一條逐格路徑走完。呼叫端每拍呼叫 `update(pos)`，看回傳的狀態決定下一步。
 
@@ -77,6 +102,8 @@ class Walker:
         self._pos_at = 0.0
         self._resends = 0      # 這一次「停住」已經重送幾次
         self._resent_at = 0.0
+        #: 這一段路不准經過的格子（自動打怪拿它擋傳點）。見 `_clear_line`。
+        self._avoid: frozenset[tuple[int, int]] = frozenset()
         self._ack_lock = threading.Lock()
         self._ack_dest: tuple[int, int] | None = None
         #: 診斷用計數
@@ -101,7 +128,27 @@ class Walker:
     def goal(self) -> tuple[int, int] | None:
         return self._path[-1] if self._path else None
 
-    def set_path(self, cells: list[tuple[int, int]]) -> None:
+    @property
+    def target(self) -> tuple[int, int] | None:
+        """最後送出去的那一段要走到哪。還沒送回 None。
+
+        被傳走之後要用它推「踩到哪裡出事」—— 我們 0.2 秒才取樣一次座標，
+        中間那段是伺服器走的，只知道在「最後看到的位置 → 這個目標」之間。
+        """
+        return self._target
+
+    def set_path(
+        self,
+        cells: list[tuple[int, int]],
+        avoid: frozenset[tuple[int, int]] | set[tuple[int, int]] | None = None,
+    ) -> None:
+        """交一條路徑給它走。
+
+        `avoid` 是「這一段直線不准經過」的格子（自動打怪用它擋傳點）。
+        ⚠ 光是把 A* 算得繞開傳點**不夠**：我們一次送 14 格，
+        中間那段路是伺服器自己算的（[PKT-030]），它會抄近路穿過去。
+        """
+        self._avoid = frozenset(avoid) if avoid else frozenset()
         self._path = list(cells)
         self._index = 0
         self._target = None
@@ -214,15 +261,47 @@ class Walker:
         left = max(abs(self._target[0] - pos[0]), abs(self._target[1] - pos[1]))
         return left <= LOOKAHEAD
 
+    def _clear_line(self, start: tuple[int, int], goal: tuple[int, int]) -> bool:
+        """從 start 直線走到 goal 會不會經過禁區。
+
+        ⚠ 為什麼要看直線：路徑是我們算的，但**每一段中間怎麼走是伺服器決定的**
+        （[PKT-030]）。A* 繞得再漂亮，一段送 14 格照樣可能被伺服器帶著抄近路
+        穿過傳點 —— 使用者實測回報的「打怪走一走被傳走」就是這樣來的。
+        碰到禁區就把這一段縮短，短到伺服器沒有近路可抄。
+
+        **起點附近那一段不算**：人本來就可能站在禁區裡（剛被傳過來、
+        或怪把我們引過去了），算進去的話每一段都被否決、一步都走不出去 ——
+        那是 [MEM-044] 已經踩過的同一個坑。
+        """
+        if not self._avoid:
+            return True
+        left = False
+        for cell in line_cells(start, goal):
+            if cell in self._avoid:
+                if left:
+                    return False
+            else:
+                left = True
+        return True
+
     def _send_next(self, pos: tuple[int, int], now: float) -> None:
-        """挑路徑上「還在單次移動上限內」的最遠一格送出去。"""
+        """挑路徑上「還在單次移動上限內、而且直線過去不會踩到禁區」的最遠一格。"""
         target = None
         limit = min(len(self._path) - 1, self._index + self._step)
         for i in range(limit, self._index - 1, -1):
             cell = self._path[i]
-            if max(abs(cell[0] - pos[0]), abs(cell[1] - pos[1])) <= self._step:
-                target = cell
-                break
+            if max(abs(cell[0] - pos[0]), abs(cell[1] - pos[1])) > self._step:
+                continue
+            if not self._clear_line(pos, cell):
+                continue  # 這一段伺服器可能抄近路穿過傳點 —— 換近一點的
+            target = cell
+            break
+        if target is None and self._index + 1 < len(self._path):
+            # 每一段都被否決：至少往前挪一格（下一格就在 A* 算好的路上，
+            # 它本來就繞開了禁區）。絕不原地不動 —— 那會被當成卡住。
+            nxt = self._path[self._index + 1]
+            if nxt != pos:
+                target = nxt
         if target is None or target == pos:
             self.clear()
             return

@@ -18,6 +18,7 @@ import logging
 import random
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -41,7 +42,8 @@ from ro_toolbox.services.gamedata import (
 from ro_toolbox.services.mapdata import GatError, MapTerrain, load_terrain
 from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
-from ro_toolbox.services.walker import MAX_STEP, Walker
+from ro_toolbox.services.travel import Traveler
+from ro_toolbox.services.walker import MAX_STEP, Walker, line_cells
 from ro_toolbox.services.world import Monster, WorldTracker
 
 log = logging.getLogger(__name__)
@@ -124,8 +126,23 @@ _NEAR_BUDGET = 3000
 #: 傳點資料（`navi_link_tw.lub` → `assets/warps.json.gz`）只給一格，
 #: 但實際的傳點是一片區域，所以要留餘裕。
 _WARP_KEEP_OUT = 3
+#: 同一張圖上通往**同一張地圖**、又共線、又靠得這麼近的兩個傳點，
+#: 當成**同一條傳點帶**，中間整段都不准踩。
+#:
+#: ⚠ 依據是實測的資料形狀：`navi_link` 對一條傳點帶只取樣幾個點 ——
+#: `moc_fild01` 往 `moc_fild02` 是 (301,16)/(321,16)/(341,16) **三筆指向
+#: 同一個目的地格**，中間 20 格一段完全沒有資料。只擋取樣點周圍 3 格，
+#: 等於在傳點帶上留了兩個 14 格寬的洞，走過去就被傳走。
+#: 實測代價很小：prt_fild08 禁區 0.2%→0.3%、moc_fild01 0.2%→0.3%。
+_WARP_STRIP_MAX = 60
 #: 脫離禁區時，最遠往外找幾格。禁區半徑之外再留一點，免得剛好停在邊界上。
 _ESCAPE_MARGIN = 4
+#: 被傳走之後，走回原本那張圖最多花多久。逾時就大聲停用。
+_RETURN_GIVEUP_SEC = 300.0
+#: 一輪裡最多被傳走幾次。超過就停下來喊人 ——
+#: 「怪站在傳點上 → 追過去被傳走 → 走回來 → 又看到牠」是會無限輪迴的
+#: （使用者自己點出來的）。學到的禁區通常一次就擋掉了，這是最後一道保險。
+_RETURN_MAX = 5
 _MISS_SKIP_SEC = 20.0  # 打到空氣的目標冷卻多久（座標過時，等它重新出現）
 #: 要不要把記憶體掃到的怪也算進來。**開著。**
 #:
@@ -153,6 +170,35 @@ _RESYNC_SEC = 2.0  # 多久檢查一次「地圖／連線有沒有換掉」
 # 傷害／動作封包：payload[0:4]=攻擊者 GID、[4:8]=目標 GID
 _DAMAGE_OPS = (0x08C8, 0x02E1)
 _OP_MOVE_ACK = 0x0087  # 伺服器確認「我」要移動：payload[4:10] = 起點+終點
+
+
+def _warp_strips(by_dest: dict[str, list[tuple[int, int]]]) -> set[tuple[int, int]]:
+    """把「同一張圖上通往同一個目的地、又共線、又靠得夠近」的傳點連成一條帶。
+
+    ⚠ 這不是猜的，是**資料形狀本身**告訴我們的：`navi_link_tw.lub` 對一條
+    傳點帶只取樣幾個點。實測 `moc_fild01` 往 `moc_fild02` 有三筆
+    (301,16)/(321,16)/(341,16) **指向同一個目的地格** —— 那顯然是一條約 40 格
+    寬的傳點帶，只被取樣三次。只擋取樣點周圍 3 格的話，中間留了兩個 14 格的洞，
+    人走過去照樣被傳走（使用者實測回報「自動打怪走一走被傳到別的地圖」）。
+
+    只連**共線**且距離 `_WARP_STRIP_MAX` 以內的兩點：距離遠的多半是兩個各自
+    獨立、剛好通往同一張圖的傳點（實測 `ayo_dun02` 有兩個相隔 252 格的），
+    連起來會擋掉一整條沒事的路。
+    """
+    strip: set[tuple[int, int]] = set()
+    for cells in by_dest.values():
+        spots = sorted(set(cells))
+        for i, a in enumerate(spots):
+            for b in spots[i + 1:]:
+                if a[0] != b[0] and a[1] != b[1]:
+                    continue  # 不共線 = 不是同一條帶
+                if max(abs(a[0] - b[0]), abs(a[1] - b[1])) > _WARP_STRIP_MAX:
+                    continue
+                if a[0] == b[0]:
+                    strip.update((a[0], y) for y in range(min(a[1], b[1]), max(a[1], b[1]) + 1))
+                else:
+                    strip.update((x, a[1]) for x in range(min(a[0], b[0]), max(a[0], b[0]) + 1))
+    return strip
 
 
 @dataclass
@@ -220,6 +266,17 @@ class FarmBot:
         self._progress: tuple | None = None  # (位置, 擊殺, 撿取) —— 用來偵測完全卡住
         self._progress_at = 0.0
         self._map = ""  # 目前綁定的地圖，換圖要重新載地形
+        #: 按下自動打怪時人在哪張圖。**被傳走就走回這裡**（使用者指定的行為）。
+        self._home_map = ""
+        #: 這張圖上最近幾拍的位置。被傳走時用來回推「踩到哪裡出事」。
+        self._recent: deque[tuple[int, int]] = deque(maxlen=4)
+        #: {地圖: 實際被傳走過的格子}。**量到的事實**，不是猜的 ——
+        #: 地圖名變了就是真的被傳走了。只活在這一次執行裡。
+        self._learned: dict[str, set[tuple[int, int]]] = {}
+        #: 正在走回原圖（None = 沒有）。走回去期間不打怪、不撿東西。
+        self._traveler: Traveler | None = None
+        self._return_since = 0.0
+        self._returns = 0
         #: 這張圖上「不准踩」的格子：傳點與它周圍 `_WARP_KEEP_OUT` 格。
         self._warp_zone: frozenset[tuple[int, int]] = frozenset()
         #: 傳點**本體**（踩到就被傳走）。禁區是本體再加周圍。
@@ -319,6 +376,8 @@ class FarmBot:
                 self._my_gid = status.aid
                 log.info("自己的 GID（AID）=%s", status.aid)
             self._map = status.map_name
+            # 按下按鈕時人在哪，那張就是「家」。被傳走要走回這裡。
+            self._home_map = status.map_name
             try:
                 self._terrain = load_terrain(status.map_name)
                 self._world.set_map_size((self._terrain.width, self._terrain.height))
@@ -393,6 +452,18 @@ class FarmBot:
             if not self._keep_in_sync(now):
                 return
             pos = self._reader.read_position() if self._reader else None
+            if pos is not None:
+                # 被傳走時要回推「踩到哪裡出事」，所以隨手記著最近幾拍的位置。
+                self._recent.append(pos)
+
+            # ⚠ 被傳到別張圖了：這一拍只做一件事 —— 走回去。
+            # **一定要排在 `_escape_warp` 前面**：剛落地時人就站在回程傳點旁邊，
+            # 脫離邏輯會把我們往外拉，正好跟「走回去」互相打架。
+            if self._traveler is not None:
+                self._go_home(now, pos)
+                self._emit()
+                self._stop.wait(_TICK)
+                continue
 
             if pos is not None:
                 if self._entities is not None:
@@ -477,6 +548,11 @@ class FarmBot:
             self._server = server
 
         if map_changed:
+            # ⚠ 走回去的途中換圖是**我們自己要的**，不是意外，不能學也不能重來。
+            if self._traveler is None and self._map:
+                self._learn_warp(self._map)
+                if not self._go_home_start(status.map_name, now):
+                    return False
             self._map = status.map_name
             try:
                 self._terrain = load_terrain(status.map_name)
@@ -786,7 +862,7 @@ class FarmBot:
             path = self._plan_path(pos, target)
             if not path:
                 return False
-            self._walker.set_path(path)
+            self._walker.set_path(path, avoid=self._warp_zone)
         return self._walker.update(pos) == "walking"
 
     def _beside(self, goal: tuple[int, int], pos: tuple[int, int]) -> tuple[int, int] | None:
@@ -848,7 +924,7 @@ class FarmBot:
             if path is None:
                 self._world.forget_item(item.entity_id)
                 return False
-            self._walker.set_path(path)
+            self._walker.set_path(path, avoid=self._warp_zone)
         if self._walker.update(pos) == "blocked":
             self._world.forget_item(item.entity_id)
         return True
@@ -900,17 +976,22 @@ class FarmBot:
                 self._roam_goal = dest
             path = self._plan_path(pos, self._roam_goal)
             if path:
-                self._walker.set_path(path)
+                self._walker.set_path(path, avoid=self._warp_zone)
                 self._walker.update(pos)
                 return
             self._bad_goals.append((self._roam_goal, now + _BAD_GOAL_SEC))
             self._roam_goal = None
-        # 完全算不出路：往近處走一步，絕不原地不動（但別踩到傳點）
+        # 完全算不出路：往近處走一步，絕不原地不動（但別踩到傳點）。
+        # ⚠ 這一步**沒有經過 Walker**，中間那段路完全是伺服器自己走的 ——
+        # 所以除了目標格，直線經過的每一格也都要檢查。
         for _ in range(6):
             near = terrain.random_walkable(random, near=pos, radius=MAX_STEP)
-            if near and near != pos and not self._near_warp(near):
-                self._send_move(*near)
-                return
+            if near is None or near == pos or self._near_warp(near):
+                continue
+            if any(cell in self._warp_zone for cell in line_cells(pos, near)[1:]):
+                continue
+            self._send_move(*near)
+            return
 
     def _plan_path(
         self, start: tuple[int, int], goal: tuple[int, int]
@@ -927,10 +1008,17 @@ class FarmBot:
 
         查不到就是空的 —— 安全退化成「跟以前一樣會踩到」，不會因此不能走路。
         """
-        zone: set[tuple[int, int]] = set()
         cells: set[tuple[int, int]] = set()
-        for x, y, _dest, _dx, _dy in warps_on_map(map_name):
+        by_dest: dict[str, list[tuple[int, int]]] = {}
+        for x, y, dest, _dx, _dy in warps_on_map(map_name):
             cells.add((x, y))
+            by_dest.setdefault(dest, []).append((x, y))
+        strip = _warp_strips(by_dest)
+        cells |= strip
+        learned = self._learned.get(map_name, set())
+        cells |= learned
+        zone: set[tuple[int, int]] = set()
+        for x, y in cells:
             for dx in range(-_WARP_KEEP_OUT, _WARP_KEEP_OUT + 1):
                 for dy in range(-_WARP_KEEP_OUT, _WARP_KEEP_OUT + 1):
                     zone.add((x + dx, y + dy))
@@ -938,8 +1026,94 @@ class FarmBot:
         # 傳點**本體**那一格。禁區是「不想去」，本體是「踩到就被傳走」——
         # 從禁區裡面往外走時只避開本體，避開整片禁區的話就永遠走不出來。
         self._warp_cells = frozenset(cells)
-        log.info("%s 的傳點 %d 個、禁區 %d 格",
-                 map_name, len(self._warp_cells), len(self._warp_zone))
+        log.info("%s 的傳點 %d 格（帶狀補了 %d、實際踩過學到 %d）、禁區 %d 格",
+                 map_name, len(self._warp_cells), len(strip), len(learned),
+                 len(self._warp_zone))
+
+    def _learn_warp(self, old_map: str) -> None:
+        """剛剛真的被傳走了 —— 把「當時正在走的那一段」記成傳點，之後不再踩。
+
+        ⚠ 這是**量到的事實**，不是推論：記憶體裡的地圖名變了，就是真的被傳走了。
+        為什麼非學不可：`assets/warps.json.gz`（來自 `navi_link_tw.lub`）每個傳點
+        只給**一格**，實際的傳點是一片區域，而且一條傳點帶只被取樣幾次
+        （見 `_warp_strips`）。照資料繞開永遠會有漏網的，踩到就把它記起來。
+
+        學的是**一整段**不是一格：座標 0.2 秒才取樣一次，而且每一段中間
+        怎麼走是伺服器決定的（[PKT-030]），所以踩進去的確切位置不知道 ——
+        只知道在「最近幾拍的位置 → 那一段送出去的目標」這條線上。
+
+        只活在這一次執行裡。存到檔案的話，遊戲改版動了傳點就會擋到沒事的地方，
+        而且沒有徵兆 —— 寧可每次重學（一次就夠）。
+        """
+        points = list(self._recent)
+        if not points:
+            return
+        target = self._walker.target
+        if target is not None:
+            points.append(target)
+        span: set[tuple[int, int]] = set(points)
+        for a, b in zip(points, points[1:], strict=False):
+            span.update(line_cells(a, b))
+        learned = self._learned.setdefault(old_map, set())
+        before = len(learned)
+        learned |= span
+        log.warning("⚠ 在 %s 被傳走了（最後看到 %s，正要走去 %s）——"
+                    "把這一段 %d 格記成傳點，這次開著的期間都不再踩",
+                    old_map, points[-2] if len(points) > 1 else points[-1], target,
+                    len(learned) - before)
+
+    def _go_home_start(self, new_map: str, now: float) -> bool:
+        """被傳到別張圖了 —— 開始走回原本那張。回 False = 已經大聲停用。
+
+        ⚠ **輪迴保險**：怪站在傳點上時，「追過去被傳走 → 走回來 → 又看到牠」
+        會無限來回（使用者自己點出來的）。正常情況 `_learn_warp` 學到的禁區
+        會讓 `_pick_target` 直接不理那隻怪，一次就斷了；`_RETURN_MAX` 是
+        萬一還是斷不掉時的最後一道保險 —— 停下來喊人，好過整晚來回踱步。
+        """
+        if not self._home_map or new_map == self._home_map:
+            return True
+        self._returns += 1
+        if self._returns > _RETURN_MAX:
+            self._fail(f"⚠ 已經被傳走 {_RETURN_MAX} 次（現在在 {new_map}），"
+                       f"再走回去只會一直輪迴，自動打怪已停止")
+            return False
+        self._aim = None
+        self._roam_goal = None
+        self._escape_goal = None
+        self._walker.clear()
+        traveler = Traveler(self._walker, time.monotonic)
+        traveler.set_goal(self._home_map)
+        self._traveler = traveler
+        self._return_since = now
+        self._note(f"被傳到 {new_map} 了，走回 {self._home_map}"
+                   f"（第 {self._returns}/{_RETURN_MAX} 次）")
+        return True
+
+    def _go_home(self, now: float, pos: tuple[int, int] | None) -> None:
+        """走回原本那張圖。到了就接著打，回不去就大聲停用。"""
+        traveler = self._traveler
+        if traveler is None:
+            return
+        if now - self._return_since > _RETURN_GIVEUP_SEC:
+            self._traveler = None
+            self._fail(f"⚠ 走了 {_RETURN_GIVEUP_SEC / 60:.0f} 分鐘還回不去 "
+                       f"{self._home_map}，自動打怪已停止")
+            return
+        status = self._reader.read() if self._reader else None
+        if status is None or not status.map_name or pos is None:
+            return  # 換圖中間讀不到是正常過渡，這一拍不動
+        state = traveler.update(status.map_name, pos)
+        if state == "arrived":
+            self._traveler = None
+            self._walker.clear()
+            self._note(f"回到 {self._home_map} 了，繼續打")
+            return
+        if state == "blocked":
+            self._traveler = None
+            self._fail(f"⚠ 回不去 {self._home_map}：{traveler.note}")
+            return
+        if traveler.note:
+            self._note(traveler.note)
 
     def _escape_warp(self, pos: tuple[int, int] | None) -> bool:
         """人在傳點禁區裡就先走出去。回 True 代表這一拍在脫離，別做其他事。
@@ -972,7 +1146,7 @@ class FarmBot:
         if not path:
             return False
         self._escape_goal = goal
-        self._walker.set_path(path)
+        self._walker.set_path(path, avoid=self._warp_cells)
         self._walker.update(pos)
         self._note(f"太靠近傳點，先走開（往 {goal[0]},{goal[1]}）")
         return True

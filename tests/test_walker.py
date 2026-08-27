@@ -14,6 +14,7 @@ from ro_toolbox.services.walker import (
     RESEND_SEC,
     STUCK_SEC,
     Walker,
+    line_cells,
 )
 
 
@@ -173,3 +174,51 @@ def test_unrelated_ack_is_ignored():
     fake.now += ACK_TIMEOUT + 0.01
     walker.update((10, 50))
     assert walker.rejected == 1
+
+
+# ---- 每一段中間的路是伺服器走的 --------------------------------------------
+
+
+#: 一片傳點區。路徑從它西邊繞到北邊，全程一格都沒踩到。
+WARP = frozenset((x, y) for x in range(12, 26) for y in range(45, 56))
+
+
+def detour() -> list[tuple[int, int]]:
+    """繞開那片傳點的路：先沿 x=10 往北，再沿 y=44 往東。兩段都在禁區外。"""
+    path = [(10, y) for y in range(49, 43, -1)]
+    path += [(x, 44) for x in range(11, 35)]
+    assert not (set(path) & WARP)
+    return path
+
+
+def test_a_segment_is_shortened_so_the_server_cannot_cut_through_a_warp():
+    """⚠ A* 繞開傳點**不夠**：我們一次送 14 格，中間那段路是伺服器自己算的
+    （[PKT-030]），它會抄近路直接穿過去 —— 使用者實測回報的
+    「自動打怪走一走被傳到別的地圖」就是這樣來的。"""
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock)
+    walker.set_path(detour(), avoid=WARP)
+    assert walker.update((10, 50)) == "walking"
+    sent = fake.sent[-1]
+    assert all(cell not in WARP for cell in line_cells((10, 50), sent))
+
+
+def test_without_the_avoid_set_the_old_behaviour_would_cut_through():
+    """反證：不給 avoid 的話，送出去的那一段直線真的會穿過傳點。
+    這條釘住「問題是真的存在」，不是為了修而修。"""
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock)
+    walker.set_path(detour())
+    walker.update((10, 50))
+    assert any(cell in WARP for cell in line_cells((10, 50), fake.sent[-1]))
+
+
+def test_standing_inside_the_zone_still_moves():
+    """人本來就可能站在禁區裡（剛被傳過來、或被怪引過去）。
+    起點那一段也算進去的話，每一段都被否決、一步都走不出去 ——
+    那是 [MEM-044] 已經踩過的同一個坑。"""
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock)
+    walker.set_path([(x, 50) for x in range(21, 45)], avoid=WARP)
+    assert walker.update((20, 50)) == "walking"
+    assert fake.sent, "站在禁區裡也必須走得出來"
