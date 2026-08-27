@@ -28,7 +28,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ro_toolbox.services.gamedata import warps_on_map
+from ro_toolbox.services.gamedata import npc_links_on_map, warps_on_map
 from ro_toolbox.services.mapdata import GatError, MapTerrain, load_terrain
 from ro_toolbox.services.walker import Walker
 
@@ -106,6 +106,61 @@ def plan_route(
             seen.add(dest)
             queue.append(dest)
     return None
+
+
+def why_no_route(start_map: str, goal_map: str) -> tuple[str, int, int, str, str] | None:
+    """走不到的時候，找出**第一個卡住的 NPC 連結**：(地圖, x, y, 目的地, NPC 名)。
+
+    為什麼要它：navi_link 裡有 862 條連結是**要跟 NPC 講話**才過得去的
+    （船夫、傳送師、告示牌），我們不會對話所以不放進 `plan_route`。
+    但那些地方遊戲裡的箭頭走得通 —— 使用者看到的是「遊戲正常，你卻說找不到」。
+
+    把 NPC 連結也放進去再 BFS 一次：走得通的話，回傳路上第一個 NPC 連結，
+    讓呼叫端**講清楚要去找誰**，而不是丟一句「找不到路線」。
+    回 None 代表就算加上 NPC 連結也到不了 —— 那是真的沒路。
+    """
+    if start_map == goal_map:
+        return None
+    came: dict[str, tuple[Hop, tuple | None]] = {}
+    seen = {start_map}
+    queue: deque[str] = deque([start_map])
+    while queue and len(seen) < 4000:
+        current = queue.popleft()
+        walk = [(x, y, d, dx, dy, "") for x, y, d, dx, dy in warps_on_map(current)]
+        for x, y, dest, dx, dy, who in walk + list(npc_links_on_map(current)):
+            if dest in seen:
+                continue
+            gate = (current, x, y, dest, who) if who else None
+            came[dest] = (Hop(current, x, y, dest, dx, dy), gate)
+            if dest == goal_map:
+                # 沿著路徑回推，回傳**最靠近起點**的那個 NPC 關卡
+                node, gates = goal_map, []
+                while node != start_map:
+                    hop, g = came[node]
+                    if g is not None:
+                        gates.append(g)
+                    node = hop.from_map
+                return gates[-1] if gates else None
+            seen.add(dest)
+            queue.append(dest)
+    return None
+
+
+def _no_route_note(start_map: str, goal_map: str, excluded: bool = False) -> str:
+    """走不到時給人看的一句話。**能講出原因就別只說「找不到」。**
+
+    使用者實測回報：人在 izlu2dun（拜倫島），遊戲裡的箭頭好好的，我們卻說
+    找不到路 —— 因為回 izlude 那條要**搭船**（跟 NPC 講話），不在可走的傳點裡。
+    """
+    tail = "（已排除走不通的傳點）" if excluded else ""
+    gate = why_no_route(start_map, goal_map)
+    if gate is None:
+        return f"⚠ 從 {start_map} 找不到通往 {goal_map} 的路{tail}"
+    where, x, y, dest, who = gate
+    return (
+        f"⚠ 到 {goal_map} 的路要**跟 NPC 對話**才過得去，自動尋路不會講話：\n"
+        f"請自己在 {where} ({x},{y}) 找「{who}」到 {dest}，到了再按一次自動尋路"
+    )
 
 
 def _trace(came: dict[str, Hop], start_map: str, goal_map: str) -> list[Hop]:
@@ -298,7 +353,7 @@ class Traveler:
             return False
         route = plan_route(map_name, self._goal_map, self._avoid)
         if route is None:
-            self.note = f"⚠ 從 {map_name} 找不到通往 {self._goal_map} 的路"
+            self.note = _no_route_note(map_name, self._goal_map)
             return False
         self._route = route
         self._route_map = map_name
@@ -425,9 +480,7 @@ class Traveler:
         self._walker.clear()
         self._route_map = ""  # 逼下一拍重新規劃
         if plan_route(map_name, self._goal_map, self._avoid) is None:
-            self.note = (
-                f"⚠ 從 {map_name} 找不到通往 {self._goal_map} 的路（已排除走不通的傳點）"
-            )
+            self.note = _no_route_note(map_name, self._goal_map, excluded=True)
             return "blocked"
         return "walking"
 

@@ -115,7 +115,7 @@ def is_equip(item_id: int | None) -> bool:
 
 
 @lru_cache(maxsize=1)
-def _warp_table() -> dict[str, list]:
+def _warp_file() -> dict:
     try:
         with gzip.open(_WARP_TABLE, "rt", encoding="utf-8") as handle:
             return json.load(handle)
@@ -124,8 +124,22 @@ def _warp_table() -> dict[str, list]:
         return {}
 
 
+def _warp_table() -> dict[str, list]:
+    """走過去就會傳送的那些。
+
+    v2 之後檔案分成 `walk`／`npc` 兩份；v1 是一個扁平的 {地圖: [...]}，
+    那時候只收得到「走得過去」的，所以整份就等於 walk。
+    """
+    data = _warp_file()
+    return data.get("walk", data) if "walk" in data else data
+
+
+def _npc_table() -> dict[str, list]:
+    return _warp_file().get("npc", {})
+
+
 def warps_on_map(map_name: str) -> list[tuple[int, int, str, int, int]]:
-    """這張地圖上的傳點：(x, y, 目的地圖, 目的x, 目的y)。
+    """這張地圖上**走過去就會傳送**的傳點：(x, y, 目的地圖, 目的x, 目的y)。
 
     來源是客戶端導航資料 `navi_link_tw.lub`（見 `tools/build_warp_table.py`）。
     查不到回空清單 —— 呼叫端要自己安全退化，不要亂走。
@@ -133,6 +147,21 @@ def warps_on_map(map_name: str) -> list[tuple[int, int, str, int, int]]:
     return [
         (int(r[0]), int(r[1]), str(r[2]), int(r[3]), int(r[4]))
         for r in _warp_table().get(map_name, [])
+        if len(r) >= 5
+    ]
+
+
+def npc_links_on_map(map_name: str) -> list[tuple[int, int, str, int, int, str]]:
+    """這張地圖上**要跟 NPC 講話**才過得去的連結，最後一欄是 NPC 名字。
+
+    ⚠ 這些**不能拿去自動走** —— 走到那一格不會發生任何事，要對話（船夫、
+    傳送師、告示牌），有的還要付錢。它只有一個用途：算不出路線時**說清楚
+    為什麼**（「izlu2dun 的船員可以送你回 izlude」），而不是丟一句「找不到」。
+    """
+    return [
+        (int(r[0]), int(r[1]), str(r[2]), int(r[3]), int(r[4]),
+         str(r[5]) if len(r) > 5 else "")
+        for r in _npc_table().get(map_name, [])
         if len(r) >= 5
     ]
 

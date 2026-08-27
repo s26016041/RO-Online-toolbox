@@ -248,3 +248,67 @@ def test_wrong_warp_self_heals_by_replanning_from_where_we_are(fake_warps):
     assert traveler.update("dead_end", (50, 50)) == "walking"
     assert [h.to_map for h in traveler.route] == ["a", "b", "c"]
     assert walker.paths[-1][-1] == (6, 6)  # dead_end 上回 a 的傳點
+
+
+# ---- 要跟 NPC 講話才過得去的連結 ------------------------------------------
+
+
+def test_npc_links_are_not_walkable_routes(monkeypatch):
+    """⚠ NPC 連結**不准**放進 plan_route。走到那一格什麼都不會發生 ——
+    放進去的話 bot 會走過去然後站在那裡等到天荒地老。"""
+    from ro_toolbox.services import travel as mod
+
+    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
+    monkeypatch.setattr(
+        mod, "npc_links_on_map",
+        lambda m: [(108, 27, "izlude", 195, 210, "船員")] if m == "izlu2dun" else [],
+    )
+    assert mod.plan_route("izlu2dun", "izlude") is None
+
+
+def test_why_no_route_names_the_npc(monkeypatch):
+    """算不出路的時候要講得出**卡在哪個 NPC** —— 不然使用者看到的是
+    「遊戲裡箭頭好好的，你卻說找不到」（實測回報）。"""
+    from ro_toolbox.services import travel as mod
+
+    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
+    monkeypatch.setattr(
+        mod, "npc_links_on_map",
+        lambda m: [(108, 27, "izlude", 195, 210, "船員")] if m == "izlu2dun" else [],
+    )
+    assert mod.why_no_route("izlu2dun", "izlude") == (
+        "izlu2dun", 108, 27, "izlude", "船員"
+    )
+    note = mod._no_route_note("izlu2dun", "izlude")
+    assert "船員" in note and "izlu2dun (108,27)" in note
+
+
+def test_why_no_route_returns_none_when_there_is_really_no_way(monkeypatch):
+    """就算把 NPC 連結也算進去還是到不了 —— 那才是真的沒路，別亂指人。"""
+    from ro_toolbox.services import travel as mod
+
+    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
+    monkeypatch.setattr(mod, "npc_links_on_map", lambda _m: [])
+    assert mod.why_no_route("izlu2dun", "geffen") is None
+    assert "找不到通往 geffen 的路" in mod._no_route_note("izlu2dun", "geffen")
+
+
+def test_the_shipped_table_has_both_kinds():
+    """實際打包的資產要真的分成兩種 —— 舊版只收型別 200，丟掉 883 條（約 20%），
+    症狀就是島嶼／地城這種靠船進出的地圖算不出任何路線。"""
+    from ro_toolbox.services.gamedata import npc_links_on_map, warps_on_map
+
+    assert warps_on_map("izlu2dun") == [(108, 83, "iz_dun00", 168, 168)]
+    npc = npc_links_on_map("izlu2dun")
+    assert npc and npc[0][2] == "izlude", f"應該有一條搭船回 izlude，實際 {npc}"
+    assert npc[0][5], "NPC 名字要留著，訊息要講得出去找誰"
+
+
+def test_izlu2dun_to_geffen_explains_the_boat():
+    """使用者實際踩到的那一條：人在拜倫島，要去 geffen。"""
+    from ro_toolbox.services import travel as mod
+
+    assert mod.plan_route("izlu2dun", "geffen") is None, "船那段不該自動走"
+    note = mod._no_route_note("izlu2dun", "geffen")
+    assert "船員" in note and "izlude" in note
+

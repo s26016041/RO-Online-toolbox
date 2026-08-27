@@ -7,12 +7,36 @@ r"""從 RODATA 抽出傳點表（哪張地圖的哪一格會傳到哪裡）。
 
 欄位是實測反推的，用 abbey01 與 prt_fild00 交叉驗證：
 
-    [1] 地圖名   [2] 連結編號  [3] 型別(200=傳點)  [4] NPC 編號(99999)
+    [1] 地圖名   [2] 連結編號  [3] 型別  [4] NPC 編號
     [5] 連結代號 [6] （空字串）[7] x  [8] y  [9] 目的地圖  [10] 目的 x  [11] 目的 y
 
     ['prt_fild00', 17738, 200, 99999, '00b-04c', '', 165, 18, 'prt_fild04', 158, 384]
 
-輸出 assets/warps.json.gz：{"prt_fild00": [[165, 18, "prt_fild04", 158, 384], ...]}
+## ⚠ 分兩種：走過去會傳送的，跟要跟 NPC 講話的
+
+判準是 **NPC 編號**，不是型別（實測 2026-08-27，4514 列）：
+
+| 型別 | 筆數 | NPC=99999 | 例子 |
+|---|---|---|---|
+| 200 | 3630 | 全部 | 一般傳點 |
+| 201 | 695 | 0 | 告示牌、分流移動器 |
+| 204 | 143 | 0 | 船夫、船員 |
+| 205 | 45 | 21 | 飛空艇內部通道（21 條）／其餘要對話 |
+
+**`npc == 99999` 就是走過去自動傳送，其他都要對話。** 用型別當判準會漏掉
+型別 205 裡那 21 條真的能走的。
+
+舊版只收型別 200，於是**丟掉 883 條連結**（約 20%）—— 症狀是從島嶼／地城
+這種只靠船進出的地圖算不出任何路線，使用者回報「遊戲裡正常，你卻說找不到」。
+izlu2dun（拜倫島）就是這樣：只有一條往地城的傳點，回 izlude 要搭船。
+
+輸出 assets/warps.json.gz：
+
+    {"version": 2,
+     "walk": {"prt_fild00": [[165, 18, "prt_fild04", 158, 384], ...]},
+     "npc":  {"izlu2dun":   [[108, 27, "izlude", 195, 210, "船員"], ...]}}
+
+`walk` 給自動尋路走；`npc` 只用來**講清楚為什麼過不去**（我們不會跟 NPC 對話）。
 
 用途：伺服器只在**登入**和**換地圖**時推整份背包清單，而背包的
 「格號 → 道具編號」記憶體裡沒有（[MEM-020]）。有了這張表就能自己走去傳點
@@ -33,7 +57,10 @@ from lub_convert import convert as lub_to64  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "assets" / "warps.json.gz"
 
-_WARP_TYPE = 200
+#: NPC 編號等於這個 = 沒有 NPC，走過去就會傳送。其他都要跟 NPC 講話。
+_NO_NPC = 99999
+#: 這一版的輸出格式。讀取端拿它分辨新舊。
+_VERSION = 2
 
 
 def _find_navi() -> Path:
@@ -76,11 +103,12 @@ def main() -> int:
     rows = load_links(path)
     print(f"navi_link 共 {len(rows):,} 列")
 
-    warps: dict[str, list] = {}
+    walk: dict[str, list] = {}
+    npc: dict[str, list] = {}
     skipped = 0
     for row in rows:
-        # 欄位不到 11 個或型別不是傳點就跳過 —— 版面變了要看得出來，不要默默算錯
-        if len(row) < 11 or row[2] != _WARP_TYPE:
+        # 欄位不到 11 個就跳過 —— 版面變了要看得出來，不要默默算錯
+        if len(row) < 11:
             skipped += 1
             continue
         source, x, y, dest, dx, dy = row[0], row[6], row[7], row[8], row[9], row[10]
@@ -90,17 +118,32 @@ def main() -> int:
         if not all(isinstance(v, (int, float)) for v in (x, y, dx, dy)):
             skipped += 1
             continue
-        warps.setdefault(source, []).append([int(x), int(y), dest, int(dx), int(dy)])
+        if source == "NULL" or not dest:
+            skipped += 1          # 資料尾端有一列 NULL 佔位
+            continue
+        entry = [int(x), int(y), dest, int(dx), int(dy)]
+        if row[3] == _NO_NPC:
+            walk.setdefault(source, []).append(entry)
+        else:
+            # NPC 名字給使用者看（「去找 izlu2dun 的船員」），不是拿來自動化的
+            name = row[4] if isinstance(row[4], str) else ""
+            npc.setdefault(source, []).append([*entry, name])
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
     with gzip.open(OUT, "wt", encoding="utf-8") as handle:
-        json.dump(warps, handle, ensure_ascii=False, separators=(",", ":"))
+        json.dump({"version": _VERSION, "walk": walk, "npc": npc},
+                  handle, ensure_ascii=False, separators=(",", ":"))
 
-    total = sum(len(v) for v in warps.values())
-    print(f"傳點 {total:,} 個，分佈在 {len(warps):,} 張地圖（跳過 {skipped:,} 列非傳點）")
-    for name in ("prt_fild00", "prontera", "moc_fild01"):
-        if name in warps:
-            print(f"  {name}：{len(warps[name])} 個，例 {warps[name][0]}")
+    walk_n = sum(len(v) for v in walk.values())
+    npc_n = sum(len(v) for v in npc.values())
+    print(f"走過去就傳送 {walk_n:,} 條（{len(walk):,} 張圖）")
+    print(f"要跟 NPC 講話 {npc_n:,} 條（{len(npc):,} 張圖）—— 只用來解釋為什麼過不去")
+    print(f"跳過 {skipped:,} 列（欄位不合或佔位列）")
+    for name in ("prt_fild00", "prontera", "izlu2dun"):
+        if name in walk:
+            print(f"  {name} 走的：{len(walk[name])} 條，例 {walk[name][0]}")
+        if name in npc:
+            print(f"  {name} 要對話：{len(npc[name])} 條，例 {npc[name][0]}")
     print(f"輸出：{OUT}（{OUT.stat().st_size / 1024:.0f} KB）")
     return 0
 
