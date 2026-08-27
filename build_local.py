@@ -93,6 +93,16 @@ def build(debug: bool = False) -> Path | None:
         return None
     print(f"\n✓ 編譯完成：{exe}"
           f"（{exe.stat().st_size / 1048576:.0f} MB，花了 {time.monotonic() - started:.0f} 秒）")
+
+    # ⚠ **一定要簽。** 未簽章的 exe 會被 GameGuard 擋掉大量記憶體讀取
+    # （錯誤碼 5，見 GAMEDATA [ENV-006]）—— 程式看起來會動，但讀不到角色、
+    # 讀不到背包，而那個症狀完全不像「忘了簽」。簽不成就不要交出去。
+    sys.path.insert(0, str(ROOT / "tools"))
+    from sign_exe import sign  # noqa: PLC0415
+
+    if not sign(exe):
+        print("✗ 簽章失敗 —— 這顆 exe 讀不到遊戲，不要用它。")
+        return None
     return exe
 
 

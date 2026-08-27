@@ -1,0 +1,355 @@
+/* RO Online Toolbox — 深色主題 */
+
+QWidget {
+    background-color: #16191f;
+    color: #d7dce3;
+    font-family: "Microsoft JhengHei UI", "Segoe UI", sans-serif;
+    /* ⚠ 這一行用**點數**不是 px。用 px 的話 QFont.pointSize() 會是 -1，
+       Windows 上每開一次下拉選單 Qt 就印一行
+       「QFont::setPointSize: Point size <= 0 (-1)」——
+       只是警告不會壞掉，但使用者兩次把它當成當機回報。
+       9.75pt 跟 13px 量出來**完全一樣**（高 16px、同一串字寬 154px），
+       所以畫面沒有任何變化。要改大小請照著改點數，不要換回 px。 */
+    font-size: 9.75pt;
+}
+
+QMainWindow::separator {
+    background: #23272f;
+    height: 1px;
+}
+
+/* ---- 側欄 ---- */
+QListWidget#sidebar {
+    background-color: #101318;
+    border: none;
+    border-right: 1px solid #23272f;
+    padding: 8px 6px;
+    outline: 0;
+}
+
+QListWidget#sidebar::item {
+    padding-left: 14px;
+    border-radius: 6px;
+    color: #98a2b3;
+}
+
+QListWidget#sidebar::item:hover {
+    background-color: #1c2028;
+    color: #d7dce3;
+}
+
+QListWidget#sidebar::item:selected {
+    background-color: #26303f;
+    color: #ffffff;
+}
+
+/* ---- 頁面 ---- */
+QLabel#pageTitle {
+    font-size: 20px;
+    font-weight: 600;
+    color: #f1f5f9;
+}
+
+QLabel#pageSubtitle {
+    color: #8b95a5;
+}
+
+QLabel#placeholder {
+    color: #6b7480;
+    border: 1px dashed #2c313a;
+    border-radius: 8px;
+    padding: 28px;
+}
+
+/* ---- 按鈕 ---- */
+QPushButton {
+    background-color: #232935;
+    border: 1px solid #313846;
+    border-radius: 6px;
+    padding: 7px 18px;
+}
+
+QPushButton:hover  { background-color: #2c3444; }
+QPushButton:pressed { background-color: #1d2330; }
+QPushButton:disabled {
+    color: #5a626e;
+    background-color: #1b1f27;
+    border-color: #262b34;
+}
+
+QPushButton#primaryButton {
+    background-color: #2f6feb;
+    border-color: #3b7bf5;
+    color: #ffffff;
+    font-weight: 600;
+}
+
+QPushButton#primaryButton:hover  { background-color: #3b7bf5; }
+QPushButton#primaryButton:pressed { background-color: #2559c4; }
+
+/* ---- 日誌面板 ---- */
+QDockWidget {
+    titlebar-close-icon: none;
+    color: #98a2b3;
+}
+
+QDockWidget::title {
+    background: #101318;
+    padding: 6px 10px;
+    border-top: 1px solid #23272f;
+}
+
+QPlainTextEdit#logView {
+    background-color: #0d1015;
+    border: none;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+    padding: 6px;
+}
+
+/* ---- 選單 / 狀態列 ---- */
+QMenuBar {
+    background-color: #101318;
+    border-bottom: 1px solid #23272f;
+}
+
+QMenuBar::item:selected { background: #26303f; }
+
+QMenu {
+    background-color: #1a1e26;
+    border: 1px solid #2c313a;
+}
+
+QMenu::item:selected { background-color: #26303f; }
+
+QStatusBar {
+    background-color: #101318;
+    border-top: 1px solid #23272f;
+    color: #8b95a5;
+}
+
+/* ---- 捲軸 ---- */
+QScrollBar:vertical {
+    background: transparent;
+    width: 10px;
+    margin: 0;
+}
+
+QScrollBar::handle:vertical {
+    background: #333a46;
+    border-radius: 5px;
+    min-height: 24px;
+}
+
+QScrollBar::handle:vertical:hover { background: #414a59; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: none; }
+
+/* ---- 提示條 ---- */
+QLabel#notice {
+    background-color: #3a2a15;
+    border: 1px solid #6b4a1d;
+    border-radius: 6px;
+    color: #e8c07d;
+    padding: 9px 12px;
+}
+
+/* ---- 下拉選單 ---- */
+QComboBox {
+    background-color: #1b202a;
+    border: 1px solid #2f3644;
+    border-radius: 5px;
+    padding: 5px 10px;
+}
+
+QComboBox:hover { border-color: #3d4757; }
+QComboBox:disabled { color: #5a626e; background-color: #171a21; }
+QComboBox::drop-down { border: none; width: 20px; }
+/* Qt 只要在 QSS 裡動過 ::drop-down，就不再畫預設的下拉箭頭 ——
+   實測（離屏算像素）：那一格原本只有邊框，一個箭頭都沒有。
+   用 border 疊三角形的老招在 Qt 裡會變成一條橫槓（實測 8x5 的實心方塊），
+   所以改用真的圖檔。`@RESOURCES@` 由 app.py 換成絕對路徑 ——
+   QSS 的 url() 是相對於**工作目錄**，不是相對於 qss 檔，寫死相對路徑會失效。 */
+QComboBox::down-arrow {
+    image: url(@RESOURCES@/arrow-down-dark.svg);
+    width: 10px;
+    height: 6px;
+    margin-right: 6px;
+}
+
+QLineEdit:read-only { color: #79828f; background-color: #171a21; }
+
+QComboBox QAbstractItemView {
+    background-color: #1b202a;
+    border: 1px solid #2f3644;
+    selection-background-color: #26303f;
+    outline: 0;
+}
+
+/* ---- 核取方塊 ---- */
+QCheckBox { spacing: 7px; }
+QCheckBox::indicator {
+    width: 15px;
+    height: 15px;
+    border: 1px solid #3a4252;
+    border-radius: 3px;
+    background: #1b202a;
+}
+QCheckBox::indicator:checked {
+    background: #2f6feb;
+    border-color: #3b7bf5;
+}
+
+/* ---- 封包列表 ---- */
+QTableView {
+    background-color: #12151b;
+    alternate-background-color: #161a21;
+    border: 1px solid #23272f;
+    border-radius: 6px;
+    gridline-color: #1f242d;
+    selection-background-color: #26303f;
+    selection-color: #ffffff;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+}
+
+QTableView::item { padding: 3px 6px; }
+
+QHeaderView::section {
+    background-color: #1a1e26;
+    border: none;
+    border-right: 1px solid #23272f;
+    border-bottom: 1px solid #23272f;
+    color: #98a2b3;
+    padding: 6px 8px;
+}
+
+/* ---- Hex 檢視 ---- */
+QPlainTextEdit#hexView {
+    background-color: #0d1015;
+    border: 1px solid #23272f;
+    border-radius: 6px;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+    padding: 8px;
+}
+
+QSplitter::handle { background: #23272f; height: 4px; }
+QSplitter::handle:hover { background: #2f6feb; }
+
+/* ---- 資訊條（說明能力邊界，非警告）---- */
+QLabel#infoBar {
+    background-color: #16283a;
+    border: 1px solid #27455f;
+    border-radius: 6px;
+    color: #8fb8d8;
+    padding: 9px 12px;
+}
+
+/* ---- 進度條 ---- */
+QProgressBar {
+    background-color: #1b202a;
+    border: 1px solid #2f3644;
+    border-radius: 5px;
+    text-align: center;
+    color: #d7dce3;
+    font-size: 11px;
+}
+
+QProgressBar::chunk {
+    background-color: #2f6feb;
+    border-radius: 4px;
+}
+
+QProgressBar#hpBar::chunk { background-color: #47a05f; }
+QProgressBar#spBar::chunk { background-color: #4c8dd9; }
+
+/* ---- 經驗條：細銀條（深色主題用亮一階的銀）---- */
+QLabel#expHead {
+    font-weight: 600;
+    color: #e6ebf2;
+}
+
+QLabel#expValue {
+    font-size: 11px;
+    color: #9aa4b2;
+}
+
+QProgressBar#baseBar,
+QProgressBar#jobBar {
+    background-color: #1b202a;
+    border: 1px solid #2f3644;
+    border-radius: 3px;
+    min-height: 6px;
+    max-height: 6px;
+    padding: 0px;
+}
+
+QProgressBar#baseBar::chunk {
+    border-radius: 2px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #f0f4fa, stop:0.35 #c3cedd, stop:0.6 #8f9db2, stop:1 #b7c3d3);
+}
+
+QProgressBar#jobBar::chunk {
+    border-radius: 2px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #faf8f4, stop:0.35 #d8d2c8, stop:0.6 #a49d93, stop:1 #c9c2b8);
+}
+
+/* ---- 卡片標題 ---- */
+QLabel#cardTitle {
+    font-size: 16px;
+    font-weight: 600;
+    color: #f1f5f9;
+}
+
+/* ---- 自動掛機的角色分頁 ---- */
+QTabWidget#farmTabs::pane {
+    border: 1px solid #23272f;
+    border-radius: 6px;
+    background: #12151b;
+    top: -1px;
+}
+
+QTabBar::tab {
+    background: #1a1e26;
+    border: 1px solid #23272f;
+    border-bottom: none;
+    border-top-left-radius: 6px;
+    border-top-right-radius: 6px;
+    padding: 6px 16px;
+    margin-right: 2px;
+    color: #98a2b3;
+}
+
+QTabBar::tab:hover { background: #222731; }
+
+QTabBar::tab:selected {
+    background: #12151b;
+    color: #ffffff;
+    font-weight: 600;
+}
+
+/* ---- 輸入框（補齊，與 light 對應）---- */
+QLineEdit {
+    background-color: #1b202a;
+    border: 1px solid #2f3644;
+    border-radius: 5px;
+    padding: 5px 10px;
+    color: #d7dce3;
+}
+QLineEdit:focus { border-color: #2f6feb; }
+QLineEdit:disabled { color: #5a626e; background-color: #171a21; }
+
+QTableWidget {
+    background-color: #12151b;
+    alternate-background-color: #161a21;
+    border: 1px solid #23272f;
+    border-radius: 6px;
+    gridline-color: #1f242d;
+    selection-background-color: #26303f;
+    selection-color: #ffffff;
+    font-family: Consolas, "Cascadia Mono", monospace;
+    font-size: 12px;
+}
