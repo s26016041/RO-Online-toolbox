@@ -30,6 +30,11 @@ SITES = 1200             # 註冊點數量（要 > 1000 才過得了基準檢查
 SITE_START = 0xC000
 
 
+#: 選角游標與角色名字這兩個全域在合成快照裡的位址（都在模組範圍內）。
+CURSOR = MODULE + 0x11D096A
+CHAR_NAME = MODULE + 0x11DA498
+
+
 def _text() -> bytes:
     """組一段假的 .text：背包骨架 + 解析函式 + 一堆封包註冊點。"""
     out = bytearray(TEXT_SIZE)
@@ -65,6 +70,28 @@ def _text() -> bytes:
         out[at : at + len(chunk)] = chunk
         struct.pack_into("<i", out, at + len(chunk), REGISTER - (at + len(chunk) + 4))
         at += len(chunk) + 4
+    # --- 選角畫面的兩個全域（自動選角的眼睛）---
+    # 游標：三種骨架各放一份，答案都指向同一個位址；
+    # 名字：一段對 0x40 bytes 做 xor 的迴圈，骨架裡三個立即值也指同一個位址。
+    cursor_sites = (
+        bytes([0x0F, 0xB6, 0x05]) + struct.pack("<I", CURSOR)
+        + bytes([0x50, 0x6A, 0x08, 0xFF, 0x15]),
+        bytes([0x0F, 0xB6, 0x0D]) + struct.pack("<I", CURSOR)
+        + bytes([0x8B, 0x87, 0x18, 0x01, 0x00, 0x00, 0x80, 0x3C, 0x01, 0x01]),
+        bytes([0x88, 0x0D]) + struct.pack("<I", CURSOR)
+        + bytes([0x8B, 0x8E, 0x34, 0x01, 0x00, 0x00, 0x85, 0xC9]),
+    )
+    name_site = (
+        bytes([0x8A, 0x8C, 0x02]) + struct.pack("<I", CHAR_NAME)
+        + bytes([0x30, 0x88]) + struct.pack("<I", CHAR_NAME)
+        + bytes([0x40, 0x83, 0xF8, 0x40, 0x72, 0xED])
+        + bytes([0xB8]) + struct.pack("<I", CHAR_NAME) + bytes([0xC3])
+    )
+    at += 0x40
+    for chunk in (*cursor_sites, name_site):
+        out[at : at + len(chunk)] = chunk
+        at += len(chunk) + 0x20
+
     assert at < TEXT_SIZE, "註冊點放不下"
     assert base + SKELETON  # base 只是為了說明位址關係
     return bytes(out)
@@ -84,6 +111,9 @@ def _snapshot() -> vs.Snapshot:
     head[e_lfanew : e_lfanew + 4] = b"PE\x00\x00"
     struct.pack_into("<H", head, e_lfanew + 6, 1)          # NumberOfSections
     struct.pack_into("<H", head, e_lfanew + 20, opt_size)  # SizeOfOptionalHeader
+    # 可選標頭 +56 是 SizeOfImage。定位全域時要靠它判斷「這個立即值是不是
+    # 模組自己的位址」（見 aob.image_size），少了它整條會退成安全預設。
+    struct.pack_into("<I", head, e_lfanew + 24 + 56, 0x2000000)
     head[sect_off : sect_off + 8] = b".text\x00\x00\x00"
     struct.pack_into("<II", head, sect_off + 8, TEXT_SIZE, TEXT_RVA)
     struct.pack_into("<I", head, sect_off + 36, 0x20000000)  # MEM_EXECUTE

@@ -17,26 +17,24 @@ from PySide6.QtWidgets import (
 from ro_toolbox import APP_NAME, __version__
 from ro_toolbox.config.settings import AppSettings, save_settings
 from ro_toolbox.core.events import EngineState
-from ro_toolbox.ui.pages.automation_page import AutomationPage
+from ro_toolbox.ui.pages.account_page import AccountPage
 from ro_toolbox.ui.pages.base_page import BasePage
-from ro_toolbox.ui.pages.dashboard_page import DashboardPage
 from ro_toolbox.ui.pages.farm_page import FarmPage
 from ro_toolbox.ui.pages.memory_page import MemoryPage
 from ro_toolbox.ui.pages.packet_page import PacketPage
-from ro_toolbox.ui.pages.settings_page import SettingsPage
 from ro_toolbox.ui.widgets.log_view import LogView
 from ro_toolbox.ui.widgets.sidebar import Sidebar
 from ro_toolbox.utils.logging import LogBridge
 
 log = logging.getLogger(__name__)
 
+# 只留真的有實作的頁面。總覽／自動化／設定原本都只是 QLabel 佔位符，
+# 留著只會讓人以為有功能。
 PAGE_CLASSES: list[type[BasePage]] = [
-    DashboardPage,
+    AccountPage,
     PacketPage,
     MemoryPage,
     FarmPage,
-    AutomationPage,
-    SettingsPage,
 ]
 
 

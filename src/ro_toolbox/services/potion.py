@@ -26,7 +26,7 @@ from ro_toolbox.core.ro_protocol import build_use_item
 from ro_toolbox.services import bag, game_socket
 from ro_toolbox.services.character import CharacterReader
 from ro_toolbox.services.gamedata import item_name
-from ro_toolbox.services.pcap_capture import PcapCapture
+from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
 
 log = logging.getLogger(__name__)
@@ -34,8 +34,28 @@ log = logging.getLogger(__name__)
 _TICK = 0.05          # 主迴圈間隔
 _ACK_TIMEOUT = 0.7    # 送出後等「數量少一個」最久多久
 _ACK_POLL = 0.01      # 確認數量的輪詢間隔
+#: 找遊戲 socket 最多重試多久。剛登入／剛換地圖的那幾秒複製不到是**正常過渡**，
+#: 不是故障 —— `auto_login` 早就是這樣等的（見它的 `_PIN_SOCKET_TIMEOUT`）。
+_SOCKET_WAIT_SEC = 10.0
+_SOCKET_POLL = 0.3
+#: 連喝時，等「那一格數量真的少一個」最多等多久。
+#:
+#: 這遊戲的藥水**沒有冷卻**（[MEM-021] 實測 12 秒喝掉 58 瓶），而且一瓶可能只補
+#: 一點點 —— 低於門檻時要**連續喝到過線**。但「不等確認就狂送」會多灌：
+#: 背包數量還沒更新，就一直看到「還有 N 瓶」（測試抓到：背包 2 瓶送了 27 次）。
+#:
+#: 所以還是等，只是**改等更便宜的訊號**：記憶體裡那一格的數量少一個
+#: （讀一格 0.007 ms），而不是等封包的使用回應（那條路要等到 0.7 秒逾時）。
+_BURST_ACK_SEC = 0.5
+_BURST_POLL = 0.01
+#: 一輪連喝最多幾瓶。純粹是保險 —— 正常情況幾瓶就過線了。
+_BURST_MAX = 25
 _MAX_MISS = 3         # 連續幾次沒喝到就停用
 _RESYNC_SEC = 2.0     # 多久檢查一次換地圖／換頻道
+#: 背包串列走不通時，最快多久才重新定位一次。
+#: 重新定位要跑一次 AOB 掃描（約 0.1 秒），而確認「有沒有喝到」是 10 ms 輪詢 ——
+#: 沒有這條限流，綁定壞掉的當下會變成一串 0.1 秒的重掃把輪詢整個塞住。
+_RELOCATE_SEC = 1.0
 _BAG_SEC = 1.0        # 多久重讀一次背包（一次約 0.1 秒）
 #: 使用道具的伺服器回應。payload = 索引(2)+道具ID(4)+AID(4)+剩餘數量(2)+結果(1)
 #: 出處 GAMEDATA [PKT-036]（實機擷取核對過）。這是**權威**確認來源：
@@ -98,12 +118,16 @@ class PotionBot:
         self._reader: CharacterReader | None = None
         self._bag: dict[int, tuple[int, int]] = {}   # 格號 → (道具編號, 數量)
         self._bag_at = 0.0
+        self._watch: bag.BagWatch | None = None      # 綁定過的背包串列（快路徑）
+        self._locate_at = 0.0                       # 上次重新定位背包的時間
+        self._burst_t0 = 0.0                        # 這一輪連喝的實測用計時
+        self._burst_n = 0
         self._sock: int | None = None
         self._server: tuple[str, int] | None = None
         self._aid = 0
         self._resync_at = 0.0
         self._miss = 0
-        self._capture: PcapCapture | None = None
+        self._capture: PacketCapture | None = None
         self._character = ""
         self._ack_lock = threading.Lock()
         # {格號: (序號, 道具編號, 剩餘數量, 結果)}
@@ -165,16 +189,9 @@ class PotionBot:
             self._cleanup()
 
     def _setup(self) -> bool:
-        server = find_server(self._pid)
-        if server is None:
-            self._fail("找不到伺服器連線（還沒登入？）")
-            return False
-        sock = game_socket.find_game_socket(self._pid, server[0], server[1])
-        if not sock:
-            self._fail("找不到遊戲 socket，無法送封包")
-            return False
-        self._sock, self._server = sock, server
-
+        # ⚠ **先定位角色，再找 socket。** 順序刻意反過來：角色一定位好就有名字，
+        # 之後每一條失敗訊息才講得出是哪一隻 —— 多開的時候，
+        # 一行「找不到遊戲 socket」根本分不出是誰失敗（使用者實際回報）。
         reader = CharacterReader()
         if not reader.attach(self._pid, should_stop=self._stop.is_set):
             self._fail("角色定位失敗")
@@ -185,16 +202,25 @@ class PotionBot:
             self._fail("讀不到角色 AID，無法送使用道具封包")
             return False
         self._aid = status.aid
-
         self._character = status.name or ""
+
+        sock, server = self._wait_for_socket()
+        if sock is None:
+            self._fail(
+                f"{_SOCKET_WAIT_SEC:.0f} 秒內找不到遊戲 socket，無法送封包"
+                if server is not None else "找不到伺服器連線（還沒登入？）"
+            )
+            return False
+        self._sock, self._server = sock, server
+
         self._refresh_bag(force=True)
         if not self._bag:
             self._fail("讀不到背包（AOB 定位失敗），自動補水停用")
             return False
 
-        capture = PcapCapture(self._pid, self._on_packet)
+        capture = PacketCapture(self._pid, self._on_packet)
         if not capture.start():
-            self._fail("開不了封包擷取（需要 Npcap 與系統管理員），無法確認有沒有喝到")
+            self._fail("開不了封包擷取（需要系統管理員），無法確認有沒有喝到")
             return False
         self._capture = capture
         self._note("待命中")
@@ -241,14 +267,41 @@ class PotionBot:
             return got[1], got[2], got[3]
 
     def _refresh_bag(self, force: bool = False) -> None:
-        """重讀背包。0.1 秒左右，每 _BAG_SEC 讀一次就夠即時。"""
+        """重讀背包。走的是 `BagWatch` 的快路徑（一次不到 1 ms）。"""
         now = time.monotonic()
         if not force and now - self._bag_at < _BAG_SEC:
             return
         self._bag_at = now
-        fresh = bag.as_dict(self._pid)
+        fresh = self._read_bag()
         if fresh:
             self._bag = fresh
+
+    def _read_bag(self) -> dict[int, tuple[int, int]]:
+        """讀背包，優先走已綁定的串列。
+
+        為什麼不直接用 `bag.as_dict()`：它每次都重跑 AOB 掃描加 2048 個偏移的
+        試走（約 0.1 秒）。喝水每一瓶都要現查格號（[MEM-028]），用它等於
+        每瓶多花 0.1 秒。綁定過的串列只重走幾十個節點。
+
+        ⚠ 綁定會過期（換地圖、背包重新配置），所以走不通就**重新定位一次**，
+        不是拿舊資料硬撐。兩條都失敗才回空的 —— 呼叫端會大聲停用。
+        """
+        if self._watch is not None:
+            rows = self._watch.snapshot()
+            if rows:
+                return rows
+            log.info("背包串列走不通了，重新定位")
+            self._watch.close()
+            self._watch = None
+        now = time.monotonic()
+        if now - self._locate_at < _RELOCATE_SEC:
+            return {}
+        self._locate_at = now
+        watch = bag.BagWatch(self._pid)
+        if not watch.open():
+            return {}
+        self._watch = watch
+        return watch.snapshot()
 
     def _slot_of(self, item_id: int | None) -> int | None:
         """那個道具現在在第幾格。**每次都現查** —— 格號會挪動（[MEM-028]）。"""
@@ -284,9 +337,14 @@ class PotionBot:
             if self._cfg.wants_hp() and status.hp_percent < self._cfg.hp_percent:
                 if not self._drink(self._cfg.hp_item, "HP", status.hp_percent):
                     return
+                # 第一瓶已經確認喝到「對的道具」了，後面就用連喝快路徑衝到過線
+                if not self._burst(self._cfg.hp_item, "HP"):
+                    return
                 continue  # 立刻重新判斷，不等下一拍
             if self._cfg.wants_sp() and status.sp_percent < self._cfg.sp_percent:
                 if not self._drink(self._cfg.sp_item, "SP", status.sp_percent):
+                    return
+                if not self._burst(self._cfg.sp_item, "SP"):
                     return
                 continue
 
@@ -341,6 +399,96 @@ class PotionBot:
         self._miss += 1
         self._note(f"⚠ 送了使用道具但伺服器沒回應（第 {self._miss} 次）")
         return self._maybe_give_up(slot)
+
+    def _burst(self, item_id: int | None, kind: str) -> bool:
+        """連續喝到過線。**不走封包確認那條路，改看記憶體數量。**
+
+        為什麼可以：這一輪的**第一瓶已經被 `_drink()` 同步驗證過**
+        （喝到的是不是你選的道具、伺服器有沒有拒絕）。同一輪裡道具沒變，
+        剩下的只要確認「真的喝掉了」就好 —— 而那件事記憶體看得到，
+        不必等封包（[MEM-021] 的手法：讀那一格的數量有沒有 -1）。
+
+        為什麼要這樣：藥水沒有冷卻，一瓶可能只補一點點。一瓶等一次封包來回
+        是每秒約 5 次（使用者回報「反應有點慢」）。
+
+        ⚠ **每一瓶都要等數量真的少一個才送下一瓶。** 不等的話會多灌 ——
+        背包數量還沒更新就一直看到「還有 N 瓶」（測試抓到：2 瓶送了 27 次）。
+        血量也每一瓶之前重讀，過線立刻停。
+        """
+        if item_id is None:
+            return True
+        if self._miss:
+            # ⚠ 第一瓶其實**沒喝到**（伺服器拒絕或沒回應，`_drink()` 還在容忍
+            # 次數內所以回 True）。這種時候繼續連喝，等於繞過失敗計數狂送。
+            return True
+        want = self._cfg.hp_percent if kind == "HP" else self._cfg.sp_percent
+        try:
+            return self._burst_loop(item_id, kind, want)
+        finally:
+            self._report_rate()
+
+    def _report_rate(self) -> None:
+        """把實測的「每瓶幾毫秒」記進日誌 —— 快不快要看數字，不是看感覺。"""
+        if self._burst_n < 2:
+            return
+        span = time.monotonic() - self._burst_t0
+        log.info("連喝 %d 瓶，共 %.2f 秒（每瓶 %.0f ms）",
+                 self._burst_n, span, span / self._burst_n * 1000)
+
+    def _burst_loop(self, item_id: int, kind: str, want: float) -> bool:
+        self._burst_t0 = time.monotonic()
+        self._burst_n = 0
+        for _ in range(_BURST_MAX):
+            if self._stop.is_set():
+                return True
+            status = self._reader.read() if self._reader else None
+            if status is None:
+                return True
+            percent = status.hp_percent if kind == "HP" else status.sp_percent
+            if percent >= want:
+                return True                      # 過線了，立刻停
+
+            self._refresh_bag(force=True)        # 格號會挪動，每次現查
+            slot = self._slot_of(item_id)
+            if slot is None:
+                return self._exhausted(kind, item_id)
+            before = self._bag[slot][1]
+            if before <= 0:
+                return self._exhausted(kind, item_id)
+
+            self._send(build_use_item(slot, self._aid))
+            if not self._wait_used(slot, before):
+                # 送了卻沒少 —— 跟「送了伺服器沒回應」是同一件事，要計入
+                # 失敗次數。不計的話連喝會變成一條悶著狂送的暗路。
+                self._miss += 1
+                self._note(f"⚠ 連喝時第 {slot} 格的數量沒有減少（第 {self._miss} 次）")
+                return self._maybe_give_up(slot)
+            # ⚠ 剩幾個要**用道具編號重算**，不能看原本那一格 ——
+            # 背包會重排，那格可能只是換了位置（[MEM-028]），不是用完了。
+            self._refresh_bag(force=True)
+            left = self._left(item_id) or 0
+            self._burst_n += 1
+            self._used(kind, slot, percent, left)
+            if left <= 0:
+                return self._exhausted(kind, item_id)
+        return True
+
+    def _wait_used(self, slot: int, before: int) -> bool:
+        """等那一格的數量真的少一個。等到回 True，逾時回 False。
+
+        讀記憶體一格只要 0.007 ms，所以可以用很密的輪詢 —— 這正是它比
+        「等封包回應」快的原因。喝完最後一瓶那一格會整個消失，那也算成功。
+        """
+        deadline = time.monotonic() + _BURST_ACK_SEC
+        while time.monotonic() < deadline:
+            if self._stop.is_set():
+                return False
+            self._refresh_bag(force=True)
+            now = self._bag.get(slot)
+            if now is None or now[1] < before:
+                return True
+            self._stop.wait(_BURST_POLL)
+        return False
 
     def _maybe_give_up(self, index: int) -> bool:
         if self._miss >= _MAX_MISS:
@@ -427,21 +575,48 @@ class PotionBot:
         self._stats.note = text
         self._push()
 
+    def _wait_for_socket(self) -> tuple[int | None, tuple[str, int] | None]:
+        """找遊戲的 socket，找不到就重試到逾時。回 (socket, 伺服器端點)。
+
+        ⚠ **不能只試一次。** 剛登入、剛換地圖的那幾秒複製不到是正常的過渡
+        （`auto_login` 也是這樣等的）。試一次就放棄等於「勾下去的時機不對就整個停用」，
+        而使用者只看得到一行「找不到遊戲 socket」，看起來像壞掉。
+        """
+        deadline = time.monotonic() + _SOCKET_WAIT_SEC
+        server = None
+        while not self._stop.is_set():
+            server = find_server(self._pid) or server
+            if server is not None:
+                sock = game_socket.find_game_socket(self._pid, server[0], server[1])
+                if sock:
+                    return sock, server
+            if time.monotonic() >= deadline:
+                break
+            self._stop.wait(_SOCKET_POLL)
+        return None, server
+
     def _fail(self, text: str) -> None:
         self._stats.failed = True
         self._stats.running = False
         self._stats.note = text
-        log.warning("自動補水停用：%s", text)
+        # 訊息要講得出是**哪一隻角色**：多開的時候一行沒有身分的警告等於沒說。
+        who = f"「{self._character}」" if self._character else ""
+        log.warning("自動補水停用%s：%s", who, text)
         self._push()
 
     def _push(self) -> None:
         if self._on_update is not None:
             self._on_update(self._stats)
 
+    def _release_bag(self) -> None:
+        if self._watch is not None:
+            self._watch.close()
+            self._watch = None
+
     def _cleanup(self) -> None:
         # 收尾不能因為某一項出錯就漏掉後面的 —— 每一項都要放掉。
         for release in (self._release_capture, self._release_socket,
-                        self._release_reader):
+                        self._release_reader, self._release_bag):
             try:
                 release()
             except Exception as exc:  # noqa: BLE001 - 收尾失敗不該蓋掉真正的錯誤

@@ -62,3 +62,61 @@ def test_page_survives_its_own_timers(qtbot, monkeypatch):
     page._on_tab_changed()
     page._read_all()
     page.shutdown()
+
+
+# ---- 自動尋路 -------------------------------------------------------
+
+
+def make_card(qtbot):
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    return card
+
+
+class FakeTravelStats:
+    def __init__(self, **kw) -> None:
+        self.running = kw.get("running", True)
+        self.goal = kw.get("goal", "prt_fild08")
+        self.goal_label = kw.get("goal_label", "普隆德拉原野")
+        self.here = kw.get("here", "")
+        self.hops_left = kw.get("hops_left", 0)
+        self.note = kw.get("note", "")
+        self.arrived = kw.get("arrived", False)
+
+
+def test_travel_button_starts_released(qtbot):
+    card = make_card(qtbot)
+    assert card.auto_travel.isChecked() is False
+    assert card.auto_hunt.isEnabled() is True
+
+
+def test_travel_busy_locks_out_auto_hunt(qtbot):
+    """趕路途中不准再開自動打怪 —— 兩個都在送走路封包會互相搶目標。"""
+    card = make_card(qtbot)
+    card.set_travel_busy(True)
+    assert card.auto_hunt.isEnabled() is False
+    card.set_travel_busy(False)
+    assert card.auto_hunt.isEnabled() is True
+
+
+def test_travel_button_pops_up_when_the_bot_stops(qtbot):
+    """按鈕壓著卻沒在走 = 看起來像還在趕路，是最糟的失效方式。"""
+    card = make_card(qtbot)
+    card.auto_travel.setChecked(True)
+    card._apply_travel_stats(
+        FakeTravelStats(running=False, note="⚠ 讀不到導航目標 —— 請先在遊戲的尋路視窗設定目的地")
+    )
+    assert card.auto_travel.isChecked() is False
+    assert "讀不到導航目標" in card.travel_label.text()
+
+
+def test_travel_label_shows_where_and_how_far(qtbot):
+    card = make_card(qtbot)
+    card._apply_travel_stats(
+        FakeTravelStats(hops_left=2, note="前往 prt_fild08：還要換 2 張圖")
+    )
+    text = card.travel_label.text()
+    assert "普隆德拉原野" in text
+    assert "還要換 2 張圖" in text

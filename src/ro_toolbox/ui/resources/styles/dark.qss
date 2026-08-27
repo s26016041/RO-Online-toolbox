@@ -4,7 +4,13 @@ QWidget {
     background-color: #16191f;
     color: #d7dce3;
     font-family: "Microsoft JhengHei UI", "Segoe UI", sans-serif;
-    font-size: 13px;
+    /* ⚠ 這一行用**點數**不是 px。用 px 的話 QFont.pointSize() 會是 -1，
+       Windows 上每開一次下拉選單 Qt 就印一行
+       「QFont::setPointSize: Point size <= 0 (-1)」——
+       只是警告不會壞掉，但使用者兩次把它當成當機回報。
+       9.75pt 跟 13px 量出來**完全一樣**（高 16px、同一串字寬 154px），
+       所以畫面沒有任何變化。要改大小請照著改點數，不要換回 px。 */
+    font-size: 9.75pt;
 }
 
 QMainWindow::separator {
@@ -159,6 +165,20 @@ QComboBox {
 QComboBox:hover { border-color: #3d4757; }
 QComboBox:disabled { color: #5a626e; background-color: #171a21; }
 QComboBox::drop-down { border: none; width: 20px; }
+/* Qt 只要在 QSS 裡動過 ::drop-down，就不再畫預設的下拉箭頭 ——
+   實測（離屏算像素）：那一格原本只有邊框，一個箭頭都沒有。
+   用 border 疊三角形的老招在 Qt 裡會變成一條橫槓（實測 8x5 的實心方塊），
+   所以改用真的圖檔。`@RESOURCES@` 由 app.py 換成絕對路徑 ——
+   QSS 的 url() 是相對於**工作目錄**，不是相對於 qss 檔，寫死相對路徑會失效。 */
+QComboBox::down-arrow {
+    image: url(@RESOURCES@/arrow-down-dark.svg);
+    width: 10px;
+    height: 6px;
+    margin-right: 6px;
+}
+
+QLineEdit:read-only { color: #79828f; background-color: #171a21; }
+
 QComboBox QAbstractItemView {
     background-color: #1b202a;
     border: 1px solid #2f3644;

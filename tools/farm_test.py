@@ -65,9 +65,26 @@ def main() -> int:
                   use_memory=args.memory)
     bot.start()
 
+    # 診斷用的第二個來源：唯讀的記憶體掃描。**不影響 bot 的決策**，
+    # 只是拿來回答「明明周圍有怪，程式卻說沒有」到底是不是真的漏看。
+    # 它不碰封包，跟 bot 的擷取不衝突。
+    probe = None
+    try:
+        from ro_toolbox.services.entities import EntityScanner
+        from ro_toolbox.services.mapdata import load_terrain
+
+        probe = EntityScanner(load_terrain(status.map_name), status.map_name, view=30)
+        if not probe.open(args.pid):
+            probe = None
+    except Exception:  # noqa: BLE001 - 診斷失敗不該擋住驗收
+        probe = None
+
     track: list[tuple[float, int, int]] = []
     phases: list[str] = []  # 每個取樣點當下在做什麼：打怪／撿東西／走路
     near: list[int] = []  # 每個取樣點看得到幾隻怪
+    blind: list[int] = []  # 記憶體看得到、但 bot（封包）沒看到的怪有幾隻
+    ghost: list[int] = []  # bot 以為在、但記憶體找不到的怪有幾隻
+    probe_at = 0.0
     costs: list[float] = []  # 記憶體掃描每次花多久
     start = time.monotonic()
     while time.monotonic() - start < args.seconds:
@@ -79,11 +96,20 @@ def main() -> int:
             scanner = bot._entities  # noqa: SLF001 - 驗收腳本，要看內部計數
             if scanner is not None:
                 costs.append(scanner.last_cost)
+            # 每秒比對一次就夠（記憶體掃描不便宜）
+            if probe is not None and time.monotonic() - probe_at > 1.0:
+                probe_at = time.monotonic()
+                seen = {m.gid for m in bot._world.monsters()}  # noqa: SLF001
+                real = {e.gid for e in probe.scan(pos)}
+                blind.append(len(real - seen))
+                ghost.append(len(seen - real))
         time.sleep(_SAMPLE)
     stats = bot.stats
     world = bot._world  # noqa: SLF001 - 驗收腳本，要看內部計數
     walker_sent, walker_rejected = bot._walker.sent, bot._walker.rejected  # noqa: SLF001
     bot.stop()
+    if probe is not None:
+        probe.close()
     after = reader.read()
     reader.close()
 
@@ -130,6 +156,12 @@ def main() -> int:
     print(f"  移動封包送出 {walker_sent} 次，被伺服器忽略 {walker_rejected} 次")
     print(f"  擊殺 {stats.kills}　撿取 {stats.picked}　最後看到附近怪 {stats.monsters_near}")
     print(f"  打到空氣（座標過時）{stats.missed} 次")
+    print(f"  補送攻擊 {stats.resent} 次（接近 0 就代表補送機制幾乎沒在用）")
+    if blind:
+        print(f"  ⚠ 記憶體看得到但 bot 沒看到的怪：平均 {sum(blind)/len(blind):.2f} 隻、"
+              f"最多 {max(blind)} 隻（{sum(1 for b in blind if b)}/{len(blind)} 次取樣有漏）")
+        print(f"  ⚠ bot 以為在但記憶體找不到的怪：平均 {sum(ghost)/len(ghost):.2f} 隻、"
+              f"最多 {max(ghost)} 隻（幽靈怪：打過去會是空氣）")
     print(f"  怪物封包驗證失敗 {world.rejected} 次（一直增加代表封包版面變了）")
     if near:
         print(f"  視野內怪物：平均 {sum(near) / len(near):.1f} 隻、最多 {max(near)} 隻")

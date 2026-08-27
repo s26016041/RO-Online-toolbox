@@ -25,10 +25,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import pathlib
 import struct
 from dataclasses import dataclass
 
+from .aob import code_section
 from .memory_scan import MemoryScanner
 
 log = logging.getLogger(__name__)
@@ -37,6 +40,8 @@ log = logging.getLogger(__name__)
 _MAX_CODE = 24 << 20
 #: `mov ecx, esi ; call rel32`
 _CALL_PATTERN = b"\x8b\xce\xe8"
+#: `push imm32`。註冊點一定會推 opcode，拿它把「純粹的 mov ecx,esi; call」濾掉。
+_PUSH_IMM32 = b"\x68"
 #: 往回看多少位元組找那四個 push
 _ARGS_BACK = 0x28
 #: 註冊函式至少要被呼叫這麼多次才採信（實測 1,783 次）
@@ -57,38 +62,18 @@ class PacketInfo:
         return self.length < 0
 
 
-def _code_section(scanner: MemoryScanner) -> tuple[int, bytes] | None:
-    """讀出 Ragexe.exe 的第一個可執行區段（主程式碼）。"""
-    module = next(
-        (m for m in scanner.list_modules() if m.name.lower() == "ragexe.exe"), None
-    )
-    if module is None:
-        return None
-    head = scanner._read_bytes(module.base, 0x400)  # noqa: SLF001
-    if not head or len(head) < 0x40:
-        return None
-    e_lfanew = struct.unpack_from("<I", head, 0x3C)[0]
-    pe = scanner._read_bytes(module.base + e_lfanew, 0x120)  # noqa: SLF001
-    if not pe or len(pe) < 24:
-        return None
-    count = struct.unpack_from("<H", pe, 6)[0]
-    opt_size = struct.unpack_from("<H", pe, 20)[0]
-    table = module.base + e_lfanew + 24 + opt_size
-    for i in range(count):
-        raw = scanner._read_bytes(table + i * 40, 40)  # noqa: SLF001
-        if not raw or len(raw) < 40:
-            continue
-        vsize, vaddr = struct.unpack_from("<II", raw, 8)
-        chars = struct.unpack_from("<I", raw, 36)[0]
-        if chars & 0x20000000 and 0x1000 < vsize <= _MAX_CODE:
-            blob = scanner._read_bytes(module.base + vaddr, vsize)  # noqa: SLF001
-            if blob:
-                return module.base + vaddr, blob
-    return None
-
-
 def _register_function(base: int, blob: bytes) -> int | None:
-    """被 `mov ecx,esi ; call` 呼叫最多次的目標 = 註冊函式。"""
+    """被 `mov ecx,esi ; call` 呼叫最多次的目標 = 註冊函式。
+
+    ⚠ **只數「前面真的推了參數」的呼叫點。** `mov ecx,esi ; call` 是
+    「對 esi 這個物件呼叫方法」，滿地都是；光數它的話第二名跟第一名只差 4.9 倍
+    （實測 1785 vs 366），離「一眼看得出是哪一個」還很遠。
+    註冊點一定會先 `push <opcode>`（imm32），把這個條件加上去之後：
+
+        真的那支 1785 → 1775（只掉 0.6%），第二名 366 → 102，領先 4.9 → 17.4 倍
+
+    這不是為了讓數字好看：領先倍數就是「這條特徵有多不容易認錯人」。
+    """
     counts: dict[int, int] = {}
     start = 0
     while True:
@@ -96,6 +81,8 @@ def _register_function(base: int, blob: bytes) -> int | None:
         if k < 0 or k + 7 > len(blob):
             break
         start = k + 1
+        if _PUSH_IMM32 not in blob[max(0, k - _ARGS_BACK):k]:
+            continue
         rel = struct.unpack_from("<i", blob, k + 3)[0]
         counts[base + k + 7 + rel] = counts.get(base + k + 7 + rel, 0) + 1
     if not counts:
@@ -164,7 +151,7 @@ def extract(pid: int, scanner: MemoryScanner | None = None) -> dict[int, PacketI
         scanner = MemoryScanner()
         scanner.open(pid)
     try:
-        section = _code_section(scanner)
+        section = code_section(scanner)
         if section is None:
             log.warning("讀不到 Ragexe 的程式碼區段")
             return {}
@@ -201,3 +188,97 @@ def extract(pid: int, scanner: MemoryScanner | None = None) -> dict[int, PacketI
     finally:
         if own:
             scanner.close()
+
+
+# ---- 存檔重用 --------------------------------------------------------------
+#
+# ⚠ 為什麼要存：抽這張表要讀遊戲的程式碼區段，而**遊戲剛開的那一兩分鐘
+# GameGuard 會擋住那個讀取**（實測：剛開時抽不到，穩定後 0.8 秒就抽到 1783 筆）。
+# 偏偏擷取器最需要它的時候正是剛開機那段 —— 沒有長度表就只能「一段當一包」，
+# 黏在後面的封包全部看不到（[PKT-043]），二次密碼的 seed 就是這樣不見的。
+#
+# 這張表跟**客戶端版本**綁在一起，不會每次不同，所以抽到就存起來重用。
+# 用 exe 的大小與修改時間當鑰匙：改版換了 exe 就自動失效、重抽。
+
+
+def _cache_file():
+    from ro_toolbox.config.paths import user_data_dir
+
+    return user_data_dir() / "packet_lengths.json"
+
+
+def _exe_key(pid: int) -> str | None:
+    """用 Ragexe.exe 的大小與修改時間當鑰匙。改版就會變，自動失效。"""
+    try:
+        import psutil
+
+        path = pathlib.Path(psutil.Process(pid).exe())
+        stat = path.stat()
+        return f"{path.name}:{stat.st_size}:{int(stat.st_mtime)}"
+    except Exception as exc:  # noqa: BLE001
+        log.debug("取不到遊戲執行檔資訊：%s", exc)
+        return None
+
+
+def load_cached(pid: int) -> dict[int, PacketInfo] | None:
+    """讀出先前存好的長度表。沒有、或客戶端換版本了就回 None。"""
+    key = _exe_key(pid)
+    if key is None:
+        return None
+    try:
+        raw = json.loads(_cache_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    entry = raw.get(key)
+    if not entry:
+        return None
+    table = {
+        int(op): PacketInfo(opcode=int(op), length=info[0], header=info[1])
+        for op, info in entry.items()
+    }
+    log.info("封包長度表用存檔（%d 個 opcode，鑰匙 %s）", len(table), key)
+    return table
+
+
+def load_any_cached() -> dict[int, PacketInfo] | None:
+    """不指定行程，讀存檔裡**最後存進去的**那一份長度表。
+
+    ⚠ 這是給「遊戲沒開」的情況用的（例如不開遊戲直接跟伺服器要角色清單）——
+    那時候沒有 pid，算不出鑰匙。存檔裡通常只有一份（同一個客戶端），
+    有多份時取最後寫入的那一份。
+
+    這份表是**從實際跑過的客戶端抽出來的**，不是猜的；客戶端改版時鑰匙會變，
+    抽出來的新表會另外存一份，舊的就不會再被寫入 —— 所以「最後一份」等於「最新的」。
+    """
+    try:
+        raw = json.loads(_cache_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    key = list(raw)[-1]
+    entry = raw[key]
+    table = {
+        int(op): PacketInfo(opcode=int(op), length=info[0], header=info[1])
+        for op, info in entry.items()
+    }
+    log.info("封包長度表用存檔（沒有指定行程，取 %s，%d 個 opcode）", key, len(table))
+    return table
+
+
+def save_cached(pid: int, table: dict[int, PacketInfo]) -> None:
+    """把抽到的長度表存起來給下次用。存不了只記一筆，不影響功能。"""
+    key = _exe_key(pid)
+    if key is None or not table:
+        return
+    path = _cache_file()
+    try:
+        raw = {}
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        raw[key] = {str(op): [info.length, info.header] for op, info in table.items()}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(raw), encoding="utf-8")
+        log.info("封包長度表已存檔（%d 個 opcode）", len(table))
+    except (OSError, ValueError) as exc:
+        log.debug("存長度表失敗：%s", exc)

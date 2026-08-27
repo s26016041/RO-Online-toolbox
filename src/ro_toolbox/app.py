@@ -9,8 +9,9 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from ro_toolbox import APP_ID, APP_NAME, ORG_NAME
-from ro_toolbox.config.paths import icon_file, stylesheet_file
+from ro_toolbox.config.paths import RESOURCES_DIR, icon_file, stylesheet_file
 from ro_toolbox.config.settings import load_settings
+from ro_toolbox.services import input_helper
 from ro_toolbox.ui.main_window import MainWindow
 from ro_toolbox.utils.logging import setup_logging
 
@@ -22,7 +23,13 @@ def _apply_stylesheet(app: QApplication, theme: str) -> None:
     if not path.exists():
         log.warning("找不到樣式檔：%s", path)
         return
-    app.setStyleSheet(path.read_text(encoding="utf-8"))
+    # QSS 裡的 url() 是相對於**工作目錄**解析的，不是相對於 qss 檔案本身 ——
+    # 寫相對路徑的話，從別的目錄啟動就找不到圖（而且 Qt 不會報錯，
+    # 只會安靜地不畫）。所以在這裡換成絕對路徑。
+    sheet = path.read_text(encoding="utf-8").replace(
+        "@RESOURCES@", RESOURCES_DIR.as_posix()
+    )
+    app.setStyleSheet(sheet)
 
 
 def _claim_taskbar_identity() -> None:
@@ -121,17 +128,48 @@ def selftest() -> int:
         problems.append(f"圖示沒收進來：{icon_file()}")
     if not stylesheet_file("light").exists():
         problems.append(f"樣式表沒收進來：{stylesheet_file('light')}")
+    # 漏收箭頭圖不會有任何錯誤訊息，下拉就只是**安靜地沒有箭頭**。
+    for arrow in ("arrow-down.svg", "arrow-down-dark.svg"):
+        if not (RESOURCES_DIR / arrow).exists():
+            problems.append(f"下拉箭頭圖沒收進來：{RESOURCES_DIR / arrow}")
+
+    # 合約書按鈕的樣板。漏收的話自動登入會退回「用視窗大小算比例」——
+    # 在別的解析度或對話框被拖過之後就會點空（見 game_screen.find_agree_button）。
+    from ro_toolbox.services.game_screen import AGREE_TEMPLATE_FILE
+    if not (RESOURCES_DIR / AGREE_TEMPLATE_FILE).exists():
+        problems.append(f"合約書按鈕樣板沒收進來：{RESOURCES_DIR / AGREE_TEMPLATE_FILE}")
+
+    # WinDivert 的驅動檔漏收的話，抓封包整個不能用（自動登入的二次密碼、
+    # 角色清單全靠它），而錯誤訊息會長得像「相依沒裝好」，很難查。
+    from ro_toolbox.services import packet_capture
+    ok, why = packet_capture.available()
+    if not ok:
+        problems.append(f"封包擷取不可用：{why}")
+    else:
+        import pathlib
+
+        import pydivert
+        root = pathlib.Path(pydivert.__file__).parent
+        drivers = [p.name for p in root.rglob("*") if p.suffix.lower() in (".dll", ".sys")]
+        if not any(name.lower().endswith(".sys") for name in drivers):
+            problems.append(f"WinDivert 驅動沒收進來（{root}）")
 
     for line in problems:
         print(f"[NG] {line}")
     if problems:
         return 1
-    print(f"[OK] 分頁 {pages} 個、道具表、怪物表、圖示、樣式表都在")
+    print(f"[OK] 分頁 {pages} 個、道具表、怪物表、圖示、樣式表、下拉箭頭、"
+          "同意按鈕樣板、WinDivert 都在")
     return 0
 
 
 def run(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv
+    # ⚠ 這一支要在**建 Qt 之前**攔下來：所有送進遊戲的輸入都由它執行。
+    # 為什麼要獨立行程：啟動遊戲的那個行程送出第一個輸入之後就會被封鎖
+    #（實測，見 services/input_helper 的說明）。
+    if input_helper.HELPER_FLAG in args:
+        return input_helper.run_helper(args)
     if "--selftest" in args:
         return selftest()
     app, window = create_app(args)

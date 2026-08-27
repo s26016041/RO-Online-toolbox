@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 _ITEM_TABLE = ASSETS_DIR / "items.json.gz"
 _MOB_TABLE = ASSETS_DIR / "mobs.json.gz"
 _WARP_TABLE = ASSETS_DIR / "warps.json.gz"
+_MAP_NAME_TABLE = ASSETS_DIR / "mapnames.json.gz"
 
 
 def _load(path) -> dict[str, dict]:
@@ -134,6 +135,25 @@ def warps_on_map(map_name: str) -> list[tuple[int, int, str, int, int]]:
         for r in _warp_table().get(map_name, [])
         if len(r) >= 5
     ]
+
+
+@lru_cache(maxsize=1)
+def _map_name_table() -> dict[str, str]:
+    try:
+        with gzip.open(_MAP_NAME_TABLE, "rt", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        log.warning("載入 %s 失敗：%s", _MAP_NAME_TABLE.name, exc)
+        return {}
+
+
+def map_display_name(map_name: str) -> str:
+    """地圖的中文名，查不到就回內部名（安全退化：顯示編號好過顯示錯的名字）。
+
+    來源是客戶端導航視窗自己用的 `navi_map_tw.lub`
+    （見 `tools/build_map_names.py`），所以顯示出來的字跟遊戲裡一致。
+    """
+    return _map_name_table().get(map_name.lower(), map_name)
 
 
 @lru_cache(maxsize=1)

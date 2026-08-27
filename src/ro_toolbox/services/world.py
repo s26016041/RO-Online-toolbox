@@ -20,7 +20,7 @@ import time
 from dataclasses import dataclass, field
 
 from ro_toolbox.core.ro_packet import RoPacket
-from ro_toolbox.core.ro_protocol import unpack_position
+from ro_toolbox.core.ro_protocol import unpack_move, unpack_position
 from ro_toolbox.services.gamedata import is_mob
 
 # ---- opcode（實測，見 GAMEDATA [PKT-029]）---------------------------
@@ -54,6 +54,15 @@ _OFF_DROP_X = 13
 _DROP_LEN = 17
 _ITEM_MIN_ID = 501  # 低於這個的不是道具編號，掃到就是雜訊
 _MAX_MAP_SIDE = 512  # RO 地圖邊長上限，沒載到地形時用來擋離譜座標
+#: 確認擊殺之後，這個 GID 保護多久不被「新的目擊」推翻。
+#:
+#: ⚠ 為什麼不能永久保護：**伺服器會重用 GID**。那隻怪死了、我們記下它的 GID，
+#: 之後同一個 GID 被新生成的怪拿去用 —— 永久保護的話我們就**永遠看不到那隻新的怪**。
+#: 症狀：怪站在旁邊打你，bot 說附近沒怪；**重開自動戰鬥就找得到**
+#: （因為 WorldTracker 是新的，集合被清空）。使用者實測回報。
+#:
+#: 保護這幾秒是為了「剛送出的那次擊殺確認」不被同一拍的殘留封包蓋掉。
+KILL_PROTECT_SEC = 8.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,12 +114,14 @@ class WorldTracker:
         self._monsters: dict[int, Monster] = {}
         self._items: dict[int, GroundItem] = {}
         self._killed = 0
-        self._killed_gids: set[int] = set()
+        self._killed_gids: dict[int, float] = {}  # gid → 確認擊殺的時間
         self._gone_gids: set[int] = set()
         # GID → 最後一次「有人打到它」的時間。**故意不跟 _monsters 綁**：
         # 怪可能因為座標過時被 forget_far 移掉，但傷害封包還是會進來；
         # 綁在一起的話就會把「正在打的怪」誤判成「打到空氣」。
         self._hits: dict[int, float] = {}
+        # gid → 記憶體連續幾次沒看到它。連續夠多次才刪（掃描偶爾會整批回 0）。
+        self._absent: dict[int, int] = {}
         self._valid_items = valid_item_ids or set()
         self._map_size = map_size
         self._lock = threading.Lock()
@@ -157,7 +168,8 @@ class WorldTracker:
             return
         payload = raw[i + 2 : i + length]
         pos_off = _POS_OFFSET[opcode]
-        if len(payload) < pos_off + 3:
+        need = 6 if opcode == OP_ENTITY_MOVE else 3
+        if len(payload) < pos_off + need:
             return
         if payload[_OFF_OBJTYPE] != _OBJTYPE_MOB:
             return  # NPC／其他玩家／傳送點：認得出來，但不是我們的目標
@@ -165,13 +177,26 @@ class WorldTracker:
         if not is_mob(class_id):
             self.rejected += 1
             return  # class ID 不在怪物表裡 → 不確定是什麼，不當成怪
-        x, y, _direction = unpack_position(payload[pos_off : pos_off + 3])
+        if opcode == OP_ENTITY_MOVE:
+            # ⚠ 移動封包帶的是 **6 bytes 的「從哪走到哪」**，不是 3 bytes 的定點。
+            # 以前只解前 3 bytes，記到的永遠是它**開始走之前**的格子 ——
+            # 實測平均落後 4.2 格、最多 7 格（當時要走到 2 格內才准送攻擊），
+            # 症狀就是「追蹤到怪物移動前位置」「打到空氣」「挑到的最近其實不是最近」。
+            #
+            # 實測證據（prt_fild07，16 個樣本）：
+            #   - 6-byte 解出來的終點 **16/16** 在地圖範圍內且落在可走格
+            #   - **前一包的終點 == 下一包的起點**，整條鏈對得上
+            #   - 3-byte 版把後半當成 direction，解出來一直是 2 或 3（那其實是座標的位元）
+            _start, (x, y) = unpack_move(payload[pos_off : pos_off + 6])
+        else:
+            x, y, _direction = unpack_position(payload[pos_off : pos_off + 3])
         if not self._in_map(x, y):
             self.rejected += 1
             return
         gid = int.from_bytes(payload[_OFF_GID : _OFF_GID + 4], "little")
-        if gid in self._killed_gids:
-            return  # 已確認死掉的不復活
+        if self._recently_killed(gid):
+            return  # 剛確認死掉的不復活（保護期過了就放行，因為 GID 會被重用）
+        self._killed_gids.pop(gid, None)
         mob = self._monsters.get(gid)
         if mob is None:
             self._monsters[gid] = Monster(gid, class_id, x, y)
@@ -191,7 +216,7 @@ class WorldTracker:
             self._gone_gids.add(gid)
             if kind == _VANISH_DEAD:
                 self._killed += 1
-                self._killed_gids.add(gid)
+                self._killed_gids[gid] = time.monotonic()
         self._items.pop(gid, None)  # 撿起／消失的地上物
 
     def _take_stopmove(self, raw: bytes, i: int) -> None:
@@ -289,21 +314,40 @@ class WorldTracker:
                     best, best_key = mob, key
             return best
 
-    def sync_from_memory(self, entities) -> None:  # noqa: ANN001 - MemoryEntity
-        """把記憶體掃到的怪**併進來**（只增不減）。
+    def sync_from_memory(
+        self,
+        entities,  # noqa: ANN001 - MemoryEntity
+        pos: tuple[int, int] | None = None,
+        view: int | None = None,
+        strikes: int = 3,
+    ) -> int:
+        """用記憶體掃描的結果更新怪物集合。回傳刪掉幾隻。
 
-        記憶體掃描是額外來源，不是權威來源：實測（見 GAMEDATA [MEM-014]）
-        它的涵蓋率**低於封包**（30 格內平均 0.16 隻 vs 封包 0.40 隻），
-        只是偶爾會補到封包漏收的那一隻。
-        所以這裡**只新增與更新，絕不刪除** —— 用一個涵蓋率較低的來源去刪掉
-        另一個來源看到的怪，等於自己把怪弄不見。
-        移除仍然只靠 0x0080 消失封包與 `forget_far()`。
+        **記憶體是主要來源。** 封包會漏：站著不動的怪只在「進入視野」時送一次，
+        bot 啟動之前就站在旁邊的那些，封包這條路**永遠**看不到
+        （RO 沒有「請給我周圍有什麼」的查詢，[PKT-061]）。記憶體看得到。
+        存活旗標（`GID-0x24 == 1` 且繪圖指標 `+0x110 != 0`，[MEM-016]）
+        會把已釋放的舊結構擋掉，所以它看到的就是畫面上真的存在的。
+
+        給了 `pos` 與 `view` 就**連刪除也交給記憶體**：視野內、記憶體連續
+        `strikes` 次都沒看到的怪就丟掉。
+
+        ⚠ **為什麼要連續好幾次而不是一次就刪**：實測記憶體掃描偶爾會整批回 0
+        （量到一次「封包看到 11 隻、記憶體同時回 0」，下一拍又回 11）。
+        一次抖動就清空的話，會把整片真的怪弄不見 —— 那比慢一拍刪掉糟得多。
+
+        ⚠ 座標不明的怪（傷害封包補進來的，見 `note_monster`）**不參與刪除**：
+        算不出距離就無從判斷它在不在視野內，而「它剛剛打到我」本身就是證據。
         """
         now = time.monotonic()
+        removed = 0
         with self._lock:
+            seen: set[int] = set()
             for entity in entities:
-                if entity.gid in self._killed_gids:
+                seen.add(entity.gid)
+                if self._recently_killed(entity.gid):
                     continue
+                self._killed_gids.pop(entity.gid, None)
                 mob = self._monsters.get(entity.gid)
                 if mob is None:
                     self._monsters[entity.gid] = Monster(
@@ -313,6 +357,25 @@ class WorldTracker:
                     mob.class_id, mob.x, mob.y = entity.class_id, entity.x, entity.y
                     mob.seen_at = now
                 self._gone_gids.discard(entity.gid)
+                self._absent.pop(entity.gid, None)
+
+            if pos is None or view is None:
+                return 0
+            for gid, mob in list(self._monsters.items()):
+                if gid in seen:
+                    continue
+                distance = mob.distance_from(pos)
+                if distance is None or distance > view:
+                    self._absent.pop(gid, None)   # 看不到的不算數
+                    continue
+                count = self._absent.get(gid, 0) + 1
+                self._absent[gid] = count
+                if count >= strikes:
+                    del self._monsters[gid]
+                    self._absent.pop(gid, None)
+                    self._gone_gids.add(gid)
+                    removed += 1
+        return removed
 
     def note_attacking(self, gid: int) -> None:
         """送出攻擊時登記一下，之後這隻的傷害封包才會被記進 last_hit。"""
@@ -358,21 +421,44 @@ class WorldTracker:
             self._items.pop(entity_id, None)
 
     def note_monster(self, gid: int) -> None:
-        """外部（如傷害封包）發現的怪 —— 主動怪可能沒被解析到就先打我，
-        用這個把它補進怪物集合，讓自動打怪能反擊。已死／已消失的不補。
-        沒有 class ID 與座標，所以只知道它存在。"""
+        """外部發現的怪 —— **它剛剛打到我**，用這個把它補進追蹤讓 bot 能反擊。
+
+        ⚠ **「以為它走了」不能擋住這條路。** 這個方法只有一個呼叫端：
+        傷害封包顯示「攻擊者是它、目標是我」。**被它打到就是它還在那裡的證據**，
+        比我們自己的判斷可信。
+
+        以前這裡連 `_gone_gids` 也擋：打到空氣時 `forget()` 會把那隻怪放進
+        `_gone_gids`，之後它就**再也補不回來** —— 於是它站在旁邊砍你，
+        `get(gid)` 永遠是 None，`_pick_target` 的「打我的怪優先」直接跳過它。
+        症狀就是「怪物打我但我卻不理他」（使用者實測回報）。
+
+        只有**確認擊殺**（`0x0080 type=1`，伺服器權威訊號）才擋 —— 死掉的不會打人。
+        沒有 class ID 與座標，所以只知道它存在。
+        """
         with self._lock:
-            if gid not in self._killed_gids and gid not in self._gone_gids:
-                self._monsters.setdefault(gid, Monster(gid))
+            if self._recently_killed(gid):
+                return
+            self._killed_gids.pop(gid, None)
+            self._gone_gids.discard(gid)
+            self._monsters.setdefault(gid, Monster(gid))
 
     def is_present(self, gid: int) -> bool:
         with self._lock:
             return gid in self._monsters
 
+    def _recently_killed(self, gid: int) -> bool:
+        """這個 GID 剛剛被確認擊殺（還在保護期內）嗎？**呼叫端要自己持鎖。**"""
+        at = self._killed_gids.get(gid)
+        return at is not None and time.monotonic() - at < KILL_PROTECT_SEC
+
     def was_killed(self, gid: int) -> bool:
-        """這隻怪是不是已被確認擊殺（0x0080 type=1）—— 100% 死亡訊號。"""
+        """這隻怪是不是剛被確認擊殺（0x0080 type=1）—— 100% 死亡訊號。
+
+        ⚠ 只在保護期內回 True。伺服器**會重用 GID**，永久記住的話，
+        同一個 GID 的新怪會被永遠當成死人（見 `KILL_PROTECT_SEC`）。
+        """
         with self._lock:
-            return gid in self._killed_gids
+            return self._recently_killed(gid)
 
     @property
     def kill_count(self) -> int:

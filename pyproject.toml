@@ -9,14 +9,23 @@ description = "RO Online 自動化工具箱"
 requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.6",
+    # 帳號頁匯入 OTP 的 QR。挑它是因為只有 1MB 又自帶原生 DLL ——
+    # opencv 也能解 QR，但會讓單一 exe 多幾十 MB，為了一張 QR 不值得。
+    # 下限標 3.1 是實測過的版本，不是猜的（見 services/qr.py）。
+    "zxing-cpp>=3.1",
+    # 封包擷取（WinDivert）。**它自己帶驅動檔**，所以使用者不必另外安裝
+    # 任何東西 —— 這正是換掉 Npcap 的理由（Npcap 要自己下載，而且授權
+    # 不准我們一起打包）。見 services/packet_capture.py 的檔頭。
+    "pydivert>=2.1",
 ]
 
 [project.optional-dependencies]
-# 封包攔截功能。注入遊戲行程 hook send，不需要 Npcap 或任何驅動。
+# 舊的封包攔截路線（注入遊戲行程 hook send）。**已停用** ——
+# GameGuard 會偵測寫入並讓遊戲當機（GAMEDATA [PKT-011]）。
+# 現在走網路層擷取（WinDivert，見主相依裡的 pydivert）。
 # pymem 讀寫記憶體、keystone 組譯 stub、pefile 解析匯入表、pywin32 列舉視窗。
 packet = [
     "psutil>=5.9",
-    "scapy>=2.5",  # inbound 封包擷取（需搭配 Npcap 驅動）
     "pymem>=1.13",
     "keystone-engine>=0.9.2",
     "pefile>=2023.2.7",

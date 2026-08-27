@@ -72,6 +72,10 @@ class FakeScanner:
     def list_modules(self):
         return [FakeModule("ragexe.exe", MODULE)]
 
+    def module_base(self, name):
+        # 正式版走這條（模組列舉會被 GameGuard 擋，見 aob.code_section）。
+        return MODULE if name.lower() == "ragexe.exe" else None
+
     def close(self):
         self.closed = True
 
@@ -217,3 +221,59 @@ def test_two_candidates_with_different_bags_disable_loudly(scanner, caplog):
     with caplog.at_level("ERROR"):
         assert read_bag(1234) == []
     assert "判定定位失敗" in caplog.text
+
+
+# ---- BagWatch（高頻輪詢用的快路徑）------------------------------------
+
+
+def test_watch_reads_the_same_bag_as_a_full_read(scanner):  # noqa: ARG001
+    """綁定之後讀到的內容要跟慢路徑一模一樣，不能為了快而讀得比較差。"""
+    watch = bag.BagWatch(1234)
+    assert watch.open() is True
+    assert watch.snapshot() == bag.as_dict(1234)
+    watch.close()
+
+
+def test_watch_does_not_rescan_on_every_snapshot(scanner, monkeypatch):  # noqa: ARG001
+    """這就是它存在的理由：綁定一次，之後不再重跑 AOB 掃描。
+
+    慢路徑每次呼叫都要掃一次（約 0.1 秒），喝水每瓶都要現查格號，
+    用慢路徑等於每瓶多花 0.1 秒。
+    """
+    watch = bag.BagWatch(1234)
+    assert watch.open() is True
+    scans = 0
+    real = bag.find_containers
+
+    def counted(sc):
+        nonlocal scans
+        scans += 1
+        return real(sc)
+
+    monkeypatch.setattr(bag, "find_containers", counted)
+    for _ in range(20):
+        assert watch.snapshot()
+    assert scans == 0, f"綁定之後不該再掃描，實際掃了 {scans} 次"
+    watch.close()
+
+
+def test_watch_reports_failure_instead_of_stale_data(scanner):
+    """串列走不通就回空的 —— 呼叫端才有機會重新定位，不是拿舊資料硬撐。"""
+    watch = bag.BagWatch(1234)
+    assert watch.open() is True
+    assert watch.snapshot()
+    scanner.items = []            # 串列變空 = 綁定過期
+    assert watch.snapshot() == {}
+    watch.close()
+
+
+def test_watch_open_fails_when_the_container_is_not_found(monkeypatch):
+    """定位不到就要老實回 False，不能回一個「空背包」讓人以為讀成功了。"""
+    fake = FakeScanner()
+    fake.code = bytes(len(fake.code))      # 特徵整個不見
+    monkeypatch.setattr(bag, "MemoryScanner", lambda: fake)
+    watch = bag.BagWatch(1234)
+    assert watch.open() is False
+    assert watch.snapshot() == {}
+    assert fake.closed is True, "定位失敗要把自己開的 scanner 關掉"
+

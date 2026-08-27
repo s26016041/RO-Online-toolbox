@@ -6,7 +6,9 @@ pywin32 屬於選用相依，沒裝時回傳空清單而不是讓程式炸掉。
 
 from __future__ import annotations
 
+import ctypes
 import logging
+from ctypes import wintypes
 from dataclasses import dataclass
 
 try:
@@ -23,6 +25,8 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
+_user32 = ctypes.windll.user32 if hasattr(ctypes, "windll") else None
+
 
 @dataclass(frozen=True, slots=True)
 class WindowInfo:
@@ -38,6 +42,27 @@ class WindowInfo:
 
 def available() -> bool:
     return win32gui is not None and win32process is not None
+
+
+def window_pid(hwnd: int) -> int | None:
+    """這個視窗屬於哪個行程。**讀不到回 None，不要回 0 假裝是答案。**
+
+    這是全專案唯一一份「視窗 → 行程」的實作，其他地方一律呼叫它
+    （CLAUDE.md：同一件事不准在第二個地方再寫一次）。
+
+    一律走 ctypes 直接打 Win32，**不准用 `win32process.GetWindowThreadProcessId`**。
+    實測 2026-08-25（GAMEDATA [INP-007]）：在「自己剛剛啟動遊戲」的那個行程裡，
+    遊戲視窗剛畫出來的那幾秒，pywin32 版本回傳的 pid 是 **0**，而 ctypes 版本
+    在**同一瞬間**回傳正確的 49356；換一個沒啟動過遊戲的行程再問，pywin32 又對了。
+    pid 讀成 0 就永遠比對不中 → `find_window` 一直回 None → 自動登入卡在
+    「等遊戲視窗」直到逾時（實際卡滿 300 秒，而視窗 9.7 秒就出現了），
+    而且是**安靜地卡**，看起來像遊戲開很慢。
+    """
+    if _user32 is None:
+        return None
+    owner = ctypes.c_ulong(0)
+    _user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(owner))
+    return owner.value or None
 
 
 def enumerate_windows(title_contains: str = "") -> list[WindowInfo]:
@@ -58,11 +83,8 @@ def enumerate_windows(title_contains: str = "") -> list[WindowInfo]:
         if keyword and keyword not in title.lower():
             return True
 
-        try:
-            _thread_id, pid = win32process.GetWindowThreadProcessId(hwnd)
-        except Exception:  # noqa: BLE001 - 視窗可能剛好關掉
-            return True
-        if not pid:
+        pid = window_pid(hwnd)
+        if pid is None:
             return True
 
         found.append(

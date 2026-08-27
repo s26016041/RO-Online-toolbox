@@ -166,3 +166,56 @@ def test_bot_stopping_unchecks_the_box(card):
     card._apply_potion_stats(PotionStats(running=False, note="⚠ 藥水用完了"))
     assert card.auto_potion.isChecked() is False
     assert card.potion_label.text() == "⚠ 藥水用完了"
+
+
+# ---- 存檔還原：程式改 UI 不算使用者的意思 ---------------------------------
+
+
+def test_restoring_saved_settings_does_not_count_as_a_user_change(card):
+    """還原存檔時 `quiet` 要立起來 —— 否則會立刻再存一次（無害但沒必要），
+    更重要的是同一道閘門擋著「bot 失敗自動取消勾選」覆蓋設定。"""
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    seen = []
+    card.potion_changed.connect(lambda: seen.append(card.quiet))
+    card.potion_toggled.connect(lambda _on: seen.append(card.quiet))
+    card.apply_saved_potion(PotionSaved(hp_percent=55, enabled=True))
+
+    assert seen, "應該有發出變動訊號"
+    assert all(quiet is True for quiet in seen), "還原期間 quiet 必須是 True"
+    assert card.quiet is False, "還原完要放下來"
+    assert card.hp_threshold.value() == 55
+    assert card.auto_potion.isChecked() is True
+
+
+def test_bot_failure_unchecking_is_not_a_user_change(card):
+    """bot 啟動失敗會自動取消勾選。那**不是**使用者關的 ——
+    當成使用者的意思就會把存檔覆蓋成「關閉」，設定一次啟動失敗就沒了。"""
+    from ro_toolbox.services.potion import PotionStats
+
+    card.auto_potion.setChecked(True)
+    seen = []
+    card.potion_toggled.connect(lambda _on: seen.append(card.quiet))
+    card._apply_potion_stats(PotionStats(running=False, note="找不到遊戲 socket"))
+
+    assert card.auto_potion.isChecked() is False
+    assert seen == [True], "自動取消勾選必須標記成『不是使用者做的』"
+
+
+def test_saved_settings_keep_the_item_id_not_the_slot(card):
+    """存的是道具編號 —— 格號會挪動，存格號遲早會喝錯東西（[MEM-028]）。"""
+    card.set_slots({44: (501, 10), 45: (505, 3)})
+    card.hp_item.setCurrentIndex(card.hp_item.findData(501))
+    saved = card.saved_potion()
+    assert saved.hp_item == 501
+
+
+def test_wanted_item_is_selected_once_the_bag_finally_loads(card):
+    """背包是非同步讀的：還原當下清單還是空的，等它填好要自己選起來。"""
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    card.apply_saved_potion(PotionSaved(hp_item=501, hp_percent=40))
+    assert card.hp_item.currentData() is None, "清單還沒填，當然還選不到"
+
+    card.set_slots({44: (501, 10)})
+    assert card.hp_item.currentData() == 501, "清單填好之後要把存檔選的那個選起來"

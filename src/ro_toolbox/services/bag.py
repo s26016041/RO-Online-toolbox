@@ -33,14 +33,30 @@ import logging
 import struct
 from dataclasses import dataclass
 
+from ro_toolbox.utils.logging import StateLog
+
+from .aob import code_section
 from .memory_scan import MemoryScanner
 
 log = logging.getLogger(__name__)
+
+#: 這支被輪詢得很兇（每一秒多一次），失敗訊息要降噪 —— 見 StateLog。
+_notes = StateLog(log)
 
 #: 「除以 34」的魔術乘數。34 是背包清單封包的記錄大小（[PKT-039]）。
 #: 這是指令骨架的錨，不是答案 —— 容器位址是從指令的立即值讀出來的。
 _MAGIC_DIV34 = b"\xb8\xf1\xf0\xf0\xf0"      # mov eax, 0xF0F0F0F1
 _SUB_5 = b"\x83\xe9\x05"                    # sub ecx, 5
+#: `shr edx, 5` —— 除以 34 的最後一步。
+#:
+#: ⚠ **這一步不能省。** 同一個魔術乘數（0xF0F0F0F1）配 `shr edx, 4` 是**除以 17**，
+#: 那是另一段完全無關的程式碼。少了這個條件，定位器會多命中一個
+#: 「除以 17」的站點並推出一個假容器（實測：真的 0x15D2AC8 之外
+#: 還冒出 0x11F0758，那個讀出來 0 筆）。目前是靠「讀不出資料」才被裁掉的 ——
+#: 但只要哪天那個假容器剛好讀得出像樣的東西，整個功能就會**大聲停用**。
+#: 骨架自己分得開，就不必賭資料。
+_SHR_EDX_5 = b"\xc1\xea\x05"
+
 _MOV_ECX_IMM = 0xB9                         # mov ecx, imm32
 _CALL_REL32 = 0xE8
 
@@ -70,48 +86,23 @@ def _u32(scanner: MemoryScanner, addr: int) -> int | None:
     return struct.unpack("<I", raw)[0] if raw else None
 
 
-def _code_section(scanner: MemoryScanner) -> tuple[int, bytes] | None:
-    module = next(
-        (m for m in scanner.list_modules() if m.name.lower() == "ragexe.exe"), None
-    )
-    if module is None:
-        return None
-    head = scanner._read_bytes(module.base, 0x400)  # noqa: SLF001
-    if not head or len(head) < 0x40:
-        return None
-    e_lfanew = struct.unpack_from("<I", head, 0x3C)[0]
-    pe = scanner._read_bytes(module.base + e_lfanew, 0x120)  # noqa: SLF001
-    if not pe or len(pe) < 24:
-        return None
-    count = struct.unpack_from("<H", pe, 6)[0]
-    opt_size = struct.unpack_from("<H", pe, 20)[0]
-    table = module.base + e_lfanew + 24 + opt_size
-    for i in range(count):
-        row = scanner._read_bytes(table + i * 40, 40)  # noqa: SLF001
-        if not row or len(row) < 40:
-            continue
-        vsize, vaddr = struct.unpack_from("<II", row, 8)
-        chars = struct.unpack_from("<I", row, 36)[0]
-        if chars & 0x20000000 and 0x1000 < vsize <= (32 << 20):
-            blob = scanner._read_bytes(module.base + vaddr, vsize)  # noqa: SLF001
-            if blob:
-                return module.base + vaddr, blob
-    return None
+def find_container_sites(scanner: MemoryScanner) -> list[tuple[int, int, int]]:
+    """AOB 定位背包容器，回傳每一處命中的 `(骨架位址, 解析函式, 容器)`。
 
+    為什麼要回**全部**而不是第一個：只回第一個的話，定位器就**看不見自己有歧義**。
+    改版新增一段長得一樣的骨架時，它會安靜地挑到別人家的全域。
+    有幾個候選要由呼叫端裁決（見 `read_bag`：兩個候選都讀得出合理背包就大聲停用）。
 
-def find_containers(scanner: MemoryScanner) -> list[int]:
-    """AOB 定位背包容器，回傳**所有**通過骨架驗證的候選（去重、保持順序）。
-
-    為什麼要回全部而不是第一個：只回第一個的話，定位器就**看不見自己有歧義**。
-    改版新增一段長得一樣的骨架（例如另一個記錄大小 34 的封包）時，
-    它會安靜地挑到別人家的全域。有幾個候選要由呼叫端用資料去裁決
-    （見 `read_bag`：兩個候選都讀得出合理背包就大聲停用）。
+    為什麼連骨架位址與解析函式一起回：`tools/verify_sigs.py` 要拿它們做改版模擬
+    （把容器立即值改掉，看定位器有沒有跟著改）。它以前自己重寫了一份一樣的邏輯 ——
+    然後這裡收緊骨架時它沒跟上，報告就開始說謊。**一份實作，兩邊共用。**
     """
-    section = _code_section(scanner)
+    section = code_section(scanner)
     if section is None:
         return []
     base, blob = section
-    found: list[int] = []
+    found: list[tuple[int, int, int]] = []
+    seen: set[int] = set()
     start = 0
     while True:
         k = blob.find(_MAGIC_DIV34, start)
@@ -121,8 +112,11 @@ def find_containers(scanner: MemoryScanner) -> list[int]:
         # 這個魔術乘數在別處也會出現，要求附近有 `sub ecx, 5`（扣掉封包標頭）
         if _SUB_5 not in blob[max(0, k - 0x20) : k + 0x20]:
             continue
-        # 往後找第一個 call rel32 —— 那是解析函式
         span = blob[k : k + 0x40]
+        # 而且要真的是**除以 34**（magic + shr 5），不是除以 17（magic + shr 4）。
+        if _SHR_EDX_5 not in span:
+            continue
+        # 往後找第一個 call rel32 —— 那是解析函式
         pos = span.find(bytes([_CALL_REL32]))
         if pos < 0:
             continue
@@ -143,9 +137,15 @@ def find_containers(scanner: MemoryScanner) -> list[int]:
                 continue          # 指向程式碼的不是容器
             if 0x400000 < value < 0x10000000:
                 log.info("背包容器 AOB 命中：0x%X（解析函式 0x%X）", value, parser)
-                if value not in found:
-                    found.append(value)
+                if value not in seen:
+                    seen.add(value)
+                    found.append((base + k, parser, value))
                 break
+
+
+def find_containers(scanner: MemoryScanner) -> list[int]:
+    """所有通過骨架驗證的候選容器（去重、保持順序）。"""
+    return [container for _site, _parser, container in find_container_sites(scanner)]
 
 
 def find_container(scanner: MemoryScanner) -> int | None:
@@ -185,24 +185,37 @@ def _read_node(scanner: MemoryScanner, node: int) -> BagItem | None:
     return BagItem(slot=slot, item_id=item_id, amount=amount)
 
 
-def _best_list(scanner: MemoryScanner, container: int) -> list[BagItem]:
-    """在容器附近逐一試 std::list 欄位，回傳驗得過的最長那條。"""
+def _read_list(scanner: MemoryScanner, head_at: int) -> list[BagItem]:
+    """讀出 `head_at` 這個 std::list 欄位指到的串列。驗不過就回空清單。
+
+    ⚠ 只有**整條**都解得出來、格號不重複才採信 —— 半信半疑的不要。
+    """
+    head = _u32(scanner, head_at)
+    if not head or not (0x10000 < head < 0xF0000000):
+        return []
+    nodes = _walk(scanner, head)
+    if len(nodes) < _MIN_ROWS:
+        return []
+    rows = [_read_node(scanner, n) for n in nodes]
+    good = [r for r in rows if r is not None]
+    if len(good) < len(nodes) or len({r.slot for r in good}) != len(good):
+        return []
+    return sorted(good, key=lambda r: r.slot)
+
+
+def _best_site(scanner: MemoryScanner, container: int) -> tuple[int, list[BagItem]]:
+    """在容器附近逐一試 std::list 欄位，回傳（偏移, 驗得過的最長那條）。"""
+    best_off = -1
     best: list[BagItem] = []
     for offset in range(0, _CONTAINER_SPAN, 4):
-        head = _u32(scanner, container + offset)
-        if not head or not (0x10000 < head < 0xF0000000):
-            continue
-        nodes = _walk(scanner, head)
-        if len(nodes) < _MIN_ROWS:
-            continue
-        rows = [_read_node(scanner, n) for n in nodes]
-        good = [r for r in rows if r is not None]
-        # 整條串列都要解得出來才採信 —— 半信半疑的不要
-        if len(good) < len(nodes) or len({r.slot for r in good}) != len(good):
-            continue
-        if len(good) > len(best):
-            best = good
-    return sorted(best, key=lambda r: r.slot)
+        rows = _read_list(scanner, container + offset)
+        if len(rows) > len(best):
+            best_off, best = offset, rows
+    return best_off, best
+
+
+def _best_list(scanner: MemoryScanner, container: int) -> list[BagItem]:
+    return _best_site(scanner, container)[1]
 
 
 def read_bag(pid: int, scanner: MemoryScanner | None = None) -> list[BagItem]:
@@ -219,23 +232,95 @@ def read_bag(pid: int, scanner: MemoryScanner | None = None) -> list[BagItem]:
     try:
         candidates = find_containers(scanner)
         if not candidates:
-            log.warning("AOB 定位不到背包容器")
-            return []
-        found = [(c, rows) for c in candidates if (rows := _best_list(scanner, c))]
-        if not found:
-            return []
-        if len({tuple(rows) for _c, rows in found}) > 1:
-            log.error(
-                "背包容器有 %d 個候選讀出不同的資料（%s），特徵已不夠精確，判定定位失敗",
-                len(found), [hex(c) for c, _r in found],
+            # 這支每一秒多就會被叫一次 —— 照實記會把日誌洗成幾百行一樣的字。
+            _notes.problem(
+                "no-container", logging.WARNING,
+                "AOB 定位不到背包容器（還沒進到遊戲裡也會這樣）",
             )
             return []
-        container, best = found[0]
-        log.info("背包讀到 %d 格（容器 %#x）", len(best), container)
+        site = _locate(scanner, candidates)
+        if site is None:
+            return []
+        container, offset, best = site
+        log.info("背包讀到 %d 格（容器 %#x + %#x）", len(best), container, offset)
         return best
     finally:
         if own:
             scanner.close()
+
+
+def _locate(
+    scanner: MemoryScanner, candidates: list[int]
+) -> tuple[int, int, list[BagItem]] | None:
+    """在候選容器裡裁決出唯一一個真的背包，回 (容器, 偏移, 內容)。
+
+    候選可能不只一個（改版可能新增長得一樣的骨架），所以**每個都試**、
+    用資料裁決：只有一個讀得出合理背包就用它；兩個讀出**不一樣**的背包
+    代表特徵已經不夠精確 —— 不賭哪個是對的，直接大聲停用。
+    """
+    found: list[tuple[int, int, list[BagItem]]] = []
+    for container in candidates:
+        offset, rows = _best_site(scanner, container)
+        if rows:
+            found.append((container, offset, rows))
+    if not found:
+        return None
+    if len({tuple(rows) for _c, _o, rows in found}) > 1:
+        log.error(
+            "背包容器有 %d 個候選讀出不同的資料（%s），特徵已不夠精確，判定定位失敗",
+            len(found), [hex(c) for c, _o, _r in found],
+        )
+        return None
+    _notes.ok("背包容器又定位到了")
+    return found[0]
+
+
+class BagWatch:
+    """綁定一次背包串列，之後只重走它 —— 給**高頻輪詢**用。
+
+    為什麼需要：`as_dict()` 每次呼叫都重跑一次 AOB 掃描，再試 2048 個偏移
+    去找串列（一次約 0.1 秒）。自動補水每喝一瓶都要現查格號（[MEM-028]），
+    用 `as_dict()` 等於每瓶多花 0.1 秒 —— 那就是使用者說的「反應有點慢」。
+    走一條已知的串列只讀幾十個節點，快兩個數量級。
+
+    ⚠ **只記住「容器位址 + 串列頭在容器裡的偏移」**（容器本身是 AOB 定位到的
+    全域），節點位址每次現走 —— 節點是動態配置的，記下來就會過期。
+    每次都做跟定位當下同樣的驗證，走不通就回 None，呼叫端要重新定位。
+    """
+
+    def __init__(self, pid: int) -> None:
+        self._pid = pid
+        self._scanner: MemoryScanner | None = None
+        self._head_at: int | None = None
+
+    def open(self) -> bool:
+        """定位一次。成功之後 `snapshot()` 才有東西可讀。"""
+        self.close()
+        scanner = MemoryScanner()
+        scanner.open(self._pid)   # 開不起來時讀取會回 None，下面的定位就會失敗
+        site = _locate(scanner, find_containers(scanner))
+        if site is None:
+            scanner.close()
+            return False
+        container, offset, _rows = site
+        self._scanner = scanner
+        self._head_at = container + offset
+        log.info("背包串列綁定於 %#x（容器 %#x + %#x）",
+                 self._head_at, container, offset)
+        return True
+
+    def snapshot(self) -> dict[int, tuple[int, int]]:
+        """{格號: (道具編號, 數量)}。驗不過回空的 —— 呼叫端要重新定位。"""
+        if self._scanner is None or self._head_at is None:
+            return {}
+        rows = _read_list(self._scanner, self._head_at)
+        return {r.slot: (r.item_id, r.amount) for r in rows}
+
+    def close(self) -> None:
+        if self._scanner is not None:
+            self._scanner.close()
+        self._scanner = None
+        self._head_at = None
 
 
 def as_dict(pid: int, scanner: MemoryScanner | None = None) -> dict[int, tuple[int, int]]:

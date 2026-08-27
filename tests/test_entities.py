@@ -133,3 +133,72 @@ def test_entity_without_render_object_is_rejected():
     """繪圖物件指標被清成 0 = 畫面上已經看不到它了。"""
     blob = make_region(CLASS_ID, 2870, 221.0, 256.0, render=0)
     assert not scanner_with(blob).scan((220, 255))
+
+
+# ---- 快路徑：記住位址，之後只讀那個位址 ------------------------------------
+
+
+import struct  # noqa: E402
+
+from ro_toolbox.services import entities as ent  # noqa: E402
+
+
+def _one_struct(gid=777, class_id=1002, x=100.0, y=100.0, alive=1, render=0x1234):
+    """組一筆「一隻怪」的記憶體內容（從存活旗標到 y）。"""
+    buf = bytearray(ent._ONE_SIZE)
+    struct.pack_into("<I", buf, ent._B_ALIVE, alive)
+    struct.pack_into("<I", buf, ent._B_CLASS, class_id)
+    struct.pack_into("<I", buf, ent._B_GID, gid)
+    struct.pack_into("<I", buf, ent._B_RENDER, render)
+    struct.pack_into("<f", buf, ent._B_X, x)
+    struct.pack_into("<f", buf, ent._B_Y, y)
+    return bytes(buf)
+
+
+def _scanner_with(monkeypatch, payload):
+    scanner = ent.EntityScanner(terrain(), MAP, view=30)
+    monkeypatch.setattr(scanner._scanner, "read_region", lambda _a, _s: payload)
+    monkeypatch.setattr(scanner, "_lut", _always_true_lut())
+    return scanner
+
+
+class _always_true_lut:
+    def __getitem__(self, _i):
+        return True
+
+
+def test_read_one_parses_a_known_address(monkeypatch):
+    """快路徑只讀 0x14C bytes，不掃記憶體 —— 這才是每一拍該做的事。"""
+    scanner = _scanner_with(monkeypatch, _one_struct(x=100.0, y=100.0))
+    got = scanner.read_one(0xDEAD0000, (100, 100))
+    assert got is not None
+    assert (got.gid, got.class_id, got.pos, got.addr) == (777, 1002, (100, 100), 0xDEAD0000)
+
+
+def test_read_one_rejects_a_dead_structure(monkeypatch):
+    """死掉的結構還在記憶體裡，但存活旗標與繪圖指標會被清掉（[MEM-016]）。"""
+    scanner = _scanner_with(monkeypatch, _one_struct(alive=0))
+    assert scanner.read_one(0xDEAD0000, (100, 100)) is None
+    scanner = _scanner_with(monkeypatch, _one_struct(render=0))
+    assert scanner.read_one(0xDEAD0000, (100, 100)) is None
+
+
+def test_read_one_rejects_a_monster_that_walked_out_of_view(monkeypatch):
+    scanner = _scanner_with(monkeypatch, _one_struct(x=100.0, y=100.0))
+    assert scanner.read_one(0xDEAD0000, (200, 200)) is None
+
+
+def test_read_known_drops_addresses_that_stopped_matching(monkeypatch):
+    """位址上的 GID 換人了＝那塊記憶體被回收給別的東西，要從清單移除。"""
+    scanner = _scanner_with(monkeypatch, _one_struct(gid=999))
+    scanner._known = {777: 0xDEAD0000}      # 我們以為 777 在那裡
+    assert scanner.read_known((100, 100)) == []
+    assert scanner.known_count == 0, "對不上的位址要丟掉，不然會一直讀到別人的資料"
+
+
+def test_read_known_returns_live_entries(monkeypatch):
+    scanner = _scanner_with(monkeypatch, _one_struct(gid=777))
+    scanner._known = {777: 0xDEAD0000}
+    found = scanner.read_known((100, 100))
+    assert [e.gid for e in found] == [777]
+    assert scanner.known_count == 1

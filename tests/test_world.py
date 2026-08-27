@@ -63,11 +63,29 @@ def test_standing_monster_is_seen():
     assert mob.pos == (108, 259)
 
 
-def test_moving_monster_has_same_position():
-    """0x09FD 的座標偏移不同（多了 moveStartTime），解出來要對得上 0x09FF。"""
+def test_moving_monster_records_where_it_is_heading():
+    """0x09FD 帶的是 **6 bytes 的「從哪走到哪」**，要記**終點**不是起點。
+
+    以前只解前 3 bytes（起點），記到的永遠是它**開始走之前**的格子。
+    實測（prt_fild07，16 個樣本）平均落後 4.2 格、最多 7 格，而 `_ATTACK_RANGE`
+    以前只有 2 格 —— 症狀就是「追蹤到怪物移動前位置」「打到空氣」
+    「挑到的最近其實不是最近」。
+
+    這份 fixture 自己就是證據：同一隻怪的站立封包說它在 (108,259)，
+    而移動封包的**起點**解出來剛好也是 (108,259)，終點是 (102,260)。
+    """
     world = WorldTracker(map_size=MAP)
+    feed(world, STAND)
+    assert world.get(GID).pos == (108, 259)      # 站著的時候在這裡
     feed(world, MOVE)
-    assert world.get(GID).pos == (108, 259)
+    assert world.get(GID).pos == (102, 260)      # 開始走了 → 記它要去的地方
+
+
+def test_move_packet_is_ignored_when_it_is_too_short():
+    """解 6 bytes 就要有 6 bytes。長度不夠寧可整包丟掉，不要拿半截去解。"""
+    world = WorldTracker(map_size=MAP)
+    feed(world, MOVE[:-4])
+    assert world.get(GID) is None
 
 
 def test_glued_packets_are_all_parsed():
@@ -185,3 +203,136 @@ def test_note_monster_adds_attacker():
     world.note_monster(777)
     assert world.is_present(777)
     assert world.get(777).pos is None
+
+
+def test_a_monster_that_hits_me_comes_back_even_after_we_gave_up_on_it():
+    """**被它打到就是它還在那裡的證據**，比我們自己的判斷可信。
+
+    打到空氣時 `forget()` 會把那隻怪放進「已消失」。以前那也會擋住
+    `note_monster()`，於是它站在旁邊砍你卻補不回追蹤 ——
+    `get(gid)` 永遠是 None，「打我的怪優先」直接跳過它。
+    症狀就是「怪物打我但我卻不理他」（使用者實測回報）。
+    """
+    world = WorldTracker(map_size=MAP)
+    feed(world, STAND)
+    assert world.get(GID) is not None
+
+    world.forget(GID)                 # 判定打到空氣，先當它不在
+    assert world.get(GID) is None
+
+    world.note_monster(GID)           # 它打了我一下
+    assert world.get(GID) is not None, "被它打到還不把它補回來，就會一直不理它"
+
+
+def test_a_confirmed_kill_is_not_resurrected_by_a_stray_damage_packet():
+    """只有**確認擊殺**擋得住 —— 死掉的不會打人，那種封包是雜訊。"""
+    world = WorldTracker(map_size=MAP)
+    feed(world, STAND)
+    feed(world, bytes.fromhex("8000") + GID.to_bytes(4, "little") + bytes([1]))
+    assert world.was_killed(GID)
+
+    world.note_monster(GID)
+    assert world.get(GID) is None, "已確認死亡的不該復活"
+
+
+# ---- 記憶體是主要來源：連刪除也交給它 --------------------------------------
+
+
+class _Ent:
+    """假的 MemoryEntity。"""
+
+    def __init__(self, gid, class_id=1055, x=108, y=259):
+        self.gid, self.class_id, self.x, self.y = gid, class_id, x, y
+
+
+def test_memory_adds_monsters_the_packets_never_announced():
+    """站著不動的怪只在「進入視野」時送一次封包 —— bot 啟動前就站在那裡的
+    那些，封包這條路**永遠**看不到（RO 沒有「請給我周圍有什麼」的查詢）。"""
+    world = WorldTracker(map_size=MAP)
+    assert world.monster_gids() == []
+    world.sync_from_memory([_Ent(999)])
+    assert world.get(999).pos == (108, 259)
+
+
+def test_memory_removes_a_monster_only_after_repeated_misses():
+    """⚠ 掃描偶爾會整批回 0（實測量到「封包看到 11 隻、記憶體同時回 0」）。
+    一次抖動就清空會把整片真的怪弄不見 —— 要連續幾次都沒看到才刪。"""
+    world = WorldTracker(map_size=MAP)
+    world.sync_from_memory([_Ent(999)])
+
+    for _ in range(2):                      # 前兩次沒看到：先記著，不刪
+        assert world.sync_from_memory([], pos=(108, 259), view=30, strikes=3) == 0
+        assert world.is_present(999)
+    assert world.sync_from_memory([], pos=(108, 259), view=30, strikes=3) == 1
+    assert not world.is_present(999)
+
+
+def test_a_single_blank_scan_does_not_wipe_everything():
+    """抖動之後又看到了 → 計數要歸零，不能累積到把它刪掉。"""
+    world = WorldTracker(map_size=MAP)
+    world.sync_from_memory([_Ent(999)])
+    world.sync_from_memory([], pos=(108, 259), view=30, strikes=3)      # 抖一下
+    world.sync_from_memory([_Ent(999)], pos=(108, 259), view=30)        # 又看到
+    world.sync_from_memory([], pos=(108, 259), view=30, strikes=3)      # 再抖一下
+    assert world.is_present(999), "中間看到過就該重新計數"
+
+
+def test_monsters_out_of_scan_range_are_not_removed():
+    """記憶體只掃視野內。視野外看不到是正常的，不能因此刪掉。"""
+    world = WorldTracker(map_size=MAP)
+    world.sync_from_memory([_Ent(999)])
+    for _ in range(5):
+        world.sync_from_memory([], pos=(300, 300), view=30, strikes=3)
+    assert world.is_present(999)
+
+
+def test_a_monster_that_hit_me_is_never_removed_by_memory():
+    """座標不明的怪（傷害封包補進來的）算不出距離 ——
+    而且「它剛剛打到我」本身就是它存在的證據，不該被記憶體掃描刪掉。"""
+    world = WorldTracker(map_size=MAP)
+    world.note_monster(777)
+    for _ in range(5):
+        world.sync_from_memory([], pos=(108, 259), view=30, strikes=3)
+    assert world.is_present(777)
+
+
+# ---- 確認擊殺會過期：伺服器會重用 GID --------------------------------------
+
+
+def test_a_reused_gid_is_visible_again_after_the_protection_window(monkeypatch):
+    """**伺服器會重用 GID。** 永久記住「這隻死了」的話，同一個 GID 的新怪
+    會被永遠當成死人 —— 怪站在旁邊打你、bot 說附近沒怪，**重開才會好**
+    （因為 WorldTracker 是新的）。使用者實測回報。
+    """
+    from ro_toolbox.services import world as mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+
+    world = WorldTracker(map_size=MAP)
+    feed(world, STAND)
+    feed(world, VANISH_DEAD)
+    assert world.was_killed(GID)
+    assert world.kill_count == 1
+
+    feed(world, STAND)                       # 保護期內：不准復活
+    assert world.get(GID) is None
+
+    clock[0] += mod.KILL_PROTECT_SEC + 1     # 保護期過了
+    feed(world, STAND)
+    assert world.get(GID) is not None, "GID 被重用時要看得到那隻新的怪"
+    assert not world.was_killed(GID)
+    assert world.kill_count == 1, "重新看到不該再算一次擊殺"
+
+
+def test_kill_confirmation_still_works_right_after_the_kill(monkeypatch):
+    """保護期是為了讓『剛送出的那次擊殺確認』不被同一拍的殘留封包蓋掉。"""
+    from ro_toolbox.services import world as mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    world = WorldTracker(map_size=MAP)
+    feed(world, STAND)
+    feed(world, VANISH_DEAD)
+    clock[0] += mod.KILL_PROTECT_SEC - 0.5
+    assert world.was_killed(GID), "保護期內一定要還認得出剛剛那次擊殺"

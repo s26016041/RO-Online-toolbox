@@ -23,12 +23,17 @@
 
 from __future__ import annotations
 
+import gzip
+import json
 import logging
 import struct
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
+
+from ro_toolbox.config.paths import ASSETS_DIR
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +55,18 @@ _HEADER_SIZE = 14
 _CELL_SIZE = 20
 _TYPE_OFFSET_IN_CELL = 16
 
+# ---- 打包用的地形資產 -----------------------------------------------
+#
+# `RODATA/` 只有開發機有，而且 1082 張 .gat 共 1800 MB，不可能打包進 exe。
+# 沒有它的機器上「走路」整個不能用，症狀還是「讀不到地形」這種看起來像
+# 資料壞掉的訊息 —— 使用者換一台電腦就踩到。
+#
+# 所以把「每格能不能站」壓成 1 bit（9,438 萬格 → 11.3 MB，gzip 後 1.5 MB）
+# 做成資產隨 exe 一起走。產生方式見 `tools/build_terrain.py`。
+TERRAIN_ASSET = ASSETS_DIR / "terrain.bin.gz"
+TERRAIN_MAGIC = b"ROTR"
+TERRAIN_VERSION = 1
+
 WALKABLE_TYPES = frozenset({0})
 """可站立的地形類型。5 的語意未確認，保守起見不算可走。"""
 
@@ -64,6 +81,10 @@ class MapTerrain:
     width: int
     height: int
     types: np.ndarray  # shape (height, width)，uint32
+    #: 這份地形是哪來的。`"gat"` = 原始 .gat（types 是真的地形類型）；
+    #: `"asset"` = 打包資產（**只有可走與否**，types 是 0/1 的合成值）。
+    #: 要用 `cell_type()` 判斷「type 5 是什麼」之類的事情之前先看這個。
+    source: str = "gat"
 
     @property
     def walkable(self) -> np.ndarray:
@@ -88,6 +109,7 @@ class MapTerrain:
         start: tuple[int, int],
         goal: tuple[int, int],
         node_budget: int = 40000,
+        blocked: frozenset[tuple[int, int]] | set[tuple[int, int]] | None = None,
     ) -> list[tuple[int, int]] | None:
         """A* 在可走格上找 start→goal 的**逐格**路徑（不含起點）。
 
@@ -96,8 +118,14 @@ class MapTerrain:
         所以要沿著路徑「邊走邊往前挑下一個目標」——挑目標時得知道中間每一格，
         才能保證每段都在上限內、而且真的沿著算好的路走。
         找不到路（被牆隔開／超出 node_budget）回 None。
+
+        `blocked` 是「地形上可走，但我們不想踩」的格子（自動打怪用它避開傳點 ——
+        踩上去會被傳到別張地圖）。**起點永遠不算被擋**：站在上面時要走得出來，
+        不然會整個算不出路（等於自己把自己關在裡面）。
         """
         import heapq
+
+        avoid = blocked or ()
 
         if not self.is_walkable(*goal) or not self.is_walkable(*start):
             return None
@@ -128,6 +156,8 @@ class MapTerrain:
             for dx, dy, cost in moves:
                 nx, ny = cx + dx, cy + dy
                 if not (0 <= nx < w and 0 <= ny < h) or not walk[ny, nx]:
+                    continue
+                if (nx, ny) in avoid:
                     continue
                 # 不允許穿角（斜走時兩側至少一格要可走，避免卡牆角）
                 if dx and dy and not (walk[cy, nx] or walk[ny, cx]):
@@ -222,8 +252,63 @@ def gat_path(map_name: str, data_dir: Path | None = None) -> Path:
     return RODATA_DIRS[0] / f"{stem}.gat"
 
 
+@lru_cache(maxsize=1)
+def _terrain_asset() -> tuple[dict[str, list[int]], bytes]:
+    """載入打包的地形資產（索引, 位元組）。沒有或壞掉就回空的，讓呼叫端退回 .gat。"""
+    try:
+        raw = gzip.decompress(TERRAIN_ASSET.read_bytes())
+    except (OSError, ValueError) as exc:
+        log.warning("載入 %s 失敗：%s", TERRAIN_ASSET.name, exc)
+        return {}, b""
+    if len(raw) < 12 or raw[:4] != TERRAIN_MAGIC:
+        log.warning("%s 不是地形資產（開頭是 %r）", TERRAIN_ASSET.name, raw[:4])
+        return {}, b""
+    version, head_len = struct.unpack_from("<II", raw, 4)
+    if version != TERRAIN_VERSION or len(raw) < 12 + head_len:
+        log.warning("%s 版本或長度不符（version=%s）", TERRAIN_ASSET.name, version)
+        return {}, b""
+    try:
+        index = json.loads(raw[12 : 12 + head_len].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as exc:
+        log.warning("%s 的索引解不開：%s", TERRAIN_ASSET.name, exc)
+        return {}, b""
+    log.debug("地形資產：%d 張地圖", len(index))
+    return index, raw[12 + head_len :]
+
+
+def _terrain_from_asset(stem: str) -> MapTerrain | None:
+    """從打包資產取一張地形。資產裡沒有這張就回 None。"""
+    index, blob = _terrain_asset()
+    entry = index.get(stem)
+    if entry is None:
+        return None
+    width, height, offset, size = entry
+    chunk = blob[offset : offset + size]
+    if len(chunk) != size:
+        log.warning("地形資產裡 %s 的資料不完整", stem)
+        return None
+    bits = np.unpackbits(np.frombuffer(chunk, dtype=np.uint8), count=width * height)
+    # 資產只存「可不可走」，所以把它還原成 types 的 0/1 —— 0 是可走、1 是不可走，
+    # 與 .gat 的語意一致（[DAT-008]）。**但這不是真的地形類型**，見 `source`。
+    types = np.where(bits.reshape(height, width) == 1, 0, 1).astype(np.uint32)
+    return MapTerrain(name=stem, width=width, height=height, types=types, source="asset")
+
+
 def load_terrain(map_name: str, data_dir: Path | None = None) -> MapTerrain:
-    """讀取並解析地形。找不到或格式不符會拋 GatError。"""
+    """讀取並解析地形。找不到或格式不符會拋 GatError。
+
+    **先查打包資產，再退回 RODATA 的 .gat**：資產隨 exe 一起走，
+    所以換一台電腦、重灌、沒有 RODATA 都能走路（`tools/build_terrain.py`）。
+    .gat 留著是給開發機用的 —— 改版新增地圖時可以先解包測，再重跑腳本更新資產。
+
+    `data_dir` 有指定就**只**讀那個目錄的 .gat（測試與工具用，不吃資產）。
+    """
+    if data_dir is None:
+        stem = map_name.rsplit(".", 1)[0].lower() if "." in map_name else map_name.lower()
+        terrain = _terrain_from_asset(stem)
+        if terrain is not None:
+            return terrain
+
     path = gat_path(map_name, data_dir)
     if not path.is_file():
         raise GatError(f"找不到地形檔：{path}")
@@ -255,11 +340,28 @@ def load_terrain(map_name: str, data_dir: Path | None = None) -> MapTerrain:
     return terrain
 
 
+def has_terrain(map_name: str) -> bool:
+    """走得到這張圖嗎（地形拿得到嗎）？
+
+    給「決定要不要接受一個目的地」用。**不要**改回去問 `.gat` 檔在不在 ——
+    使用者的電腦上沒有 `RODATA/`，那樣問等於全部拒絕。
+    """
+    stem = map_name.rsplit(".", 1)[0].lower() if "." in map_name else map_name.lower()
+    if stem in _terrain_asset()[0]:
+        return True
+    return gat_path(stem).is_file()
+
+
 def available_maps(data_dir: Path | None = None) -> int:
-    """有幾張地圖的地形檔可用。同名只算一次（data.grf 會覆蓋 data0.grf）。"""
-    directories = [data_dir] if data_dir is not None else list(RODATA_DIRS)
+    """有幾張地圖的地形可用。同名只算一次（data.grf 會覆蓋 data0.grf）。
+
+    沒指定目錄時把**打包資產**也算進來 —— 那才是使用者機器上真正的來源。
+    """
     names: set[str] = set()
+    if data_dir is None:
+        names.update(_terrain_asset()[0])
+    directories = [data_dir] if data_dir is not None else list(RODATA_DIRS)
     for directory in directories:
         if directory is not None and directory.is_dir():
-            names.update(p.stem for p in directory.glob("*.gat"))
+            names.update(p.stem.lower() for p in directory.glob("*.gat"))
     return len(names)

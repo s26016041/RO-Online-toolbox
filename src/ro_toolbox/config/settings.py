@@ -28,6 +28,21 @@ class AppSettings:
 
     theme: str = "light"
     log_level: str = "WARNING"
+    # 遊戲啟動器的完整路徑，例如 D:\ro\RagnarokOnline\Ragnarok.exe。
+    # 遊戲本體與工作目錄都從它推（見 services/game_launcher.GamePaths）。
+    # 這不是機密，可以留在這個檔；帳密與 OTP 種子在加密過的 accounts.dat。
+    game_path: str = ""
+    #: 合約書「同意」按鈕在**視窗內的比例位置**（x, y），例如 [0.5628, 0.621]。
+    #:
+    #: 為什麼存比例不存座標：視窗會移動、大小會變、DPI 縮放也會變，
+    #: 存絕對座標的那一刻它就已經是壞的。比例只跟「版面」有關。
+    #:
+    #: 為什麼要存：那個畫面**只吃滑鼠**（鍵盤全試過都沒反應，[INP-001]），
+    #: 而按鈕位置會隨客戶端的解析度設定跑掉。內建的預設值是在 1280x800
+    #: 的客戶端上量的；別人的解析度不同時，自動登入會請他手動按一次同意，
+    #: **然後把他按的位置學起來**（見 auto_login._learn_agree_button）。
+    #: 空的代表還沒學過，用內建預設值。
+    agree_button: list[float] | None = None
     window: WindowSettings = field(default_factory=WindowSettings)
 
     def to_dict(self) -> dict[str, Any]:
@@ -46,18 +61,41 @@ class AppSettings:
         return settings
 
 
+#: 全程式共用的那一份。**不准各拿各的** —— 見 `current_settings`。
+_current: AppSettings | None = None
+
+
+def current_settings() -> AppSettings:
+    """拿全程式共用的那一份設定。
+
+    ⚠ **不要自己再 `load_settings()` 一份。** 兩份在記憶體裡各改各的，
+    誰最後存檔誰贏，而且輸的那邊是**安靜地**消失。
+
+    實際踩過：帳號頁自己 load 了一份、把遊戲路徑存進檔案；關視窗時主視窗
+    拿它那份（`game_path` 還是空的）整檔覆蓋回去 —— 使用者選好的路徑，
+    下次開程式就不見了，沒有任何錯誤訊息。
+    """
+    return _current if _current is not None else load_settings()
+
+
 def load_settings() -> AppSettings:
+    global _current
     path = config_file()
     if not path.exists():
-        return AppSettings()
+        _current = AppSettings()
+        return _current
     try:
-        return AppSettings.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        _current = AppSettings.from_dict(json.loads(path.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError) as exc:
         log.warning("設定檔讀取失敗，改用預設值：%s", exc)
-        return AppSettings()
+        _current = AppSettings()
+    return _current
 
 
 def save_settings(settings: AppSettings) -> None:
+    global _current
+    # 存下去的這一份就是往後大家共用的那一份。
+    _current = settings
     path = config_file()
     try:
         path.write_text(

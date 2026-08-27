@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
@@ -116,6 +117,18 @@ class ScanWorker(QThread):
             self.failed.emit(str(exc))
 
 
+def _is_admin() -> bool:
+    """本行程是不是系統管理員。
+
+    遊戲掛 GameGuard 且通常以較高權限執行；權限不夠時 `OpenProcess` 會直接失敗，
+    症狀是「選定程序」按下去什麼都讀不到。與其等使用者撞牆，一進頁面就講清楚。
+    """
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:  # noqa: BLE001 - 查不到就不要嚇使用者
+        return True
+
+
 def _row(*widgets: QWidget) -> QWidget:
     container = QWidget()
     layout = QHBoxLayout(container)
@@ -185,6 +198,24 @@ class MemoryPage(BasePage):
         self.attached_label = QLabel("尚未選定程序")
         self.attached_label.setObjectName("pageSubtitle")
         self.add(self.attached_label)
+
+        # ⚠ 所有提示／錯誤都寫在這裡，**不准用 QMessageBox**。
+        # QMessageBox 是強制回應（modal）的：遊戲通常是全螢幕或置頂，
+        # 對話框會跳到遊戲**後面** —— 使用者看不到也點不到，整個工具箱就
+        # 「沒有回應」，看起來就是當機（實際回報：選定程序後直接當掉，
+        # 同時出現 QFont::setPointSize 警告 —— 那行正是 Qt 在建對話框時噴的）。
+        self.notice_label = QLabel("")
+        self.notice_label.setObjectName("pageSubtitle")
+        self.notice_label.setWordWrap(True)
+        self.notice_label.setVisible(False)
+        self.add(self.notice_label)
+
+        if not _is_admin():
+            self._notice(
+                "目前**不是**以系統管理員身分執行。遊戲行程多半開不起來（開啟失敗）——"
+                "請以系統管理員身分重開本工具。",
+                error=True,
+            )
 
     def _build_scan_row(self) -> None:
         self.type_combo = QComboBox()
@@ -310,6 +341,33 @@ class MemoryPage(BasePage):
         splitter.setStretchFactor(1, 2)
         self._layout.addWidget(splitter, 1)
 
+    # ---- 訊息 -------------------------------------------------------
+
+    def _notice(self, message: str, error: bool = False) -> None:
+        """把提示寫在頁面上。
+
+        這裡刻意**不用 QMessageBox**：它是強制回應的，而遊戲通常全螢幕或置頂，
+        對話框會跳到遊戲後面 —— 使用者看不到、也點不到，整個工具箱就停在那裡，
+        看起來完全就是當機（實際回報過，當下伴隨 QFont::setPointSize 警告，
+        那正是 Qt 建對話框時噴的）。頁面上的一行字看得到、也不會擋住操作。
+        """
+        self.notice_label.setText(message)
+        self.notice_label.setVisible(bool(message))
+        self.notice_label.setStyleSheet("color: #d64545;" if error else "")
+        if message:
+            (log.warning if error else log.info)("記憶體分頁：%s", message)
+
+    def _front(self) -> None:
+        """把工具箱視窗拉到最前面。
+
+        只有**非用要不可**的對話框（要打字、要確認破壞性寫入）才會用到；
+        不先拉到前面的話，對話框會躲在全螢幕遊戲後面。
+        """
+        window = self.window()
+        if window is not None:
+            window.raise_()
+            window.activateWindow()
+
     # ---- 目標選擇 ---------------------------------------------------
 
     def refresh_windows(self) -> None:
@@ -320,17 +378,17 @@ class MemoryPage(BasePage):
         #   在掃描執行緒腳下抽走；而 Windows 常把同一個 handle 值配給緊接著的
         #   OpenProcess，掃描後半段就會靜默讀到**另一個程序**的記憶體。
         if self._worker is not None and self._worker.isRunning():
-            QMessageBox.information(self, "提示", "掃描進行中，請等它結束再切換程序。")
+            self._notice("掃描進行中，請等它結束再切換程序。")
             return
 
         target = self.picker.selected()
         if target is None:
-            QMessageBox.information(self, "提示", "請先選一個視窗。")
+            self._notice("請先選一個視窗。")
             return
         try:
             self._scanner.open(target.pid)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "開啟失敗", str(exc))
+            self._notice(str(exc), error=True)
             self._update_enabled()
             return
 
@@ -383,7 +441,7 @@ class MemoryPage(BasePage):
 
     def do_first_scan(self) -> None:
         if not self._scanner.attached:
-            QMessageBox.information(self, "提示", "請先選定程序。")
+            self._notice("請先選定程序。")
             return
 
         vt = self._current_vt()
@@ -393,14 +451,13 @@ class MemoryPage(BasePage):
         if scan_type in VALUE_REQUIRED:
             value, error = self._parse_value(vt)
             if error:
-                QMessageBox.warning(self, "數值錯誤", error)
+                self._notice(error, error=True)
                 return
         elif scan_type != "unknown":
-            QMessageBox.warning(
-                self,
-                "條件不適用",
-                "首次搜尋只能用「等於 / 大於 / 小於 / 未知初始值」。\n"
+            self._notice(
+                "首次搜尋只能用「等於 / 大於 / 小於 / 未知初始值」；"
                 "「增加 / 減少 / 改變」要先有一輪結果才能比較。",
+                error=True,
             )
             return
 
@@ -411,19 +468,19 @@ class MemoryPage(BasePage):
 
     def do_next_scan(self) -> None:
         if not self._scanner.has_results:
-            QMessageBox.information(self, "提示", "請先做一次首次搜尋。")
+            self._notice("請先做一次首次搜尋。")
             return
 
         scan_type = self.scan_combo.currentData()
         if scan_type == "unknown":
-            QMessageBox.warning(self, "條件不適用", "「未知初始值」只用於首次搜尋。")
+            self._notice("「未知初始值」只用於首次搜尋。", error=True)
             return
 
         value = None
         if scan_type in VALUE_REQUIRED:
             value, error = self._parse_value(self._current_vt())
             if error:
-                QMessageBox.warning(self, "數值錯誤", error)
+                self._notice(error, error=True)
                 return
 
         self._run_scan(
@@ -450,7 +507,7 @@ class MemoryPage(BasePage):
         self._set_scanning(False)
         self.progress.setValue(0)
         self.scan_status.setText("搜尋失敗")
-        QMessageBox.critical(self, "搜尋失敗", message)
+        self._notice(f"搜尋失敗：{message}", error=True)
 
     def reset_scan(self) -> None:
         self._scanner.reset()
@@ -462,11 +519,11 @@ class MemoryPage(BasePage):
 
     def do_string_scan(self) -> None:
         if not self._scanner.attached:
-            QMessageBox.information(self, "提示", "請先選定程序。")
+            self._notice("請先選定程序。")
             return
         text = self.string_edit.text()
         if not text:
-            QMessageBox.information(self, "提示", "請輸入要搜尋的文字。")
+            self._notice("請輸入要搜尋的文字。")
             return
 
         encodings = [self.encoding_combo.currentData()]
@@ -485,7 +542,7 @@ class MemoryPage(BasePage):
         只有你真正在改的那個位址會留下來。
         """
         if not self._string_hits:
-            QMessageBox.information(self, "提示", "請先做一次字串搜尋。")
+            self._notice("請先做一次字串搜尋。")
             return
         text = self.string_edit.text()
         if not text:
@@ -560,7 +617,7 @@ class MemoryPage(BasePage):
     def add_selected_to_watch(self) -> None:
         rows = self.result_table.selectionModel().selectedRows()
         if not rows:
-            QMessageBox.information(self, "提示", "請先在結果中選取要觀察的列。")
+            self._notice("請先在結果中選取要觀察的列。")
             return
 
         vt = self._current_vt()
@@ -575,6 +632,7 @@ class MemoryPage(BasePage):
         self._rebuild_watch_table()
 
     def add_manual_address(self) -> None:
+        self._front()
         text, ok = QInputDialog.getText(
             self, "手動加入位址", "輸入記憶體位址（可用 0x 十六進位）："
         )
@@ -583,7 +641,7 @@ class MemoryPage(BasePage):
         try:
             address = int(text.strip(), 0)
         except ValueError:
-            QMessageBox.warning(self, "位址錯誤", f"「{text}」不是有效的位址。")
+            self._notice(f"「{text}」不是有效的位址。", error=True)
             return
         self._add_watch(address, self._current_vt())
         self._rebuild_watch_table()
@@ -646,7 +704,7 @@ class MemoryPage(BasePage):
             return
         rows = self.watch_table.selectionModel().selectedRows()
         if not rows:
-            QMessageBox.information(self, "提示", "請先在觀察清單選一列。")
+            self._notice("請先在觀察清單選一列。")
             return
 
         entry = self._watch[rows[0].row()]
@@ -655,6 +713,7 @@ class MemoryPage(BasePage):
             return
 
         vt = entry["vt"]
+        self._front()
         text, ok = QInputDialog.getText(
             self, "寫入數值", f"對位址 0x{entry['addr']:X} 寫入新的 {vt.label}："
         )
@@ -664,18 +723,19 @@ class MemoryPage(BasePage):
         try:
             value = float(text) if vt.is_float else int(text, 0)
         except ValueError:
-            QMessageBox.warning(self, "數值錯誤", f"「{text}」不是有效的數值。")
+            self._notice(f"「{text}」不是有效的數值。", error=True)
             return
 
         try:
             self._scanner.write_value(entry["addr"], vt, value)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "寫入失敗", str(exc))
+            self._notice(f"寫入失敗：{exc}", error=True)
             return
         self._refresh_watch_values()
 
     def _write_string_entry(self, entry: dict) -> None:
         encoding = entry["str_enc"]
+        self._front()
         text, ok = QInputDialog.getText(
             self, "寫入字串", f"對位址 0x{entry['addr']:X} 寫入新文字："
         )
@@ -685,14 +745,15 @@ class MemoryPage(BasePage):
         try:
             new_bytes = text.encode(encoding)
         except (UnicodeEncodeError, LookupError) as exc:
-            QMessageBox.warning(
-                self, "編碼錯誤", f"這段文字無法用 {STRING_ENCODINGS[encoding]} 編碼：{exc}"
+            self._notice(
+                f"這段文字無法用 {STRING_ENCODINGS[encoding]} 編碼：{exc}", error=True
             )
             return
 
         # 比原長度長 → 會覆蓋相鄰記憶體，先問過
         null_terminate = True
         if len(new_bytes) > entry["str_len"]:
+            self._front()
             reply = QMessageBox.question(
                 self,
                 "字串較長",
@@ -708,7 +769,7 @@ class MemoryPage(BasePage):
         try:
             self._scanner.write_string(entry["addr"], text, encoding, null_terminate)
         except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "寫入失敗", str(exc))
+            self._notice(f"寫入失敗：{exc}", error=True)
             return
         self._refresh_watch_values()
 

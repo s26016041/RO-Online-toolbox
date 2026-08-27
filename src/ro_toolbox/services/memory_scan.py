@@ -31,13 +31,17 @@ from __future__ import annotations
 
 import bisect
 import ctypes
+import logging
 import os
 import struct
 import threading
+import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 psapi = ctypes.WinDLL("psapi", use_last_error=True)
@@ -95,6 +99,22 @@ _READ_CHUNK = 16 * 1024 * 1024
 #   （症狀：拿到別的位址的資料 → 用錯的怪物 ID 去寫記憶體）。
 _scratch = threading.local()
 _SCRATCH_MAX = 32 * 1024 * 1024   # 超過就照舊當場配置，不長期佔住記憶體
+
+#: 列舉模組最多等多久（秒）。GameGuard 會讓 `EnumProcessModulesEx` 卡住不回來，
+#: 實測會把整個介面凍死；逾時就當查不到，功能安全退化。
+_MODULE_TIMEOUT = 3.0
+
+#: pid → 上次「列舉模組逾時」的時間。**放在模組層級，不是實例上。**
+#:
+#: ⚠ 為什麼不能記在實例上：`MemoryScanner` 到處都是新開的（`submitted_account()`
+#: 每次呼叫一顆、`game_census.take()` 每個實例一顆、帳號頁每三秒查一次連線）。
+#: 實例層級的「查過就不再查」對它們完全無效 —— 每一顆都要重付一次 3 秒逾時，
+#: 而且各噴一行 WARNING。使用者實測看到的就是每隔幾秒洗一行同樣的訊息，
+#: 而每次逾時還會留下一條卡死在 `EnumProcessModulesEx` 裡的執行緒。
+_module_blocked: dict[int, float] = {}
+#: 被擋之後隔多久才再試一次。GameGuard 擋的窗口大約是遊戲剛開的一兩分鐘
+#: （[MEM-031]），所以冷卻要短到「放行後很快就會恢復」，長到「不會一直洗版」。
+MODULE_BLOCK_COOLDOWN = 30.0
 
 
 def _region_buffer(size: int):
@@ -402,6 +422,7 @@ class MemoryScanner:
         self._mod_starts: list[int] = []
         self._mod_ends: list[int] = []
         self._module_by_name: dict[str, int] = {}
+        self._modules_loaded = False
 
     # ------------------------------------------------------------------
     # 程序開關
@@ -432,7 +453,11 @@ class MemoryScanner:
         self._psize = 4 if self._is_wow64(handle) else 8
         self.reset()
         self._clear_pointer_state()
-        self.refresh_modules()
+        # ⚠ **這裡不准列舉模組。** `EnumProcessModulesEx` 對掛 GameGuard 的
+        # 行程會卡住不回來 —— 實測：使用者在記憶體分頁選了 RO 之後整個介面凍住，
+        # py-spy 抓到主執行緒就停在 list_modules → EnumProcessModulesEx。
+        # 模組表改成**要用到才查**（`_ensure_modules`），而且查的時候有逾時保護。
+        self._modules_loaded = False
 
     @staticmethod
     def _is_wow64(handle: int) -> bool:
@@ -454,6 +479,7 @@ class MemoryScanner:
         self._mod_starts = []
         self._mod_ends = []
         self._module_by_name = {}
+        self._modules_loaded = False
 
     def _clear_pointer_state(self) -> None:
         self._ptr_vals = np.empty(0, np.uint64)
@@ -1024,8 +1050,47 @@ class MemoryScanner:
     # 模組列舉（把動態位址表達成「模組名 + 偏移」，重開才能還原）
     # ==================================================================
     def list_modules(self) -> list[ModuleInfo]:
-        """列出目標程序目前載入的所有模組（含 32 位元 DLL）。"""
-        handle = self._require_handle()
+        """列出目標程序目前載入的所有模組（含 32 位元 DLL）。
+
+        ⚠ **一定要有逾時。** `EnumProcessModulesEx` 對掛 GameGuard 的行程
+        會卡住不回來（實測：整個工具箱凍住，py-spy 顯示主執行緒停在這裡）。
+        Win32 沒有「非阻塞版」，所以丟到背景執行緒去做，逾時就當作查不到 ——
+        **大聲記一筆**，然後回空清單讓上層安全退化，不要拖著整個介面陪葬。
+        """
+        pid = self._pid
+        now = time.monotonic()
+        blocked_at = _module_blocked.get(pid) if pid is not None else None
+        if blocked_at is not None and now - blocked_at < MODULE_BLOCK_COOLDOWN:
+            # 已知這個行程正被擋著：直接當查不到。**不再卡 3 秒、也不再記一次** ——
+            # 每隔幾秒重試一次除了洗版之外，還會每次留下一條卡死的執行緒。
+            return []
+
+        result: list[list[ModuleInfo]] = []
+        worker = threading.Thread(
+            target=lambda: result.append(self._list_modules_blocking()), daemon=True
+        )
+        worker.start()
+        worker.join(_MODULE_TIMEOUT)
+        if not result:
+            if pid is not None:
+                _module_blocked[pid] = now
+            log.warning(
+                "列舉模組超過 %.0f 秒沒有回應（GameGuard 會擋這個查詢）——"
+                "先當作查不到，需要模組基底的功能會停用（%.0f 秒內不再重試）",
+                _MODULE_TIMEOUT, MODULE_BLOCK_COOLDOWN,
+            )
+            return []
+        if pid is not None and _module_blocked.pop(pid, None) is not None:
+            log.info("模組列舉恢復正常（PID %s）", pid)
+        return result[0]
+
+    def _list_modules_blocking(self) -> list[ModuleInfo]:
+        """真正去問 Win32 的那一段。**可能永遠不回來**，只准由 `list_modules` 在
+        背景執行緒裡呼叫。"""
+        try:
+            handle = self._require_handle()
+        except RuntimeError:
+            return []
         count = 1024
         arr = (wintypes.HMODULE * count)()
         needed = wintypes.DWORD(0)
@@ -1082,6 +1147,7 @@ class MemoryScanner:
         if not game_dir:
             return names
         prefix = os.path.normcase(os.path.join(game_dir, ""))
+        self._ensure_modules()
         for m in self._mods_sorted:
             if m.path and os.path.normcase(m.path).startswith(prefix):
                 names.add(m.name.lower())
@@ -1095,17 +1161,120 @@ class MemoryScanner:
         self._mod_starts = [m.base for m in mods_sorted]
         self._mod_ends = [m.end for m in mods_sorted]
         self._module_by_name = {}
+        self._modules_loaded = True
         for m in mods:
             # 同名以第一個（通常是主模組）為準
             self._module_by_name.setdefault(m.name.lower(), m.base)
         return mods
 
+    def _is_main_image(self, base: int) -> bool:
+        """這個位址是不是主程式的 PE 映像開頭（MZ + PE + 夠大的 SizeOfImage）。"""
+        head = self._read_bytes(base, 0x40)
+        if not head or head[:2] != b"MZ":
+            return False
+        e_lfanew = int.from_bytes(head[0x3C:0x40], "little")
+        if not 0 < e_lfanew < 0x1000:
+            return False
+        pe = self._read_bytes(base + e_lfanew, 0x60)
+        if not pe or pe[:4] != b"PE" + bytes(2):
+            return False
+        image_size = int.from_bytes(pe[0x50:0x54], "little")
+        # 主程式是 33 MB 級，DLL 沒有這麼大 —— 用它排除掉載在同一位址的其他映像。
+        return image_size > 0x1000000
+
+    def image_base_by_scan(self) -> int | None:
+        """不靠模組列舉，直接掃記憶體找主程式的映像基底。
+
+        ⚠ 為什麼需要這條路：`EnumProcessModulesEx` 對掛 GameGuard 的行程**會被擋**
+        （[MEM-031]，客戶端剛開的那一兩分鐘尤其明顯），於是所有「模組基底＋偏移」
+        的功能在最需要的時候剛好不能用 —— 自動登入要在開機後十幾秒就讀欄位，
+        正好落在被擋的窗口裡（實測：跑的時候讀不到、跑完 151 秒才讀得到）。
+
+        做法：走過每個已提交區段，找 `AllocationBase == BaseAddress` 且開頭是
+        `MZ` 的映像，讀它 PE 標頭裡的 `SizeOfImage`，取**最大的那個**。
+        主程式（33 MB 級）比任何 DLL 都大得多，這個判準很穩。
+        找不到回 `None`，呼叫端要安全退化。
+        """
+        handle = self._require_handle()
+
+        # 先試最常見的那個基底再驗證。**這不是寫死答案** —— 驗不過就照樣走完整掃描。
+        # 為什麼值得：完整掃描要走過整個位址空間，而客戶端剛開的那一分鐘
+        # 讀取常常被擋，走捷徑成功率高很多（實測 Ragexe 每次都載在 0x400000）。
+        if self._is_main_image(0x400000):
+            return 0x400000
+
+        best: tuple[int, int] | None = None
+        addr = 0
+        mbi = MEMORY_BASIC_INFORMATION()
+        size_mbi = ctypes.sizeof(mbi)
+        while addr < _MAX_ADDR:
+            if kernel32.VirtualQueryEx(handle, addr, ctypes.byref(mbi), size_mbi) == 0:
+                break
+            base = mbi.BaseAddress
+            region = mbi.RegionSize
+            if region == 0:
+                break
+            if mbi.State == MEM_COMMIT and base == mbi.AllocationBase:
+                head = self._read_bytes(base, 0x40)
+                if head and head[:2] == b"MZ":
+                    e_lfanew = int.from_bytes(head[0x3C:0x40], "little")
+                    if 0 < e_lfanew < 0x1000:
+                        pe = self._read_bytes(base + e_lfanew, 0x60)
+                        if pe and pe[:4] == b"PE" + bytes(2):
+                            # SizeOfImage 在 optional header +0x38（32 與 64 位元同位置）
+                            image_size = int.from_bytes(pe[0x50:0x54], "little")
+                            if best is None or image_size > best[1]:
+                                best = (base, image_size)
+            addr = base + region
+        return best[0] if best else None
+
+    def _ensure_modules(self) -> None:
+        """要用到模組表了才去查（查一次就記住）。
+
+        不在 `open()` 就查，是因為那會卡住呼叫端 —— 見 `list_modules` 的說明。
+        查失敗（逾時）也算查過，不要每次都再卡一輪；要重試就明確呼叫
+        `refresh_modules()`。
+        """
+        if not self._modules_loaded:
+            self.refresh_modules()
+
     def module_base(self, name: str) -> int | None:
-        """回傳指定模組當下的載入基底位址；未載入 / 未選定程序時為 None。"""
-        return self._module_by_name.get(name.lower())
+        """回傳指定模組當下的載入基底位址；未載入 / 未選定程序時為 None。
+
+        ⚠ **主程式一律先用掃描，不要先問模組表。** GameGuard 會擋模組列舉
+        （[MEM-031]），被擋時 `_ensure_modules()` 會**卡滿逾時**才回空清單。
+        以前這裡是「先問模組表、失敗才掃描」，等於每次都先付一次逾時。
+
+        為什麼會踩到：`input_helper.submitted_account()` 原本是直接叫
+        `image_base_by_scan()`（全程不碰模組列舉，它的註解就寫著這個理由），
+        後來改用 `locate_global()` 之後就走進這裡了 —— 而它掛在帳號頁
+        **每三秒一次**的連線查詢上，於是每三秒卡一次、噴一行警告。
+        `bag.py`、`packet_table.py` 也走同一條路，一起受益。
+
+        `image_base_by_scan()` 對主程式很快（先驗 `0x400000` 這個捷徑，
+        實測 Ragexe 每次都載在那裡），而且**完全不經過會被擋的 API**。
+        掃不到才回頭問模組表 —— 順序反過來就好，兩條路都還在。
+
+        ⚠ 掃描那條路認的是「**映像最大的那個**」＝主程式。所以 `.exe` 的查詢
+        **假設問的就是主程式**（目前所有呼叫端都是：`ragexe.exe` 或行程自己的
+        映像名）。要查輔助行程之類的別的 .exe，這個假設就不成立了。
+        """
+        # `attached` 要先擋：掃描需要行程 handle，沒附加時它會拋例外。
+        if name.lower().endswith(".exe") and self.attached:
+            base = self.image_base_by_scan()
+            if base is not None:
+                return base
+        self._ensure_modules()
+        base = self._module_by_name.get(name.lower())
+        if base is not None:
+            return base
+        if name.lower().endswith(".exe"):
+            return self.image_base_by_scan()
+        return None
 
     def module_for_address(self, addr: int) -> tuple[ModuleInfo, int] | None:
         """位址若落在某模組內，回傳 (模組, 相對偏移)，否則 None。"""
+        self._ensure_modules()
         if not self._mod_starts:
             return None
         i = bisect.bisect_right(self._mod_starts, addr) - 1

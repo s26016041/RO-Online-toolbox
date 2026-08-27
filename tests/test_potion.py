@@ -70,9 +70,20 @@ class FakeBag:
         self.readable = readable
         self.shuffle = shuffle       # 每喝一次就把剩下的搬到別格（模擬背包重排）
         self.drunk = 0
+        self.generation = 0          # 綁定世代，bump 一次代表舊的 watch 過期
+        self.watches: list[FakeWatch] = []
 
     def as_dict(self, pid):  # noqa: ARG002
         return dict(self.rows) if self.readable else {}
+
+    def BagWatch(self, pid):  # noqa: N802, ARG002 - 冒充 bag 模組裡的類別
+        watch = FakeWatch(self)
+        self.watches.append(watch)
+        return watch
+
+    def expire_watches(self):
+        """模擬綁定過期（換地圖、背包重新配置）：已開的 watch 全部失效。"""
+        self.generation += 1
 
     def consume(self, slot):
         if slot not in self.rows:
@@ -82,6 +93,34 @@ class FakeBag:
         del self.rows[slot]
         if amount > 1:
             self.rows[slot + 10 if self.shuffle else slot] = (item_id, amount - 1)
+
+
+class FakeWatch:
+    """假的 `bag.BagWatch`：綁定成功與否跟著 FakeBag 的 readable 走。"""
+
+    def __init__(self, bag: FakeBag):
+        self.bag = bag
+        self.bound = False
+        self.opens = 0
+        self.closed = 0
+        self.generation = -1
+
+    def open(self) -> bool:
+        self.opens += 1
+        self.generation = self.bag.generation
+        self.bound = self.bag.readable
+        return self.bound
+
+    def snapshot(self):
+        if not self.bound or not self.bag.readable:
+            return {}
+        if self.generation != self.bag.generation:
+            return {}          # 綁定過期了
+        return dict(self.bag.rows)
+
+    def close(self) -> None:
+        self.bound = False
+        self.closed += 1
 
 
 class FakeCapture:
@@ -104,9 +143,11 @@ class FakeCapture:
 class FakeSocket:
     """送出使用道具時，依設定投遞（或不投遞）伺服器回應。"""
 
-    def __init__(self, bag: FakeBag, *, reply=True, item_id=RED_POTION, result=1, wrong=None):
+    def __init__(self, bag: FakeBag, *, reply=True, item_id=RED_POTION, result=1,
+                 wrong=None, dies_after=None):
         self.bag = bag
         self.reply = reply
+        self.dies_after = dies_after   # 前 N 次正常，之後裝死（不扣、不回）
         self.item_id = item_id
         self.result = result
         self.wrong = wrong          # 回包謊稱是別的道具（模擬格號被挪動）
@@ -120,6 +161,8 @@ class FakeSocket:
         self.sent.append(data)
         slot = int.from_bytes(data[2:4], "little")
         if not self.reply:
+            return len(data)
+        if self.dies_after is not None and len(self.sent) > self.dies_after:
             return len(data)
         real = self.bag.rows.get(slot, (self.item_id, 0))[0]
         if self.result == 1:
@@ -149,7 +192,7 @@ def wired(monkeypatch):
         monkeypatch.setattr(potion, "CharacterReader", lambda: reader)
         monkeypatch.setattr(potion, "bag", fake_bag)
         monkeypatch.setattr(potion, "game_socket", sock)
-        monkeypatch.setattr(potion, "PcapCapture", FakeCapture)
+        monkeypatch.setattr(potion, "PacketCapture", FakeCapture)
         return fake_bag, reader, sock
 
     return build
@@ -327,3 +370,158 @@ def test_cleanup_releases_everything(wired):
     assert sock.closed >= 1
     assert FakeCapture.latest.stopped >= 1
     assert bot.stats.running is False
+
+
+# ---- 啟動：不該一試就放棄，訊息要講得出是哪一隻 ---------------------------
+
+
+def test_socket_lookup_retries_instead_of_giving_up_once(monkeypatch):
+    """剛登入／剛換地圖的那幾秒複製不到 socket 是**正常過渡**，不是故障。
+
+    以前只試一次，勾下去的時機不對就整個停用，使用者只看到一行
+    「找不到遊戲 socket」，看起來像壞掉（實際回報）。
+    """
+    from ro_toolbox.services import potion as mod
+
+    tries = []
+
+    def flaky(_pid, _ip, _port):
+        tries.append(1)
+        return 0 if len(tries) < 3 else 0x1234      # 第三次才成功
+
+    monkeypatch.setattr(mod, "find_server", lambda _pid: ("1.2.3.4", 10000))
+    monkeypatch.setattr(mod.game_socket, "find_game_socket", flaky)
+    monkeypatch.setattr(mod, "_SOCKET_POLL", 0.0)
+
+    bot = mod.PotionBot(1234, mod.PotionConfig())
+    sock, server = bot._wait_for_socket()
+    assert sock == 0x1234
+    assert server == ("1.2.3.4", 10000)
+    assert len(tries) == 3
+
+
+def test_socket_lookup_gives_up_at_the_deadline(monkeypatch):
+    """重試也要有上限 —— 逾時就大聲停用，不能永遠卡在啟動。"""
+    from ro_toolbox.services import potion as mod
+
+    monkeypatch.setattr(mod, "find_server", lambda _pid: ("1.2.3.4", 10000))
+    monkeypatch.setattr(mod.game_socket, "find_game_socket", lambda *a: 0)
+    monkeypatch.setattr(mod, "_SOCKET_POLL", 0.0)
+    monkeypatch.setattr(mod, "_SOCKET_WAIT_SEC", 0.05)
+
+    bot = mod.PotionBot(1234, mod.PotionConfig())
+    sock, _server = bot._wait_for_socket()
+    assert sock is None
+
+
+def test_failure_message_names_the_character(caplog):
+    """多開的時候，一行沒有身分的警告等於沒說。"""
+    import logging
+
+    from ro_toolbox.services import potion as mod
+
+    bot = mod.PotionBot(1234, mod.PotionConfig())
+    bot._character = "狐狐狸"
+    with caplog.at_level(logging.WARNING, logger="ro_toolbox.services.potion"):
+        bot._fail("找不到遊戲 socket，無法送封包")
+    assert any("狐狐狸" in r.message for r in caplog.records)
+
+
+def test_failure_message_survives_an_unknown_character(caplog):
+    """名字還沒讀到就失敗時不要硬塞空引號，訊息照樣要通順。"""
+    import logging
+
+    from ro_toolbox.services import potion as mod
+
+    bot = mod.PotionBot(1234, mod.PotionConfig())
+    with caplog.at_level(logging.WARNING, logger="ro_toolbox.services.potion"):
+        bot._fail("角色定位失敗")
+    assert any("自動補水停用：角色定位失敗" in r.message for r in caplog.records)
+
+
+# ---- 連喝（藥水沒有冷卻，低於門檻要一路喝到過線）------------------------
+
+
+def test_burst_never_sends_more_than_the_bag_holds(wired):
+    """⚠ 連喝**不准多灌**。
+
+    這條擋的是一個真的踩到的設計錯誤：連喝為了快而不等確認，背包數量還沒
+    更新就一直看到「還有 N 瓶」，結果背包只有 2 瓶卻送了 27 次使用道具。
+    """
+    # 背包裡還有別的東西 —— 真實情況本來就這樣，而且串列要有東西才驗得過
+    fake_bag, _reader, sock = wired(
+        {6: (RED_POTION, 2), 7: (BLUE_POTION, 9), 8: (909, 3)}, start=10.0
+    )
+    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=99))
+    _run(bot, 5.0)
+    assert len(sock.sent) == 2, f"背包只有 2 瓶，卻送了 {len(sock.sent)} 次"
+    assert fake_bag.drunk == 2
+
+
+def test_burst_stops_and_counts_a_miss_when_nothing_is_consumed(wired):
+    """連喝時數量沒少 = 跟「送了沒回應」同一件事，要計入失敗次數。
+
+    不計的話連喝會變成一條悶著狂送的暗路 —— 主迴圈的保護完全繞過去了。
+    """
+    _bag, _reader, sock = wired({6: (RED_POTION, 50)}, start=10.0, dies_after=1)
+    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=99))
+    _run(bot, 8.0)
+    assert bot.stats.failed is True
+    assert len(sock.sent) <= potion._MAX_MISS + 1, f"送了 {len(sock.sent)} 次"
+
+
+def test_burst_is_skipped_when_the_first_drink_did_not_land(wired):
+    """第一瓶沒喝到就不准連喝 —— 那些送出會整個繞過失敗計數。"""
+    _bag, _reader, sock = wired({6: (RED_POTION, 9)}, start=10.0, result=0)
+    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=99))
+    _run(bot, 5.0)
+    assert len(sock.sent) == potion._MAX_MISS
+
+
+# ---- 背包快路徑 --------------------------------------------------------
+
+
+def test_bag_is_read_through_a_bound_list(wired):
+    """喝水要走綁定過的串列，不是每次重跑 AOB 掃描（那是每瓶 0.1 秒）。"""
+    fake_bag, _reader, _sock = wired({6: (RED_POTION, 20)}, start=30.0)
+    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=60))
+    _run(bot, 2.0)
+    assert len(fake_bag.watches) == 1, "只該綁定一次"
+    assert fake_bag.watches[0].opens == 1
+    assert bot.stats.hp_used == 3
+
+
+def test_stale_binding_is_relocated_not_trusted(wired):
+    """綁定過期（換地圖、背包重配置）要重新定位，不是拿舊資料硬撐。"""
+    fake_bag, _reader, _sock = wired({6: (RED_POTION, 40)}, start=30.0)
+    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=60))
+    bot.start()
+    deadline = time.monotonic() + 3.0
+    bumped = False
+    while time.monotonic() < deadline and bot.running:
+        if not bumped and bot.stats.hp_used >= 1:
+            fake_bag.expire_watches()
+            bumped = True
+        elif bumped and len(fake_bag.watches) > 1:
+            break
+        time.sleep(0.02)
+    bot.stop()
+    assert bumped, "測試沒跑到喝水就結束了"
+    assert len(fake_bag.watches) > 1, "綁定過期之後應該重新定位"
+    assert fake_bag.watches[0].closed >= 1, "舊的綁定要關掉"
+    assert bot.stats.failed is False
+
+
+def test_relocating_is_throttled(wired):
+    """重新定位要跑一次 AOB 掃描（0.1 秒）—— 不能在 10 ms 輪詢裡一直跑。"""
+    fake_bag, _reader, _sock = wired({6: (RED_POTION, 40)}, start=30.0)
+    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=60))
+    bot.start()
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline and bot.running:
+        fake_bag.expire_watches()      # 每次都讓綁定失效，逼它想重新定位
+        time.sleep(0.01)
+    bot.stop()
+    # 1.5 秒 ÷ _RELOCATE_SEC 上限約 2~3 次；沒有限流會是幾十次
+    assert len(fake_bag.watches) <= 4, f"重新定位了 {len(fake_bag.watches)} 次"
+

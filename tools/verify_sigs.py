@@ -18,7 +18,11 @@ CLAUDE.md 要求所有位址一律 AOB 定位，而 AOB 有兩種安靜的壞法
 主控台只印結論，完整明細寫到 `reports/verify_sigs-<時間>.md`。
 
 **唯一性檢查**（對執行中的行程）
-  - `CHAR_STATUS`：整個可寫記憶體只能命中 1 個位址。
+  - 角色狀態：AOB 命中幾個都可以，但**通過合理性驗證的只能有 1 個**。
+    （原始 AOB 唯一是錯的判準：堆積裡會有同樣位元組樣式的垃圾，見 [MEM-041]。）
+  - 角色座標：`POSITION_X/Y_SIGS` 各要定位成功，而且 **y 必須是 x+4**。
+  - 導航目標全域：`NAVI_DEST_SIGS` 要定位成功。
+  - 送出帳號緩衝：`SUBMITTED_ACCOUNT_SIGS` 要定位成功（自動登入的閉環驗證靠它）。
   - 背包容器骨架：`sub ecx,5` + 除以 34 的魔術乘數，只能解出一個容器。
   - 封包長度表：`mov ecx,esi; call` 的最熱門目標要**明顯**領先第二名。
 
@@ -46,9 +50,19 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from ro_toolbox.services import bag, packet_table  # noqa: E402
-from ro_toolbox.services.aob import scan  # noqa: E402
+from ro_toolbox.services.aob import locate_global, scan  # noqa: E402
+from ro_toolbox.services.character import CharacterReader  # noqa: E402
 from ro_toolbox.services.memory_scan import MemoryScanner  # noqa: E402
-from ro_toolbox.services.signatures import CHAR_STATUS  # noqa: E402
+from ro_toolbox.services.signatures import (  # noqa: E402
+    CHAR_STATUS,
+    NAVI_DEST_SIGS,
+    POSITION_X_SIGS,
+    POSITION_XY_GAP,
+    POSITION_Y_SIGS,
+    SELECT_CURSOR_SIGS,
+    SELECT_NAME_SIGS,
+    SUBMITTED_ACCOUNT_SIGS,
+)
 
 GAME = "ragexe.exe"
 
@@ -117,8 +131,8 @@ class SnapshotScanner:
     """假的 scanner：只服務快照涵蓋的位址。
 
     介面刻意只做 `bag` 與 `packet_table` 真正會用到的那幾個
-    （`list_modules` / `_read_bytes` / `close`）。多做的部分沒有真實資料
-    當靠山，反而會讓模擬結果不能信。
+    （`module_base` / `list_modules` / `_read_bytes` / `close`）。多做的部分
+    沒有真實資料當靠山，反而會讓模擬結果不能信。
     """
 
     class _Module:
@@ -132,11 +146,20 @@ class SnapshotScanner:
         self.closed = False
 
     @property
-    def module_base(self) -> int:
+    def _base(self) -> int:
         return self._snap.module_base + self._delta
 
+    def module_base(self, name: str) -> int | None:
+        """跟真的 `MemoryScanner` 同名同形 —— `aob.code_section` 走這條。
+
+        ⚠ 這裡不能做成 property。正式版是**方法**（模組列舉被 GameGuard
+        擋住時它會改用掃描），假的做成屬性就會在模擬時炸掉，
+        而那正是我們要用它來擋下的那種「兩邊不一致」。
+        """
+        return self._base if name.lower() == GAME.lower() else None
+
     def list_modules(self):
-        return [self._Module(GAME, self.module_base)]
+        return [self._Module(GAME, self._base)]
 
     def close(self) -> None:
         self.closed = True
@@ -257,46 +280,22 @@ def load_snapshot(path: Path) -> Snapshot:
 # ---------------------------------------------------------------------------
 
 
-def _container_candidates(base: int, blob: bytes) -> list[tuple[int, int, int]]:
-    """列出所有通過骨架濾網的候選 [(骨架位址, 解析函式, 容器)]。
+def _container_candidates(scanner) -> list[tuple[int, int, int]]:
+    """列出所有通過骨架濾網的候選 `(骨架位址, 解析函式, 容器)`。
 
-    這裡刻意**重走一次 `bag.find_container` 的邏輯**而不是直接呼叫它 ——
-    它只回第一個命中，看不出「到底有幾個」。有幾個才是這支工具要問的事。
+    ⚠ **直接呼叫正式的 `bag.find_container_sites`**，不要在這裡重寫一份。
+    它本來就回**全部**候選（不是只回第一個），所以問得出「到底有幾個」。
+    重寫一份的話，正式版收緊骨架時這裡不會跟上，報告就會說謊（踩過）。
     """
-    out: list[tuple[int, int, int]] = []
-    start = 0
-    while True:
-        k = blob.find(bag._MAGIC_DIV34, start)  # noqa: SLF001
-        if k < 0:
-            return out
-        start = k + 1
-        if bag._SUB_5 not in blob[max(0, k - 0x20) : k + 0x20]:  # noqa: SLF001
-            continue
-        span = blob[k : k + 0x40]
-        pos = span.find(bytes([bag._CALL_REL32]))  # noqa: SLF001
-        if pos < 0:
-            continue
-        rel = struct.unpack_from("<i", span, pos + 1)[0]
-        parser = base + k + pos + 5 + rel
-        if not (base <= parser < base + len(blob)):
-            continue
-        body = blob[parser - base : parser - base + 0x200]
-        at = 0
-        while True:
-            at = body.find(bytes([bag._MOV_ECX_IMM]), at)  # noqa: SLF001
-            if at < 0 or at + 5 > len(body):
-                break
-            value = struct.unpack_from("<I", body, at + 1)[0]
-            at += 1
-            if base <= value < base + len(blob):
-                continue
-            if 0x400000 < value < 0x10000000:
-                out.append((base + k, parser, value))
-                break
+    return bag.find_container_sites(scanner)
 
 
 def _call_targets(base: int, blob: bytes) -> dict[int, int]:
-    """`mov ecx,esi ; call rel32` 各個目標被呼叫幾次。"""
+    """每個被 `mov ecx,esi ; call` 呼叫的目標被呼叫幾次。
+
+    ⚠ 條件要跟 `packet_table._register_function` **一模一樣**（包含
+    「前面要有 push imm32」那一條），不然這裡量到的領先倍數是另一個東西的。
+    """
     counts: dict[int, int] = {}
     start = 0
     while True:
@@ -304,6 +303,9 @@ def _call_targets(base: int, blob: bytes) -> dict[int, int]:
         if k < 0 or k + 7 > len(blob):
             return counts
         start = k + 1
+        window = blob[max(0, k - packet_table._ARGS_BACK):k]  # noqa: SLF001
+        if packet_table._PUSH_IMM32 not in window:  # noqa: SLF001
+            continue
         rel = struct.unpack_from("<i", blob, k + 3)[0]
         target = base + k + 7 + rel
         counts[target] = counts.get(target, 0) + 1
@@ -313,23 +315,68 @@ def check_live(pid: int, snap: Snapshot, report: Report, notes: list[str]) -> No
     print(f"\n[唯一性] PID {pid}")
     base, blob = snap.text_base, snap.text
 
-    # --- 1. 角色狀態特徵：整個可寫記憶體只能命中一個 ---
+    # --- 1. 角色狀態：AOB 是**錨**，唯一性靠內容驗證（[MEM-041]）---
+    #
+    # ⚠ 這裡以前要求「原始 AOB 只能命中 1 個」，那個判準是錯的：玩久了堆積裡會
+    # 出現同樣位元組樣式的垃圾（實測 6 個命中裡 5 個是 HP 15／maxHP 42 億／名字空白）。
+    # 真正要守的是「**驗完之後只剩一個**」—— 那才是生產路徑的行為。
+    reader = CharacterReader()
+    located = reader.attach(pid)
+    try:
+        scanner = MemoryScanner()
+        scanner.open(pid)
+        try:
+            hits = scan(scanner, CHAR_STATUS, writable_only=True, limit=64)
+        finally:
+            scanner.close()
+        real = [h for h in hits if reader.probe(h) is not None] if located else []
+    finally:
+        reader.close()
+    report.add(
+        f"PID {pid} 角色狀態驗證後唯一",
+        len(real) == 1,
+        f"AOB 命中 {len(hits)} 個，通過合理性驗證 {len(real)} 個："
+        f"{[hex(h) for h in real]}",
+    )
+    notes.append(
+        f"- PID {pid} 角色狀態：AOB 命中 {len(hits)} 個 → 驗證後 {len(real)} 個"
+        f"（其餘是堆積垃圾，見 [MEM-041]）"
+    )
+
+    # --- 1b. 座標與導航目標：程式碼特徵，一定要**唯一且交叉對得上** ---
     scanner = MemoryScanner()
     scanner.open(pid)
     try:
-        # 生產路徑用 limit=8；這裡放寬成 64，才看得出到底有幾個。
-        hits = scan(scanner, CHAR_STATUS, writable_only=True, limit=64)
+        x = locate_global(scanner, POSITION_X_SIGS)
+        y = locate_global(scanner, POSITION_Y_SIGS)
+        navi = locate_global(scanner, NAVI_DEST_SIGS)
+        account = locate_global(scanner, SUBMITTED_ACCOUNT_SIGS)
     finally:
         scanner.close()
     report.add(
-        f"PID {pid} CHAR_STATUS 唯一",
-        len(hits) == 1,
-        f"命中 {len(hits)} 個：{[hex(h) for h in hits]}",
+        f"PID {pid} 角色座標定位（x 與 y 必須相鄰）",
+        x is not None and y is not None and y - x == POSITION_XY_GAP,
+        f"x={x and hex(x)} y={y and hex(y)}（相差 {y - x if x and y else None}，"
+        f"應為 {POSITION_XY_GAP}）",
     )
-    notes.append(f"- PID {pid} CHAR_STATUS 命中 {len(hits)} 個：{[hex(h) for h in hits]}")
+    report.add(
+        f"PID {pid} 導航目標全域定位",
+        navi is not None,
+        f"位址 {navi and hex(navi)}",
+    )
+    report.add(
+        f"PID {pid} 送出帳號緩衝定位",
+        account is not None,
+        f"位址 {account and hex(account)}",
+    )
 
     # --- 2. 背包容器骨架 ---
-    cands = _container_candidates(base, blob)
+    scanner = MemoryScanner()
+    scanner.open(pid)
+    try:
+        cands = _container_candidates(scanner)
+    finally:
+        scanner.close()
     containers = sorted({c for _s, _p, c in cands})
     report.add(
         f"PID {pid} 背包容器骨架唯一",
@@ -404,7 +451,7 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
     print("\n[改版模擬]")
     truth = bag.find_container(SnapshotScanner(snap))
     report.add("基準：快照上定位得到容器", truth is not None, "快照本身就定位不到")
-    cands = _container_candidates(snap.text_base, snap.text)
+    cands = _container_candidates(SnapshotScanner(snap))
     if truth is None or not cands:
         return
     notes.append(f"- 基準容器 = {truth:#x}")
@@ -432,7 +479,12 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
         )
 
     # 3. 容器換到別的全域：定位器要回**新**值（證明沒有寫死）
-    moved = 0x0BADF00
+    #
+    # ⚠ 假值一定要落在**模組映像之外**。定位器會把「指向程式碼區段的立即值」
+    # 判定為不是容器（那是正確的：容器是資料不是程式碼），所以挑一個落在
+    # 映像內的假值，它會被合理地跳過，然後這個檢查就會誤報成不合格 ——
+    # 原本用 0x0BADF00 就是這樣（在 base+程式碼長度 之內）。
+    moved = 0x1BADF00
     patched = _patch_container(snap, cands[0], moved)
     got = None if patched is None else bag.find_container(_mutate(snap, patched))
     report.add(
@@ -510,6 +562,76 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
     got = packet_table.extract(0, _mutate(snap, broken))
     report.add("呼叫骨架被破壞 -> 回空表（安全退化）", got == {},
                f"竟然抽到 {len(got)} 個")
+
+    # --- 選角畫面的兩個全域（游標格號、選定的角色名字）---
+    #
+    # 這兩個是自動選角的眼睛：移游標之前要讀得到「現在在第幾格」，
+    # 按下 Enter 之後要讀得到「客戶端選了誰」。定位錯了會選到別人，
+    # 所以位移不變、骨架壞掉要退成 None，兩件事都要驗。
+    for label, sigs in (("選角游標", SELECT_CURSOR_SIGS), ("角色名字", SELECT_NAME_SIGS)):
+        truth = locate_global(SnapshotScanner(snap), sigs)
+        if truth is None:
+            # 舊的快照可能是在這兩條特徵存在之前存的 —— 那不算不合格。
+            # 真的壞掉會在 `check_live`（對著跑起來的遊戲）那邊變成 NG。
+            report.skip(f"{label}：改版模擬", "這份快照裡沒有這組骨架")
+            continue
+        report.add(f"基準：快照上定位得到{label}", True)
+        notes.append(f"- 基準{label} {truth:#x}")
+
+        # 1) 程式碼整體位移：骨架自己會跟著搬，讀出來的位址不該變
+        #    （位址是從立即值讀的，跟骨架在哪一行無關）
+        shifted = _mutate(snap, _shift_code(snap.text, 0x400))
+        report.add(
+            f"{label}：程式碼位移後答案不變",
+            locate_global(shifted, sigs) == truth,
+            f"位移後變成 {locate_global(shifted, sigs)}",
+        )
+
+        # 2) 把指令裡的立即值改掉：答案一定要跟著改
+        #    這一項是在證明「答案不是寫死在特徵裡的」——
+        #    如果哪天有人把位址硬編進程式，這裡會當場抓到。
+        moved = truth + 0x40
+        text = bytearray(snap.text)
+        for sig in sigs:
+            for match in sig.compiled().finditer(bytes(text)):
+                for off in sig.operands:
+                    spot = match.start() + off
+                    text[spot:spot + 4] = moved.to_bytes(4, "little")
+        report.add(
+            f"{label}：立即值改掉之後答案跟著改",
+            locate_global(_mutate(snap, bytes(text)), sigs) == moved,
+            "答案沒跟著改（位址可能被寫死在程式裡）",
+        )
+
+        # 3) 骨架被破壞 -> 一定要回 None，不准退回舊值或猜一個
+        broken = snap.text
+        for sig in sigs:
+            for match in list(sig.compiled().finditer(broken)):
+                broken = (broken[:match.start()]
+                          + b"\x90" * (match.end() - match.start())
+                          + broken[match.end():])
+        report.add(
+            f"{label}：骨架被破壞 -> 回 None（安全退化）",
+            locate_global(_mutate(snap, broken), sigs) is None,
+            "竟然還定位得到",
+        )
+
+        # 4) 兩處答案不一致 -> 拒絕作答（不准挑一個用）
+        first = sigs[0].compiled().search(snap.text)
+        hits = list(sigs[0].compiled().finditer(snap.text))
+        enough = len(hits) > 1 or len(sigs) > 1 or len(sigs[0].operands) > 1
+        if first is not None and enough:
+            tampered = bytearray(snap.text)
+            spot = first.start() + sigs[0].operands[0]
+            tampered[spot:spot + 4] = (truth + 0x40).to_bytes(4, "little")
+            report.add(
+                f"{label}：兩處答案不一致 -> 回 None",
+                locate_global(_mutate(snap, bytes(tampered)), sigs) is None,
+                "竟然還給了答案",
+            )
+        else:
+            report.skip(f"{label}：兩處答案不一致 -> 回 None",
+                        "只有一處命中，做不出不一致的情況")
 
 
 # ---------------------------------------------------------------------------

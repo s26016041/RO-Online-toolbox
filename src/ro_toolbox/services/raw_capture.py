@@ -8,7 +8,7 @@ IPv4 流量，只用標準函式庫就能做到，代價只有「必須以系統
 - **收不到 inbound TCP。** Windows 的 TCP/IP 堆疊會攔下進入的 TCP，不交給
   raw socket。實測 RCVALL_ON 與 RCVALL_IPLEVEL 兩種模式下，帶 payload 的
   inbound TCP 封包數都是 0，而 outbound 正常。inbound UDP 則收得到。
-  要看伺服器回應必須改用 Npcap，或注入遊戲行程 hook recv。見 GAMEDATA [PKT-003]。
+  要看伺服器回應必須改用 WinDivert（見 services/packet_capture）。GAMEDATA [PKT-003]。
 - 只能被動接收，不能攔截或修改封包。
 - 只收 IPv4，收不到 loopback（127.0.0.1）流量。
 - socket 綁在單一介面 IP 上，多網卡／VPN 環境要綁對那張才收得到。

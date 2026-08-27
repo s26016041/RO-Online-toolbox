@@ -31,9 +31,15 @@ from ro_toolbox.core.ro_protocol import (
 from ro_toolbox.services import game_socket
 from ro_toolbox.services.character import CharacterReader
 from ro_toolbox.services.entities import EntityScanner
-from ro_toolbox.services.gamedata import is_farmable, item_name, item_names, mob_name
+from ro_toolbox.services.gamedata import (
+    is_farmable,
+    item_name,
+    item_names,
+    mob_name,
+    warps_on_map,
+)
 from ro_toolbox.services.mapdata import GatError, MapTerrain, load_terrain
-from ro_toolbox.services.pcap_capture import PcapCapture
+from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.walker import MAX_STEP, Walker
 from ro_toolbox.services.world import Monster, WorldTracker
@@ -49,15 +55,85 @@ _ROAM_MAX = 160  # 漫遊目標最遠這麼遠
 _ROAM_BUDGET = 150_000  # A* 節點上限（150 格的路實測遠低於這個數）
 _BAD_GOAL_SEC = 90.0  # 走不到的目標區域冷卻多久
 _BAD_GOAL_RADIUS = 8  # 走不到的目標附近多少格內都別再挑
-_MELEE_RANGE = 2  # 走到這麼近才送攻擊。玩家點怪也是先走近再打（[PKT-015]）
+#: 走到離怪這麼近才送攻擊。
+#:
+#: ⛔ **試過放寬到 13 格，失敗了，不要再試。**
+#: 想法是「攻擊封包只帶 GID 不帶座標，最後一段交給伺服器帶」——
+#: 單獨實驗確實成立（站穩後從 9~14 格送攻擊，伺服器 4/5 會自己走過去，
+#: 見 GAMEDATA [PKT-065]）。但**放進 bot 就壞了**，原因是實驗漏掉的差異：
+#:
+#:   實驗：角色**站穩**才送攻擊 → 伺服器接手帶路
+#:   bot ：角色多半**正在走**的時候跨過門檻，`_walker.clear()` 之後
+#:         攻擊在移動中送達 → 伺服器多半忽略它
+#:
+#: 而 `_fight()` 一旦 `attacked=True` 就再也不走路（[PKT-034]：移動會取消
+#: 連續攻擊），於是變成「在 13 格外原地罰站等 grace 到期」——
+#: 使用者實測回報「都沒走到怪物旁邊就放攻擊封包，導致原地罰站」。
+#:
+#: 所以回到「走近再打」。座標本身已經修好了（[PKT-064]），
+#: 留 3 格而不是原本的 2 格，是給「讀座標」與「怪又走一步」之間那一拍的餘裕。
+_ATTACK_RANGE = 3
 _LOOT_PAUSE = 0.4  # 打死一隻之後停這麼久，讓掉落封包進來、撿完再換下一隻
 _LOST_GRACE = 4.0  # 已經開打的怪暫時從追蹤裡消失，先寬限這麼久再放棄
-_ATTACK_ACK_SEC = 2.0  # 送出攻擊後這麼久還沒打到任何東西，就是打到空氣了
+#: 送出攻擊後這麼久還沒打到任何東西，就是打到空氣了。
+#: ⚠ 這是**基礎**額度，還要加上「伺服器把角色帶過去要走的時間」——
+#: 攻擊可以從 `_ATTACK_RANGE` 格外送出，光走過去就要好幾秒（實測 1 格約 0.15 秒）。
+#: 固定 2 秒的話，遠距送出的攻擊會在角色還在路上時就被判定打空氣
+#: （實測：改成 13 格攻擊後，70 秒內「打到空氣」7 次、擊殺只有 4）。
+_ATTACK_ACK_SEC = 2.0
+#: 走一格大約要多久（實測，見 GAMEDATA [PKT-030]）。用來換算上面那筆額外額度。
+_WALK_SEC_PER_CELL = 0.15
+#: 送出攻擊後還沒打到任何東西，隔這麼久補送一次。
+#:
+#: ⚠ **只在「一筆傷害都還沒收到」時才補。** `0x0437` action=7 是**連續**攻擊，
+#: 重送很可能把攻速計時器重置 —— 正在正常互打時補送，DPS 會掉。
+#: 補送要解決的是另一種情況：攻擊石沉大海（伺服器沒接、怪剛好跑掉），
+#: 那時候一筆傷害都不會有，補一次比乾等到放棄划算。
+#:
+#: ⚠ 1 秒曾經實測比較差，但**那是攻擊距離還是 13 格的時候**：
+#:
+#:     2 秒＋走完閘門（13 格）  擊殺 16、打空氣 5 → 0.31
+#:     1 秒＋走完閘門（13 格）  擊殺  4、打空氣 8 → 2.00   ← 補送 20 次
+#:
+#: 當時 1 秒之所以差，是因為伺服器要走 13 格（約 2 秒），1 秒的間隔會補在
+#: 路上、把攻速計時器重置。**攻擊距離已經退回 3 格**（走完只要約 0.45 秒），
+#: 那個原因不成立了，所以改回 1 秒。若又看到「打空氣」變多，先懷疑這裡。
+_ATTACK_RETRY_SEC = 1.0
+#: 補送前必須先靠這麼近。**這是「等訊號不等時間」的那個訊號**：
+#: 伺服器把角色帶過去要時間（13 格約 2 秒），還在路上就補送等於自己打斷起手。
+#: 實測 1 秒間隔、不看距離：100 秒補送 17 次，擊殺反而比 2 秒那組略低。
+_RESEND_NEAR = 3
+#: 用**真的路徑**確認「夠近了」時，允許比直線多繞幾格。
+#:
+#: ⚠ `distance_from()` 是契比雪夫距離（直線），**中間有牆也照樣算 3 格**。
+#: 只看直線的話，隔著石頭的怪會被判成「貼到了」→ 送出攻擊 → 站著打空氣
+#: （使用者實測回報）。所以直線夠近之後，再用 A* 確認實際要走的步數也夠近。
+_PATH_SLACK = 3
+#: 那個確認用的 A* 節點上限。只走幾格，不該花時間；超過就當「繞太遠」。
+_NEAR_BUDGET = 3000
+#: 傳點周圍幾格內一律不去。
+#:
+#: ⚠ **踩到傳點會被傳到別張地圖。** 那不只是走錯路 —— 新地圖可能有打不動的怪，
+#: 而且 bot 會在那裡繼續打（使用者實測回報「怪在傳點裡面或旁邊，追過去就被傳走」）。
+#: 傳點資料（`navi_link_tw.lub` → `assets/warps.json.gz`）只給一格，
+#: 但實際的傳點是一片區域，所以要留餘裕。
+_WARP_KEEP_OUT = 3
 _MISS_SKIP_SEC = 20.0  # 打到空氣的目標冷卻多久（座標過時，等它重新出現）
-#: 要不要把記憶體掃到的怪也算進來。見 GAMEDATA [MEM-014]：
-#: 結構是對的，但沒有實體清單、只能特徵掃描，涵蓋率輸給封包又會混進舊的結構，
-#: 實測反而讓擊殺數下降。找到實體清單之前一律關閉。
-_USE_MEMORY_ENTITIES = False
+#: 要不要把記憶體掃到的怪也算進來。**開著。**
+#:
+#: 為什麼需要它：**站著不動的怪只在「進入視野」時送一次封包**。
+#: 那隻怪如果在 bot 啟動之前就已經站在旁邊，我們永遠收不到它的封包 ——
+#: 螢幕上看得到、程式完全不知道它存在（使用者實測回報「明明有怪卻說沒怪」）。
+#: RO 沒有「請給我周圍有什麼」的查詢（[PKT-061]），所以那種怪**只有記憶體看得到**。
+#:
+#: 為什麼以前關著：[MEM-014] 實測「接進 bot 會讓擊殺數腰斬」。但那是在
+#: [MEM-016] 找到存活旗標（`GID-0x24 == 1` 且繪圖指標 `+0x110 != 0`）**之前**測的
+#: —— 當時會撈到已釋放的舊結構當幽靈怪，對空氣送攻擊。旗標加上去之後
+#: 打到空氣降到 0 次；移動封包也修好了（[PKT-064]）。
+#:
+#: ⚠ 它是**只增不減**的來源（`WorldTracker.sync_from_memory`），
+#: 絕不會拿涵蓋率較低的來源去刪掉封包看到的怪。
+_USE_MEMORY_ENTITIES = True
 _PICKUP_RANGE = 2  # 這麼近才撿得到
 _LOOT_WALK_MAX = 25  # 掉落物超過這麼遠就不特地跑過去
 _LOOT_TIMEOUT = 8.0  # 撿不到就放棄這一個，別卡住
@@ -82,6 +158,7 @@ class FarmStats:
     last_loot: str = ""  # 最近撿到什麼（中文道具名）
     walk_rejected: int = 0  # 被伺服器忽略的移動次數（診斷用）
     missed: int = 0  # 打到空氣的次數（座標過時，診斷用）
+    resent: int = 0  # 補送攻擊的次數（診斷用：接近 0 就代表補送機制沒在用）
 
 
 @dataclass
@@ -93,6 +170,9 @@ class _Aim:
     best_distance: int = 1 << 30
     attacked: bool = False
     attacked_at: float = 0.0  # 送出攻擊的時間，用來判斷有沒有打到
+    attacked_dist: int = 0  # 送出攻擊時離它多遠（伺服器要走這段路，要多給時間）
+    sent_at: float = 0.0  # 最後一次送出攻擊的時間（補送用，跟 attacked_at 分開）
+    resends: int = 0  # 補送過幾次（診斷用）
     lost_at: float = 0.0  # 從追蹤裡消失的時間（0 = 還在）
 
 
@@ -109,7 +189,7 @@ class FarmBot:
         self._on_update = on_update
         self._use_memory = use_memory
         self._world = WorldTracker(valid_item_ids=set(item_names()))
-        self._capture: PcapCapture | None = None
+        self._capture: PacketCapture | None = None
         self._sock: int | None = None
         self._reader: CharacterReader | None = None
         self._terrain: MapTerrain | None = None
@@ -122,6 +202,9 @@ class FarmBot:
         self._walker = Walker(self._send_move)
         self._aim: _Aim | None = None
         self._skip: dict[int, float] = {}  # 打不到的目標 → 黑名單到期時間
+        #: gid → 被列入黑名單的時間。用來判斷「之後有沒有再看到它」——
+        #: 收到更新的實體封包就是**它還在那裡的證據**，那比我們的黑名單可信。
+        self._skip_at: dict[int, float] = {}
         self._bad_goals: list[tuple[tuple[int, int], float]] = []
         self._loot_since: dict[int, float] = {}  # 掉落物 → 開始嘗試撿的時間
         self._loot_until = 0.0  # 剛打死一隻，停到這個時間讓它撿東西
@@ -129,6 +212,8 @@ class FarmBot:
         self._progress: tuple | None = None  # (位置, 擊殺, 撿取) —— 用來偵測完全卡住
         self._progress_at = 0.0
         self._map = ""  # 目前綁定的地圖，換圖要重新載地形
+        #: 這張圖上「不准踩」的格子：傳點與它周圍 `_WARP_KEEP_OUT` 格。
+        self._warp_zone: frozenset[tuple[int, int]] = frozenset()
         self._server: tuple[str, int] | None = None  # 目前綁定的伺服器端點
         self._resync_at = 0.0
         # 傷害封包分析：學到自己的 GID 後，就能認出「正在打我的怪」優先反擊
@@ -225,6 +310,7 @@ class FarmBot:
             try:
                 self._terrain = load_terrain(status.map_name)
                 self._world.set_map_size((self._terrain.width, self._terrain.height))
+                self._load_warps(status.map_name)
             except GatError as exc:
                 self._terrain = None  # 沒地形也能打，只是不會探索走路
                 log.warning("載入地形失敗，不會自動漫遊：%s", exc)
@@ -234,10 +320,13 @@ class FarmBot:
                 self._entities = scanner if scanner.open(self._pid) else None
                 if self._entities is None:
                     log.warning("記憶體掃描開不起來，怪物只能靠封包（會漏看）")
+                else:
+                    # 找新的怪放背景做，主迴圈只讀已知位址
+                    self._entities.start_discovery(self._reader.read_position)
 
-        self._capture = PcapCapture(self._pid, self._on_packet)
+        self._capture = PacketCapture(self._pid, self._on_packet)
         if not self._capture.start():
-            self._fail("封包擷取啟動失敗（需要 Npcap＋系統管理員）")
+            self._fail("封包擷取啟動失敗（需要系統管理員）")
             return False
 
         self._world.clear()
@@ -295,8 +384,19 @@ class FarmBot:
 
             if pos is not None:
                 if self._entities is not None:
-                    # 記憶體掃描是**額外**來源，只增不減（涵蓋率不如封包，見 [MEM-014]）
-                    self._world.sync_from_memory(self._entities.scan(pos))
+                    # 記憶體是**主要來源**：站著不動的怪只在進入視野時送一次封包，
+                    # bot 啟動前就站在那裡的那些，封包永遠看不到（[PKT-061]）。
+                    #
+                    # ⚠ 這裡走**快路徑**：只讀已經記住的怪物位址（每隻 0x14C bytes），
+                    # 不掃記憶體。找新的怪由背景執行緒做（`start_discovery`）——
+                    # 掃一輪要 1.5 秒級，放在主迴圈裡每拍都會卡住，
+                    # 症狀就是「刷新怪物清單跟打怪太慢」（使用者實測回報）。
+                    #
+                    # 連刪除也交給記憶體 —— 但要連續幾次沒看到才刪，因為掃描
+                    # 偶爾會抖（實測 364 次取樣有 4 次孤島 0，見 [MEM-042]）。
+                    self._world.sync_from_memory(
+                        self._entities.read_known(pos), pos=pos, view=_VIEW_RANGE
+                    )
                 # 漏收 0x0080 會留下永遠打不到的幽靈怪，會害 bot 一直鎖它
                 self._world.forget_far(pos, _VIEW_RANGE)
 
@@ -362,6 +462,7 @@ class FarmBot:
             try:
                 self._terrain = load_terrain(status.map_name)
                 self._world.set_map_size((self._terrain.width, self._terrain.height))
+                self._load_warps(status.map_name)
             except GatError as exc:
                 self._terrain = None
                 log.warning("新地圖沒有地形檔，不會漫遊：%s", exc)
@@ -371,6 +472,7 @@ class FarmBot:
             self._roam_goal = None
             self._aim = None
             self._skip.clear()
+            self._skip_at.clear()
             self._bad_goals.clear()
             self._loot_since.clear()
             if self._entities is not None:
@@ -379,6 +481,8 @@ class FarmBot:
             if self._terrain is not None and self._use_memory:
                 scanner = EntityScanner(self._terrain, status.map_name, view=_VIEW_RANGE)
                 self._entities = scanner if scanner.open(self._pid) else None
+                if self._entities is not None:
+                    self._entities.start_discovery(self._reader.read_position)
         self._note("　".join(what) + "，已重新綁定")
         return True
 
@@ -414,6 +518,7 @@ class FarmBot:
     def _expire(self, now: float) -> None:
         for gid in [g for g, until in self._skip.items() if now > until]:
             del self._skip[gid]
+            self._skip_at.pop(gid, None)
         with self._dmg_lock:
             for gid in [g for g, at in self._aggro.items() if now - at > _AGGRO_SEC]:
                 del self._aggro[gid]
@@ -446,6 +551,7 @@ class FarmBot:
                     aim.lost_at = now
                 elif now - aim.lost_at > _LOST_GRACE:
                     self._skip[aim.gid] = now + _SKIP_SEC
+                    self._skip_at[aim.gid] = now
                     self._drop_aggro(aim.gid)
                     self._aim = aim = None
             else:
@@ -461,6 +567,7 @@ class FarmBot:
                 elif now - aim.since > _GIVE_UP_SEC:
                     # 打太久又沒更靠近＝打不到，黑名單換目標，別卡在這隻
                     self._skip[aim.gid] = now + _SKIP_SEC
+                    self._skip_at[aim.gid] = now
                     self._drop_aggro(aim.gid)
                     self._aim = aim = None
 
@@ -476,11 +583,26 @@ class FarmBot:
         MVP 與草一律跳過（`is_farmable`）：它們跟一般怪一樣打得動、也會掉東西，
         但草是浪費時間、MVP 是送死。**菁英怪不算 MVP，照打。**
         """
+        # ⚠ **黑名單被新的目擊推翻。** 拉黑多半是因為座標過時打到空氣；
+        # 之後又收到那隻怪的實體封包，就代表它真的還在，而且我們拿到新座標了。
+        # 不放行的話，附近幾隻怪一被拉黑，畫面上明明有怪、程式卻說「附近沒怪」
+        # 而且要等 20 秒（使用者實際回報）。
+        for gid, at in list(self._skip_at.items()):
+            mob = self._world.get(gid)
+            if mob is not None and mob.seen_at > at:
+                self._skip.pop(gid, None)
+                self._skip_at.pop(gid, None)
         skip = set(self._skip)
         skip.update(m.gid for m in self._world.monsters() if not is_farmable(m.class_id))
+        # ⚠ **站在傳點裡（或旁邊）的怪一律不打。** 追過去就會踩到傳點被傳走 ——
+        # 新地圖可能有打不動的怪，而 bot 會在那裡繼續打（使用者實測回報）。
+        # 連正在打我的怪也不追：被打幾下，好過被傳到不該去的地方。
+        in_warp = {m.gid for m in self._world.monsters() if self._near_warp(m.pos)}
+        skip.update(in_warp)
         # 正在打我的怪**不受「打到空氣」黑名單限制**：它打得到我就代表它真的在旁邊，
         # 座標不可能過時。以前被黑名單擋住，症狀就是「怪在打我卻不理它」。
         no_hunt = {m.gid for m in self._world.monsters() if not is_farmable(m.class_id)}
+        no_hunt |= in_warp
         with self._dmg_lock:
             aggro = sorted(self._aggro.items(), key=lambda kv: -kv[1])
         for gid, _at in aggro:
@@ -503,6 +625,9 @@ class FarmBot:
         使用者提供的實測封包（[PKT-015]）：左鍵點怪送 `0x0368`(查詢) →
         `0x035F`(走近) → `0x0437`(連續攻擊)，之後客戶端自己打到死。
 
+        「走近」只要走到 `_ATTACK_RANGE` 格內就夠了 —— 最後那一段由伺服器帶，
+        它知道怪真正在哪（見 `_ATTACK_RANGE` 的實測說明）。
+
         **攻擊送出後絕對不能再送移動**：移動會取消連續攻擊，
         症狀就是「打一下就跑掉」。所以 attacked 之後這裡什麼都不做，等擊殺訊號。
         """
@@ -511,13 +636,17 @@ class FarmBot:
             return
         if aim.attacked:
             self._walker.clear()  # 已經在打了，站著等 0x0080 確認死亡
+            self._resend_attack(aim, now, pos)
             self._check_hit(aim, now)
             return
 
+        # ⚠ 每一拍都重讀它現在在哪 —— 這遊戲的怪移動很頻繁，
+        # 用上一拍的位置判斷「夠不夠近」就會在它走開之後對著空地打。
         mob = self._world.get(aim.gid)
         distance = mob.distance_from(pos) if (mob is not None and pos is not None) else None
-        if distance is not None and distance > _MELEE_RANGE and self._approach(pos, mob.pos):
-            return  # 還在走過去
+        if distance is not None and pos is not None and not self._close_enough(pos, mob.pos, distance):
+            if self._approach(pos, mob.pos):
+                return  # 還太遠（或中間有牆要繞），先走近一點
         # 貼到了（或算不出路，那就直接打，打不到會被放棄計時器換掉）
         self._walker.clear()
         self._world.note_attacking(aim.gid)
@@ -525,6 +654,82 @@ class FarmBot:
         self._send(build_attack(aim.gid))
         aim.attacked = True
         aim.attacked_at = now
+        aim.sent_at = now
+        aim.attacked_dist = distance or 0
+
+    def _resend_attack(self, aim: _Aim, now: float, pos: tuple[int, int] | None) -> None:
+        """還沒打到任何東西就補送一次攻擊。**打到了就絕不補。**
+
+        為什麼要有：攻擊可能石沉大海 —— 伺服器沒接、或送出的那一刻怪剛好走掉。
+        那種情況一筆傷害都不會有，乾等到放棄額度用完是浪費。
+
+        為什麼「打到了就不補」：`0x0437` action=7 是**連續**攻擊，
+        重送很可能把攻速計時器重置，正常互打時補送反而讓 DPS 變差。
+        傷害封包一直進來就代表這次攻擊生效了，不要去碰它。
+
+        為什麼還要看距離：攻擊可以從 13 格外送出，伺服器要先把角色帶過去
+        （約 2 秒）。只看時間的話會在路上就補送 —— 實測 1 秒間隔、不看距離，
+        100 秒補送 17 次，擊殺反而比 2 秒那組略低。走到旁邊了才算數。
+        """
+        if self._world.last_hit(aim.gid) > aim.attacked_at:
+            return  # 已經打到了，別碰攻速計時器
+        if now - aim.sent_at < _ATTACK_RETRY_SEC:
+            return
+        # ⚠ 還在被伺服器帶過去的路上就不要補 —— 那會打斷起手。
+        # 兩個都算「路走完了」，符合一個就行：
+        #   a) 已經走到怪旁邊（看得到就用，但我們的座標本來就會慢一拍）
+        #   b) 送出到現在的時間，已經夠伺服器走完那段距離了
+        # 只用 (a) 的話會因為座標落後而一直判「還沒到」，補送幾乎不會發生
+        # （實測：打到空氣從 2 次變 6 次）。
+        mob = self._world.get(aim.gid)
+        distance = mob.distance_from(pos) if (mob is not None and pos is not None) else None
+        near = distance is None or distance <= _RESEND_NEAR
+        walked = now - aim.attacked_at >= aim.attacked_dist * _WALK_SEC_PER_CELL
+        if not (near or walked):
+            return
+        # 補送也要在放棄額度內 —— 額度用完就該換人，不是無限補
+        if now - aim.attacked_at >= self._hit_grace(aim):
+            return
+        self._send(build_attack(aim.gid))
+        aim.sent_at = now
+        aim.resends += 1
+        self._stats.resent += 1
+
+    @staticmethod
+    def _hit_grace(aim: _Aim) -> float:
+        """這次攻擊「多久沒打到就算打空氣」。從遠處送的要把帶路時間算進去。"""
+        return _ATTACK_ACK_SEC + aim.attacked_dist * _WALK_SEC_PER_CELL
+
+    def _close_enough(
+        self, pos: tuple[int, int], goal: tuple[int, int], straight: int
+    ) -> bool:
+        """真的夠近了嗎？**直線不算數，要用實際走得到的步數。**
+
+        `distance_from()` 是契比雪夫距離，中間隔著石頭、水、牆也照樣算 3 格。
+        只看直線的話，隔著障礙的怪會被判成「貼到了」→ 送出攻擊 → 站著打空氣
+        （使用者實測回報）。所以直線夠近之後，再用 A* 確認繞過去的步數也夠近。
+
+        貼身（1 格內）直接算數，不必再算路徑。算不出路徑（被牆完全隔開）
+        就回 False，讓呼叫端去走 —— 走不成的話 `_approach` 會回 False，
+        那時才會直接打，由放棄計時器收尾。
+        """
+        if straight > _ATTACK_RANGE:
+            return False
+        if straight <= 1:
+            return True
+        terrain = self._terrain
+        if terrain is None:
+            return True  # 沒地形就只能信直線
+        path = terrain.find_path(pos, goal, node_budget=_NEAR_BUDGET)
+        if path is None:
+            # 怪站的那格可能不可走（牠站在斜坡邊之類）—— 改看牠旁邊那格
+            beside = self._beside(goal, pos)
+            if beside is None or beside == pos:
+                return True
+            path = terrain.find_path(pos, beside, node_budget=_NEAR_BUDGET)
+        if path is None:
+            return False
+        return len(path) <= _ATTACK_RANGE + _PATH_SLACK
 
     def _check_hit(self, aim: _Aim, now: float) -> None:
         """攻擊送出後有沒有真的打到？沒有就是對著**過時的座標**打空氣。
@@ -534,7 +739,9 @@ class FarmBot:
         現在只要 2 秒內沒有任何「打到它」的訊號（傷害封包或怪物 HP 變動），
         就把它從追蹤裡拿掉並短暫冷卻 —— 它真的還在的話會再送出現封包。
         """
-        if now - aim.attacked_at <= _ATTACK_ACK_SEC:
+        # 從遠處送的攻擊，伺服器要先把角色帶過去 —— 那段路的時間要算進去，
+        # 不然角色還在走就被判「打到空氣」，白白換掉一個好目標。
+        if now - aim.attacked_at <= self._hit_grace(aim):
             return
         if self._world.last_hit(aim.gid) > aim.attacked_at:
             return  # 有打到，繼續打
@@ -543,6 +750,7 @@ class FarmBot:
         self._stats.missed += 1
         self._world.forget(aim.gid)
         self._skip[aim.gid] = now + _MISS_SKIP_SEC
+        self._skip_at[aim.gid] = now
         self._drop_aggro(aim.gid)
         self._aim = None
         self._note(f"打到空氣（座標過時），換下一隻｜共 {self._stats.missed} 次")
@@ -666,8 +874,8 @@ class FarmBot:
                 dest = terrain.random_walkable(
                     random, near=pos, radius=_ROAM_MAX, min_radius=_ROAM_MIN
                 )
-                if dest is None or self._is_bad_goal(dest):
-                    continue
+                if dest is None or self._is_bad_goal(dest) or self._near_warp(dest):
+                    continue   # 漫遊目標也不准挑在傳點上
                 self._roam_goal = dest
             path = self._plan_path(pos, self._roam_goal)
             if path:
@@ -676,17 +884,38 @@ class FarmBot:
                 return
             self._bad_goals.append((self._roam_goal, now + _BAD_GOAL_SEC))
             self._roam_goal = None
-        # 完全算不出路：往近處走一步，絕不原地不動
-        near = terrain.random_walkable(random, near=pos, radius=MAX_STEP)
-        if near and near != pos:
-            self._send_move(*near)
+        # 完全算不出路：往近處走一步，絕不原地不動（但別踩到傳點）
+        for _ in range(6):
+            near = terrain.random_walkable(random, near=pos, radius=MAX_STEP)
+            if near and near != pos and not self._near_warp(near):
+                self._send_move(*near)
+                return
 
     def _plan_path(
         self, start: tuple[int, int], goal: tuple[int, int]
     ) -> list[tuple[int, int]] | None:
+        """算一條路，而且**繞開傳點** —— 踩上去會被傳到別張地圖。"""
         if self._terrain is None:
             return None
-        return self._terrain.find_path(start, goal, node_budget=_ROAM_BUDGET)
+        return self._terrain.find_path(
+            start, goal, node_budget=_ROAM_BUDGET, blocked=self._warp_zone
+        )
+
+    def _load_warps(self, map_name: str) -> None:
+        """記下這張圖上不准踩的格子（傳點與周圍）。
+
+        查不到就是空的 —— 安全退化成「跟以前一樣會踩到」，不會因此不能走路。
+        """
+        zone: set[tuple[int, int]] = set()
+        for x, y, _dest, _dx, _dy in warps_on_map(map_name):
+            for dx in range(-_WARP_KEEP_OUT, _WARP_KEEP_OUT + 1):
+                for dy in range(-_WARP_KEEP_OUT, _WARP_KEEP_OUT + 1):
+                    zone.add((x + dx, y + dy))
+        self._warp_zone = frozenset(zone)
+        log.info("%s 的傳點禁區 %d 格", map_name, len(self._warp_zone))
+
+    def _near_warp(self, cell: tuple[int, int] | None) -> bool:
+        return cell is not None and cell in self._warp_zone
 
     def _is_bad_goal(self, cell: tuple[int, int]) -> bool:
         return any(

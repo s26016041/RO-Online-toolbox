@@ -7,9 +7,16 @@
 #
 # 三個非收不可的東西，漏了都不會報錯、只會安靜地壞掉：
 #
-# 1. `assets/*.json.gz`（道具／怪物／傳點表）—— 漏收的話 item_name() 一律查不到，
-#    自動補水的選單整個空白，程式完全不會抱怨。路徑對應
-#    `config/paths.py` 的 `_bundle_root()`。
+# 1. `assets/` —— **使用者的電腦沒有 `RODATA/`，這裡是那些資料的唯一來源**。
+#    漏收不會報錯，只會安靜地少一塊功能。路徑對應 `config/paths.py`
+#    的 `_bundle_root()`，每一份都有對應的 `tools/build_*.py` 可以重建：
+#
+#      items.json.gz    1.3 MB  漏收 → item_name() 查不到、補水選單全空
+#      mobs.json.gz      90 KB  漏收 → 草／MVP 過濾失效（會去打草或送死）
+#      warps.json.gz     31 KB  漏收 → 跨圖尋路算不出路線
+#      mapnames.json.gz   8 KB  漏收 → 尋路只顯示得出 prt_fild08 這種內部名
+#      terrain.bin.gz   1.5 MB  ⛔ 漏收 → **走路類功能全滅**（不漫遊、尋路停用）
+#      icons.bin        3.0 MB  漏收 → 道具圖示全空白（外觀降級，功能不受影響）
 # 2. `ro_toolbox/ui/resources/`（icon.ico、styles/*.qss）—— 漏收會變成
 #    沒有圖示的白底視窗。
 # 3. 有原生 DLL 或 lazy import 的套件（pymem、pefile、capstone、numpy…）——
@@ -37,7 +44,14 @@ hiddenimports += collect_submodules("ro_toolbox")
 # 少了它們的症狀分別是：記憶體掃描變慢或報錯（numpy）、
 # 封包長度表抽不出來 → 切包退回啟發式（capstone）、
 # 注入功能不可用（pymem/pefile，本專案不用但 import 得到才不會炸）。
-for package in ("numpy", "capstone", "pymem", "pefile", "psutil"):
+# zxingcpp 是編譯出來的擴充模組，漏收的話帳號頁的「匯入 QR」會停用
+# （qr.available() 回 False），程式不會炸但功能就少一半。
+# pydivert 一定要 collect_all：它帶著 **WinDivert64.dll 與 WinDivert64.sys**，
+# 那兩個檔案就是「使用者不必自己安裝 Npcap」的全部原因。漏收的話
+# exe 跑起來抓不到任何封包，而且錯誤訊息會指向「沒裝 pydivert」，
+# 讓人以為是相依沒裝好（見 services/packet_capture.py）。
+for package in ("numpy", "capstone", "pymem", "pefile", "psutil", "zxingcpp",
+                "pydivert"):
     try:
         found_datas, found_binaries, found_hidden = collect_all(package)
     except Exception:                      # noqa: BLE001 - 沒裝就跳過，不擋打包
@@ -46,11 +60,7 @@ for package in ("numpy", "capstone", "pymem", "pefile", "psutil"):
     binaries += found_binaries
     hiddenimports += found_hidden
 
-# scapy 只在有 Npcap 的機器上用得到，整包收進去會胖很多且大部分用不到。
-# 只收實際會 import 的那幾支（services/npcap_capture.py）。
 hiddenimports += [
-    "scapy.all",
-    "scapy.layers.inet",
     "PySide6.QtNetwork",
 ]
 

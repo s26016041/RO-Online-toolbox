@@ -28,6 +28,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
+    QSpacerItem,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -40,7 +42,10 @@ from ro_toolbox.services import bag, icons, window_list
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
 from ro_toolbox.services.gamedata import heals_hp, heals_sp, item_name
+from ro_toolbox.services import potion_store
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
+from ro_toolbox.services.ro_capture import find_server
+from ro_toolbox.services.travel_bot import TravelBot
 from ro_toolbox.ui.pages.base_page import BasePage
 
 log = logging.getLogger(__name__)
@@ -107,11 +112,13 @@ def item_icon(item_id: int) -> QIcon:
     got = _ICON_CACHE.get(item_id)
     if got is not None:
         return got
-    path = icons.icon_path(item_id)
+    # 走 `icon_bytes` 不走 `icon_path`：使用者的電腦沒有 RODATA，
+    # 圖示的唯一來源是打包資產 `assets/icons.bin`。
+    data = icons.icon_bytes(item_id)
     icon = QIcon()
-    if path is not None:
-        pixmap = QPixmap(str(path))
-        if not pixmap.isNull():
+    if data is not None:
+        pixmap = QPixmap()
+        if pixmap.loadFromData(data) and not pixmap.isNull():
             image = pixmap.toImage()
             image.setAlphaChannel(image.createMaskFromColor(
                 QColor(_TRANSPARENT).rgb(), Qt.MaskMode.MaskOutColor
@@ -130,6 +137,14 @@ class CharacterCard(QWidget):
     #: 上面的東西不會因為空間不夠被壓扁（不夠就整張卡片捲動）。
     ROW_HEIGHT = 26
     SPIN_WIDTH = 56
+    #: 自動尋路按鈕的**最小**尺寸。它在主欄之外的獨立右欄，所以卡片內容一格都不用讓。
+    #:
+    #: ⚠ 這裡是下限不是固定值。樣式表給 QPushButton 的內距是 `7px 18px`
+    #: ＋ 1px 邊框，光上下就吃掉 16px；鎖成 ROW_HEIGHT(26) 會把字夾扁
+    #: （使用者實際回報）。而且鎖死尺寸換一種字型或高 DPI 就會再夾一次。
+    #: 讓它照內容自然長、只擋「不要太小」，字永遠不會被壓到。
+    TRAVEL_BUTTON_MIN_W = 96
+    TRAVEL_BUTTON_MIN_H = 34
     #: 道具小圖的邊長（解包出來的圖示是 24×24）。
     ICON_PX = 24
 
@@ -143,9 +158,20 @@ class CharacterCard(QWidget):
     potion_changed = Signal()
     #: 背景 PotionBot 回報狀態。
     potion_stats = Signal(object)
+    #: 使用者按下／取消「自動尋路」。參數：是否開啟。
+    travel_toggled = Signal(bool)
+    #: 背景 TravelBot 回報狀態。
+    travel_stats = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
+        #: 這張卡是哪一隻角色（補水設定用它當鍵，不是 PID —— PID 每次開遊戲都變）
+        self.character = ""
+        #: 想選但清單裡還沒出現的道具（背包是非同步讀的，選單填好才選得到）
+        self._want_item: dict[str, int | None] = {"hp": None, "sp": None}
+        #: True = 現在是**程式自己**在改 UI，不是使用者的意思 —— 這種變動不存檔。
+        #: 少了這道閘門，bot 啟動失敗時自動取消勾選會把使用者的設定覆蓋成「關閉」。
+        self.quiet = False
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -155,7 +181,10 @@ class CharacterCard(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # 橫向捲軸改成「需要才出現」：主欄 380 之外多了一個 96px 的右欄之後，
+        # 卡片需要約 516px。視窗被縮很小的時候，AlwaysOff 會讓右邊的按鈕
+        # **直接消失**（沒有捲軸可以捲過去）—— 寧可出現捲軸，不要弄丟功能。
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         outer.addWidget(scroll)
 
         holder = QWidget()
@@ -168,7 +197,28 @@ class CharacterCard(QWidget):
         # 固定寬度而非上限：靠左對齊時 maximumWidth 會讓容器縮到內容寬度，
         # 進度條就變得又細又短。
         inner.setFixedWidth(self.CONTENT_WIDTH)
-        board.addWidget(inner, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+
+        # 自動尋路的按鈕放在**卡片主欄之外**的右邊欄。
+        # 放進 Base 那一行的話會跟等級／經驗數字搶同一條的寬度，把它擠扁；
+        # 分成獨立的一欄，主欄 380px 一格都不用讓（分頁區約有 950px 可用）。
+        side = QWidget()
+        side_box = QVBoxLayout(side)
+        side_box.setContentsMargins(0, 0, 0, 0)
+        side_box.setSpacing(0)
+        # 往下推一行，讓按鈕大致對齊 Base 區塊而不是角色名字那一行
+        side_box.addSpacing(self.ROW_HEIGHT)
+        side_box.addWidget(self._make_travel_button())
+        side_box.addStretch(1)
+
+        top = QWidget()
+        top_row = QHBoxLayout(top)
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(12)
+        top_row.addWidget(inner)
+        top_row.addWidget(side, 0, Qt.AlignmentFlag.AlignTop)
+        top_row.addStretch(1)
+
+        board.addWidget(top, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
         board.addStretch(1)
 
         layout = QVBoxLayout(inner)
@@ -176,6 +226,16 @@ class CharacterCard(QWidget):
         layout.setSpacing(10)
         # 高度一律照元件自己要的來，不讓版面把它們拉長或壓扁
         layout.setSizeConstraint(QVBoxLayout.SizeConstraint.SetMinAndMaxSize)
+        # ⚠ 上面那個約束會**蓋掉** `inner.setFixedWidth()` —— 它把 min/max 都改成
+        # 版面自己算出來的值，所以卡片實際只有 354px（量出來的），
+        # 那行 setFixedWidth 從頭到尾沒生效過，進度條也就一直比預期短。
+        # 用一個「寬 CONTENT_WIDTH、高 0」的間隔件把版面的最小寬度撐起來：
+        # 高度保護留著，寬度也真的變成我們要的。
+        layout.addItem(
+            QSpacerItem(
+                self.CONTENT_WIDTH, 0, QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+            )
+        )
 
         self.name_label = QLabel("—")
         self.name_label.setObjectName("cardTitle")
@@ -188,11 +248,11 @@ class CharacterCard(QWidget):
 
         # 經驗值：遊戲畫面只給百分比，這裡把實際數字讀出來。
         # 條子做細的，數字放在條子上方 —— 6px 高的條塞不下文字。
-        base_block, self.base_head, self.base_value, self.base_bar = self._make_exp_block(
-            "Base", "baseBar"
+        base_block, self.base_head, self.base_value, self.base_bar = (
+            self._make_exp_block("Base", "baseBar")
         )
-        job_block, self.job_head, self.job_value, self.job_bar = self._make_exp_block(
-            "Job", "jobBar"
+        job_block, self.job_head, self.job_value, self.job_bar = (
+            self._make_exp_block("Job", "jobBar")
         )
         layout.addWidget(base_block)
         layout.addWidget(job_block)
@@ -227,8 +287,64 @@ class CharacterCard(QWidget):
         # ---- 自動補水 ----
         layout.addWidget(self._build_potion_panel())
 
+        # ---- 自動尋路 ----
+        layout.addWidget(self._build_travel_panel())
+
         self.farm_stats.connect(self._apply_farm_stats)
         self.potion_stats.connect(self._apply_potion_stats)
+        self.travel_stats.connect(self._apply_travel_stats)
+
+    # ---- 自動尋路 ---------------------------------------------------
+
+    def _make_travel_button(self) -> QPushButton:
+        """按下去就照**遊戲自己的尋路目標**走過去，會自己穿越多張地圖。
+
+        目的地不在這裡選：按下遊戲內建的尋路鍵時客戶端一個封包都沒送
+        （實測 `封包/按下尋路.txt`），箭頭是客戶端自己算的 —— 所以我們從記憶體
+        讀它指向哪張圖，再用同一份 `navi_link` 傳點表自己算路走過去。
+        """
+        self.auto_travel = QPushButton("自動尋路")
+        self.auto_travel.setCheckable(True)
+        self.auto_travel.setMinimumSize(
+            self.TRAVEL_BUTTON_MIN_W, self.TRAVEL_BUTTON_MIN_H
+        )
+        self.auto_travel.setToolTip(
+            "先在遊戲的尋路視窗設好目的地（箭頭出現），再按這裡。\n"
+            "純趕路：途中不打怪、不撿東西，抵達就停。"
+        )
+        self.auto_travel.toggled.connect(self.travel_toggled)
+        return self.auto_travel
+
+    def _build_travel_panel(self) -> QWidget:
+        """自動尋路的狀態列。按鈕本身在上面 Base 那一行。"""
+        panel = QWidget()
+        box = QVBoxLayout(panel)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+
+        self.travel_label = QLabel("先在遊戲的尋路視窗設好目的地，再按「自動尋路」。")
+        self.travel_label.setObjectName("pageSubtitle")
+        self.travel_label.setWordWrap(True)
+        box.addWidget(self.travel_label)
+        return panel
+
+    def _apply_travel_stats(self, stats) -> None:  # noqa: ANN001 - TravelStats
+        if not stats.running:
+            self.travel_label.setText(stats.note)
+            # 走完（或失敗）就把按鈕彈起來 —— 按鈕壓著卻沒在走，
+            # 看起來會像「還在趕路」，那是最糟的失效方式。
+            if self.auto_travel.isChecked():
+                self.auto_travel.setChecked(False)
+            return
+        where = stats.goal_label or stats.goal
+        head = f"前往 {where}" if where else "讀取導航目標…"
+        if stats.hops_left:
+            head += f"　還要換 {stats.hops_left} 張圖"
+        self.travel_label.setText(f"{head}\n{stats.note}")
+
+    def set_travel_busy(self, busy: bool) -> None:
+        """趕路途中不讓人再去勾自動打怪 —— 兩個都在送走路封包會互相打架。"""
+        self.auto_hunt.setEnabled(not busy)
 
     # ---- 自動補水 ---------------------------------------------------
 
@@ -311,7 +427,9 @@ class CharacterCard(QWidget):
         **選單的值是道具編號不是格號** —— 格號會挪動，存格號遲早會喝錯東西。
         同一組道具時只改文字不重建，避免每秒閃爍、也不會打斷正在挑的人。
         """
-        for combo, wants in ((self.hp_item, heals_hp), (self.sp_item, heals_sp)):
+        for key, combo, wants in (
+            ("hp", self.hp_item, heals_hp), ("sp", self.sp_item, heals_sp)
+        ):
             wanted = [
                 (item_id, amount) for _slot, (item_id, amount) in sorted(rows.items())
                 if wants(item_id)
@@ -328,6 +446,8 @@ class CharacterCard(QWidget):
             if combo.view().isVisible():
                 continue  # 使用者正在挑，別把清單抽掉
             keep = combo.currentData()
+            if keep is None:
+                keep = self._want_item[key]      # 還原存檔時選的那個
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("未選擇", None)
@@ -337,6 +457,8 @@ class CharacterCard(QWidget):
             position = combo.findData(keep)
             combo.setCurrentIndex(position if position >= 0 else 0)
             combo.blockSignals(False)
+            if position >= 0 and keep == self._want_item[key]:
+                self._want_item[key] = None      # 還原成功，不必再等了
         self._show_icon(self.hp_item, self.hp_icon)
         self._show_icon(self.sp_item, self.sp_icon)
 
@@ -344,6 +466,39 @@ class CharacterCard(QWidget):
     def _slot_text(item_id: int, amount: int) -> str:
         """只顯示名稱與數量 —— 格號是內部資料，使用者不需要看到。"""
         return f"{item_name(item_id)} × {amount}"
+
+    def apply_saved_potion(self, saved) -> None:  # noqa: ANN001 - PotionSaved
+        """把存檔的補水設定填回畫面。
+
+        ⚠ 全程 `quiet=True`：這是程式在還原，不是使用者剛剛改的，**不該再存一次**。
+        道具可能還不在下拉選單裡（背包是非同步讀的），所以先記在 `_want_item`，
+        等 `set_slots()` 把清單填好時再選起來。
+        """
+        self.quiet = True
+        try:
+            self._want_item = {"hp": saved.hp_item, "sp": saved.sp_item}
+            self.hp_threshold.setValue(saved.hp_percent)
+            self.sp_threshold.setValue(saved.sp_percent)
+            for key, combo in (("hp", self.hp_item), ("sp", self.sp_item)):
+                position = combo.findData(self._want_item[key])
+                if position >= 0:
+                    combo.setCurrentIndex(position)
+                    self._want_item[key] = None
+            self.auto_potion.setChecked(bool(saved.enabled))
+        finally:
+            self.quiet = False
+
+    def saved_potion(self):  # noqa: ANN201 - PotionSaved
+        """目前畫面上的補水設定，要存起來的樣子。"""
+        from ro_toolbox.services.potion_store import PotionSaved
+
+        return PotionSaved(
+            hp_item=self.hp_item.currentData(),
+            hp_percent=self.hp_threshold.value(),
+            sp_item=self.sp_item.currentData(),
+            sp_percent=self.sp_threshold.value(),
+            enabled=self.auto_potion.isChecked(),
+        )
 
     def potion_config(self) -> PotionConfig:
         return PotionConfig(
@@ -357,7 +512,13 @@ class CharacterCard(QWidget):
         if not stats.running:
             self.potion_label.setText(stats.note)
             if self.auto_potion.isChecked():
-                self.auto_potion.setChecked(False)
+                # ⚠ 這是 bot 自己停掉（沒登入、定位失敗…），**不是使用者關的**。
+                # 不加這道閘門，一次啟動失敗就會把使用者存的「開啟」覆蓋成「關閉」。
+                self.quiet = True
+                try:
+                    self.auto_potion.setChecked(False)
+                finally:
+                    self.quiet = False
             return
         bits = [stats.note] if stats.note else []
         if stats.hp_used:
@@ -469,6 +630,7 @@ class FarmPage(BasePage):
         self._workers: dict[int, AttachWorker] = {}
         self._bots: dict[int, FarmBot] = {}
         self._potions: dict[int, PotionBot] = {}
+        self._travelers: dict[int, TravelBot] = {}
         self._bag_workers: dict[int, BagWorker] = {}
         self._bag_loaded: set[int] = set()
         # 每個角色最近一次讀到的背包 {格號: (道具編號, 數量)}
@@ -636,7 +798,14 @@ class FarmPage(BasePage):
             if pid in self._cards or pid in self._workers:
                 continue
             if now < self._retry_at.get(pid, 0.0):
-                continue  # 還在重試冷卻中（多半是尚未登入）
+                continue  # 還在重試冷卻中
+            if find_server(pid) is None:
+                # 還沒登入（停在登入畫面）。**先問連線再決定要不要 AOB**：
+                # 記憶體不是判斷依據 —— 斷線後角色狀態還留著（[MEM-029]），
+                # 登入畫面也可能掃到殘留結構，於是建出一個讀不到背包的空分頁，
+                # 再對著使用者喊「AOB 定位失敗」。那不是失敗，是還沒登入。
+                self._retry_at[pid] = now + _RETRY_AFTER_SEC
+                continue
             self._start_attach(pid)
 
     def _start_attach(self, pid: int) -> None:
@@ -661,14 +830,23 @@ class FarmPage(BasePage):
             return
 
         card = CharacterCard()
+        card.character = status.name
         card.update_status(status)
         card.set_note(f"PID {pid}")
         card.farm_toggled.connect(lambda on, p=pid: self._toggle_farm(p, on))
         card.potion_toggled.connect(lambda on, p=pid: self._toggle_potion(p, on))
         card.potion_changed.connect(lambda p=pid: self._apply_potion_config(p))
+        card.travel_toggled.connect(lambda on, p=pid: self._toggle_travel(p, on))
 
         self._readers[pid] = reader
         self._cards[pid] = card
+        # 把這隻角色上次的補水設定帶回來（存的是道具編號，不是格號）。
+        # ⚠ 要在接上 signal **之後**才套用，勾選才會真的把 bot 帶起來。
+        saved = potion_store.get(status.name)
+        if saved is not None:
+            card.apply_saved_potion(saved)
+            if saved.enabled:
+                self._toggle_potion(pid, True)
         self._failures[pid] = 0
         self._names[pid] = status.name
         self.tabs.addTab(card, status.name or f"PID {pid}")
@@ -688,6 +866,10 @@ class FarmPage(BasePage):
         potion = self._potions.pop(pid, None)
         if potion is not None:
             potion.stop()
+
+        traveler = self._travelers.pop(pid, None)
+        if traveler is not None:
+            traveler.stop()
         self._names.pop(pid, None)
         self._bag_loaded.discard(pid)
         self._bags.pop(pid, None)
@@ -735,6 +917,37 @@ class FarmPage(BasePage):
             if card is not None:
                 card.set_exp_gain("")
 
+    # ---- 自動尋路 ---------------------------------------------------
+
+    def _toggle_travel(self, pid: int, on: bool) -> None:
+        """按下自動尋路：讀遊戲的導航目標，走過去，到了就停。
+
+        **會先把自動打怪關掉**：兩個都在送走路封包會互相搶目標，
+        角色會在原地抽搐。純趕路是使用者選的行為，所以這裡直接讓路。
+        """
+        card = self._cards.get(pid)
+        if not on:
+            traveler = self._travelers.pop(pid, None)
+            if traveler is not None:
+                traveler.stop()
+            if card is not None:
+                card.set_travel_busy(False)
+            return
+        if pid in self._travelers:
+            return
+
+        if pid in self._bots and card is not None and card.auto_hunt.isChecked():
+            # 先讓 UI 走正常的關閉流程（_toggle_farm 會停 bot、保留戰利品）
+            card.auto_hunt.setChecked(False)
+            card.travel_label.setText("已先關掉自動打怪（趕路途中不打怪）")
+        if card is None:
+            return  # 沒有卡片就沒有回報去處，別讓它在背景默默走
+        card.set_travel_busy(True)
+
+        traveler = TravelBot(pid, on_update=lambda s, c=card: c.travel_stats.emit(s))
+        self._travelers[pid] = traveler
+        traveler.start()
+
     # ---- 自動補水 ---------------------------------------------------
 
     def _refresh_current_bag(self) -> None:
@@ -750,8 +963,19 @@ class FarmPage(BasePage):
             self._load_bag(pid)
 
     def _load_bag(self, pid: int, again: bool = False) -> None:
-        """在背景讀背包（約 0.1 秒）。數量會自己一直更新，不需要任何按鈕。"""
+        """在背景讀背包（約 0.1 秒）。數量會自己一直更新，不需要任何按鈕。
+
+        ⚠ **沒登入就不掃。** 分頁是登入時建的，但玩家可能回到選角畫面或斷線；
+        那時候記憶體裡的背包結構已經不在了，再掃只會每秒噴一行
+        「AOB 定位不到背包容器」，看起來像特徵壞了 —— 其實只是沒登入
+        （[MEM-029]、[PKT-044]）。有沒有登入一律問連線，不能看記憶體。
+        """
         if pid in self._bag_workers or (pid in self._bags and not again):
+            return
+        if find_server(pid) is None:
+            card = self._cards.get(pid)
+            if card is not None:
+                card.potion_label.setText("尚未登入（回到選角畫面？）—— 暫停讀背包")
             return
         self._bag_loaded.add(pid)
         worker = BagWorker(pid)
@@ -785,6 +1009,7 @@ class FarmPage(BasePage):
             bot = self._potions.pop(pid, None)
             if bot is not None:
                 bot.stop()
+            self._save_potion(pid)
             return
         if pid in self._potions or card is None:
             return
@@ -796,13 +1021,27 @@ class FarmPage(BasePage):
         bot = PotionBot(pid, config, on_update=lambda s, c=card: c.potion_stats.emit(s))
         self._potions[pid] = bot
         bot.start()
+        self._save_potion(pid)
 
     def _apply_potion_config(self, pid: int) -> None:
-        """設定改了就即時套用，不必關掉重開。"""
+        """設定改了就即時套用，不必關掉重開；順便記到本機。"""
         card = self._cards.get(pid)
         bot = self._potions.get(pid)
         if card is not None and bot is not None:
             bot.configure(card.potion_config())
+        self._save_potion(pid)
+
+    def _save_potion(self, pid: int) -> None:
+        """把畫面上的補水設定記起來（依角色名）。
+
+        ⚠ `card.quiet` 為 True 時**不存**：那是程式自己在改 UI ——
+        還原存檔、或 bot 啟動失敗自動取消勾選。把那些當成使用者的意思，
+        一次啟動失敗就會把設定覆蓋成「關閉」。
+        """
+        card = self._cards.get(pid)
+        if card is None or card.quiet or not card.character:
+            return
+        potion_store.save(card.character, card.saved_potion())
 
     # ---- 數值更新 ---------------------------------------------------
 

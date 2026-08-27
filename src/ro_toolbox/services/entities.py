@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import logging
+import struct
+import threading
 import time
 
 import numpy as np
@@ -42,6 +44,18 @@ _MAX_GID = 0x7FFF_FFFF
 _FULL_RESCAN_SEC = 5.0  # 冷區段輪掃一輪結束後，至少隔這麼久才重新輪一次
 _SWEEP_CHUNK = 120  # 每次多掃幾個冷區段（把 1.5 秒的全掃攤平成每拍幾十毫秒）
 _MIN_REGION = 0x1000
+#: 讀「一隻已知的怪」要抓多少位元組：從存活旗標（GID-0x24）一路到 y（GID+0x124）。
+_ONE_START = OFF_ALIVE               # 相對 GID 的起點（負的）
+_ONE_SIZE = -OFF_ALIVE + OFF_Y + 4   # 0x24 + 0x128 = 0x14C
+#: 緩衝內的欄位位置（相對 `_ONE_START`）
+_B_ALIVE = 0
+_B_CLASS = -OFF_ALIVE + OFF_CLASS
+_B_GID = -OFF_ALIVE
+_B_RENDER = -OFF_ALIVE + OFF_RENDER
+_B_X = -OFF_ALIVE + OFF_X
+_B_Y = -OFF_ALIVE + OFF_Y
+#: 背景發現執行緒兩輪之間睡多久。掃描本身就會花時間，這只是別把 CPU 佔滿。
+_DISCOVER_IDLE = 0.05
 
 
 class MemoryEntity:
@@ -100,6 +114,14 @@ class EntityScanner:
         #: 診斷用：最近一次掃描花多少秒、掃了幾個區段
         self.last_cost = 0.0
         self.last_regions = 0
+        #: gid → 那隻怪的結構位址。**找到一次就記住，之後只讀那個位址。**
+        #: 掃描是為了「發現新的怪」，讀位置不該每次都重掃整份記憶體。
+        self._known: dict[int, int] = {}
+        self._known_lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        #: 診斷用：背景發現跑了幾輪、目前記著幾隻
+        self.discovered = 0
 
     @staticmethod
     def _build_lut(map_name: str) -> tuple[np.ndarray, bool]:
@@ -122,7 +144,114 @@ class EntityScanner:
             return False
         return True
 
+    # ---- 快路徑：只讀已知位址 ---------------------------------------
+
+    def read_one(self, addr: int, me: tuple[int, int]) -> MemoryEntity | None:
+        """從**已知位址**直接讀一隻怪。驗不過（死了／走遠了／位址失效）回 None。
+
+        只讀 0x14C bytes，不掃記憶體 —— 這才是每一拍該做的事。
+        驗證條件與掃描那條路完全一樣（存活旗標、繪圖指標、class 在表裡、
+        座標有限且在地圖內、站在可走格），所以不會因為走快路徑而放寬標準。
+        """
+        raw = self._scanner.read_region(addr + _ONE_START, _ONE_SIZE)
+        if raw is None or len(raw) < _ONE_SIZE:
+            return None
+        buf = bytes(raw)
+        alive, = struct.unpack_from("<I", buf, _B_ALIVE)
+        render, = struct.unpack_from("<I", buf, _B_RENDER)
+        gid, = struct.unpack_from("<I", buf, _B_GID)
+        class_id, = struct.unpack_from("<I", buf, _B_CLASS)
+        x, = struct.unpack_from("<f", buf, _B_X)
+        y, = struct.unpack_from("<f", buf, _B_Y)
+        if alive != 1 or render == 0:
+            return None                      # 死掉的結構還在，但這兩個欄位會被清掉
+        if not (0 < gid < _MAX_GID) or not (0 < class_id < 65536):
+            return None
+        if not self._lut[class_id]:
+            return None
+        if not (x == x and y == y):           # NaN
+            return None
+        cell_x, cell_y = int(round(x)), int(round(y))
+        if not (0 < cell_x < self._terrain.width and 0 < cell_y < self._terrain.height):
+            return None
+        if max(abs(cell_x - me[0]), abs(cell_y - me[1])) > self._view:
+            return None                      # 走出視野了
+        if not self._terrain.is_walkable(cell_x, cell_y):
+            return None
+        return MemoryEntity(gid, class_id, x, y, addr)
+
+    def read_known(self, me: tuple[int, int]) -> list[MemoryEntity]:
+        """讀所有記著的怪，回傳還活著、還在視野內的那些。**很便宜。**
+
+        讀不到的就從清單移除 —— 牠死了、走遠了，或那塊記憶體被回收了。
+        新的怪由背景的 `start_discovery()` 補進來。
+        """
+        with self._known_lock:
+            known = dict(self._known)
+        out: list[MemoryEntity] = []
+        dead: list[int] = []
+        for gid, addr in known.items():
+            entity = self.read_one(addr, me)
+            if entity is None or entity.gid != gid:
+                dead.append(gid)             # gid 對不上＝那塊記憶體換人住了
+                continue
+            out.append(entity)
+        if dead:
+            with self._known_lock:
+                for gid in dead:
+                    self._known.pop(gid, None)
+        return out
+
+    # ---- 背景發現 ---------------------------------------------------
+
+    def start_discovery(self, position) -> None:  # noqa: ANN001 - 回目前座標的函式
+        """在背景持續掃描記憶體找**新的**怪，把位址記起來。
+
+        掃一輪整份記憶體要 1.5 秒級，放在主迴圈裡會讓 bot 每拍卡住 ——
+        所以搬到背景執行緒。主迴圈只走 `read_known()`（只讀已知位址）。
+        """
+        if self._thread is not None:
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._discover_loop, args=(position,),
+            name="entity-discovery", daemon=True,
+        )
+        self._thread.start()
+
+    def _discover_loop(self, position) -> None:  # noqa: ANN001
+        while not self._stop.is_set():
+            here = None
+            try:
+                here = position()
+            except Exception:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
+                here = None
+            if here is None:
+                self._stop.wait(0.2)
+                continue
+            try:
+                for entity in self.scan(here):
+                    with self._known_lock:
+                        self._known[entity.gid] = entity.addr
+                self.discovered += 1
+            except Exception as exc:  # noqa: BLE001
+                log.debug("背景找怪失敗：%s", exc)
+            self._stop.wait(_DISCOVER_IDLE)
+
+    def stop_discovery(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(3.0)
+        self._thread = None
+
+    @property
+    def known_count(self) -> int:
+        with self._known_lock:
+            return len(self._known)
+
     def close(self) -> None:
+        self.stop_discovery()
         self._scanner.close()
 
     # ---- 掃描 -------------------------------------------------------

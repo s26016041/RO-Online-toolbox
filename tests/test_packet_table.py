@@ -63,6 +63,10 @@ class FakeScanner:
     def list_modules(self):
         return [FakeModule(self.module, BASE)]
 
+    def module_base(self, name):
+        # 正式版走這條（模組列舉會被 GameGuard 擋，見 aob.code_section）。
+        return BASE if name.lower() == self.module.lower() else None
+
     def _read_bytes(self, addr: int, size: int):
         if addr == BASE:                       # DOS 標頭：只有 e_lfanew 有意義
             head = bytearray(0x400)

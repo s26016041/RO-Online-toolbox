@@ -49,6 +49,56 @@ class RoPacket:
         return text + " …" if len(self.payload) > limit else text
 
 
+def split_stream(
+    data: bytes, lengths: dict[int, tuple[int, int]] | None = None
+) -> tuple[list[tuple[int, bytes]], bytes]:
+    """切包，並把**沒切完的尾巴**交回給呼叫端。
+
+    回 `(封包清單, 剩下的位元組)`。呼叫端要把剩下的接在下一段 TCP 資料前面，
+    這就是 TCP 重組。
+
+    ## 為什麼一定要重組
+
+    TCP 是位元組流，一個 RO 封包**可能跨兩個分段**。實測 2026-08-25：
+    伺服器的登入回應 `0x0B60` 宣告自己 392 bytes，卻被切成 64 + 328 兩段送達。
+    沒有重組的話，第一段被當成一個 64 bytes 的 `0x0B60`（內容被截斷），
+    第二段的開頭兩個 byte 被當成新的 opcode —— 於是冒出 `0xA8C0`、`0x5FF8`、
+    `0x96E7` 這種不可能存在的 opcode，而**內容整個錯位**。
+    伺服器清單就是這樣被誤讀的（[PKT-050]）。
+    """
+    if not lengths:
+        # 沒有長度表時無法判斷邊界，維持舊行為：整段當一包，不留尾巴。
+        return ([(int.from_bytes(data[:2], "little"), data)] if len(data) >= 2 else []), b""
+
+    out: list[tuple[int, bytes]] = []
+    pos = 0
+    while pos + 2 <= len(data):
+        opcode = int.from_bytes(data[pos : pos + 2], "little")
+        info = lengths.get(opcode)
+        if info is None:
+            # 不認得的 opcode：無法安全地往下切。這通常代表我們已經失去同步，
+            # 把剩下的整段交出去（至少看得到內容），不要留成尾巴無限累積。
+            out.append((opcode, data[pos:]))
+            return out, b""
+        size, header = info
+        if size < 0:
+            if pos + 4 > len(data):
+                break                      # 連宣告長度都還沒到齊，留給下一段
+            size = int.from_bytes(data[pos + 2 : pos + 4], "little")
+            if size < max(header, 4):
+                # 宣告長度不合理 → 失去同步，剩下的整段交出去
+                out.append((opcode, data[pos:]))
+                return out, b""
+        if size < 2:
+            out.append((opcode, data[pos:]))
+            return out, b""
+        if pos + size > len(data):
+            break                          # 這一包還沒到齊，留給下一段
+        out.append((opcode, data[pos : pos + size]))
+        pos += size
+    return out, data[pos:]
+
+
 def split_packets(
     data: bytes, lengths: dict[int, tuple[int, int]] | None = None
 ) -> list[tuple[int, bytes]]:
@@ -64,32 +114,11 @@ def split_packets(
     但因為黏在別的封包後面，擷取端一次都沒看到。
     長度表用 AOB 從客戶端程式碼抽出來（`services/packet_table.py`，[MEM-024]）。
     """
-    if len(data) < 2:
-        return []
-    if not lengths:
-        opcode = int.from_bytes(data[:2], "little")
-        return [(opcode, data)]
-
-    out: list[tuple[int, bytes]] = []
-    pos = 0
-    while pos + 2 <= len(data):
-        opcode = int.from_bytes(data[pos : pos + 2], "little")
-        info = lengths.get(opcode)
-        if info is None:
-            # 不認得的 opcode：無法安全地往下切，把剩下的整段交出去
-            out.append((opcode, data[pos:]))
-            break
-        size, header = info
-        if size < 0:
-            if pos + 4 > len(data):
-                break
-            size = int.from_bytes(data[pos + 2 : pos + 4], "little")
-            if size < max(header, 4):
-                break
-        if size < 2 or pos + size > len(data):
-            # 封包被切在分段邊界上：剩下的整段交出去，不要硬切
-            out.append((opcode, data[pos:]))
-            break
-        out.append((opcode, data[pos : pos + size]))
-        pos += size
-    return out
+    packets, leftover = split_stream(data, lengths)
+    if len(leftover) >= 2:
+        # ⚠ 尾巴沒地方去。逐段處理 TCP 流的呼叫端**必須改用 `split_stream`**
+        # 並自己把尾巴接到下一段前面，否則跨段的封包會被截斷、
+        # 下一段的開頭兩個 byte 會被誤判成新的 opcode。
+        # 這裡至少把它當一包交出去（看得到總比消失好），但內容是截斷的。
+        packets.append((int.from_bytes(leftover[:2], "little"), leftover))
+    return packets

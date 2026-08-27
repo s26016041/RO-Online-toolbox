@@ -1,12 +1,17 @@
-"""道具圖示：從解包資料找出每個道具的小圖檔。
+"""道具圖示（24×24）。
 
-路徑：`RODATA/.../texture/유저인터페이스/item/<資源名>.bmp`（24×24 BMP）。
+**優先讀打包資產 `assets/icons.bin`**，讀不到才退回解包目錄
+`RODATA/.../texture/유저인터페이스/item/<資源名>.bmp`。
+使用者的電腦沒有 `RODATA/`，只靠解包目錄的話圖示會全部空白
+（CLAUDE.md：資料檔也一樣，不准依賴只有開發機有的東西）。
+資產怎麼產生見 `tools/build_icons.py`。
 
 兩個坑：
 - **資源名是韓文**（`iteminfo` 的 `identifiedResourceName`，euc-kr），
   跟顯示名是兩回事（見 [DAT-001]）。
 - 解包工具把 euc-kr 位元組當 latin-1 存成檔名，所以磁碟上的檔名是亂碼
   （`빨간포션` → `»§°£Æ÷¼Ç`）。要用同樣的方式轉回去才找得到檔案。
+  **資產裡存的是還原後的韓文資源名**，讀取端不必再碰那層亂碼。
 
 找不到就回 None —— 介面顯示沒有圖示的項目，不會拿別的圖來頂。
 """
@@ -16,6 +21,7 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import struct
 from functools import lru_cache
 from pathlib import Path
 
@@ -32,6 +38,14 @@ _TEXTURE_DIRS = (
 )
 _UI_DIR = "유저인터페이스"
 _SUBDIRS = ("item", "collection")
+
+#: 打包資產。格式與產生方式見 `tools/build_icons.py`。
+ICON_ASSET = ASSETS_DIR / "icons.bin"
+ICON_MAGIC = b"ROIC"
+ICON_VERSION = 1
+#: 每桶幾張圖。128 張時整份約 4.0 MB（接近 solid gzip 的 3.8 MB），
+#: 而取一張圖只要解壓那一桶（約 0.2 MB）—— 不必把 17.5 MB 全攤在記憶體裡。
+ICON_BUCKET = 128
 
 
 def _mangled(text: str) -> str:
@@ -63,7 +77,10 @@ def _ui_root() -> Path | None:
 
 @lru_cache(maxsize=4096)
 def icon_path(item_id: int) -> Path | None:
-    """這個道具的圖示檔。找不到回 None。"""
+    """這個道具的圖示檔（**只在有解包目錄的機器上**才有值）。找不到回 None。
+
+    一般顯示請用 `icon_bytes()` —— 使用者的電腦沒有 `RODATA/`，這裡永遠回 None。
+    """
     resource = _resources().get(item_id)
     root = _ui_root()
     if not resource or root is None:
@@ -76,6 +93,74 @@ def icon_path(item_id: int) -> Path | None:
     return None
 
 
+# ---- 打包資產 -------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _asset() -> tuple[dict, bytes] | None:
+    """(索引, 桶區塊)。沒有資產或格式不符就回 None，讓呼叫端退回解包目錄。"""
+    try:
+        raw = ICON_ASSET.read_bytes()
+    except OSError:
+        return None
+    if len(raw) < 12 or raw[:4] != ICON_MAGIC:
+        log.warning("%s 不是圖示資產（開頭是 %r）", ICON_ASSET.name, raw[:4])
+        return None
+    version, head_len = struct.unpack_from("<II", raw, 4)
+    if version != ICON_VERSION or len(raw) < 12 + head_len:
+        log.warning("%s 版本或長度不符（version=%s）", ICON_ASSET.name, version)
+        return None
+    try:
+        index = json.loads(gzip.decompress(raw[12 : 12 + head_len]).decode("utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        log.warning("%s 的索引解不開：%s", ICON_ASSET.name, exc)
+        return None
+    return index, raw[12 + head_len :]
+
+
+@lru_cache(maxsize=8)
+def _bucket(number: int) -> bytes:
+    """解壓第 `number` 桶。只留幾桶在快取裡，記憶體不會一直長。"""
+    loaded = _asset()
+    if loaded is None:
+        return b""
+    index, blob = loaded
+    try:
+        offset, size = index["b"][number]
+        return gzip.decompress(blob[offset : offset + size])
+    except (IndexError, KeyError, OSError, ValueError) as exc:
+        log.warning("圖示資產第 %d 桶解不開：%s", number, exc)
+        return b""
+
+
+def icon_bytes(item_id: int) -> bytes | None:
+    """這個道具的圖示位元組（BMP）。找不到回 None。
+
+    先查打包資產（使用者的電腦上唯一的來源），再退回解包目錄。
+    """
+    resource = _resources().get(item_id)
+    if not resource:
+        return None
+    loaded = _asset()
+    if loaded is not None:
+        entry = loaded[0]["i"].get(resource)
+        if entry is not None:
+            number, offset, size = entry
+            data = _bucket(number)[offset : offset + size]
+            if len(data) == size:
+                return data
+    path = icon_path(item_id)
+    if path is not None:
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+    return None
+
+
 def available() -> bool:
-    """解包資料在不在（不在的話介面就不顯示圖示，不是錯誤）。"""
-    return _ui_root() is not None
+    """有沒有圖示可用（打包資產或解包目錄，兩者有一就行）。
+
+    都沒有的話介面就不顯示圖示 —— 那是**外觀降級不是錯誤**。
+    """
+    return _asset() is not None or _ui_root() is not None

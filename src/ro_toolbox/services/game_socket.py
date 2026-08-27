@@ -144,11 +144,15 @@ def find_game_socket(pid: int, server_ip: str, server_port: int) -> int | None:
                 continue
             peer = _peer_of(dup.value)
             if peer == (server_ip, server_port):
-                log.info("找到遊戲 socket：handle %#x 連到 %s:%s",
-                         dup.value, server_ip, server_port)
+                log.debug("找到遊戲 socket：handle %#x 連到 %s:%s",
+                          dup.value, server_ip, server_port)
                 return dup.value
             _k32.CloseHandle(dup)
-        log.warning("在 PID %s 裡找不到連到 %s:%s 的 socket", pid, server_ip, server_port)
+        # ⚠ 這裡**只記 DEBUG**。呼叫端幾乎都是「重試到成功或逾時」的迴圈
+        # （剛換到角色伺服器的那幾秒複製不到，過一下就好），
+        # 每次沒找到就 WARNING 的話，短短兩秒就是上百行洗版 ——
+        # 使用者實際回報過。真的放棄時由呼叫端說一次就好。
+        log.debug("在 PID %s 裡找不到連到 %s:%s 的 socket", pid, server_ip, server_port)
         return None
     finally:
         _k32.CloseHandle(source)

@@ -16,3 +16,16 @@ RODATA/
 
 # 診斷產出（verify_sigs、farm_test 等工具寫的報告與快照，只在本機看）
 reports/
+
+# OTP 綁定用的 QR 截圖 —— 等同種子明文，絕對不能進版控
+qr.jpg
+*-qr.png
+*-qr.jpg
+
+# 封包擷取的原始輸出 —— RO 封包是明文（[PKT-012]），登入那包裡有帳號與認證位元組
+封包/
+*.etl
+PktMon.etl
+
+# 打包實驗的殘留
+onedir-test.spec

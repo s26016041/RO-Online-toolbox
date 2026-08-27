@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ro_toolbox.core.ro_packet import RoPacket  # noqa: E402
 from ro_toolbox.services import (
-    npcap_capture,  # noqa: E402
+    npacket_capture,  # noqa: E402
     window_list,  # noqa: E402
 )
 from ro_toolbox.services.process_monitor import is_admin  # noqa: E402
@@ -82,9 +82,9 @@ def main() -> int:
     def on_error(message: str) -> None:
         print(f"錯誤：{message}", file=sys.stderr)
 
-    if npcap_capture.available()[0]:
+    if npacket_capture.available()[0]:
         print("（Npcap 可用：雙向擷取，含伺服器推送）")
-        capture = npcap_capture.NpcapCapture(pid, on_packet, on_error=on_error)
+        capture = npacket_capture.NpcapCapture(pid, on_packet, on_error=on_error)
     else:
         print("（無 Npcap：只抓送出方向。裝 Npcap 後可看伺服器推送）")
         capture = RoPacketCapture(pid, on_packet, on_error=on_error)
