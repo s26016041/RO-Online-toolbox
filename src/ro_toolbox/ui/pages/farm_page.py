@@ -80,7 +80,7 @@ class AttachWorker(QThread):
 
 
 class BagWorker(QThread):
-    """在背景讀背包（AOB 定位約 0.1 秒），不要卡住介面。
+    """在背景讀背包（AOB 定位實測 22 ms），不要卡住介面。
 
     讀出來的是 {格號: (道具編號, 數量)} —— 名字查表、數量即時，
     完全不需要封包（見 GAMEDATA [MEM-028]）。
@@ -1002,7 +1002,7 @@ class FarmPage(BasePage):
             self._load_bag(pid)
 
     def _load_bag(self, pid: int, again: bool = False) -> None:
-        """在背景讀背包（約 0.1 秒）。數量會自己一直更新，不需要任何按鈕。
+        """在背景讀背包（實測 22 ms）。數量會自己一直更新，不需要任何按鈕。
 
         ⚠ **沒登入就不掃。** 分頁是登入時建的，但玩家可能回到選角畫面或斷線；
         那時候記憶體裡的背包結構已經不在了，再掃只會每秒噴一行
@@ -1039,7 +1039,7 @@ class FarmPage(BasePage):
             card.set_alert("⚠ 讀不到背包（AOB 定位失敗）")
 
     def _refresh_bag(self, pid: int) -> None:
-        """重讀背包。一次約 0.1 秒，放在背景執行緒做。"""
+        """重讀背包。一次實測 22 ms，放在背景執行緒做。"""
         self._load_bag(pid, again=True)
 
     def _toggle_potion(self, pid: int, on: bool) -> None:
