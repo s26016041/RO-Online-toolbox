@@ -6,9 +6,23 @@
 
 只讀不寫（CLAUDE.md：RO 掛 GameGuard，寫入會被反制）。
 
-**位址一律用程式碼特徵定位**（`signatures.NAVI_DEST_SIGS`），不寫死。
-而且那條特徵錨在 CRT 靜態建構鏈上、只有 1 處命中，改版時建構順序一變
-就可能安靜地指到別的全域 —— 所以讀出來的內容**一定要驗**：
+**位址一律用程式碼特徵定位**（`signatures.NAVI_GOAL_SIGS`），不寫死。
+
+## ⚠ 走過一次冤枉路：讀錯全域了（[MEM-046]）
+
+原本讀的是 `NAVI_DEST_SIGS` 定位到的那個 `std::string`。它有時候真的等於
+目的地，所以測起來像對的 —— 但它其實比較像**「最近載入／請求的地圖檔」**：
+人站在 izlu2dun 時裡面就是 `izlu2dun.rsw`，而且用完會被清空。
+使用者回報「遊戲裡箭頭好好的，你卻說讀不到導航目標」就是這樣來的。
+
+抓到它的方法是**數程式碼引用**：整個程式碼區段裡只有 1 處引用那個全域，
+就是它自己的靜態建構子 —— 沒有任何程式用絕對位址寫它，那它憑什麼是目的地。
+真正的目的地（`0x15ADD6C`）有 5 處引用。
+
+教訓：**「讀出來像地圖名」不等於「這就是我要的那個地圖名」。** 認一個全域
+之前先看誰在用它。
+
+讀出來的內容**一定要驗**：
 
 1. 像不像地圖名（ASCII、只有 `a-z0-9_@`、去掉 `.rsw` 副檔名）；
 2. 我們**真的走得到那張圖**（拿不到地形就走不過去，讀到也沒用）。
@@ -24,7 +38,7 @@ import re
 from ro_toolbox.services.aob import locate_global
 from ro_toolbox.services.mapdata import has_terrain
 from ro_toolbox.services.memory_scan import MemoryScanner
-from ro_toolbox.services.signatures import NAVI_DEST_MAX_BYTES, NAVI_DEST_SIGS
+from ro_toolbox.services.signatures import NAVI_DEST_MAX_BYTES, NAVI_GOAL_SIGS
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +89,7 @@ class NavigationReader:
         except OSError as exc:
             log.error("附加行程 %s 失敗：%s", pid, exc)
             return False
-        address = locate_global(scanner, NAVI_DEST_SIGS)
+        address = locate_global(scanner, NAVI_GOAL_SIGS)
         if address is None:
             log.error("導航目標全域定位失敗（遊戲可能已改版），功能停用")
             scanner.close()
@@ -96,11 +110,8 @@ class NavigationReader:
             return None
         raw = self._scanner.read_string(self._address, NAVI_DEST_MAX_BYTES, "ascii")
         if not raw:
-            # ⚠ 空的**不代表沒設定目的地**。實測（2026-08-27）：目的地選**地城**
-            # （iz_dun02）時，這個全域的第一個位元組被清成 0 —— 後面還留著上一個
-            # 目標的殘骸（`NUL + zlu2dun.rsw`，也就是被清掉的 `izlu2dun.rsw`）。
-            # 清空 C 字串就是在開頭寫一個 NUL，所以那是客戶端主動清的，不是我們讀錯。
-            # 地城的目標客戶端另外存（見 [MEM-045]），這裡看不到。
+            # 空的 = 這一場還沒在遊戲裡設過尋路目標。
+            # （舊版讀錯全域時這裡會**誤判**成「沒設定」，見上面的 [MEM-046]。）
             self.blank = True
             return None
         self.blank = False

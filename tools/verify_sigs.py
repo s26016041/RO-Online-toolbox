@@ -21,7 +21,7 @@ CLAUDE.md 要求所有位址一律 AOB 定位，而 AOB 有兩種安靜的壞法
   - 角色狀態：AOB 命中幾個都可以，但**通過合理性驗證的只能有 1 個**。
     （原始 AOB 唯一是錯的判準：堆積裡會有同樣位元組樣式的垃圾，見 [MEM-041]。）
   - 角色座標：`POSITION_X/Y_SIGS` 各要定位成功，而且 **y 必須是 x+4**。
-  - 導航目標全域：`NAVI_DEST_SIGS` 要定位成功。
+  - 尋路目的地全域：`NAVI_GOAL_SIGS` 要定位成功（兩條獨立骨架互相驗證）。
   - 送出帳號緩衝：`SUBMITTED_ACCOUNT_SIGS` 要定位成功（自動登入的閉環驗證靠它）。
   - 背包容器骨架：`sub ecx,5` + 除以 34 的魔術乘數，只能解出一個容器。
   - 封包長度表：`mov ecx,esi; call` 的最熱門目標要**明顯**領先第二名。
@@ -55,7 +55,7 @@ from ro_toolbox.services.character import CharacterReader  # noqa: E402
 from ro_toolbox.services.memory_scan import MemoryScanner  # noqa: E402
 from ro_toolbox.services.signatures import (  # noqa: E402
     CHAR_STATUS,
-    NAVI_DEST_SIGS,
+    NAVI_GOAL_SIGS,
     POSITION_X_SIGS,
     POSITION_XY_GAP,
     POSITION_Y_SIGS,
@@ -349,7 +349,7 @@ def check_live(pid: int, snap: Snapshot, report: Report, notes: list[str]) -> No
     try:
         x = locate_global(scanner, POSITION_X_SIGS)
         y = locate_global(scanner, POSITION_Y_SIGS)
-        navi = locate_global(scanner, NAVI_DEST_SIGS)
+        navi = locate_global(scanner, NAVI_GOAL_SIGS)
         account = locate_global(scanner, SUBMITTED_ACCOUNT_SIGS)
     finally:
         scanner.close()
@@ -360,7 +360,7 @@ def check_live(pid: int, snap: Snapshot, report: Report, notes: list[str]) -> No
         f"應為 {POSITION_XY_GAP}）",
     )
     report.add(
-        f"PID {pid} 導航目標全域定位",
+        f"PID {pid} 尋路目的地全域定位",
         navi is not None,
         f"位址 {navi and hex(navi)}",
     )

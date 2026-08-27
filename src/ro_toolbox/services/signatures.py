@@ -216,6 +216,48 @@ NAVI_DEST_SIGS = (
 #: 導航目標緩衝區讀幾個 bytes。地圖名最長 `xxxxxxxxxxx.rsw`，讀 24 再截到 null。
 NAVI_DEST_MAX_BYTES = 24
 
+# ---- 尋路視窗選的「目的地地圖」-------------------------------------------
+#
+# ⚠ 上面那條 `NAVI_DEST_SIGS` 定位到的全域**不是使用者選的目的地**。
+# 實測（2026-08-27，[MEM-046]）：它比較像「最近載入／請求的地圖檔」——
+# 人站在 izlu2dun 時裡面是 `izlu2dun.rsw`，而且會被清空。整個程式碼區段裡
+# **只有一處**引用它（就是那個靜態建構子），代表沒有任何程式用絕對位址寫它。
+#
+# 真正的目的地在 `0x15ADD6C`（相對 +0x11ADD6C）：模組內的靜態 `std::string`，
+# 使用者在遊戲裡選 iz_dun02 時它就是 `iz_dun02`（size=8、capacity=15）。
+# 有 5 處程式碼引用，下面挑兩個互相獨立的骨架。
+#
+# MSVC 讀 `std::string` 的標準版面（buffer 在 +0、size 在 +0x10、capacity 在 +0x14）：
+#
+#     83 3d <物件+0x14> 10    cmp dword [capacity], 10h   ← 短字串走內嵌 buffer
+#     …
+#     b8 <物件>               mov eax, <物件>
+#     0f 43 05 <物件>         cmovae eax, [<物件>]        ← capacity>=16 才改用指標
+#
+# 同一個位址在骨架裡出現兩次（capacity 那個是 +0x14，所以遮掉不當答案），
+# 兩個立即值必須相等 —— 那是這條特徵自帶的一致性檢查。
+NAVI_GOAL_SIGS = (
+    CodeSignature(
+        name="navi-goal-read",
+        pattern="83 3D ?? ?? ?? ?? 10 53 8B D9 56 57 8B BB F0 00 00 00 "
+                "8B 07 8B B0 D8 00 00 00 B8 ?? ?? ?? ?? 0F 43 05 ?? ?? ?? ?? "
+                "8B CE 50 FF 15 ?? ?? ?? ??",
+        operands=(27, 34),
+        why="MSVC 取 std::string 資料指標的標準骨架（cmp capacity,10h → "
+            "mov eax,<物件> → cmovae eax,[<物件>]），前面接 mov edi,[ebx+0F0h] / "
+            "mov esi,[eax+0D8h]。兩個立即值必須相等。實機 1 處命中，讀出 0x15ADD6C。",
+    ),
+    CodeSignature(
+        name="navi-goal-pass",
+        pattern="85 C0 0F 84 ?? ?? ?? ?? 8B 8B E0 00 00 00 E8 ?? ?? ?? ?? 50 "
+                "B9 ?? ?? ?? ?? E8 ?? ?? ?? ?? B9 ?? ?? ?? ??",
+        operands=(21,),
+        why="另一處引用：test eax,eax / jz / mov ecx,[ebx+0E0h] / call / push eax / "
+            "mov ecx,<物件>; call。跟上面那條完全獨立，用來互相驗證。"
+            "實機 1 處命中，讀出 0x15ADD6C。",
+    ),
+)
+
 # ---- 「上一次送出去的帳號」-------------------------------------------------
 #
 # 自動登入用它做**閉環驗證**：按下送出之後，如果這裡不是我們要登入的帳號，

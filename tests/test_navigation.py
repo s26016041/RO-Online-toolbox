@@ -131,3 +131,26 @@ def test_blank_clears_once_a_real_target_appears(monkeypatch):
     assert reader.destination() == "prt_fild08"
     assert reader.blank is False
 
+
+def test_the_goal_signature_masks_its_answer():
+    """特徵裡不准把答案寫死（CLAUDE.md）—— 位址一律遮成 ??，當場讀出來。"""
+    from ro_toolbox.services.signatures import NAVI_GOAL_SIGS
+
+    assert NAVI_GOAL_SIGS, "特徵不能是空的"
+    for sig in NAVI_GOAL_SIGS:
+        tokens = sig.pattern.split()
+        for off in sig.operands:
+            assert tokens[off:off + 4] == ["??"] * 4, (
+                f"{sig.name} 的立即值 {off} 沒有遮掉 —— 那等於把答案寫死"
+            )
+        assert sig.why, f"{sig.name} 要寫骨架出處，改版壞掉時要靠它重找"
+
+
+def test_the_goal_signature_cross_checks_itself():
+    """第一條骨架裡同一個位址出現兩次，讀出來必須相等 —— 那是自帶的一致性檢查。"""
+    from ro_toolbox.services.signatures import NAVI_GOAL_SIGS
+
+    read = NAVI_GOAL_SIGS[0]
+    assert len(read.operands) == 2, "少了互驗的第二個立即值"
+    assert len(NAVI_GOAL_SIGS) >= 2, "要有第二條獨立骨架互相驗證"
+
