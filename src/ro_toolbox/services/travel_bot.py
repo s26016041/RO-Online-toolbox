@@ -180,9 +180,17 @@ class TravelBot:
             if not reader.attach(self._pid):
                 return self._fail("⚠ 導航目標定位失敗（遊戲可能已改版），自動尋路停用")
             destination = reader.destination()
+            blank = reader.blank
         finally:
             reader.close()
         if not destination:
+            if blank:
+                # 實測：目的地選**地城**時客戶端會把這個全域清空（[MEM-045]）。
+                # 對一個明明設了目的地的人說「請先設定目的地」是最惹人火的錯誤訊息。
+                return self._fail(
+                    "⚠ 遊戲的導航目標是空的。選**地城**當目的地時客戶端不會寫進"
+                    "我們讀的那個位置 —— 目前只支援地面地圖，請改選地城入口那張圖"
+                )
             return self._fail("⚠ 讀不到導航目標 —— 請先在遊戲的尋路視窗設定目的地")
         self._destination = destination
         self._stats.goal = destination

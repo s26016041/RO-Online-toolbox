@@ -52,6 +52,10 @@ class NavigationReader:
     def __init__(self) -> None:
         self._scanner: MemoryScanner | None = None
         self._address: int | None = None
+        #: 上一次讀到的是「空字串」（定位成功、但客戶端把目標清掉了）。
+        #: 用來把「還沒設定目的地」跟「設了但我們讀不到」講清楚 ——
+        #: 對使用者說「請先設定目的地」而他明明設了，是最惹人火的錯誤訊息。
+        self.blank = False
 
     @property
     def located(self) -> bool:
@@ -92,7 +96,14 @@ class NavigationReader:
             return None
         raw = self._scanner.read_string(self._address, NAVI_DEST_MAX_BYTES, "ascii")
         if not raw:
+            # ⚠ 空的**不代表沒設定目的地**。實測（2026-08-27）：目的地選**地城**
+            # （iz_dun02）時，這個全域的第一個位元組被清成 0 —— 後面還留著上一個
+            # 目標的殘骸（`NUL + zlu2dun.rsw`，也就是被清掉的 `izlu2dun.rsw`）。
+            # 清空 C 字串就是在開頭寫一個 NUL，所以那是客戶端主動清的，不是我們讀錯。
+            # 地城的目標客戶端另外存（見 [MEM-045]），這裡看不到。
+            self.blank = True
             return None
+        self.blank = False
         name = clean_map_name(raw)
         if name is None:
             log.warning("導航目標讀到 %r，不像地圖名 —— 不採用", raw)

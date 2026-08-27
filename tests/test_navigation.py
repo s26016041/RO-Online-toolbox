@@ -95,3 +95,39 @@ def test_real_asset_knows_the_maps_we_ship():
 def test_destination_is_none_before_attach():
     assert NavigationReader().destination() is None
     assert NavigationReader().located is False
+
+
+# ---- 「空的」跟「讀不到」不是同一件事 --------------------------------------
+
+
+def test_blank_target_is_flagged_separately(monkeypatch):
+    """⚠ 客戶端把目標**清空**跟我們讀不到，訊息要講得不一樣。
+
+    實測（2026-08-27，[MEM-045]）：目的地選**地城**（iz_dun02）時，這個
+    std::string 的 size 被設成 0（buffer 裡還留著上一個目標的殘骸）。
+    對一個明明設好目的地的人說「請先設定目的地」是最惹人火的錯誤訊息。
+    """
+    monkeypatch.setattr(navigation, "has_terrain", lambda _name: True)
+    reader = make("")
+    assert reader.destination() is None
+    assert reader.blank is True
+
+
+def test_junk_is_not_reported_as_blank(monkeypatch):
+    """讀到垃圾是「特徵可能指錯了」，不是「使用者沒設定」—— 別混為一談。"""
+    monkeypatch.setattr(navigation, "has_terrain", lambda _name: True)
+    reader = make("rubbish!!")
+    assert reader.destination() is None
+    assert reader.blank is False
+
+
+def test_blank_clears_once_a_real_target_appears(monkeypatch):
+    """旗標不能黏著 —— 讀到真的目標之後要放掉。"""
+    monkeypatch.setattr(navigation, "has_terrain", lambda _name: True)
+    reader = make("")
+    reader.destination()
+    assert reader.blank is True
+    reader._scanner.text = "prt_fild08.rsw"
+    assert reader.destination() == "prt_fild08"
+    assert reader.blank is False
+
