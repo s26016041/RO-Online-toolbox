@@ -249,15 +249,22 @@ def probe() -> int:
     # 直接跑一次特徵掃描，看命中幾個、幾個通過驗證 ——
     # 「attach 回 True 但 read() 回 None」就是這一步挑錯了候選。
     if ok:
+        import numpy
+
         from ro_toolbox.services.aob import scan as aob_scan
         from ro_toolbox.services.signatures import CHAR_STATUS
 
-        hits = aob_scan(reader._scanner, CHAR_STATUS,  # noqa: SLF001 - 診斷
-                        writable_only=True, limit=64)
-        good = [h for h in hits if reader.probe(h) is not None]
-        say(f"[探針] 角色特徵命中 {len(hits)} 個，通過數值驗證 {len(good)} 個")
-        say(f"[探針]   命中：{[hex(h) for h in hits[:8]]}")
-        say(f"[探針]   驗過：{[hex(h) for h in good[:8]]}")
+        sc = reader._scanner  # noqa: SLF001 - 診斷
+        regions = sc.regions(writable_only=True)
+        total = sum(size for _base, size in regions)
+        say(f"[探針] numpy {numpy.__version__}")
+        say(f"[探針] 可寫區段 {len(regions)} 個，共 {total / 1024 / 1024:.0f} MB")
+        # 連掃三次：分辨「穩定掃不到」與「時好時壞」
+        for round_no in (1, 2, 3):
+            hits = aob_scan(sc, CHAR_STATUS, writable_only=True, limit=64)
+            good = [h for h in hits if reader.probe(h) is not None]
+            say(f"[探針] 第 {round_no} 次掃描：命中 {len(hits)} 個、驗過 {len(good)} 個"
+                f"　{[hex(h) for h in hits[:4]]}")
     reader.close()
     return 0
 
