@@ -29,3 +29,6 @@ PktMon.etl
 
 # 打包實驗的殘留
 onedir-test.spec
+
+# Nuitka 的建置產物（387 MB）。留著只是為了記錄「這條路走過」，不進版控。
+build_nuitka/
