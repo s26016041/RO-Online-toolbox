@@ -285,6 +285,11 @@ class Traveler:
         return self._goal_map
 
     @property
+    def terrain(self):
+        """目前這張圖的地形（沒載到回 None）。給呼叫端挑走位目標用。"""
+        return self._terrain
+
+    @property
     def here_map(self) -> str:
         """目前這條路線是從哪張圖算出來的（＝角色現在在哪）。"""
         return self._route_map

@@ -394,3 +394,76 @@ def test_waiting_gives_up_loudly_not_silently(monkeypatch):
     assert t.update("izlu2dun", (108, 27)) == "blocked"
     assert "已停止" in t.note
 
+
+
+# ---- 認不出 NPC 時：走遠再走回來 -----------------------------------------
+
+
+class FakeReader:
+    def __init__(self, pos):
+        self.pos = pos
+
+    def read_position(self):
+        return self.pos
+
+
+def _shaker(monkeypatch, pos):
+    """一個只夠測 _shake_view 的 TravelBot（不開執行緒、不碰遊戲）。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234)
+    bot._reader = FakeReader(pos)
+    bot._traveler._terrain = open_terrain("t", side=200)
+    sent = []
+    monkeypatch.setattr(bot, "_send_move", lambda x, y: sent.append((x, y)))
+    return bot, sent, mod
+
+
+def test_it_walks_away_when_it_cannot_see_the_npc(monkeypatch):
+    """⚠ 站在 NPC 旁邊按下按鈕時，那一包早就送完了 —— 位置知道也沒用，
+    只能讓他重新進一次視野。"""
+    hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
+    bot, sent, mod = _shaker(monkeypatch, (109, 27))
+    bot._shake_view(hop)
+    assert sent, "應該送出往外走的封包"
+    away = sent[-1]
+    assert max(abs(away[0] - 108), abs(away[1] - 27)) >= mod._OUT_OF_VIEW
+
+
+def test_it_walks_back_only_after_really_getting_out_of_view(monkeypatch):
+    """⚠ 判斷「出視野了沒」看**真的座標**，不是等幾秒。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
+    bot, sent, _mod = _shaker(monkeypatch, (109, 27))
+    bot._shake_view(hop)
+    bot._reader.pos = (115, 27)          # 才走一半，還在視野內
+    bot._shake_view(hop)
+    assert bot._shake == "away"
+    bot._reader.pos = (108 + mod._OUT_OF_VIEW, 27)   # 出去了
+    bot._shake_view(hop)
+    assert bot._shake == "back"
+    assert sent[-1] == (108, 27), "要走回 NPC 那一格"
+
+
+def test_it_gives_up_after_a_couple_of_rounds(monkeypatch):
+    """做不到就交給人，不要一直來回踱步。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
+    bot, sent, _mod = _shaker(monkeypatch, (109, 27))
+    for _ in range(mod._SHAKE_ROUNDS):
+        bot._shake_view(hop)
+        bot._shake = None                 # 假裝這一輪失敗
+    before = len(sent)
+    bot._shake_view(hop)
+    assert len(sent) == before, "試夠了就不該再走"
+
+
+def test_no_shake_when_there_is_no_terrain(monkeypatch):
+    """沒有地形就挑不出安全的目標格 —— 安全退化，不亂走。"""
+    hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
+    bot, sent, _mod = _shaker(monkeypatch, (109, 27))
+    bot._traveler._terrain = None
+    bot._shake_view(hop)
+    assert sent == []

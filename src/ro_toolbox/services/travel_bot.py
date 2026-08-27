@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -45,8 +46,12 @@ _ENT_CLASS = 21     # uint16 外觀編號
 _ENT_POS = 61       # 3-byte 壓縮座標
 #: NPC 座標容許差幾格。Navi_Npc 給的是他站的格，實際可能差一點。
 _NPC_SNAP = 3
-#: 找 NPC 時掃自己周圍幾格。走到他面前才會用到，不必大。
-_NPC_VIEW = 20
+#: 走多遠才確定出了 NPC 的視野。RO 的視野約 14 格，抓 22 有餘裕。
+_OUT_OF_VIEW = 22
+#: 「走遠再走回來」最多做幾輪。做不到就交給人，不要一直來回踱步。
+_SHAKE_ROUNDS = 2
+#: 每一步的逾時：走不到就當這一輪失敗。只是放棄的上限。
+_SHAKE_STEP_SEC = 30.0
 
 
 @dataclass
@@ -88,6 +93,11 @@ class TravelBot:
         #: 要找的 NPC：(外觀編號, x, y)。認人要兩個欄位同時對上。
         self._npc_want: tuple[int, int, int] | None = None
         self._npc_gid: int | None = None
+        #: 「走遠再走回來」的進度：None／"away"／"back"
+        self._shake = None
+        self._shake_round = 0
+        self._shake_since = 0.0
+        self._shake_cell: tuple[int, int] | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._walker = Walker(self._send_move)
@@ -289,6 +299,57 @@ class TravelBot:
 
     # ---- 自己跟 NPC 講話 --------------------------------------------
 
+    def _shake_view(self, hop) -> None:  # noqa: ANN001 - travel.Hop
+        """走遠再走回來，逼遊戲重送 NPC 的「進入視野」封包。
+
+        ⚠ 為什麼非這樣不可：接觸 NPC 的封包要 **GID**，而
+        - GID 是**伺服器執行時**給的：RODATA 沒有（實測 `Navi_Npc` 給 izlude
+          船員的編號是 18518，實際封包用的是 **91**，整份表裡也沒有 91）；
+        - 記憶體的怪物掃描器**看不到 NPC**（靠 `alive==1` 當錨，[MEM-047]）；
+        - 實體只在**進入視野**時送一次封包（[PKT-061]）。
+
+        所以位置知道也沒用 —— 只能讓他**重新進一次視野**。
+
+        每一步都等**讀得到的訊號**（自己的座標到了沒），不是等秒數；
+        逾時只是放棄的上限。做滿 `_SHAKE_ROUNDS` 輪還認不出來就交給人。
+        """
+        pos = self._reader.read_position() if self._reader else None
+        terrain = self._traveler.terrain
+        if pos is None or terrain is None:
+            return
+        npc = (hop.x, hop.y)
+        now = time.monotonic()
+        far = max(abs(pos[0] - npc[0]), abs(pos[1] - npc[1]))
+
+        if self._shake is None:
+            if self._shake_round >= _SHAKE_ROUNDS:
+                return                      # 試過了，停著等人
+            cell = terrain.random_walkable(
+                random, near=npc, radius=_OUT_OF_VIEW + 6, min_radius=_OUT_OF_VIEW
+            )
+            if cell is None:
+                return
+            self._shake_round += 1
+            self._shake, self._shake_cell, self._shake_since = "away", cell, now
+            self._note(f"認不出「{hop.npc}」，先走遠一點讓他重新進視野"
+                       f"（第 {self._shake_round} 次）")
+            self._send_move(*cell)
+            return
+
+        if now - self._shake_since > _SHAKE_STEP_SEC:
+            self._shake = None              # 這一輪走不到，重來或放棄
+            return
+        if self._shake == "away":
+            if far >= _OUT_OF_VIEW:
+                self._shake, self._shake_since = "back", now
+                self._note(f"走回「{hop.npc}」那裡")
+                self._send_move(*npc)
+            elif self._shake_cell is not None:
+                self._send_move(*self._shake_cell)
+            return
+        if far <= _NPC_SNAP:
+            self._shake = None              # 回到他旁邊了，這時應該收得到封包
+
     def _watch_next_npc(self) -> None:
         """路線上**下一段**如果要跟 NPC 講話，現在就開始留意他的實體封包。
 
@@ -322,7 +383,10 @@ class TravelBot:
             return
         if self._talk is None:
             if self._npc_gid is None:
-                return       # 還認不出那隻 NPC —— 就停著等人，不亂送封包
+                # 認不出來多半是「按下按鈕時人就站在他旁邊」，那一包早就送完了。
+                # 走遠再走回來逼他重新進視野 —— 這是唯一不必猜的辦法。
+                self._shake_view(hop)
+                return
             want = map_display_name(hop.to_map)
             self._talk = npc_dialog.NpcTalk(self._npc_gid, want)
             log.info("開始跟「%s」(GID %s) 對話，想去 %s",
