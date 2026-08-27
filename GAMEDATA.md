@@ -3085,9 +3085,13 @@ A1  <全域>        mov  eax, [某全域]
   但這救不了「還沒讀過就被挖掉」的表 —— 這次的 `mobs.json.gz` 就是那種，
   所以根治只能靠上面那兩道關卡。
 
-- **⚠ 姊妹專案要一起修**：`s26016041/Angels-Online-toolbox` 的
-  `app/core/updater.py` 有同一份 `_clean_stale_mei()`（本專案的 updater 就是從
-  它移植過來的）。這次挖空我們的正是它 —— 只修這邊，症狀還會再發生。
+- **✅ 姊妹專案已一起修**（2026-08-28，commit `17b9bfc`）：
+  `s26016041/Angels-Online-toolbox` 的 `app/core/updater.py` 有同一份
+  `_clean_stale_mei()`（本專案的 updater 就是從它移植過來的），這次挖空我們的
+  正是它 —— 只修這邊症狀還會再發生。那邊**只加第二道關卡**
+  （`_looks_abandoned()`）：第一道要 psutil，而那支 updater 的規矩是
+  「只用標準庫，不加相依」，單靠 DLL 探測就足以擋住這個問題。
+  回歸測試在它的 `tools/mei_cleanup_check.py`（6 項）。
 
 - **影響**：`services/updater.py`（`_live_bundle_dirs`／`_looks_abandoned`／
   `_clean_stale_mei`）、`services/gamedata.py`（`_load` 快取）、
