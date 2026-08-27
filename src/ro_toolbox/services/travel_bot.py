@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from ro_toolbox.core.ro_protocol import build_move, unpack_move, unpack_position
 from ro_toolbox.services import game_socket, npc_dialog
 from ro_toolbox.services.character import CharacterReader
-from ro_toolbox.services.gamedata import map_display_name
+from ro_toolbox.services.gamedata import map_display_name, npc_links_on_map
 from ro_toolbox.services.navigation import NavigationReader
 from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
@@ -455,7 +455,17 @@ class TravelBot:
                     self._ask_for_help(hop)
                 return
             want = map_display_name(hop.to_map)
-            self._talk = npc_dialog.NpcTalk(self._npc_gid, want, npc=hop.npc)
+            # 這隻 NPC（同一個座標）在我們的資料裡只通往一個地方嗎？
+            # 只有這種時候，「使用 / 結束」那種**沒有地名的確認選單**才准點 ——
+            # 有好幾個目的地卻跳確認，代表我們看漏了什麼，寧可停手。
+            here = [
+                link for link in npc_links_on_map(hop.from_map)
+                if (link[0], link[1]) == (hop.x, hop.y)
+            ]
+            self._talk = npc_dialog.NpcTalk(
+                self._npc_gid, want, npc=hop.npc, sole=len(here) == 1
+            )
+            log.info("「%s」在資料裡有 %d 個目的地", hop.npc, len(here))
             log.info("開始跟「%s」(GID %s) 對話，想去 %s",
                      hop.npc, self._npc_gid, want)
         talk = self._talk

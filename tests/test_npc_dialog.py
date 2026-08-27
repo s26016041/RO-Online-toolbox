@@ -403,3 +403,89 @@ def test_place_of_strips_the_price():
     assert nd.place_of("普隆德拉 -> 120 z") == "普隆德拉"
     assert nd.place_of("艾爾貝塔 港口-> 500金幣") == "艾爾貝塔港口"
     assert nd.place_of("取消") == "取消"
+
+
+# ---- 只通一個地方的 NPC：選單是「確定嗎」，不是「選去哪」------------------
+#
+# 使用者實測回報（2026-08-27）：只能傳去依斯魯得島的那隻，選單是
+# ['使用', '結束'] —— 沒有地名可以比對，因為根本沒得選。
+
+
+def test_a_sole_destination_npc_can_be_confirmed():
+    talk = nd.NpcTalk(BOAT_GID, "衛星都市 依斯魯得島", npc="船員",
+                      sole=True, now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "使用", "結束"))
+    assert [p.hex() for p in _drain(talk)] == ["b8005b00000001"]
+    assert talk.done is True and talk.failed is False
+
+
+def test_the_same_menu_is_refused_when_the_npc_has_several_destinations():
+    """⚠ 有好幾個目的地卻跳「確定嗎」—— 代表我們看漏了什麼，停手。"""
+    talk = nd.NpcTalk(BOAT_GID, "衛星都市 依斯魯得島", npc="船員",
+                      sole=False, now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "使用", "結束"))
+    assert _drain(talk) == []
+    assert talk.failed is True
+
+
+def test_confirm_never_picks_the_way_out():
+    """⛔ 結束／取消永遠不准被選到 —— 那等於自己把對話關掉還以為成功了。"""
+    for danger in ("結束", "取消"):
+        assert danger not in nd.CONFIRM_OPTIONS
+    index, _why = nd.pick_confirm(["結束", "取消"])
+    assert index is None
+
+
+def test_a_real_destination_still_wins_over_confirm():
+    """選單裡有地名時走原本那條路，不要被確認白名單搶走。"""
+    talk = nd.NpcTalk(KAFRA_GID, "魔法之都 吉芬", npc="卡普拉職員",
+                      sole=True, now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, KAFRA_MENU2)
+    assert [p.hex() for p in _drain(talk)] == ["b80091000000" + "01"]
+
+
+@pytest.mark.parametrize("options", [
+    ["使用", "結束"],        # 實機：只通依斯魯得島的那隻
+    ["回去", "結束"],        # 實機：另一隻，同樣只通一個地方
+    ["出發吧", "取消"],      # 沒見過的說法 —— 排除法一樣接得住
+])
+def test_any_two_option_confirm_works_when_there_is_only_one_destination(options):
+    """⚠ 不要每遇到一個新的確認詞就回來加白名單。
+
+    只通一個地方、而且只剩一個「不是離開」的選項時，那個必然就是「做這件事」。
+    """
+    talk = nd.NpcTalk(BOAT_GID, "衛星都市 依斯魯得島", npc="船員",
+                      sole=True, now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, *options))
+    assert [p.hex() for p in _drain(talk)] == ["b8005b00000001"], options
+
+
+def test_several_unknown_options_still_stop():
+    """剩兩個以上不知道是什麼的選項 —— 分不出來就不賭。
+
+    （認得出來的確認詞另當別論：`使用` 就算旁邊還有別的選項也選得下去，
+    那是白名單，不是排除法。）
+    """
+    talk = nd.NpcTalk(BOAT_GID, "衛星都市 依斯魯得島", npc="船員",
+                      sole=True, now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "購買", "說明", "結束"))
+    assert _drain(talk) == []
+    assert talk.failed is True
+
+
+def test_a_known_confirm_word_wins_even_with_other_options():
+    talk = nd.NpcTalk(BOAT_GID, "衛星都市 依斯魯得島", npc="船員",
+                      sole=True, now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "說明", "使用", "結束"))
+    assert [p.hex() for p in _drain(talk)] == ["b8005b00000002"]
+
+
+def test_a_menu_of_only_exits_picks_nothing():
+    index, _why = nd.pick_confirm(["結束", "取消"])
+    assert index is None

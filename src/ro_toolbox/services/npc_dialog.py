@@ -75,6 +75,22 @@ _CONTACT_TYPE = 1
 #: 亂點的代價是花掉玩家的錢或改掉他的存檔點，而且是安靜地發生。
 SUBMENU_OPTIONS = ("傳送服務",)
 
+#: **只有一個目的地的 NPC，選單是「確定嗎」而不是「選去哪」時**，
+#: 允許點下去的選項。
+#:
+#: 實機看過（2026-08-27，使用者回報的選單內容）：只通往依斯魯得島的那幾隻，
+#: 選單是 `使用 : 結束` 或 `回去 : 結束` —— 沒有地名可以比對，因為根本沒得選。
+#:
+#: ⚠ **這條有前提**：`navi_link` 裡這隻 NPC（同一個座標）**只有一條連結**。
+#: 有好幾個目的地卻跳出「確定嗎」的話，代表我們看漏了什麼，一律停手。
+#: ⛔ `結束`／`取消` 永遠不准進來。
+CONFIRM_OPTIONS = ("使用", "回去")
+
+#: 「離開對話」的選項。⛔ **永遠不准選** —— 選了等於自己把對話關掉還以為成功了。
+#: 也是「排除法」的依據：只通一個地方、而且**只剩一個不是離開的選項**時，
+#: 那個必然就是「做這件事」，不必每遇到一個新的確認詞就回來加白名單。
+EXIT_OPTIONS = ("結束", "取消")
+
 #: 一次對話最多回答幾層選單。
 #:
 #: 船員是**一層**（實測）。卡普拉那種「先選傳送服務、再選城市」是兩層以上，
@@ -230,6 +246,31 @@ def pick_submenu(options: list[str]) -> tuple[int | None, str]:
     return None, f"可以往下點的有 {len(hits)} 個，分不出來"
 
 
+def pick_confirm(options: list[str]) -> tuple[int | None, str]:
+    """只有一個目的地時，選單是「確定嗎」—— 挑那個確認選項。
+
+    **只認 `CONFIRM_OPTIONS` 白名單**，而且只准剛好一個對上。
+    ⛔ `結束`／`取消` 不在白名單裡，永遠不會被選到。
+    """
+    hits = [
+        i for i, opt in enumerate(options, start=1)
+        if _squash(opt) in CONFIRM_OPTIONS
+    ]
+    if len(hits) == 1:
+        return hits[0], f"第 {hits[0]} 項「{options[hits[0] - 1]}」是確認"
+    if len(hits) > 1:
+        return None, f"確認選項有 {len(hits)} 個，分不出來"
+    # 白名單沒中：改用排除法。這隻只通一個地方，選單又只剩一個「不是離開」的
+    # 選項 —— 那個必然就是「做這件事」，沒有別的可能。
+    rest = [
+        i for i, opt in enumerate(options, start=1)
+        if _squash(opt) not in EXIT_OPTIONS
+    ]
+    if len(rest) == 1:
+        return rest[0], f"第 {rest[0]} 項「{options[rest[0] - 1]}」是唯一不是離開的選項"
+    return None, f"沒有可以確認的選項（{len(rest)} 個非離開選項，分不出來）"
+
+
 def cost_of(option: str) -> str:
     """選項裡寫的代價（`150 金幣`）。看不出來回空字串 —— 只是拿來提醒人。"""
     import re
@@ -253,11 +294,15 @@ class NpcTalk:
     #: 送出之後多久沒有任何回應就放棄。只是放棄的上限，不是成功的依據。
     TIMEOUT = 15.0
 
-    def __init__(self, gid: int, want: str, npc: str = "", now=None) -> None:
+    def __init__(self, gid: int, want: str, npc: str = "",
+                 sole: bool = False, now=None) -> None:
         import time as _time
 
         self._gid = gid
         self._want = want
+        #: 這隻 NPC 在我們的資料裡**只通往一個地方** —— 那它的選單如果沒有
+        #: 地名，多半是「確定嗎」。只有這種情況才准點確認選項。
+        self._sole = sole
         self._npc = npc or f"NPC #{gid}"
         self._now = now or _time.monotonic
         self._queue: list[bytes] = [build_contact(gid)]
@@ -307,6 +352,20 @@ class NpcTalk:
                 log.info("%s", self.note)
                 self._push(build_choose(self._gid, index))
                 return
+            if self._sole:
+                index, ok_why = pick_confirm(options)
+                if index is not None:
+                    self.cost = cost_of(options[index - 1])
+                    money = f"，{self.cost}" if self.cost else ""
+                    self.note = (
+                        f"找「{self._npc}」傳送到 {self._want}{money}"
+                        f"（他只通這一個地方，選單是確認）"
+                    )
+                    log.info("%s：%s", self.note, ok_why)
+                    self._push(build_choose(self._gid, index))
+                    self.done = True
+                    return
+                sub_why = f"{sub_why}；{ok_why}"
             # ⛔ 分不出來就**不准賭**：猜錯是把人傳到別的島、或花掉他的錢。
             self.failed = True
             self.note = f"⚠ 看不懂 NPC 的選單，沒有動作：{why}；{sub_why}"
