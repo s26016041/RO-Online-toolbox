@@ -28,7 +28,11 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ro_toolbox.services.gamedata import npc_links_on_map, warps_on_map
+from ro_toolbox.services.gamedata import (
+    npc_links_on_map,
+    warp_landings_on,
+    warps_on_map,
+)
 from ro_toolbox.services.mapdata import GatError, MapTerrain, load_terrain
 from ro_toolbox.services.walker import Walker
 
@@ -250,6 +254,9 @@ class Traveler:
         self._warp_cell: tuple[int, int] | None = None
         self._npc_wait: Hop | None = None   # 正在等人跟這個 NPC 講話
         self._npc_since = 0.0
+        #: 「從我現在站的地方走得到哪些格」。室內圖一張地圖裡有好幾個互不相連的
+        #: 房間，挑門要靠它（見 `_gate_options`）。換圖就作廢。
+        self._reach: frozenset[tuple[int, int]] | None = None
         self._stale_since = 0.0  # 座標還停在上一張圖的起算時間（[MEM-022]）
         self.note = ""
 
@@ -334,17 +341,9 @@ class Traveler:
         if not map_name:
             return "walking"  # 換圖中間讀不到地圖名是正常過渡，不亂動
 
-        # 地圖名變了（或第一次跑）：這是唯一被承認的「過去了」訊號。
-        if map_name != self._route_map:
-            if self._route_map:
-                log.info("換圖 %s → %s，重新規劃", self._route_map, map_name)
-            if not self._replan(map_name):
-                return "blocked"
-            if not self._route and self._goal_cell is None:
-                self.note = f"已抵達 {map_name}"
-                self.clear()
-                return "arrived"
-
+        # ⚠ 順序有意義：**地形與座標先確定，才輪到規劃路線**。
+        # 挑傳點要看「從我站的地方走不走得到那道門」（室內圖一張地圖裡有好幾個
+        # 互不相連的房間，見 `_gate_options`），沒有地形與可信的座標就挑不了。
         if not self._load_terrain(map_name):
             return "blocked"
 
@@ -369,6 +368,17 @@ class Traveler:
             self._stale_since = 0.0
             self.note = self._progress_note()
         pos = here
+
+        # 地圖名變了（或第一次跑）：這是唯一被承認的「過去了」訊號。
+        if map_name != self._route_map:
+            if self._route_map:
+                log.info("換圖 %s → %s，重新規劃", self._route_map, map_name)
+            if not self._replan(map_name):
+                return "blocked"
+            if not self._route and self._goal_cell is None:
+                self.note = self._arrival_note(map_name, pos)
+                self.clear()
+                return "arrived"
 
         # 正在等人跟 NPC 講話：什麼都不做，連走路封包都不送。
         # 換圖了的話上面那段早就重新規劃、把這個狀態清掉了。
@@ -395,6 +405,11 @@ class Traveler:
         if self._replans > MAX_REPLANS:
             self.note = f"⚠ 重新規劃 {MAX_REPLANS} 次仍到不了 {self._goal_map}，已放棄"
             return False
+        # 「正在計算」要寫進日誌：BFS 跑得再快，使用者按下按鈕到看到第一步
+        # 中間還是有一段空白。空白期沒有任何字，看起來就像沒反應。
+        log.info("正在計算 %s → %s 的路線…（第 %d 次規劃）",
+                 map_name, self._goal_map, self._replans)
+        self.note = f"正在計算前往 {self._goal_map} 的路線…"
         # 先試**純走路**走得到的路線。走得到就別麻煩人 ——
         # BFS 只看換圖次數，不擋的話它會為了少換一張圖就叫你去搭船。
         route = plan_route(map_name, self._goal_map, self._avoid)
@@ -405,15 +420,56 @@ class Traveler:
             return False
         self._route = route
         self._route_map = map_name
-        self._terrain = None
-        self._terrain_map = ""
-        self._stale_since = 0.0  # 新地圖重新起算「等座標更新」
+        # ⚠ 不清 `_terrain`：這支現在是在地形載好、座標確認過之後才被呼叫的，
+        # 清掉的話 `_start_leg` 會拿到 None，變成「找不到目標格」。
         self._npc_wait = None    # 換圖了 = 那一段過去了（或人自己走去別的地方）
         self._clear_warp()
         self._walker.clear()
         if route:
+            log.info("路線算好了：%d 段 —— %s", len(route),
+                     " → ".join([map_name] + [hop.to_map for hop in route]))
             self.note = self._progress_note()
+        else:
+            log.info("已經在 %s 上了，只剩最後一段", map_name)
         return True
+
+    def _arrival_note(self, map_name: str, pos: tuple[int, int]) -> str:
+        """到了。順便**大聲說出**「這張圖分成好幾個互不相連的房間」這件事。
+
+        遊戲的尋路目標只給**地圖名**（`navigation.py` 讀到的就是一個字串），
+        但主城的室內圖是一張圖裡好幾間店：`prt_in` 實測 26 個互不相連的區塊、
+        22 道各自獨立通往 prontera 的門。我們只保證進得了這張圖，
+        進到的是不是你要的那一間**沒有資料可以判斷**（要有目標座標才行）。
+
+        那就講清楚，不要安靜地宣告成功 —— CLAUDE.md：安靜地做錯事一律當 bug。
+        """
+        base = f"已抵達 {map_name}"
+        terrain = self._terrain
+        if terrain is None or self._goal_cell is not None:
+            return base
+        reach = self._reachable(terrain, pos)
+        if not reach:
+            return base
+        # ⚠ 判準是「**還有幾個入口**落在我走不到的地方」，不是「這張圖有沒有
+        # 不相連的區塊」。野外圖的邊角本來就有一堆走不進去的小口袋
+        # （實測 prt_fild08 從第一格泛洪只有 799 / 90798 格），拿那個當判準
+        # 等於每張圖都跳警告 —— 警告一旦每次都出現，就等於沒有警告。
+        others = 0
+        for cell in warp_landings_on(map_name):
+            spot = nearest_walkable(terrain, cell, radius=3)
+            if spot is not None and spot not in reach:
+                others += 1
+        # 只在**過半**的入口都通到我走不到的地方時才講。野外圖的角落常有一兩個
+        # 走不進去的小口袋（實測 prt_fild08 是 1/6），那種每次都跳警告
+        # 等於警告失效；過半才代表「你要的地方比較可能不在我站的這一塊」。
+        if others * 2 <= len(warp_landings_on(map_name)):
+            return base
+        return (
+            f"{base}，但⚠ 這張圖 {len(warp_landings_on(map_name))} 個入口裡有"
+            f" {others} 個通到我**走不過去**的區域"
+            f"（室內圖是一張地圖裡好幾間店）。遊戲的尋路目標只給地圖名、沒給座標，"
+            f"我只能保證把你帶進這張圖 —— 是不是你要的那一間請自己確認"
+        )
 
     def _progress_note(self) -> str:
         """現在在做什麼的一句話。狀態文字要跟得上實際行為，否則就是另一種安靜的錯。"""
@@ -431,6 +487,8 @@ class Traveler:
             self.note = f"⚠ 讀不到 {map_name} 的地形，無法尋路：{exc}"
             return False
         self._terrain_map = map_name
+        self._reach = None       # 換圖了，上一張圖算出來的可走區塊不算數
+        self._stale_since = 0.0  # 新地圖重新起算「等座標更新」
         return True
 
     def _leg_goal(self) -> tuple[int, int] | None:
@@ -443,21 +501,122 @@ class Traveler:
             return None
         return nearest_walkable(terrain, raw)
 
+    def _gate_options(self, map_name: str) -> list[Hop]:
+        """這張圖上通往**下一張圖**的所有傳點，目前選的那個排第一。
+
+        ⚠ 為什麼不能只用 `route[0]`：`plan_route` 是 BFS，只挑「最少換圖」，
+        同一個目的地有好幾道門時它挑到哪一道**完全是任意的**。
+        主城的室內圖是一張地圖裡好幾間店：`prt_in` 實測 26 個互不相連的區塊、
+        22 道各自獨立通往 prontera 的門。人站在藥水店裡時，只有那一間的門走得到；
+        挑到別間的門，A* 回「走不到」，整段就被判失敗、傳點被列黑名單，
+        然後下一拍再挑到另一道也走不到的門 —— 磨到 `MAX_REPLANS` 才大聲放棄。
+        症狀正是使用者回報的「主城商店裡面沒辦法尋路」。
+
+        黑名單（`_avoid`）裡的門不放進來：那些是**真的踩過不去**的，不是挑錯。
+        """
+        hop = self._route[0]
+        if hop.npc:
+            return [hop]  # 要跟 NPC 講話的那種：人站在哪就是哪，不能換一道門
+        out = [hop]
+        seen = {hop.cell}
+        for x, y, dest, dx, dy in warps_on_map(map_name):
+            if dest != hop.to_map or (x, y) in seen or (map_name, x, y) in self._avoid:
+                continue
+            seen.add((x, y))
+            out.append(Hop(map_name, x, y, dest, dx, dy))
+        return out
+
+    def _reachable(self, terrain: MapTerrain, pos: tuple[int, int]) -> frozenset:
+        """「從我站的這一格走得到哪些格」。同一塊區域只算一次。
+
+        只在**第一道門走不到**的時候才算 —— 一般地圖第一道門就走得到，
+        不必為了沒發生的問題每次泛洪整張圖。
+        """
+        cached = self._reach
+        if cached is not None and pos in cached:
+            return cached
+        log.info("正在算 %s 上「從 (%d,%d) 走得到哪些格」…", self._terrain_map, *pos)
+        reach = terrain.reachable_from(pos)
+        self._reach = reach
+        log.info("%s 上我這一塊有 %d 格，整張圖 %d 格可走",
+                 self._terrain_map, len(reach), terrain.walkable_cells())
+        return reach
+
+    def _reachable_gates(
+        self, terrain: MapTerrain, pos: tuple[int, int], hops: list[Hop]
+    ) -> list[Hop]:
+        """把走不到的門篩掉，剩下的由近到遠排。算不出可走區域就原封不動退回。"""
+        reach = self._reachable(terrain, pos)
+        if not reach:
+            return list(hops)
+        near = []
+        for hop in hops:
+            cell = nearest_walkable(terrain, hop.cell)
+            if cell is not None and cell in reach:
+                near.append(hop)
+        near.sort(key=lambda h: max(abs(h.x - pos[0]), abs(h.y - pos[1])))
+        return near
+
     def _start_leg(self, map_name: str, pos: tuple[int, int]) -> str:
         terrain = self._terrain
-        goal = self._leg_goal()
-        if terrain is None or goal is None:
+        if terrain is None:
             self.note = f"⚠ {map_name} 上找不到可以走到的目標格"
             return self._give_up_leg(map_name)
-        if max(abs(goal[0] - pos[0]), abs(goal[1] - pos[1])) <= ARRIVE_RADIUS:
-            return self._on_leg_done(pos)
-        path = terrain.find_path(pos, goal, node_budget=NODE_BUDGET)
-        if not path:
-            self.note = f"⚠ {map_name} 上走不到 {goal}"
-            return self._give_up_leg(map_name)
-        self._walker.set_path(path)
-        self._walker.update(pos)
-        return "walking"
+
+        if not self._route:
+            # 最後一段：走到指定座標（沒指定座標的話上面早就回 arrived 了）
+            goal = self._leg_goal()
+            if goal is None:
+                self.note = f"⚠ {map_name} 上找不到可以走到的目標格"
+                return self._give_up_leg(map_name)
+            if max(abs(goal[0] - pos[0]), abs(goal[1] - pos[1])) <= ARRIVE_RADIUS:
+                return self._on_leg_done(pos)
+            log.info("正在計算 %s 上從 %s 到目的地 %s 的路徑…", map_name, pos, goal)
+            path = terrain.find_path(pos, goal, node_budget=NODE_BUDGET)
+            if not path:
+                self.note = f"⚠ {map_name} 上走不到 {goal}"
+                return self._give_up_leg(map_name)
+            self._walker.set_path(path)
+            self._walker.update(pos)
+            self.note = self._progress_note()
+            return "walking"
+
+        # 這一段要走到「通往下一張圖的門」。同一個目的地常常有好幾道門，
+        # 走得到的才算數（見 `_gate_options`）。
+        options = self._gate_options(map_name)
+        doors = len(options)     # 記下原本有幾道；options 之後會被篩掉一部分
+        widened = False
+        index = 0
+        while index < len(options):
+            hop = options[index]
+            index += 1
+            goal = nearest_walkable(terrain, hop.cell)
+            if goal is None:
+                continue  # 這道門周圍一格都站不上去，換下一道
+            if max(abs(goal[0] - pos[0]), abs(goal[1] - pos[1])) <= ARRIVE_RADIUS:
+                self._route[0] = hop
+                return self._on_leg_done(pos)
+            log.info("正在計算 %s 上從 %s 到 %s 傳點 %s 的路徑…",
+                     map_name, pos, hop.to_map, goal)
+            path = terrain.find_path(pos, goal, node_budget=NODE_BUDGET)
+            if path:
+                if hop != self._route[0]:
+                    log.info("%s 上通往 %s 的門有 %d 道，從這裡走得到的是 %s",
+                             map_name, hop.to_map, doors, goal)
+                self._route[0] = hop
+                self._walker.set_path(path)
+                self._walker.update(pos)
+                self.note = self._progress_note()
+                return "walking"
+            if not widened and len(options) > 1:
+                # 第一道門走不到 → 先把「我這一塊通到哪」一次算出來，
+                # 剩下的門用查表篩，不要一道一道去跑 A*。
+                widened = True
+                options = options[:index] + self._reachable_gates(
+                    terrain, pos, options[index:]
+                )
+        self.note = f"⚠ {map_name} 上走不到任何一道通往 {self._route[0].to_map} 的傳點"
+        return self._give_up_leg(map_name)
 
     def _on_leg_done(self, pos: tuple[int, int]) -> str:
         """這張圖上該走的走完了。還有下一段就開始踩傳點，不然就是到了。"""
@@ -555,14 +714,21 @@ class Traveler:
         return candidates[index] if index < len(candidates) else None
 
     def _give_up_leg(self, map_name: str) -> str:
-        """這一段走不成：把當前傳點列黑名單並重新規劃。規劃不出來就 blocked。"""
+        """這一段走不成：把當前傳點列黑名單並重新規劃。規劃不出來就 blocked。
+
+        ⚠ **放棄的理由要留著**。`_no_route_note` 只會說「找不到通往 X 的路」，
+        但真正的原因常常更具體（例如「這間房間的門一道都走不到」）——
+        只印通用句的話，使用者看到的是一句跟遊戲畫面矛盾的話（傳點明明就在那）。
+        """
+        reason = self.note if self.note.startswith("⚠") else ""
         if self._route:
             self._avoid.add(self._route[0].key)
         self._clear_warp()
         self._walker.clear()
         self._route_map = ""  # 逼下一拍重新規劃
         if plan_route(map_name, self._goal_map, self._avoid) is None:
-            self.note = _no_route_note(map_name, self._goal_map, excluded=True)
+            fallback = _no_route_note(map_name, self._goal_map, excluded=True)
+            self.note = f"{reason}\n{fallback}" if reason else fallback
             return "blocked"
         return "walking"
 

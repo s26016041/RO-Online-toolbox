@@ -173,6 +173,7 @@ class TravelBot:
         if self._destination is None and not self._read_navigation():
             return False
 
+        self._note("正在找遊戲連線…")
         server = find_server(self._pid)
         if server is None:
             return self._fail("找不到伺服器連線（還沒登入？）")
@@ -181,6 +182,9 @@ class TravelBot:
             return self._fail("找不到遊戲 socket，無法送封包")
         self._sock, self._server = sock, server
 
+        # AOB 定位要一秒上下。不講一聲的話這段就是完全的沉默，
+        # 使用者按下按鈕之後看不到任何字，會以為是沒反應（CLAUDE.md：狀態要跟得上行為）。
+        self._note("正在定位角色（AOB 特徵掃描）…")
         reader = CharacterReader()
         if not reader.attach(self._pid, should_stop=self._stop.is_set):
             return self._fail("角色定位失敗")
@@ -192,13 +196,15 @@ class TravelBot:
         self._reader = reader
 
         # Walker 靠 0x0087 判斷每一段有沒有被接受；沒有擷取就只能瞎送（[PKT-030]）
+        self._note("正在啟動封包擷取…")
         capture = PacketCapture(self._pid, self._on_packet)
         if not capture.start():
             return self._fail("封包擷取啟動失敗（需要系統管理員）")
         self._capture = capture
 
         self._traveler.set_goal(self._destination)
-        self._note(f"前往 {self._stats.goal_label or self._destination}")
+        self._note(f"前往 {self._stats.goal_label or self._destination}"
+                   f"（{self._destination}），正在計算路線…")
         return True
 
     def _read_navigation(self) -> bool:
@@ -207,6 +213,7 @@ class TravelBot:
         讀不到就**大聲停用**，絕不退回「隨便走一張圖」——
         走錯地方比不走糟得多（CLAUDE.md：失效只能大聲停用或安全退化）。
         """
+        self._note("正在讀遊戲的尋路目標…")
         reader = NavigationReader()
         try:
             if not reader.attach(self._pid):
@@ -293,7 +300,13 @@ class TravelBot:
                 # 對話走不完（看不懂選單、沒回應）就退回「等你手動做」。
                 self._run_dialog()
             self._stats.hops_left = len(self._traveler.route)
-            self._stats.note = self._traveler.note
+            # ⚠ 這裡要走 `_note()`，不能直接指派：`Traveler` 一路算出來的狀態
+            # （正在計算路線、還要換幾張圖、踩傳點、等座標更新…）本來只寫進
+            # `stats.note`，而 `stats.note` 只有介面在看 —— 介面又刻意不顯示它。
+            # 結果整段趕路過程在執行日誌裡是**全白的**，使用者只看得到頭尾。
+            # `_note()` 自己會擋掉重複，每拍呼叫也不會洗版。
+            if self._traveler.note:
+                self._note(self._traveler.note)
 
             if state == "arrived":
                 self._stats.arrived = True

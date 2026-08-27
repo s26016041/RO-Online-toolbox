@@ -188,6 +188,24 @@ def npc_links_on_map(
     ]
 
 
+@lru_cache(maxsize=32)
+def warp_landings_on(map_name: str) -> tuple[tuple[int, int], ...]:
+    """從**別的地圖**進到 `map_name` 時會落在哪些格（含要跟 NPC 講話的那種）。
+
+    用途只有一個：判斷「這張圖是不是分成好幾個各自獨立進出的區域」。
+    主城的室內圖是一張圖裡好幾間店 —— `prt_in` 實測 26 個互不相連的區塊、
+    20 道各自獨立通往 prontera 的門。遊戲的尋路目標只給**地圖名**，
+    走進去的是不是你要的那一間，我們沒有資料可以判斷，只能講清楚。
+    """
+    out: list[tuple[int, int]] = []
+    for table in (_warp_table(), _npc_table()):
+        for rows in table.values():
+            for row in rows:
+                if len(row) >= 5 and str(row[2]) == map_name:
+                    out.append((int(row[3]), int(row[4])))
+    return tuple(dict.fromkeys(out))
+
+
 @lru_cache(maxsize=1)
 def _map_name_table() -> dict[str, str]:
     try:

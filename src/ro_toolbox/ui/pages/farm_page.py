@@ -58,6 +58,7 @@ from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel_bot import TravelBot
 from ro_toolbox.ui.pages.base_page import BasePage
+from ro_toolbox.ui.widgets.toast import show_toast
 
 log = logging.getLogger(__name__)
 
@@ -178,6 +179,9 @@ class CharacterCard(QWidget):
         super().__init__()
         #: 這張卡是哪一隻角色（補水設定用它當鍵，不是 PID —— PID 每次開遊戲都變）
         self.character = ""
+        #: 這一趟的「到了」通知跳過沒有。bot 停下來時還會再回報一次同一份
+        #: stats（arrived 仍是 True），沒有這道閘門會跳兩次。
+        self._travel_notified = False
         #: 想選但清單裡還沒出現的道具（背包是非同步讀的，選單填好才選得到）
         self._want_item: dict[str, int | None] = {"hp": None, "sp": None, "home": None}
         #: True = 現在是**程式自己**在改 UI，不是使用者的意思 —— 這種變動不存檔。
@@ -362,6 +366,16 @@ class CharacterCard(QWidget):
         """⚠ 這裡**不記日誌** —— `TravelBot._note()` 已經記過了。
         兩邊都記的症狀是同一句話印兩次（實測：「前往 依斯魯得島　前往 izlude」）。
         介面上唯一的表現是：bot 停了，按鈕就彈起來。"""
+        if getattr(stats, "arrived", False) and not self._travel_notified:
+            # 到了要**跳到螢幕最前面**講一聲：趕路動輒幾十秒，人早就切回遊戲
+            # 或去做別的事了，只寫在日誌等於沒講。
+            self._travel_notified = True
+            where = stats.goal_label or stats.goal or "目的地"
+            who = self.character or "角色"
+            body = f"{who} 已抵達 {where}"
+            if stats.note:
+                body = f"{body}\n{stats.note}"
+            show_toast("自動尋路：到了", body)
         if not stats.running:
             # 走完（或失敗）就把按鈕彈起來 —— 按鈕壓著卻沒在走，
             # 看起來會像「還在趕路」，那是最糟的失效方式。
@@ -371,6 +385,8 @@ class CharacterCard(QWidget):
     def set_travel_busy(self, busy: bool) -> None:
         """趕路途中不讓人再去勾自動打怪 —— 兩個都在送走路封包會互相打架。"""
         self.auto_hunt.setEnabled(not busy)
+        if busy:
+            self._travel_notified = False  # 新的一趟，抵達通知重新算
 
     # ---- 自動補水 ---------------------------------------------------
 

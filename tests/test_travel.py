@@ -250,6 +250,140 @@ def test_wrong_warp_self_heals_by_replanning_from_where_we_are(fake_warps):
     assert walker.paths[-1][-1] == (6, 6)  # dead_end 上回 a 的傳點
 
 
+# ---- 一張圖裡好幾間互不相連的房間（主城的商店） ----------------------------
+
+
+def test_picks_the_gate_it_can_actually_reach(monkeypatch):
+    """室內圖是**一張地圖裡好幾間互不相連的店**（`prt_in` 實測 26 個區塊、
+    22 道各自獨立通往 prontera 的門）。`plan_route` 是 BFS，挑到哪一道門
+    完全是任意的 —— 挑到別間的門，A* 回「走不到」，整段被判失敗、
+    傳點列黑名單，下一拍再挑到另一道也走不到的門，磨到上限才放棄。
+    症狀就是使用者回報的「主城商店裡面沒辦法尋路」。"""
+    from ro_toolbox.services import travel as mod
+
+    terrain = open_terrain("shop")
+    terrain.types[:, 20] = 1  # 一道整片的牆，把地圖切成左右兩間房
+    monkeypatch.setattr(
+        mod, "warps_on_map",
+        lambda m: [(5, 5, "b", 1, 1), (35, 35, "b", 2, 2)] if m == "shop" else [],
+    )
+    traveler, walker, _clock = make(loader=lambda _name: terrain)
+    traveler.set_goal("b")
+
+    # 人在右邊那間。BFS 先挑到的是左邊 (5,5) 那道門，但那道走不到。
+    assert traveler.update("shop", (30, 30)) == "walking"
+    assert walker.paths[-1][-1] == (35, 35)
+    assert traveler.route[0].cell == (35, 35)
+
+
+def test_no_reachable_gate_fails_loudly(monkeypatch):
+    """一道門都走不到就要大聲停下 —— 不准站在原地磨到重規劃上限。"""
+    from ro_toolbox.services import travel as mod
+
+    terrain = open_terrain("shop")
+    terrain.types[:, 20] = 1
+    monkeypatch.setattr(
+        mod, "warps_on_map",
+        lambda m: [(5, 5, "b", 1, 1)] if m == "shop" else [],
+    )
+    traveler, walker, _clock = make(loader=lambda _name: terrain)
+    traveler.set_goal("b")
+    assert traveler.update("shop", (30, 30)) == "blocked"
+    assert "走不到" in traveler.note
+    assert walker.paths == []
+
+
+def test_arriving_on_a_multi_room_map_says_so(monkeypatch):
+    """遊戲的尋路目標只給**地圖名**，但主城室內圖是一張圖裡好幾間店。
+    我們只保證進得了這張圖 —— 那就講清楚，不要安靜地宣告成功。"""
+    from ro_toolbox.services import travel as mod
+
+    terrain = open_terrain("prt_in")
+    terrain.types[:, 20] = 1  # 一道整片的牆，把地圖切成左右兩間房
+    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
+    # 三個入口，兩個落在左邊那間 —— 我站在右邊，所以「過半的入口在別間」
+    monkeypatch.setattr(mod, "warp_landings_on", lambda _m: ((5, 5), (8, 8), (35, 35)))
+    traveler, _walker, _clock = make(loader=lambda _name: terrain)
+    traveler.set_goal("prt_in")
+    assert traveler.update("prt_in", (30, 30)) == "arrived"
+    assert "走不過去" in traveler.note
+
+
+def test_a_stray_pocket_does_not_cry_wolf(monkeypatch):
+    """野外圖角落常有一兩個走不進去的小口袋（實測 prt_fild08 是 6 個入口裡有 1 個）。
+    那種每次都跳警告的話，警告就等於沒有了。"""
+    from ro_toolbox.services import travel as mod
+
+    terrain = open_terrain("prt_fild08")
+    terrain.types[:, 20] = 1
+    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
+    monkeypatch.setattr(
+        mod, "warp_landings_on", lambda _m: ((5, 5), (30, 30), (40, 40), (60, 60)))
+    traveler, _walker, _clock = make(loader=lambda _name: terrain)
+    traveler.set_goal("prt_fild08")
+    assert traveler.update("prt_fild08", (30, 30)) == "arrived"
+    assert traveler.note == "已抵達 prt_fild08"
+
+
+# ---- 狀態要寫進執行日誌 ----------------------------------------------------
+
+
+def test_planning_says_what_it_is_doing(fake_warps, caplog):
+    """按下按鈕到走出第一步中間有一段空白。那段沒有任何字，看起來就像沒反應。"""
+    import logging
+
+    traveler, _walker, _clock = make()
+    traveler.set_goal("c")
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.services.travel"):
+        traveler.update("a", (5, 5))
+    assert "正在計算" in caplog.text
+    assert "路線算好了" in caplog.text
+
+
+def test_travel_bot_logs_the_traveler_progress(caplog):
+    """`Traveler` 一路算出來的狀態要真的進執行日誌。
+
+    舊版是直接指派給 `stats.note`，而介面**刻意不顯示** `note`
+    （提示字一律走日誌）—— 結果整段趕路過程在日誌裡是全白的，
+    使用者只看得到「前往 X」跟「已抵達 X」，中間幾十秒完全沒有字。
+    """
+    import logging
+
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234, destination="prontera")
+
+    class FakeStatus:
+        hp = 100
+        map_name = "prt_fild08"
+
+    class FakeReader:
+        def read(self):
+            return FakeStatus()
+
+        def read_position(self):
+            return (50, 50)
+
+    class FakeTraveler:
+        note = "前往 prontera：還要換 2 張圖"
+        route: list = []
+        terrain = None
+
+        def __init__(self, stop) -> None:
+            self._stop = stop
+
+        def update(self, *_args):
+            self._stop.set()   # 只跑一拍
+            return "walking"
+
+    bot._reader = FakeReader()
+    bot._traveler = FakeTraveler(bot._stop)
+    bot._keep_in_sync = lambda _now: True
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.services.travel_bot"):
+        bot._loop()
+    assert "還要換 2 張圖" in caplog.text
+
+
 # ---- 要跟 NPC 講話才過得去的連結 ------------------------------------------
 
 

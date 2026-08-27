@@ -140,6 +140,48 @@ def test_travel_failure_only_pops_the_button(qtbot):
     assert card.status_label.text() == "PID 1234"
 
 
+def test_arrival_pops_a_notice_on_top_once(qtbot, monkeypatch):
+    """趕路動輒幾十秒，人早就切回遊戲或去做別的事了 —— 只寫日誌等於沒講。
+    到了要跳一個置頂通知；而 bot 停下來時還會再回報一次同一份 stats
+    （arrived 仍是 True），所以只准跳一次。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    shown = []
+    monkeypatch.setattr(mod, "show_toast", lambda *args: shown.append(args))
+    card = make_card(qtbot)
+    card.set_travel_busy(True)
+    card.auto_travel.setChecked(True)
+    card._apply_travel_stats(FakeTravelStats(running=True, arrived=True))
+    card._apply_travel_stats(FakeTravelStats(running=False, arrived=True))
+    assert len(shown) == 1
+    assert "普隆德拉原野" in shown[0][1]
+
+
+def test_travel_that_fails_pops_no_notice(qtbot, monkeypatch):
+    """沒到就不要跳「到了」—— 安靜地做錯事一律當 bug。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    shown = []
+    monkeypatch.setattr(mod, "show_toast", lambda *args: shown.append(args))
+    card = make_card(qtbot)
+    card.set_travel_busy(True)
+    card._apply_travel_stats(FakeTravelStats(running=False, arrived=False, note="⚠ 到不了"))
+    assert shown == []
+
+
+def test_notice_never_steals_focus(qtbot):
+    """置頂是必要的，**不搶焦點**更必要：搶了焦點全螢幕的遊戲會被切到背景
+    甚至最小化，那比沒有通知糟得多。"""
+    from PySide6.QtCore import Qt
+
+    from ro_toolbox.ui.widgets.toast import TopToast
+
+    toast = TopToast("到了", "測試", seconds=0)
+    qtbot.addWidget(toast)
+    assert toast.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+    assert toast.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+
+
 def test_the_bot_is_the_one_that_logs(caplog):
     """提示字只由 bot 記一次，而且**同一句話不重複記**（每拍都會呼叫）。"""
     import logging

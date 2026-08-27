@@ -11,6 +11,10 @@
 3. **被拒絕的移動是靜默的**：伺服器不回任何錯誤，就是不動。實測有角色對著
    一個到不了的點連送 12 次、原地站 46 秒。所以送出後要等 `0x0087`
    （伺服器確認移動）；沒等到就是被拒絕，要立刻改別條路，不能傻等。
+4. **走路會被打斷**：途中被怪打，角色就停在半路，而且**伺服器一樣不吭聲**
+   （使用者實測回報）。所以「位置停住」不能直接當成走不成 ——
+   要先把這一段重送、把腳步接回去；重送幾次都救不回來才算真的被擋住。
+   判斷依據一律是**讀得到的訊號**（自己的座標有沒有在動），不是睡幾秒。
 """
 
 from __future__ import annotations
@@ -28,7 +32,19 @@ MAX_STEP = 14
 LOOKAHEAD = 4
 #: 送出移動後多久沒收到 0x0087 就當被拒絕。實測確認延遲約 0.04 秒。
 ACK_TIMEOUT = 0.4
+#: 位置多久沒變就先**把同一段再送一次**。
+#:
+#: 為什麼要重送：RO 走路途中被怪打會被打斷 —— 角色停在半路，
+#: 伺服器**不會送任何錯誤**，畫面上就是站著不動（使用者實測回報）。
+#: 沒有重送的話要等 `STUCK_SEC` 才判定「這條路走不成」，然後整條路線重規劃：
+#: 明明只是被打了一下，卻變成繞遠路，路上怪多的時候會一直重來。
+#: 走路速度約 1 格/0.15 秒，正常走路每一拍位置都在變，0.5 秒不動就是真的停了。
+RESEND_SEC = 0.5
+#: 連續重送幾次（位置完全沒動）才准放棄這條路。
+MAX_RESEND = 3
 #: 位置多久沒變就當走不動（走路速度約 1 格/0.15 秒）。
+#: ⚠ 重送用完**而且**停超過這個時間才判定 blocked ——
+#: 「被打斷」與「真的被擋住」的差別就是重送有沒有救回來。
 STUCK_SEC = 2.0
 #: 偏離路徑超過幾格就當這條路走不成，重新規劃。
 OFF_PATH = 5
@@ -59,11 +75,14 @@ class Walker:
         self._step = MAX_STEP
         self._pos: tuple[int, int] | None = None
         self._pos_at = 0.0
+        self._resends = 0      # 這一次「停住」已經重送幾次
+        self._resent_at = 0.0
         self._ack_lock = threading.Lock()
         self._ack_dest: tuple[int, int] | None = None
         #: 診斷用計數
         self.sent = 0
         self.rejected = 0
+        self.resent = 0
 
     # ---- 由封包執行緒呼叫 -------------------------------------------
 
@@ -89,12 +108,15 @@ class Walker:
         self._acked = True
         self._step = MAX_STEP
         self._pos = None
+        self._resends = 0
+        self._resent_at = 0.0
 
     def clear(self) -> None:
         self._path = []
         self._index = 0
         self._target = None
         self._acked = True
+        self._resends = 0
 
     def update(self, pos: tuple[int, int]) -> str:
         if not self._path:
@@ -104,6 +126,7 @@ class Walker:
         if pos != self._pos:
             self._pos = pos
             self._pos_at = now
+            self._resends = 0   # 動了就是接回去了，重送次數重新起算
 
         index = self._progress(pos)
         if index is None:
@@ -130,10 +153,25 @@ class Walker:
                     return "blocked"
                 log.debug("移動被拒絕，改用 %d 格一段", self._step)
 
-        # 走不動（被實際地形擋住，伺服器接受了但走不到）
-        if self._target is not None and now - self._pos_at > STUCK_SEC:
-            self.clear()
-            return "blocked"
+        # 停住了。**先假設是被打斷，把同一段再送一次**（被怪打是最常見的原因，
+        # 伺服器不會吭聲）；重送用完而且還是不動，才當這條路真的走不成。
+        if self._target is not None and now - self._pos_at > RESEND_SEC:
+            if self._resends >= MAX_RESEND and now - self._pos_at > STUCK_SEC:
+                self.clear()
+                return "blocked"
+            if self._resends < MAX_RESEND and now - self._resent_at >= RESEND_SEC:
+                self._resends += 1
+                self._resent_at = now
+                self.resent += 1
+                log.debug("停住 %.1f 秒，重送這一段（第 %d 次）",
+                          now - self._pos_at, self._resends)
+                # 從**現在站的地方**重挑目標，不是把舊的原封不動再送一次：
+                # 被擊退／被拉走的話舊目標可能已經超過單次移動上限。
+                self._target = None
+                self._send_next(pos, now)
+                if not self._path:
+                    return "blocked"
+                return "walking"
 
         if self._needs_next(pos):
             self._send_next(pos, now)

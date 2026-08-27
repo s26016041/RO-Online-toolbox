@@ -6,7 +6,15 @@
 
 from __future__ import annotations
 
-from ro_toolbox.services.walker import ACK_TIMEOUT, LOOKAHEAD, MAX_STEP, STUCK_SEC, Walker
+from ro_toolbox.services.walker import (
+    ACK_TIMEOUT,
+    LOOKAHEAD,
+    MAX_RESEND,
+    MAX_STEP,
+    RESEND_SEC,
+    STUCK_SEC,
+    Walker,
+)
 
 
 class Fake:
@@ -102,15 +110,48 @@ def test_arrived_when_goal_reached():
     assert not walker.active
 
 
-def test_stuck_is_blocked():
-    """伺服器接受了移動，但實際被地形擋住走不到 —— 位置不會變。"""
+def test_stuck_resends_before_giving_up():
+    """位置停住**不能直接當成走不成**：走路途中被怪打會被打斷，角色停在半路，
+    伺服器一樣不吭聲（使用者實測回報）。要先把同一段重送把腳步接回去，
+    重送用完而且還是不動，才算真的被地形擋住。"""
     fake = Fake()
     walker = Walker(fake.send, now=fake.clock)
     walker.set_path(straight_path(40))
     walker.update((10, 50))
     walker.note_move_ack(fake.sent[-1])
+
+    state = "walking"
+    for _ in range(MAX_RESEND + 3):
+        fake.now += RESEND_SEC + 0.05
+        state = walker.update((10, 50))
+        walker.note_move_ack(fake.sent[-1])  # 伺服器每次都接受，但人就是不動
+        if state == "blocked":
+            break
+    assert state == "blocked"
+    assert walker.resent == MAX_RESEND       # 放棄之前真的重送過
+
+
+def test_interrupted_walk_is_picked_back_up_instead_of_replanned():
+    """被打斷 → 重送 → 又動了。這種情況不准回報 blocked，
+    不然「路上被打一下」就會變成整條路線重新規劃、繞遠路。"""
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock)
+    walker.set_path(straight_path(40))
+    walker.update((10, 50))
+    walker.note_move_ack(fake.sent[-1])
+
+    fake.now += RESEND_SEC + 0.05
+    assert walker.update((10, 50)) == "walking"   # 停住了 → 先重送
+    assert walker.resent == 1
+    walker.note_move_ack(fake.sent[-1])
+
+    fake.now += 0.2
+    assert walker.update((11, 50)) == "walking"   # 動了 = 接回去了
+
+    # 位置動過就重新起算：後面再被打斷還有完整的重送機會，不會直接放棄
     fake.now += STUCK_SEC + 0.1
-    assert walker.update((10, 50)) == "blocked"
+    assert walker.update((11, 50)) == "walking"
+    assert walker.resent == 2
 
 
 def test_off_path_is_blocked():

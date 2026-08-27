@@ -170,6 +170,47 @@ class MapTerrain:
                     heapq.heappush(open_heap, (ng + heuristic(nx, ny), ng, nxt))
         return None
 
+    def reachable_from(self, start: tuple[int, int]) -> frozenset[tuple[int, int]]:
+        """從 `start` **走得到**的所有格子。起點不可走就回空集合。
+
+        規則跟 `find_path()` 完全一致（8 方向、斜走不穿角），否則會出現
+        「泛洪說走得到、A* 說走不到」這種互相矛盾的答案。
+
+        為什麼需要它：城鎮的室內圖是**一張地圖裡好幾個互不相連的房間** ——
+        實測 `prt_in` 有 26 個區塊、22 道各自獨立通往 prontera 的門。
+        站在藥水店裡時只有那一道門走得到；挑到別間的門，A* 就回「走不到」，
+        整條路線因此被判失敗（使用者回報：主城商店裡面尋路不出來）。
+        一次泛洪把「這間房間通到哪些格」算出來，之後挑門用查表，
+        比一道一道去跑 A* 便宜得多，也不會漏掉真的走得到的那一道。
+        """
+        from collections import deque
+
+        if not self.is_walkable(*start):
+            return frozenset()
+        walk = self.walkable          # 只算一次：`walkable` 每次呼叫都重建整個陣列
+        w, h = self.width, self.height
+        seen = np.zeros((h, w), dtype=bool)
+        seen[start[1], start[0]] = True
+        found = [start]
+        queue = deque(found)
+        moves = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+        while queue:
+            cx, cy = queue.popleft()
+            for dx, dy in moves:
+                nx, ny = cx + dx, cy + dy
+                if not (0 <= nx < w and 0 <= ny < h) or seen[ny, nx] or not walk[ny, nx]:
+                    continue
+                if dx and dy and not (walk[cy, nx] or walk[ny, cx]):
+                    continue  # 不穿角，跟 find_path 同一條規則
+                seen[ny, nx] = True
+                found.append((nx, ny))
+                queue.append((nx, ny))
+        return frozenset(found)
+
+    def walkable_cells(self) -> int:
+        """整張圖有幾格可站。跟 `reachable_from()` 一比就知道這張圖分不分房間。"""
+        return int(self.walkable.sum())
+
     @staticmethod
     def _trace(came_from, start, goal) -> list[tuple[int, int]]:
         """把 came_from 回溯成 start→goal 的逐格路徑（不含起點）。"""
