@@ -163,13 +163,8 @@ push 之前一定要做的三件事：
 | `services/packet_table.py` | 封包長度表（`mov ecx,esi; call rel32` 最多人呼叫的那個） |
 
 打包資產（使用者的電腦沒有 `RODATA/`，這些是唯一來源）：
-`assets/` 的 `items` / `mobs` / `warps` / `mapnames` / `terrain`，
+`assets/` 的 `items` / `mobs` / `warps` / `mapnames` / `terrain` / `icons`，
 產生腳本都在 `tools/build_*.py`。
-
-### 已知還沒改掉的（違反最高原則，要修）
-
-- `services/icons.py` 直接讀 `RODATA/.../texture/`，使用者的電腦上道具圖示會全空白
-  （純外觀，不影響功能，但同樣要抽成 assets）。
 
 **2026-08-26 已清掉的寫死位址**（留著當範例，同類問題照這個做）：
 `StatusOffsets.position`、`input_helper.SUBMITTED_ACCOUNT_OFFSET`、
