@@ -60,6 +60,13 @@ TEXT_ENCODING = "cp950"
 #: 接觸 NPC 的型別。實測擷取就是 1。
 _CONTACT_TYPE = 1
 
+#: 一次對話最多回答幾層選單。
+#:
+#: 船員是**一層**（實測）。卡普拉那種「先選傳送服務、再選城市」是兩層以上，
+#: 有的還會再問一次「確定嗎」。設上限是怕選單繞圈圈時無限點下去 ——
+#: 超過就停手，不要一直亂點別人的 NPC。
+MAX_MENUS = 4
+
 
 def build_contact(gid: int) -> bytes:
     return (
@@ -186,7 +193,7 @@ class NpcTalk:
         self._now = now or _time.monotonic
         self._queue: list[bytes] = [build_contact(gid)]
         self._since = self._now()
-        self._chosen = False
+        self._menus = 0            # 回答過幾層選單
         self.done = False
         self.failed = False
         self.note = f"跟 NPC #{gid} 對話中…"
@@ -195,7 +202,10 @@ class NpcTalk:
     # ---- 擷取執行緒 -------------------------------------------------
 
     def feed(self, opcode: int, payload: bytes) -> None:
-        if self.done or self.failed:
+        # ⚠ 選完**不停止監聽**：卡普拉那種是多層選單（先「傳送服務」再選城市），
+        # 有的還會再問一次「確定嗎」。選完就關耳朵的話第二層永遠等不到。
+        # 真的過去了沒有，一律看**地圖名有沒有變**，由呼叫端判定（[DAT-026]）。
+        if self.failed:
             return
         if opcode == ZC_WAIT_DIALOG and parse_wait(payload) == self._gid:
             self._push(build_next(self._gid))
@@ -208,6 +218,12 @@ class NpcTalk:
         if opcode == ZC_MENU_LIST:
             got = parse_menu(payload)
             if got is None or got[0] != self._gid:
+                return
+            self._menus += 1
+            if self._menus > MAX_MENUS:
+                self.failed = True
+                self.note = f"⚠ 選單超過 {MAX_MENUS} 層，這不像單純的傳送，停手"
+                log.warning("%s", self.note)
                 return
             self._on_menu(got[1])
 
@@ -224,7 +240,7 @@ class NpcTalk:
         self.note = f"選了{why}{money}"
         log.info("%s", self.note)
         self._push(build_choose(self._gid, index))
-        self._chosen = True
+        self.done = True        # 該送的都送了，剩下等地圖變
 
     def _push(self, data: bytes) -> None:
         self._queue.append(data)
@@ -236,12 +252,9 @@ class NpcTalk:
         """要送出去的下一個封包。沒有就回 None。"""
         if self._queue:
             return self._queue.pop(0)
-        if self.failed or self.done:
+        if self.failed:
             return None
-        if self._chosen:
-            self.done = True        # 選完了，剩下等地圖變（呼叫端負責）
-            return None
-        if self._now() - self._since > self.TIMEOUT:
+        if self._now() - self._since > self.TIMEOUT and not self.done:
             self.failed = True
             self.note = f"⚠ 跟 NPC #{self._gid} 對話 {self.TIMEOUT:.0f} 秒沒有回應，放棄"
             log.warning("%s", self.note)

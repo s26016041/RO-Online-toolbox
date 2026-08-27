@@ -235,3 +235,52 @@ def test_entity_layout_matches_the_login_capture():
     assert int.from_bytes(payload[mod._ENT_CLASS:mod._ENT_CLASS + 2], "little") == 105
     x, y, _d = unpack_position(bytes(payload[mod._ENT_POS:mod._ENT_POS + 3]))
     assert (x, y) == (29, 200)
+
+
+# ---- 多層選單（卡普拉那種：先選傳送服務、再選城市）------------------------
+
+
+def _menu(gid: int, *options: str) -> bytes:
+    """組一個 0x00B7 選單封包（跟實機同版面：長度 + GID + cp950，`:` 分隔）。"""
+    text = ":".join(options).encode("cp950") + b"\x00"
+    return (len(text) + 6).to_bytes(2, "little") + gid.to_bytes(4, "little") + text
+
+
+def test_a_second_menu_is_still_listened_to():
+    """⚠ 選完**不能關耳朵** —— 卡普拉的第二層在第一層之後才來。"""
+    talk = nd.NpcTalk(BOAT_GID, "魔法之都 吉芬", now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "傳送服務", "結束"))
+    assert talk.failed is True, "第一層對不上就該停手（不准亂點）"
+
+    talk2 = nd.NpcTalk(BOAT_GID, "魔法之都 吉芬", now=Clock())
+    _drain(talk2)
+    talk2.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "普隆德拉", "吉芬 1200z", "結束"))
+    assert [p.hex() for p in _drain(talk2)] == ["b8005b00000002"]
+    # 第二層又來一個（例如確認畫面）：還要收得到，不能因為已經選過就不理
+    talk2.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "吉芬", "取消"))
+    assert [p.hex() for p in _drain(talk2)] == ["b8005b00000001"]
+
+
+def test_it_stops_after_too_many_menus():
+    """選單繞圈圈時要停手 —— 不要一直亂點別人的 NPC。"""
+    clock = Clock()
+    talk = nd.NpcTalk(BOAT_GID, "吉芬", now=clock)
+    _drain(talk)
+    for _ in range(nd.MAX_MENUS + 1):
+        talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "吉芬", "結束"))
+        _drain(talk)
+    assert talk.failed is True
+    assert "層" in talk.note
+
+
+def test_it_never_clicks_an_option_it_cannot_match():
+    """⛔ 這是最重要的一條：對不上就**一個封包都不送**。
+
+    亂點的代價是花掉玩家的錢、或被傳到別的地方 —— 而且是安靜地發生。
+    """
+    talk = nd.NpcTalk(BOAT_GID, "魔法之都 吉芬", now=Clock())
+    _drain(talk)
+    talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "傳送服務", "存放物品", "結束"))
+    assert _drain(talk) == []
+    assert talk.failed is True
