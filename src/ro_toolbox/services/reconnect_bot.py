@@ -83,7 +83,6 @@ class ReconnectSupervisor:
         snapshot: Callable[[int], Snapshot],
         restore: Callable[[int, Snapshot], None],
         decider: ReconnectDecider | None = None,
-        see_dialog: Callable[[int], bool | None] = lambda _pid: None,
     ) -> None:
         self.name = name
         self._find_pid = find_pid
@@ -94,9 +93,6 @@ class ReconnectSupervisor:
         self._login = login
         self._snapshot = snapshot
         self._restore = restore
-        #: 畫面上有沒有「與伺服器斷線」。回 None＝看不了 —— 那就走觀察期。
-        #: 預設「永遠看不了」，所以沒接畫面判定的呼叫端行為完全不變。
-        self._see_dialog = see_dialog
         self._decider = decider or ReconnectDecider()
         #: 最後一次「連線正常」時在跑什麼。斷線之後就是靠它接回去。
         self.snap = Snapshot()
@@ -110,10 +106,7 @@ class ReconnectSupervisor:
             # ⚠ 只在**連線正常**時更新快照。斷線當下的狀態是「什麼都停了」，
             # 那時候拍下來等於把要接回去的東西全部忘掉。
             self.snap = self._snapshot(pid)
-        # ⚠ 只在**沒有連線**的時候才去看畫面：抓圖＋比對要一百多毫秒，
-        # 連線正常時每拍都做是白花的。
-        dialog = None if alive or pid is None else self._see_dialog(pid)
-        state = self._decider.decide(alive, self._network_up(), now, dialog)
+        state = self._decider.decide(alive, self._network_up(), now)
         self.note = self._decider.note
         if state != RECONNECT:
             return state

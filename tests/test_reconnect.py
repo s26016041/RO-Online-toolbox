@@ -48,9 +48,15 @@ def test_the_grace_window_starts_only_after_the_network_is_back():
     assert d.decide(has_server=False, network_up=True, now=T0 + 321) == RECONNECT
 
 
-def test_a_map_change_does_not_count_as_a_disconnect():
-    """換地圖時伺服器會把連線移到另一台 map server（[PKT-038]），
-    那個瞬間 find_server() 就是 None。看到一次就重開＝每次換圖都把自己踢掉。"""
+def test_one_lone_sample_of_no_connection_does_not_kill_the_game():
+    """看到一拍沒連線就重開遊戲＝拿單一次讀數做不可逆的事。
+
+    ⚠ 這一條的理由**不是換地圖**。[PKT-063] 量過換圖那一刻的連線表：
+    新舊兩條並存（舊的過 11 分鐘才收），所以換圖根本不會讓
+    `find_server()` 變 None。留著觀察期是因為 `find_server()` 讀的是
+    Windows TCP 表的快照，單一次取樣可能因為讀取失敗或時序落差而騙人 ——
+    而重連會**關掉使用者正在玩的遊戲**。
+    """
     d = ReconnectDecider(grace=20)
     assert d.decide(has_server=False, network_up=True, now=T0) == WATCHING
     assert d.decide(has_server=False, network_up=True, now=T0 + 3) == WATCHING
@@ -96,47 +102,15 @@ def test_backoff_is_cleared_once_we_are_connected_again():
     assert d.failures == 0, "連上了就把退避歸零，下次斷線不該被上次的失敗拖累"
 
 
-# ---- 畫面上的「與伺服器斷線」：加速確認，但不准繞過任何保護 ----------------
+def test_the_grace_window_is_short_because_it_is_only_about_sampling():
+    """觀察期只需要「連續幾拍」，不需要幾十秒。
 
-
-def test_the_dialog_confirms_a_disconnect_without_waiting():
-    """遊戲自己說了「與伺服器斷線」就不必等滿觀察期 —— 換圖不會跳這個框。"""
-    d = ReconnectDecider(grace=20)
-    assert d.decide(has_server=False, network_up=True, now=T0, dialog=True) == RECONNECT
-    assert "與伺服器斷線" in d.note
-
-
-def test_no_dialog_still_goes_through_the_grace_window():
-    """看不到框（None＝看不了、False＝看了沒有）一律走原本的觀察期。
-
-    **這是安全退化**：畫面判定壞掉、樣板載不到、視窗被最小化，
-    自動回連都還是會動，只是慢 20 秒。
+    呼叫端每秒取樣一次，所以預設 5 秒 ≈ 連續 5 拍都沒有連線。
+    整條回連（關遊戲→重開→重新登入）本來就要三十秒級，
+    前面這 5 秒在體感上等於即時。
     """
-    for seen in (None, False):
-        d = ReconnectDecider(grace=20)
-        assert d.decide(False, True, T0, dialog=seen) == WATCHING
-        assert d.decide(False, True, T0 + 10, dialog=seen) == WATCHING
-        assert d.decide(False, True, T0 + 21, dialog=seen) == RECONNECT
-
-
-def test_my_own_network_being_down_still_wins_over_the_dialog():
-    """網路是我自己斷的時候，畫面上照樣會有那個框 —— **不准動遊戲**。"""
-    d = ReconnectDecider(grace=20)
+    assert reconnect.GRACE_SEC == 5.0
+    d = ReconnectDecider()
     for i in range(5):
-        assert d.decide(False, network_up=False, now=T0 + i, dialog=True) == NO_NETWORK
-
-
-def test_backoff_still_wins_over_the_dialog():
-    """伺服器維修時畫面上一樣是那個框。看到框就立刻重試＝把退避繞過去，
-    等於無腦一直重開遊戲 —— 那正是使用者說「很糟糕」的行為。"""
-    d = ReconnectDecider(grace=20)
-    d.note_attempt_failed(T0)
-    assert d.decide(False, True, T0 + 5, dialog=True) == BACKOFF
-    assert d.decide(False, True, T0 + 29, dialog=True) == BACKOFF
-    assert d.decide(False, True, T0 + 31, dialog=True) == RECONNECT
-
-
-def test_a_live_connection_beats_a_stale_dialog():
-    """連線好好的就是 OK —— 畫面上那個框可能只是還沒被關掉。"""
-    d = ReconnectDecider(grace=20)
-    assert d.decide(has_server=True, network_up=True, now=T0, dialog=True) == OK
+        assert d.decide(False, True, T0 + i) == WATCHING, "5 秒內不准動手"
+    assert d.decide(False, True, T0 + 6) == RECONNECT
