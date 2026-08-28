@@ -17,10 +17,25 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ro_toolbox.services import window_list  # noqa: E402
+from ro_toolbox.services.character import CharacterReader  # noqa: E402
 from ro_toolbox.services.process_monitor import is_admin  # noqa: E402
 from ro_toolbox.services.skills import SkillReader  # noqa: E402
 
 PROCESS = "ragexe.exe"
+
+
+def _who(pid: int) -> str:
+    """這個分身現在是誰在玩。讀不到就只寫 PID —— 安全退化，不要假裝知道。"""
+    reader = CharacterReader()
+    try:
+        if not reader.attach(pid):
+            return f"PID {pid}"
+        status = reader.read()
+        if status is None or not status.name:
+            return f"PID {pid}"
+        return f"{status.name}（PID {pid}，{status.map_name} Base {status.base_level}）"
+    finally:
+        reader.close()
 
 
 def main() -> int:
@@ -60,7 +75,7 @@ def main() -> int:
         exit_code = 0
         shown = [s for s in skills if args.all or s.learned]
         learned = sum(1 for s in skills if s.learned)
-        print(f"\nPID {win.pid}　技能 {len(skills)} 個（已學會 {learned} 個）"
+        print(f"\n{_who(win.pid)}　技能 {len(skills)} 個（已學會 {learned} 個）"
               f"　掃描 {elapsed:.1f}s")
         print(f"  {'ID':>6}  {'等級':<7} {'SP':>4}  {'代號':<24}名稱")
         for skill in shown:

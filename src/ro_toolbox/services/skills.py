@@ -50,6 +50,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from ro_toolbox.services.character import CharacterReader
 from ro_toolbox.services.gamedata import skill_codes, skill_name, skill_table
 from ro_toolbox.services.memory_scan import MemoryScanner
 
@@ -176,11 +177,38 @@ class SkillReader:
         self._pid = pid
         return True
 
-    def read(self, should_stop=None) -> list[Skill] | None:
+    def _online(self) -> bool:
+        """這個分身現在真的有角色在遊戲裡嗎？
+
+        ⚠ **不能只看「有沒有連線」。** 實測 PID 4116 停在選角畫面：`find_server()`
+        回得出伺服器（連著 char server 的 10022 埠），角色狀態卻定位失敗，
+        而技能表照樣讀得到 **18 個技能**（AL_HEAL Lv1）—— 那是上一次登入留下的殘留。
+        技能跟背包、角色狀態一樣，**登出之後不會被清掉**（同 [MEM-029]）。
+
+        判準用「角色狀態結構定位得到」：那份結構是選角畫面之後才寫的（[MEM-035]），
+        它在＝真的有角色在場上。
+        """
+        if self._pid is None:
+            return False
+        reader = CharacterReader()
+        try:
+            return reader.attach(self._pid) and reader.read() is not None
+        finally:
+            reader.close()
+
+    def read(self, should_stop=None, *, require_online: bool = True) -> list[Skill] | None:
         """回傳技能清單（依 ID 排序）。定位失敗回 None，**不回空清單充數**。
 
         should_stop: 可選 callable，每個記憶體區塊掃描前問一次；回傳 True 就中止。
+        require_online: 先確認真的有角色在遊戲裡（見 `_online()`）。只有在呼叫端
+            已經自己確認過的時候才准關掉 —— 關掉等於接受「可能拿到上一隻角色的技能」。
         """
+        if require_online and not self._online():
+            log.info(
+                "這個分身現在沒有角色在場上（選角或登入畫面），"
+                "記憶體裡的技能表是上一次登入的殘留 —— 不採用",
+            )
+            return None
         codes = skill_codes()
         if not codes:
             log.warning("技能表（assets/skills.json.gz）載不到，技能功能停用")

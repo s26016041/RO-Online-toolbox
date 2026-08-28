@@ -104,6 +104,32 @@ class FakeScanner:
         return None
 
 
+class OnlineCharacter:
+    """假的角色狀態讀取器：有角色在場上。"""
+
+    def attach(self, pid):  # noqa: ARG002
+        return True
+
+    def read(self):
+        return object()
+
+    def close(self) -> None:
+        return None
+
+
+class OfflineCharacter(OnlineCharacter):
+    """停在選角／登入畫面：連線還在，但角色狀態定位不到。"""
+
+    def attach(self, pid):  # noqa: ARG002
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _character_online(monkeypatch):
+    """預設「有角色在場上」，否則每條測試都會卡在線上檢查。"""
+    monkeypatch.setattr(skills_mod, "CharacterReader", OnlineCharacter)
+
+
 @pytest.fixture
 def reader():
     scanner = FakeScanner()
@@ -194,6 +220,24 @@ def test_missing_table_disables_the_feature(reader, monkeypatch, caplog):
     with caplog.at_level(logging.WARNING):
         assert r.read() is None
     assert "停用" in caplog.text
+
+
+def test_leftovers_are_not_reported_when_nobody_is_in_game(reader, monkeypatch, caplog):
+    """停在選角畫面時，記憶體裡的技能表是上一次登入的殘留 —— 不准當成答案。
+
+    實機遇過：PID 4116 連著 char server（`find_server()` 回得出伺服器），
+    角色狀態定位失敗，技能表卻照樣讀得出 18 個。「有沒有連線」判不出這件事。
+    """
+    r, scanner = reader
+    scanner.add_skill(28, 1, 13)      # AL_HEAL，上一隻角色留下來的
+    monkeypatch.setattr(skills_mod, "CharacterReader", OfflineCharacter)
+
+    with caplog.at_level(logging.INFO):
+        assert r.read() is None
+    assert "殘留" in caplog.text
+
+    # 呼叫端自己確認過在場上時才准跳過檢查。
+    assert r.read(require_online=False) is not None
 
 
 def test_should_stop_aborts(reader):
