@@ -760,48 +760,77 @@ def _bot(monkeypatch, found: list[int] | None):
     return bot
 
 
-def test_probe_found_on_the_heap_means_the_caret_is_in_the_account_box(
-    monkeypatch, wired
-):
+def _bot_probing(monkeypatch, findable: set[str]):
+    """做一個 AutoLogin，並決定「哪些探針會在堆積上被找到」。"""
+    bot = AutoLogin(_account(), 4242)
+    monkeypatch.setattr(
+        auto_login.input_helper, "field_addresses",
+        lambda pid, text: [0x18254788] if text in findable else [],
+    )
+    return bot
+
+
+def test_the_first_probe_landing_means_we_are_in_the_account_box(monkeypatch, wired):
     """[MEM-032] 的不對稱：帳號欄打進去的字在堆積上找得到。"""
-    bot = _bot(monkeypatch, [0x18254788])
+    bot = _bot_probing(monkeypatch, {AutoLogin._PROBE})
     assert bot._probe_focus(0x1234) is False        # False = 不用先打密碼
-    assert f"type:{bot._PROBE}" in wired, "探針要真的打進去"
+    assert f"type:{AutoLogin._PROBE}" in wired, "探針要真的打進去"
 
 
-def test_probe_never_showing_up_means_the_caret_is_in_the_password_box(
+def test_the_second_probe_gives_the_other_direction_a_positive_answer(
     monkeypatch, wired
 ):
-    """密碼欄打進去的字**整個記憶體都搜不到**（[MEM-032]）。
+    """⚠⚠ **只做第一段是不夠的**（第一版就是這樣）。
 
-    ⚠ 但「搜不到」也可能是記憶體讀不到，所以 `_probe_focus` 回 None
-    （不知道），由 `_decide_focus` 去套預設值 —— 不准把「量不到」當成定論。
+    那時「搜不到」同時代表「在密碼欄」與「記憶體讀不到」，把後者當成前者
+    就會賭錯 —— 使用者實測「一直打反」「輸入帳號是我的密碼」都是這個。
+
+    補上第二段：Tab 到另一格再打一個**不同的**探針，搜得到就證明
+    那一格才是帳號欄 → 原本在密碼欄。兩個方向都有正面證據。
     """
-    bot = _bot(monkeypatch, [])
+    bot = _bot_probing(monkeypatch, {AutoLogin._PROBE_B})
+    assert bot._probe_focus(0x1234) is False        # Tab 之後現在在帳號欄
+    assert f"type:{AutoLogin._PROBE_B}" in wired
+    assert "key:9" in wired, "要 Tab 到另一格"
+    assert any("原本在密碼欄" in step for step in bot.progress.steps)
+
+
+def test_the_two_probes_must_be_different():
+    """一樣的話「搜到了」就分不出它是打在哪一格。"""
+    assert AutoLogin._PROBE != AutoLogin._PROBE_B
+
+
+def test_neither_probe_landing_is_unknown_not_a_verdict(monkeypatch, wired):
+    """兩個都搜不到＝記憶體讀不到＝**不知道**，不准當成任何一邊。"""
+    bot = _bot_probing(monkeypatch, set())
     assert bot._probe_focus(0x1234) is None
 
 
-def test_unmeasurable_focus_falls_back_to_the_password_box(monkeypatch, wired):
-    """量不出來時沿用舊的預設（焦點在密碼欄）＋ 送出後的閉環驗證兜底。"""
-    bot = _bot(monkeypatch, [])
-    bot._decide_focus(0x1234)
-    assert bot._tab_first is True
-    assert any("沿用預設" in step for step in bot.progress.steps)
+def test_unmeasurable_focus_accounts_for_the_tab_it_already_did(monkeypatch, wired):
+    """⚠ 走到「不知道」時**已經 Tab 過一次**，位置跟一開始不一樣了。
 
-
-def test_a_measured_focus_beats_the_default(monkeypatch, wired):
-    bot = _bot(monkeypatch, [0x18254788])
+    預設假設是「客戶端記住帳號 → 一開始在密碼欄」，加上那一次 Tab，
+    結論是「現在在帳號欄」。
+    """
+    bot = _bot_probing(monkeypatch, set())
     bot._decide_focus(0x1234)
     assert bot._tab_first is False
-    assert any("量到焦點在帳號欄" in step for step in bot.progress.steps)
+    assert any("Tab 之後現在在帳號欄" in step for step in bot.progress.steps)
+
+
+def test_a_measured_focus_is_recorded(monkeypatch, wired):
+    bot = _bot_probing(monkeypatch, {AutoLogin._PROBE})
+    bot._decide_focus(0x1234)
+    assert bot._tab_first is False
+    assert any("就在帳號欄" in step for step in bot.progress.steps)
 
 
 def test_focus_is_measured_once_not_every_attempt(monkeypatch, wired):
     """量一次就好 —— 每次都掃記憶體會讓重試更慢。翻面由閉環驗證負責。"""
-    bot = _bot(monkeypatch, [])
-    bot._tab_first = False
+    bot = _bot_probing(monkeypatch, set())
+    bot._tab_first = True
     bot._decide_focus(0x1234)
-    assert bot._tab_first is False, "已經有結論就不准再量"
+    assert bot._tab_first is True, "已經有結論就不准再量"
 
 
 # ---- 空的欄位不要清（每一次清空都是一個子行程）--------------------------

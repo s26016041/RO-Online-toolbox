@@ -411,8 +411,10 @@ class AutoLogin:
             log.debug("判斷畫面失敗：%s", exc)
             return False
 
-    #: 用來探測焦點在哪一格的標記。挑一個不會跟遊戲內容撞的組合。
+    #: 探測焦點用的兩個標記。挑不會跟遊戲內容撞的組合，而且**兩個必須不一樣** ——
+    #: 一樣的話「搜到了」就分不出它是打在哪一格。
     _PROBE = "ZQ7X4K"
+    _PROBE_B = "VM3H8T"
 
     def _clear_actions(self) -> list[dict]:
         """把目前這一格清乾淨，**兩個方向都清**。
@@ -453,7 +455,7 @@ class AutoLogin:
         return [input_helper.focus(), input_helper.key_foreground(_VK_TAB)]
 
     def _probe_focus(self, hwnd: int) -> bool | None:
-        """量出焦點現在在哪一格。回「是不是在密碼欄」，量不出來回 None。
+        """量出焦點在哪一格。回「接下來要不要先打密碼」，量不出來回 None。
 
         ## 為什麼要量，不能猜
 
@@ -465,38 +467,73 @@ class AutoLogin:
         遊戲剛開還沒送出過任何東西，兩種情況讀到的都是空的 ——
         於是每次都賭同一邊，賭錯就整輪重來（使用者回報「一直打反」）。
 
-        ## 怎麼量
+        ## 怎麼量：兩段式，**兩個方向都要正面訊號**
 
         [MEM-032] 量過一個**不對稱**，這裡拿它當判準：
 
             打進帳號欄的字 → 輪詢幾拍就能在**堆積**上找到（ASCII）
             打進密碼欄的字 → **整個記憶體都搜不到**
 
-        所以往現在有焦點的那一格打一個探針字串，再去記憶體裡找它：
-        找得到＝在帳號欄，找不到＝在密碼欄。**不必送出去讓伺服器拒絕才知道。**
+        所以：
+
+            ① 往現在有焦點的那一格打探針 A → 搜得到 → **現在就在帳號欄**
+            ② 搜不到 → Tab 到另一格、打探針 B → 搜得到 → **現在在帳號欄**
+            ③ 兩個都搜不到 → 真的讀不到 → 不知道
+
+        ⚠⚠ **只做①是不夠的**（第一版就是這樣）：那時「搜不到」同時代表
+        「在密碼欄」與「讀不到」，把後者當成前者就會賭錯。
+        補上②之後，兩個方向都有**正面**證據。
+
+        **①②結束時我們都站在帳號欄**，所以兩種情況都回 `False`
+        （＝不用先打密碼），後面的順序永遠固定：
+        清空 → 打帳號 → Tab → 清空 → 打密碼 → Enter。
+
+        ⚠ 走到③時我們**已經 Tab 過一次**，位置跟一開始不一樣了。
+        呼叫端的預設假設（客戶端記住帳號 → 一開始在密碼欄）搭配那一次 Tab，
+        結論同樣是「現在在帳號欄」—— 見 `_decide_focus`。
 
         探針用固定字串而不是帳號本身：客戶端會把記住的帳號預填進帳號欄，
         拿帳號去搜的話，就算焦點在密碼欄也會搜到那個預填值 —— 永遠是「找得到」。
-
-        ⚠ **逾時不等於「在密碼欄」是確定的**：記憶體讀不到（GameGuard、
-        行程權限）也會逾時。所以回 None 讓呼叫端沿用舊的預設假設，
-        而且送出之後的閉環驗證照舊留著兜底。
         """
+        if self._type_probe(hwnd, self._PROBE) and self._probe_landed(self._PROBE):
+            self._step(f"量到現在就在帳號欄（探針 {self._PROBE} 在堆積上找得到）")
+            return False
+        # 搜不到 → 可能在密碼欄，也可能是讀不到。**再往另一格打一個探針**，
+        # 讓「在密碼欄」也拿得出正面證據。
+        self._step("這一格搜不到探針，Tab 到另一格再確認一次")
+        if not self._type_probe(hwnd, self._PROBE_B, tab_first=True):
+            return None
+        if self._probe_landed(self._PROBE_B):
+            self._step(
+                f"量到 Tab 過來這一格是帳號欄（探針 {self._PROBE_B} 找得到）"
+                " —— 原本在密碼欄"
+            )
+            return False
+        return None
+
+    def _type_probe(self, hwnd: int, text: str, tab_first: bool = False) -> bool:
+        """把探針打進去。**不先清空** —— 剛進登入畫面時那一格本來就是空的，
+        而且就算接在既有文字後面也不影響判斷（我們搜的是**子字串**）。"""
+        actions = self._tab_actions() if tab_first else []
         try:
-            # ⚠ **不先清空。** 使用者實測：剛進登入畫面時，有焦點的那一格
-            # 本來就是空的（客戶端記住帳號時焦點會落在空的密碼欄，
-            # 沒記住時落在空的帳號欄）。白清一次就是白開一個子行程。
-            # 就算真的接在既有文字後面也不影響判斷 —— 我們搜的是探針**子字串**。
-            input_helper.send(hwnd, self._type_actions(self._PROBE))
+            input_helper.send(hwnd, actions + self._type_actions(text))
         except input_helper.InputHelperError as exc:
             log.debug("探針送不進去：%s", exc)
-            return None
+            return False
+        return True
+
+    def _probe_landed(self, text: str) -> bool:
+        """這個探針有沒有出現在**堆積上的欄位緩衝**裡。
+
+        ⚠ 找不到**不代表它在密碼欄** —— 也可能是記憶體那一拍讀不到。
+        呼叫端要自己補上另一個方向的正面證據。
+        """
         deadline = time.monotonic() + _PROBE_TIMEOUT
         while True:
-            if input_helper.field_addresses(self._pid, self._PROBE):
-                return False              # 找得到 → 焦點在帳號欄
+            if input_helper.field_addresses(self._pid, text):
+                return True
             if time.monotonic() >= deadline:
-                return None               # 找不到，但也可能是讀不到 —— 別當定論
+                return False
             time.sleep(_POLL)
 
     def _decide_focus(self, hwnd: int) -> None:
@@ -505,17 +542,15 @@ class AutoLogin:
             return
         measured = self._probe_focus(hwnd)
         if measured is None:
-            # ⚠ 量不出來時**預設「焦點在密碼欄」**。客戶端只要登入過一次就會
-            # 記住帳號，之後焦點都落在密碼欄（使用者實測，實務上幾乎永遠如此）。
-            # 猜錯也不會卡死：送出後有閉環驗證，錯了就翻面重打。
-            self._tab_first = True
-            self._step("量不出焦點在哪一格（記憶體讀不到），沿用預設：焦點在密碼欄")
+            # ⚠ 量不出來（記憶體讀不到）。預設假設是「客戶端記住帳號 →
+            # 一開始在密碼欄」（使用者實測，實務上幾乎永遠如此）；
+            # 而探針的第二段**已經 Tab 過一次**，所以現在應該在帳號欄。
+            # 猜錯也不會卡死：送出前後都有閉環驗證。
+            self._tab_first = False
+            self._step("量不出焦點在哪一格（記憶體讀不到），沿用預設："
+                       "一開始在密碼欄、Tab 之後現在在帳號欄")
         else:
             self._tab_first = measured
-            self._step(
-                f"量到焦點在{'密碼欄' if measured else '帳號欄'}"
-                f"（探針 {self._PROBE} 在堆積上{'找不到' if measured else '找得到'}）"
-            )
 
     def _credential_batches(self, hwnd: int) -> list[list[dict]]:
         """組出整組輸入動作，**一批一個子行程**。
