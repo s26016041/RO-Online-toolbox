@@ -141,6 +141,28 @@ _SERVER_LIST_TOP = 5
 _CLEAR_KEYS = 24
 
 
+def _process_alive(pid: int) -> bool:
+    """行程還在嗎。**查不到一律回 True** —— 寧可多試一次，也不要誤判成死掉。"""
+    try:
+        import psutil
+
+        return psutil.pid_exists(pid)
+    except Exception as exc:  # noqa: BLE001 - 查不到就別亂判死
+        log.debug("查不到遊戲行程死活：%s", exc)
+        return True
+
+
+def _window_alive(hwnd: int) -> bool:
+    """視窗還在嗎。查不到一律回 True，理由同上。"""
+    try:
+        import win32gui
+
+        return bool(win32gui.IsWindow(hwnd))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("查不到遊戲視窗死活：%s", exc)
+        return True
+
+
 @dataclass
 class LoginProgress:
     """一次自動登入的過程記錄。失敗時它就是診斷報告。"""
@@ -563,6 +585,34 @@ class AutoLogin:
 
         （第一格照樣要清：重試時裡面是上一輪我們自己打的字。）
         """
+        return True
+
+    def _game_gone(self, hwnd: int | None = None) -> bool:
+        """遊戲已經不在了嗎（行程結束、或視窗關掉）？
+
+        ⚠⚠ **這是不可恢復的，看到就要當場停手。** 使用者實測回報：
+        突然斷線之後他直接把遊戲關掉，而自動登入**照樣重試了 11 次**：
+
+            14:00:19  回連：第 11 次 OTP 送不進去：輸入沒送出去：
+                      遊戲視窗已經不在了（遊戲關掉了？）。
+            14:00:25  卡在「等登入結果」：送了 11 次 OTP…
+
+        `input.py` 其實**明確知道**視窗不在了，但那個判斷被包成一般的
+        「送不進去」，重試迴圈就照樣重試。使用者的要求很清楚：
+        **不要做無意義的等待，有問題就馬上停。**
+
+        ⚠ 不靠比對錯誤訊息的字串 —— 那會在下一次改訊息時安靜地失效。
+        直接問行程死活與視窗還在不在，那是**確定的事實**。
+        """
+        if not _process_alive(self._pid):
+            return True
+        return hwnd is not None and not _window_alive(hwnd)
+
+    def _stop_if_gone(self, hwnd: int, where: str) -> bool:
+        """遊戲不在了就把整條登入停掉並回 True。"""
+        if not self._game_gone(hwnd):
+            return False
+        self.progress.fail(where, "遊戲已經關掉了 —— 不再重試。")
         return True
 
     def _dismiss_error(self, hwnd: int) -> None:
@@ -1036,6 +1086,10 @@ class AutoLogin:
             server = find_server(self._pid)
             if server is not None and server != exclude:
                 return server
+            # 遊戲關掉了就別等滿逾時 —— 那是**確定不會發生**的等待。
+            if self._game_gone():
+                log.warning("等連線時發現遊戲已經關掉了，不再等")
+                return None
             time.sleep(_POLL)
         return None
 
@@ -1058,6 +1112,9 @@ class AutoLogin:
         attempt = 0
         asked = False
         while True:
+            # 遊戲不在了就不要再打了（使用者：有問題就馬上停）。
+            if self._stop_if_gone(hwnd, "輸入帳號密碼"):
+                return False
             attempt += 1
             if (not asked and attempt > _AGREE_TRIES
                     and self._still_on_eula(hwnd)):
@@ -1085,6 +1142,8 @@ class AutoLogin:
                 input_helper.send(hwnd, enter)
             except input_helper.InputHelperError as exc:
                 log.debug("第 %d 次送不進去：%s", attempt, exc)
+                if self._stop_if_gone(hwnd, "輸入帳號密碼"):
+                    return False
                 if time.monotonic() >= deadline:
                     self.progress.fail("輸入帳號密碼", f"送不進視窗訊息：{exc}")
                     return False
@@ -1257,6 +1316,8 @@ class AutoLogin:
         secret = self._account.secret
         attempt = 0
         while time.monotonic() < deadline:
+            if self._stop_if_gone(hwnd, "送出 OTP"):
+                return False
             left = self._remaining(secret)
             if left < _OTP_MIN_SECONDS:
                 # 等下一組。等的是**碼的有效期**（可以精確算出來的東西），
@@ -1302,6 +1363,10 @@ class AutoLogin:
                 # 外面看到的是「0.4 秒送一次、送了 145 次」的鬼打牆，
                 # 而真正的原因（打不進去）一個字都沒留下。實際踩過。
                 self._step(f"第 {attempt} 次 OTP 送不進去：{exc}")
+                # ⚠ 先看遊戲還在不在 —— 不在的話再等再試都是白費
+                # （實機踩過：遊戲關掉之後照樣重試了 11 次）。
+                if self._stop_if_gone(hwnd, "送出 OTP"):
+                    return False
                 # 送不進去就等一下再試，不要把整段預算在幾秒內燒光。
                 time.sleep(_OTP_STEP_TIMEOUT)
                 continue
@@ -1371,6 +1436,9 @@ class AutoLogin:
                 if packet.opcode == opcode:
                     return True
             if time.monotonic() >= deadline:
+                return False
+            if self._game_gone():
+                log.warning("等封包 0x%04X 時發現遊戲已經關掉了，不再等", opcode)
                 return False
             time.sleep(0.1)
 

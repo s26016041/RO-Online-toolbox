@@ -71,6 +71,9 @@ def fast(monkeypatch):
 def wired(monkeypatch, fast):
     """把外部相依全部換成假的，並記錄送出去的輸入。"""
     sent: list[str] = []
+    # 假的世界裡遊戲一直活著。真的死活檢查另外有測（見檔案結尾）。
+    monkeypatch.setattr(auto_login, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(auto_login, "_window_alive", lambda hwnd: True)
     monkeypatch.setattr(game_input, "ensure_dpi_aware", lambda: True)
     monkeypatch.setattr(game_screen, "find_window", lambda pid: 0x1234)
     monkeypatch.setattr(game_screen, "is_minimised", lambda hwnd: False)
@@ -923,3 +926,80 @@ def test_no_window_message_after_a_key_in_the_same_batch(monkeypatch, wired):
                 seen_key = True
             if "text" in action or "key" in action:
                 assert not seen_key, f"按鍵之後又送視窗訊息：{batch}"
+
+
+# ---- 遊戲不在了就馬上停，不要做無意義的重試與等待 -----------------------
+#
+# 使用者實測回報：突然斷線之後他直接把遊戲關掉，而自動登入照樣重試了 11 次：
+#   14:00:19  回連：第 11 次 OTP 送不進去：輸入沒送出去：
+#             遊戲視窗已經不在了（遊戲關掉了？）。
+#   14:00:25  卡在「等登入結果」：送了 11 次 OTP…
+# input.py 其實**明確知道**視窗不在了，但那個判斷被包成一般的「送不進去」。
+# 使用者的話：「不要做無意義等待，有問題就馬上。」
+
+
+def test_a_dead_process_stops_everything_at_once(monkeypatch, wired):
+    """行程沒了就是不可恢復 —— 一次都不要再試。"""
+    monkeypatch.setattr(auto_login, "_process_alive", lambda pid: False)
+    bot = AutoLogin(_account(), 4242)
+    assert bot._game_gone(0x1234) is True
+    assert bot._stop_if_gone(0x1234, "送出 OTP") is True
+    assert "遊戲已經關掉了" in bot.progress.detail
+
+
+def test_a_closed_window_counts_too(monkeypatch, wired):
+    monkeypatch.setattr(auto_login, "_window_alive", lambda hwnd: False)
+    bot = AutoLogin(_account(), 4242)
+    assert bot._game_gone(0x1234) is True
+
+
+def test_a_live_game_is_never_mistaken_for_a_dead_one(monkeypatch, wired):
+    bot = AutoLogin(_account(), 4242)
+    assert bot._game_gone(0x1234) is False
+    assert bot._stop_if_gone(0x1234, "送出 OTP") is False
+
+
+def test_an_unanswerable_check_never_declares_it_dead(monkeypatch):
+    """⚠ 查不到一律當作**還活著** —— 誤判成死掉會把好端端的登入砍掉。"""
+    def _boom(*_a):
+        raise OSError("查不到")
+
+    monkeypatch.setattr(auto_login.log, "debug", lambda *a, **k: None)
+    monkeypatch.setattr("psutil.pid_exists", _boom)
+    assert auto_login._process_alive(4242) is True
+
+
+def test_the_otp_loop_does_not_grind_on_a_closed_game(monkeypatch, wired):
+    """⚠ 這就是那 11 次。遊戲關掉之後 OTP 一次都不該再送。"""
+    sends = []
+    monkeypatch.setattr(
+        auto_login.input_helper, "send",
+        lambda hwnd, actions: sends.append(actions),
+    )
+    monkeypatch.setattr(auto_login, "_process_alive", lambda pid: False)
+    bot = AutoLogin(_account(), 4242)
+    assert bot._send_otp(0x1234) is False
+    assert sends == [], f"遊戲都不在了還送了 {len(sends)} 批"
+    assert "遊戲已經關掉了" in bot.progress.detail
+
+
+def test_the_credentials_loop_does_not_grind_either(monkeypatch, wired):
+    sends = []
+    monkeypatch.setattr(
+        auto_login.input_helper, "send",
+        lambda hwnd, actions: sends.append(actions),
+    )
+    monkeypatch.setattr(auto_login, "_process_alive", lambda pid: False)
+    bot = AutoLogin(_account(), 4242)
+    assert bot._send_credentials(0x1234) is False
+    assert sends == []
+
+
+def test_waiting_stops_early_when_the_game_dies(monkeypatch, wired):
+    """⚠ 等一個**確定不會發生**的東西等到逾時，就是使用者說的無意義等待。"""
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
+    monkeypatch.setattr(auto_login, "_process_alive", lambda pid: False)
+    bot = AutoLogin(_account(), 4242)
+    began = time.monotonic()
+    assert bot._wait_connection(30.0) is None
+    assert time.monotonic() - began < 2.0, "不該等滿 30 秒"
