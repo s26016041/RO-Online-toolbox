@@ -349,3 +349,103 @@ MAP_NAME_MAX_BYTES = 24
 # 經驗值欄位以前一直對不上，是因為當成 int32 讀（-0x10 / -0x08 的猜測），
 # 而它們其實是 **int64**、而且順序是「Base經驗, Base門檻, Job門檻, Job經驗」。
 # 現在四個都已實測確認，見上面的 base_exp 等欄位與 GAMEDATA [MEM-015]。
+
+
+# ---------------------------------------------------------------------------
+# 身上的狀態（EFST，畫面上那排狀態圖示）
+# ---------------------------------------------------------------------------
+# 客戶端把「我身上現在有什麼狀態」放在 ragexe 的一個 **static `std::vector`**
+# 裡（三個相鄰欄位 begin／end／capacity）。定位的是 `begin` 的位址，
+# end／cap 用 vector 自己的結構偏移 +4／+8 取（同一個物件內部的欄位距離，
+# 屬於 CLAUDE.md 允許寫死的「結構偏移」——**不是**兩個獨立全域相減）。
+#
+# 怎麼找到的（2026-08-29，見 GAMEDATA [MEM-051]）：
+#   1. 使用者身上只有「雙手劍加速」一個 buff。全行程掃「像到期時間的 dword」
+#      （值落在 [now, now+1小時]）只有 4200 個，請使用者**重放一次**技能，
+#      再掃一次找「往前跳一大段」的那個 → 0x166A41D4。
+#   2. 掃誰指向那塊 → **只有 3 個指標，而且都在 ragexe 的映像裡、彼此相鄰**
+#      → 這是個 static vector。(end-begin)/28 = 1 筆，剛好對上「只有一個 buff」。
+#   3. 反組譯引用處：`cmp [eax],esi` / `add eax,0x1c` / `cmp eax,ecx` 的走訪迴圈
+#      → 每筆 28 bytes、第一個欄位就是 EFST 編號。
+#
+# 為什麼相信「這就是身上的狀態」而不是別的清單（[MEM-047] 的教訓：
+# 特徵找得到 ≠ 找到的是對的東西）—— 三個行程同時讀，內容各自對上角色身分：
+#   獵人 → EFST_FALCON(馴鷹術)＋箭矢；騎士 → EFST_TWOHANDQUICKEN 剩 61 秒；
+#   商人 → EFST_ON_PUSH_CART(手推車)。
+#   而且盯著看到**到期那一秒筆數從 1 變 0**（03:51:54）。
+#
+# 驗證（2026-08-29）：四條骨架各自獨立，在三個行程裡全部解出同一個位址
+#   0x1357D74（ragexe+0xF57D74）；A/B/C 各命中 1 處，D 命中 3 處但值一致。
+_STATUS_VEC_LOOP = (
+    "A1 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 3B C1 74 ?? 39 30 74 ?? 83 C0 1C 3B C1"
+)
+
+STATUS_VEC_SIGS = (
+    CodeSignature(
+        name="status-vec-find",
+        pattern=_STATUS_VEC_LOOP,
+        operands=(1,),
+        why="「身上有沒有這個狀態」查詢函式：載入 begin／end，逐筆比對第一個"
+            "欄位，`add eax,0x1c` 前進。0x1c 就是每筆的大小。實機 1 處命中。",
+    ),
+    CodeSignature(
+        name="status-vec-find-const",
+        pattern="A1 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 3B C8 74 ?? 81 38 ?? ?? ?? ?? 74",
+        operands=(1,),
+        why="另一處走訪：拿固定的 EFST 編號（`cmp dword ptr [eax],imm32`）比對。"
+            "編號本身遮成 ?? —— 它是那個功能的參數，不是我們要的答案。實機 1 處命中。",
+    ),
+    CodeSignature(
+        name="status-vec-walk",
+        pattern="8B 0D ?? ?? ?? ?? 8B 3D ?? ?? ?? ?? C7 85 ?? ?? ?? ?? 01 00 00 00 3B CF",
+        operands=(2,),
+        why="走訪整串的另一個骨架（mov ecx,[begin] / mov edi,[end] / 旗標設 1）。"
+            "實機 1 處命中，與前兩條同值。",
+    ),
+    CodeSignature(
+        name="status-vec-edi",
+        pattern="8B 3D ?? ?? ?? ?? A1 ?? ?? ?? ?? 3B F8 74 ?? 8B F0",
+        operands=(2,),
+        why="edi/eax 版的載入順序（mov edi,[begin] / mov eax,[end] / cmp）。"
+            "實機 3 處命中，三處讀出的位址完全一致 —— 這條自帶交叉驗證。",
+    ),
+)
+
+
+@dataclass(frozen=True)
+class StatusVectorOffsets:
+    """`std::vector<狀態>` 與每一筆狀態的結構偏移。
+
+    都是**同一個物件內部**的欄位距離（CLAUDE.md 允許寫死的類別），
+    出處是反組譯：走訪迴圈的 `add eax,0x1c` 給了每筆大小，
+    欄位意義由三個行程的實機內容對照封包 0x0984／0x043F 的版面確認。
+    """
+
+    # vector 本體：三個相鄰指標。
+    begin: int = 0x00
+    end: int = 0x04
+    capacity: int = 0x08
+
+    #: 每一筆的大小（走訪迴圈的 `add eax,0x1c`）。
+    stride: int = 0x1C
+    #: EFST 編號（走訪迴圈比對的就是這個欄位）。
+    efst: int = 0x00
+    #: 到期時刻，GetTickCount() 同一個時基。實機：重放技能時整個往前跳。
+    expire_tick: int = 0x04
+    val1: int = 0x08
+    val2: int = 0x0C
+    val3: int = 0x10
+    #: 總時長（毫秒），對應封包 0x0984 的 total。**9999 = 無時限**
+    #: （伺服器的永久旗標，實機在馴鷹術／手推車上都是 9999）。
+    total_ms: int = 0x14
+    #: 掛上當下的剩餘時間（毫秒），對應封包的 remain。剛放的技能與 total 相同。
+    remain_ms: int = 0x18
+
+
+STATUS_VEC_OFFSETS = StatusVectorOffsets()
+
+#: 伺服器用來表示「這個狀態沒有時限」的 total 值（封包與記憶體都是它）。
+STATUS_NO_TIME_LIMIT = 9999
+
+#: 合理性上限：一次身上不可能有這麼多狀態。超過就是解錯了，寧可整批不信。
+STATUS_MAX_ENTRIES = 128

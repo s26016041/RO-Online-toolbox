@@ -15,6 +15,7 @@ import logging
 from ro_toolbox.services.aob import locate_global, scan
 from ro_toolbox.services.memory_scan import VALUE_TYPES, MemoryScanner
 from ro_toolbox.services.player_position import PlayerPosition
+from ro_toolbox.services.status_effects import ActiveStatus, StatusEffects
 from ro_toolbox.services.signatures import (
     CHAR_STATUS,
     MAP_NAME_ENCODING,
@@ -276,6 +277,9 @@ class CharacterReader:
         #: 舊版讀的是小地圖標記留下的全域，在沒有小地圖圖檔的 396 張地圖上
         #: **從頭到尾不會被寫**，卻照樣回一個看起來合理的殘留值（[MEM-047]）。
         self._position = PlayerPosition(self._scanner)
+        #: 身上有什麼狀態（buff／debuff）。與 HP 結構無關，是 ragexe 的一個
+        #: static vector，用程式碼特徵定位（見 `services/status_effects.py`）。
+        self._effects = StatusEffects(self._scanner)
         #: 上一次讀到的地圖。換圖時要把實體位址丟掉重找 —— 舊實體會被回收，
         #: 但**回收不等於清乾淨**（[MEM-022]／[MEM-047]）。
         self._map_name = ""
@@ -353,6 +357,9 @@ class CharacterReader:
         self._pid = pid
         log.info("角色狀態結構定位於 %#x", self._base)
         self._locate_position()
+        # 狀態清單定位失敗不影響角色狀態本身（它會自己記 error 並停用），
+        # 所以不讓它把 attach 拉成失敗 —— 少一個顯示，不是少一整個角色。
+        self._effects.locate()
         return True
 
     def _locate_position(self) -> bool:
@@ -364,6 +371,15 @@ class CharacterReader:
         status = self._collect()
         self._map_name = status.map_name if status is not None else ""
         return self._position.locate(status.aid if status is not None else 0)
+
+    @property
+    def effects_located(self) -> bool:
+        """狀態清單定位成功了嗎？沒有的話 `status_effects()` 一律回 None。"""
+        return self._effects.located
+
+    def status_effects(self) -> list[ActiveStatus] | None:
+        """身上現在有哪些狀態。`None` = 問不出來（**不等於沒有 buff**）。"""
+        return self._effects.read()
 
     @property
     def position_located(self) -> bool:
@@ -503,6 +519,7 @@ class CharacterReader:
         self._base = None
         self._map_name = ""
         self._position.forget()
+        self._effects.forget()
         try:
             self._scanner.close()
         except Exception as exc:  # noqa: BLE001

@@ -310,6 +310,13 @@ class CharacterCard(QWidget):
         self.exp_label.setObjectName("pageSubtitle")
         layout.addWidget(self.exp_label)
 
+        # 身上有什麼狀態（buff／debuff）。讀不到與「沒有 buff」要看得出差別，
+        # 不然功能壞掉會長得跟「剛好沒 buff」一模一樣（見 set_buffs）。
+        self.buff_label = QLabel("")
+        self.buff_label.setObjectName("pageSubtitle")
+        self.buff_label.setWordWrap(True)
+        layout.addWidget(self.buff_label)
+
         self._note_text = "定位中…"
         self._last_alert = ""
         self.status_label = QLabel(self._note_text)
@@ -818,6 +825,20 @@ class CharacterCard(QWidget):
         bar.setValue(int(percent))
         # 遊戲畫面只給到小數一位且無條件捨去，這裡多給一位看得出有沒有在動
         label.setText(f"{exp:,} / {need:,}　{percent:.2f}%")
+
+    def set_buffs(self, rows) -> None:
+        """身上的狀態那一行。
+
+        三種情形要分得出來（CLAUDE.md：安靜地做錯事一律當 bug）：
+        `None` = 問不出來、`[]` = 確定身上沒東西、有內容 = 列出來。
+        """
+        if rows is None:
+            self.buff_label.setText("狀態：讀不到（定位失敗或內容不可信）")
+            return
+        if not rows:
+            self.buff_label.setText("狀態：無")
+            return
+        self.buff_label.setText("狀態：" + "　".join(row.describe() for row in rows))
 
     def set_exp_gain(self, text: str) -> None:
         self.exp_label.setText(text)
@@ -1672,6 +1693,7 @@ class FarmPage(BasePage):
             self._failures[pid] = 0
             card.update_status(status)
             card.set_exp_gain(self._exp_gain_text(pid, status))
+            card.set_buffs(reader.status_effects())
             index = self.tabs.indexOf(card)
             if index >= 0 and status.name and self.tabs.tabText(index) != status.name:
                 self.tabs.setTabText(index, status.name)

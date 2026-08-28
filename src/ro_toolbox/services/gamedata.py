@@ -28,6 +28,7 @@ _WARP_TABLE = ASSETS_DIR / "warps.json.gz"
 _MAP_NAME_TABLE = ASSETS_DIR / "mapnames.json.gz"
 _NPC_TABLE = ASSETS_DIR / "npcs.json.gz"
 _SKILL_TABLE = ASSETS_DIR / "skills.json.gz"
+_EFST_TABLE = ASSETS_DIR / "efst.json.gz"
 
 
 #: 讀成功的表就留在記憶體裡，見 `_load()`。
@@ -150,6 +151,33 @@ def skill_name(skill_id: int | None) -> str:
         return "未知"
     entry = skill_table().get(skill_id)
     return (entry or {}).get("name") or f"#{skill_id}"
+
+
+@lru_cache(maxsize=1)
+def efst_table() -> dict[int, dict]:
+    """狀態圖示編號（EFST）→ `{key, name, en, timed}`。來源 tools/build_efst_table.py。
+
+    記憶體裡的「身上有什麼狀態」清單存的就是這個編號（見 `services/status_effects.py`），
+    1463 個編號裡只有 740 個在畫面上會出現、有中文名稱，其餘只有英文代號。
+    """
+    return {int(k): v for k, v in _load(_EFST_TABLE).items()}
+
+
+def efst_name(efst_id: int | None) -> str:
+    """狀態名稱。查不到就回代號或 `#編號` —— 安全退化，不要假裝知道。"""
+    if efst_id is None:
+        return "未知"
+    entry = efst_table().get(efst_id) or {}
+    return entry.get("name") or entry.get("key") or f"#{efst_id}"
+
+
+def efst_is_timed(efst_id: int | None) -> bool:
+    """畫面上這個狀態有沒有倒數（`haveTimeLimit`）。
+
+    只當**顯示**的參考：真正判斷永久與否要看記憶體裡的 total（9999 = 無時限），
+    因為同一個編號可能被有時限與無時限兩種來源掛上。
+    """
+    return bool((efst_table().get(efst_id) or {}).get("timed"))
 
 
 @lru_cache(maxsize=1)
