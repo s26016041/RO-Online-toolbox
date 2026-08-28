@@ -41,6 +41,10 @@ _SUBDIRS = ("item", "collection")
 
 #: 打包資產。格式與產生方式見 `tools/build_icons.py`。
 ICON_ASSET = ASSETS_DIR / "icons.bin"
+#: 技能圖示。同一個格式、同一個 `item/` 目錄，只是**索引的鍵是技能英文代號**
+#: （`SM_BASH`，磁碟上的檔名是小寫）。分成兩份資產是因為 `icons.bin` 只收
+#: 道具表用得到的資源名，技能圖不在裡面。產生方式見 `tools/build_skill_icons.py`。
+SKILL_ICON_ASSET = ASSETS_DIR / "skill_icons.bin"
 ICON_MAGIC = b"ROIC"
 ICON_VERSION = 1
 #: 每桶幾張圖。128 張時整份約 4.0 MB（接近 solid gzip 的 3.8 MB），
@@ -96,32 +100,32 @@ def icon_path(item_id: int) -> Path | None:
 # ---- 打包資產 -------------------------------------------------------
 
 
-@lru_cache(maxsize=1)
-def _asset() -> tuple[dict, bytes] | None:
+@lru_cache(maxsize=4)
+def _asset_at(path: Path) -> tuple[dict, bytes] | None:
     """(索引, 桶區塊)。沒有資產或格式不符就回 None，讓呼叫端退回解包目錄。"""
     try:
-        raw = ICON_ASSET.read_bytes()
+        raw = path.read_bytes()
     except OSError:
         return None
     if len(raw) < 12 or raw[:4] != ICON_MAGIC:
-        log.warning("%s 不是圖示資產（開頭是 %r）", ICON_ASSET.name, raw[:4])
+        log.warning("%s 不是圖示資產（開頭是 %r）", path.name, raw[:4])
         return None
     version, head_len = struct.unpack_from("<II", raw, 4)
     if version != ICON_VERSION or len(raw) < 12 + head_len:
-        log.warning("%s 版本或長度不符（version=%s）", ICON_ASSET.name, version)
+        log.warning("%s 版本或長度不符（version=%s）", path.name, version)
         return None
     try:
         index = json.loads(gzip.decompress(raw[12 : 12 + head_len]).decode("utf-8"))
     except (OSError, ValueError, UnicodeDecodeError) as exc:
-        log.warning("%s 的索引解不開：%s", ICON_ASSET.name, exc)
+        log.warning("%s 的索引解不開：%s", path.name, exc)
         return None
     return index, raw[12 + head_len :]
 
 
-@lru_cache(maxsize=8)
-def _bucket(number: int) -> bytes:
+@lru_cache(maxsize=16)
+def _bucket_at(path: Path, number: int) -> bytes:
     """解壓第 `number` 桶。只留幾桶在快取裡，記憶體不會一直長。"""
-    loaded = _asset()
+    loaded = _asset_at(path)
     if loaded is None:
         return b""
     index, blob = loaded
@@ -129,8 +133,29 @@ def _bucket(number: int) -> bytes:
         offset, size = index["b"][number]
         return gzip.decompress(blob[offset : offset + size])
     except (IndexError, KeyError, OSError, ValueError) as exc:
-        log.warning("圖示資產第 %d 桶解不開：%s", number, exc)
+        log.warning("%s 第 %d 桶解不開：%s", path.name, number, exc)
         return b""
+
+
+def _packed(path: Path, key: str) -> bytes | None:
+    """從資產取一張圖。找不到回 None。"""
+    loaded = _asset_at(path)
+    if loaded is None:
+        return None
+    entry = loaded[0]["i"].get(key)
+    if entry is None:
+        return None
+    number, offset, size = entry
+    data = _bucket_at(path, number)[offset : offset + size]
+    return data if len(data) == size else None
+
+
+def _asset() -> tuple[dict, bytes] | None:
+    return _asset_at(ICON_ASSET)
+
+
+def _bucket(number: int) -> bytes:
+    return _bucket_at(ICON_ASSET, number)
 
 
 def icon_bytes(item_id: int) -> bytes | None:
@@ -141,15 +166,39 @@ def icon_bytes(item_id: int) -> bytes | None:
     resource = _resources().get(item_id)
     if not resource:
         return None
-    loaded = _asset()
-    if loaded is not None:
-        entry = loaded[0]["i"].get(resource)
-        if entry is not None:
-            number, offset, size = entry
-            data = _bucket(number)[offset : offset + size]
-            if len(data) == size:
-                return data
+    data = _packed(ICON_ASSET, resource)
+    if data is not None:
+        return data
     path = icon_path(item_id)
+    if path is not None:
+        try:
+            return path.read_bytes()
+        except OSError:
+            return None
+    return None
+
+
+def skill_icon_path(key: str) -> Path | None:
+    """解包目錄裡這個技能的圖示。磁碟上的檔名是**小寫**的英文代號。"""
+    root = _ui_root()
+    if root is None or not key:
+        return None
+    path = root / "item" / (key.lower() + ".bmp")
+    return path if path.is_file() else None
+
+
+def skill_icon_bytes(key: str) -> bytes | None:
+    """技能圖示（BMP）。`key` 是英文代號（`SM_BASH`）。找不到回 None。
+
+    1,605 個技能裡有 1,317 個有圖，其餘（多半是不會出現在技能欄的內部技能）
+    介面就不顯示圖示 —— **外觀降級不是錯誤**。
+    """
+    if not key:
+        return None
+    data = _packed(SKILL_ICON_ASSET, key)
+    if data is not None:
+        return data
+    path = skill_icon_path(key)
     if path is not None:
         try:
             return path.read_bytes()

@@ -34,14 +34,15 @@ def _key(skill_id: int) -> str:
 
 
 def _node(skill_id: int, level: int, sp: int, name_ptr: int, *,
-          maxlv: int | None = None, tail: int = 0) -> bytes:
+          maxlv: int | None = None, tail: int = 0, inf: int = 4) -> bytes:
     """一個技能結構（版面見 services/skills.py 開頭）。
 
     `tail` 塞進 `+0x14` —— 那個欄位意義未解，實機出現過 2 和 4。
+    `inf` 是 `+0x04` 的目標型態，分類會用到。
     """
     out = bytearray(0x24)
     struct.pack_into("<I", out, 0x00, skill_id)
-    struct.pack_into("<I", out, 0x04, 4)
+    struct.pack_into("<I", out, 0x04, inf)
     struct.pack_into("<I", out, 0x08, level)
     struct.pack_into("<I", out, 0x0C, sp)
     struct.pack_into("<I", out, 0x14, tail)
@@ -70,12 +71,12 @@ class FakeScanner:
 
     def add_skill(self, skill_id: int, level: int, sp: int, *,
                   key: str | None = None, maxlv: int | None = None,
-                  tail: int = 0) -> int:
+                  tail: int = 0, inf: int = 4) -> int:
         """放一個技能結構，回傳它在記憶體裡的位址。"""
         pointer = self.put_string(_key(skill_id) if key is None else key)
         offset = FIRST + self._slot * STRIDE
         self._slot += 1
-        blob = _node(skill_id, level, sp, pointer, maxlv=maxlv, tail=tail)
+        blob = _node(skill_id, level, sp, pointer, maxlv=maxlv, tail=tail, inf=inf)
         self.region[offset:offset + len(blob)] = blob
         return REGION + offset
 
@@ -152,6 +153,51 @@ def test_reads_skills_with_levels(reader):
     assert bash.name and not bash.name.startswith("#")
     assert bash.max_level == _maxlv(5)
     assert quicken.learned and not counter.learned
+
+
+def test_classifies_active_buff_and_passive(reader):
+    """分類要跟遊戲自己的說明一致，不能靠猜。
+
+    - SM_BASH「類型 : 近距離物理」→ 打怪型
+    - SM_MAGNUM「類型 : 近距離物理，Buff」→ **打怪型**（怒爆是攻擊技能，
+      比對順序要讓攻擊字樣先中，否則會被 buff 搶走）
+    - KN_TWOHANDQUICKEN「類型 : Buff」→ 補助型
+    - `inf == 0` → 被動，比資料表的分類更權威
+    """
+    r, scanner = reader
+    scanner.add_skill(5, 10, 15)                 # SM_BASH
+    scanner.add_skill(7, 5, 30)                  # SM_MAGNUM
+    scanner.add_skill(60, 7, 38)                 # KN_TWOHANDQUICKEN
+    scanner.add_skill(3, 10, 0, inf=0)           # SM_TWOHAND（被動熟練度）
+
+    found = {s.id: s for s in r.read() or []}
+    assert found[5].kind == skills_mod.ACTIVE
+    assert found[7].kind == skills_mod.ACTIVE
+    assert found[60].kind == skills_mod.BUFF
+    assert found[3].kind == skills_mod.PASSIVE
+    assert found[60].castable and not found[3].castable
+
+
+def test_garbage_inf_is_not_forced_into_a_class(reader):
+    """未學的被動技能那一欄是垃圾值（實機 6322451）—— 不准硬塞進打怪／補助。"""
+    r, scanner = reader
+    # SM_MOVINGRECOVERY 沒有「類型」欄位，只能靠 inf；inf 是垃圾就該收手。
+    scanner.add_skill(144, 0, 0, inf=6322451)
+
+    found = r.read()
+    assert found is not None
+    assert found[0].kind == skills_mod.UNKNOWN
+    assert not found[0].castable
+
+
+def test_description_comes_from_the_game(reader):
+    """tooltip 用的說明是遊戲自己的字串，顏色碼原樣留著。"""
+    r, scanner = reader
+    scanner.add_skill(60, 7, 38)
+
+    lines = (r.read() or [])[0].description()
+    assert lines and "雙手劍攻擊速度增加" in lines[0]
+    assert any("^" in line for line in lines)
 
 
 def test_ignores_struct_whose_name_does_not_match_id(reader):
@@ -244,6 +290,16 @@ def test_should_stop_aborts(reader):
     r, scanner = reader
     scanner.add_skill(5, 10, 15)
     assert r.read(should_stop=lambda: True) is None
+
+
+def test_skill_icons_ship_with_the_program():
+    """使用者的電腦沒有 RODATA —— 圖示只能從打包資產來（CLAUDE.md）。"""
+    from ro_toolbox.services.icons import skill_icon_bytes
+
+    data = skill_icon_bytes("SM_BASH")
+    assert data and data[:2] == b"BM", "技能圖示應該是 BMP"
+    assert skill_icon_bytes("NOT_A_REAL_SKILL") is None
+    assert skill_icon_bytes("") is None
 
 
 def test_close_releases_only_owned_scanner():

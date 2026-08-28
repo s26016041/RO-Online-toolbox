@@ -23,6 +23,8 @@ from ro_toolbox.services.skills import SkillReader  # noqa: E402
 
 PROCESS = "ragexe.exe"
 
+KIND = {"active": "打怪", "buff": "補助", "passive": "被動", "unknown": "？"}
+
 
 def _who(pid: int) -> str:
     """這個分身現在是誰在玩。讀不到就只寫 PID —— 安全退化，不要假裝知道。"""
@@ -77,11 +79,11 @@ def main() -> int:
         learned = sum(1 for s in skills if s.learned)
         print(f"\n{_who(win.pid)}　技能 {len(skills)} 個（已學會 {learned} 個）"
               f"　掃描 {elapsed:.1f}s")
-        print(f"  {'ID':>6}  {'等級':<7} {'SP':>4}  {'代號':<24}名稱")
+        print(f"  {'ID':>6}  {'等級':<7} {'SP':>4} {'分類':<8}{'代號':<24}名稱")
         for skill in shown:
             level = f"{skill.level}/{skill.max_level}"
             mark = " " if skill.learned else "·"
-            print(f"{mark} {skill.id:>6}  {level:<7} {skill.sp:>4}  "
+            print(f"{mark} {skill.id:>6}  {level:<7} {skill.sp:>4} {KIND[skill.kind]:<8}"
                   f"{skill.key:<24}{skill.name}")
     return exit_code
 

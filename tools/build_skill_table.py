@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -75,6 +76,65 @@ def _numbers(value) -> list[int] | None:
     return out
 
 
+#: 描述文字裡的顏色碼（`^993300主動^000000`）。介面要不要上色自己決定，
+#: 但抽欄位之前一定要先拿掉，否則 `系列 : ^993300主動` 比對不到。
+_COLOR = re.compile(r"\^[0-9a-fA-F]{6}")
+
+#: 「類型 : 近距離物理」這種欄位。冒號有全形也有半形。
+_FIELD = re.compile(r"^([^:：]{1,10})\s*[:：]\s*(.*)$")
+
+#: 把「類型」歸成打怪型還是補助型。**順序有意義**：
+#: `SM_MAGNUM`（怒爆）的類型是「近距離物理，Buff」—— 它是攻擊技能，
+#: 先比對攻擊字樣才不會被後面的 buff 搶走。
+_ACTIVE_WORDS = ("物理", "魔法", "攻擊", "debuff", "陷阱", "安裝", "召喚", "製作", "恢復")
+_BUFF_WORDS = ("buff", "輔助")
+
+
+def _descriptions(folder: Path) -> dict[str, list[str]]:
+    """skilldescript.lub：`SKILL_DESCRIPT[SKID.X] = {"第一行", "第二行", …}`。
+
+    **原始行原樣留著**（含 `^RRGGBB` 顏色碼）——介面要照遊戲那樣上色才有得用，
+    清乾淨就回不去了。要抽欄位的地方自己先過 `_COLOR`。
+    """
+    _, pairs = simulate(load(str(folder / "skilldescript.lub")).main)
+    out: dict[str, list[str]] = {}
+    for _table, key, value in pairs:
+        if not isinstance(key, Index) or not isinstance(key.key, str):
+            continue
+        if isinstance(value, list) and all(isinstance(x, str) for x in value):
+            out[key.key] = [tw(x) for x in value]
+    return out
+
+
+def _fields(lines: list[str]) -> dict[str, str]:
+    """從描述行抽出「系列 / 類型 / 對象」這些欄位。`[Lv 1] : …` 不算欄位。"""
+    found: dict[str, str] = {}
+    for line in lines:
+        plain = _COLOR.sub("", line).strip()
+        if plain.startswith("["):
+            continue
+        matched = _FIELD.match(plain)
+        if matched:
+            found.setdefault(matched.group(1).strip(), matched.group(2).strip())
+    return found
+
+
+def _kind_hint(fields: dict[str, str]) -> str | None:
+    """從描述判斷是打怪型還是補助型。判斷不出來回 None —— 留給 `inf` 決定。
+
+    只吃「類型」欄位：「系列」欄位實測有 **100 多種寫法**（主動／主動/buff／
+    BUFF/特殊／海鮮類(輔助)…），拿它分類就是在猜。
+    """
+    text = (fields.get("類型") or "").lower()
+    if not text:
+        return None
+    if any(word in text for word in _ACTIVE_WORDS):
+        return "active"
+    if any(word in text for word in _BUFF_WORDS):
+        return "buff"
+    return None
+
+
 def build() -> dict:
     folder = _find_lua()
     skid = _skill_ids(folder)
@@ -90,6 +150,8 @@ def build() -> dict:
             outer.append((key, value))
         elif isinstance(key, str):
             inner[id(table)][key] = value
+
+    descriptions = _descriptions(folder)
 
     skills: dict[int, dict] = {}
     unresolved: list[str] = []
@@ -117,16 +179,32 @@ def build() -> dict:
             numbers = _numbers(fields.get(field))
             if numbers:
                 entry[out_key] = numbers
+
+        lines = descriptions.get(code)
+        if lines:
+            entry["desc"] = lines
+            labels = _fields(lines)
+            for label, out_key in (("類型", "type"), ("對象", "target"), ("系列", "series")):
+                if labels.get(label):
+                    entry[out_key] = labels[label]
+            hint = _kind_hint(labels)
+            if hint:
+                entry["kind"] = hint
         skills[skill_id] = entry
 
+    kinds = {"active": 0, "buff": 0, "none": 0}
+    for entry in skills.values():
+        kinds[entry.get("kind") or "none"] += 1
     meta = {
-        "source": "luafiles514/skillinfoz/{skillid,skillinfolist}.lub",
+        "source": "luafiles514/skillinfoz/{skillid,skillinfolist,skilldescript}.lub",
         "counts": {
             "skid": len(skid),
             "info_rows": len(outer),
             "resolved": len(skills),
             "unresolved": len(unresolved),
             "nameless": len(nameless),
+            "described": sum(1 for e in skills.values() if e.get("desc")),
+            "kind": kinds,
         },
     }
     table = {"_meta": meta, **{str(k): v for k, v in sorted(skills.items())}}
@@ -148,11 +226,15 @@ def main() -> None:
         print(f"  （查不到代號的前 10 個：{unresolved[:10]}）")
     if nameless:
         print(f"  （沒有中文名的前 10 個：{nameless[:10]}）")
-    for skill_id in (1, 5, 28, 60):
+    print(f"有描述的 {counts['described']} 個；"
+          f"從「類型」分得出來的：打怪型 {counts['kind']['active']}、"
+          f"補助型 {counts['kind']['buff']}、判不出來 {counts['kind']['none']}（交給 inf）")
+    for skill_id in (5, 7, 8, 60, 142):
         entry = table.get(str(skill_id))
         if entry:
-            print(f"  {skill_id:>5}  {entry['key']:<20} {entry['name']}  "
-                  f"MaxLv {entry['maxlv']}  SP {entry.get('sp')}")
+            print(f"  {skill_id:>5}  {entry['key']:<20} {entry['name']:<12} "
+                  f"類型={entry.get('type')!r} 對象={entry.get('target')!r} "
+                  f"→ {entry.get('kind')}")
     size = OUT.stat().st_size
     print(f"\n-> {OUT}（{size / 1024:.0f} KB）")
 

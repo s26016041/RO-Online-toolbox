@@ -60,6 +60,9 @@ log = logging.getLogger(__name__)
 #: 這是**同一個結構內部**的欄位距離，屬於「大更新才會壞」的類別，
 #: 允許寫死（CLAUDE.md）。跨結構的距離一律不准這樣算。
 _I_ID = 0
+#: 目標型態 bitmask。**只有值合法時才准用**（見 `_classify`）：實測未學的
+#: 被動技能那一欄是垃圾（6322451、1745644），拿來分類會安靜分錯。
+_I_INF = 1
 _I_LEVEL = 2
 _I_SP = 3
 _I_NAME_PTR = 6
@@ -74,6 +77,23 @@ _NAME_BYTES = 48
 #: ⚠ 只准拿**確認過意義**的欄位來篩：拿沒把握的欄位篩會安靜漏掉技能（見模組開頭）。
 _MAX_LEVEL = 20
 _MAX_SP = 10000
+
+# --- 分類 ------------------------------------------------------------------
+#: `inf` 的位元（rAthena 的 SKILL_INF_*，實測與封包 0x0B33 對得上）。
+_INF_ENEMY = 0x01
+_INF_GROUND = 0x02
+_INF_SELF = 0x04
+_INF_SUPPORT = 0x10
+_INF_TRAP = 0x20
+#: 合法的 inf 只會用到低位那幾個位元。超出就是垃圾（未學技能那一欄沒被填）。
+_INF_KNOWN = _INF_ENEMY | _INF_GROUND | _INF_SELF | _INF_SUPPORT | _INF_TRAP | 0x08
+
+#: 分類。`ACTIVE` 是打怪型、`BUFF` 是補助型、`PASSIVE` 不能施放、
+#: `UNKNOWN` 是「資料不足以判斷」——**不准硬塞進前兩類**（CLAUDE.md：不確定留空）。
+ACTIVE = "active"
+BUFF = "buff"
+PASSIVE = "passive"
+UNKNOWN = "unknown"
 #: 指標要落在使用者空間、而且 4 對齊。
 _PTR_LOW = 0x00010000
 _PTR_HIGH = 0x7FF00000
@@ -90,13 +110,50 @@ class Skill:
     max_level: int
     #: 這一級的消耗 SP。0 通常代表被動技能（記憶體＝封包＝lub 三方一致）。
     sp: int
+    #: `ACTIVE`／`BUFF`／`PASSIVE`／`UNKNOWN`，見 `_classify()`。
+    kind: str = UNKNOWN
 
     @property
     def learned(self) -> bool:
         return self.level > 0
 
+    @property
+    def castable(self) -> bool:
+        """能不能主動施放。被動與分類不明的都不算 —— 送出去只會被伺服器丟掉。"""
+        return self.learned and self.kind in (ACTIVE, BUFF)
+
+    def description(self) -> list[str]:
+        """遊戲內的技能說明（每行一個字串，含 `^RRGGBB` 顏色碼）。沒有就回空。"""
+        return list((skill_table().get(self.id) or {}).get("desc") or [])
+
     def __repr__(self) -> str:  # pragma: no cover - 只給除錯看
-        return f"<Skill {self.id} {self.key} {self.name} Lv{self.level}/{self.max_level}>"
+        return (f"<Skill {self.id} {self.key} {self.name} "
+                f"Lv{self.level}/{self.max_level} {self.kind}>")
+
+
+def _classify(skill_id: int, inf: int) -> str:
+    """這個技能是打怪型還是補助型。
+
+    順序有意義：
+
+    1. **`inf == 0`（而且值合法）一律 `PASSIVE`** —— 伺服器說它沒有施放目標，
+       那就是被動技能，比資料表的分類更權威。
+    2. 資料表的 `kind`（從遊戲的技能說明「類型 : Buff／近距離物理」抽的，
+       見 `tools/build_skill_table.py`）。
+    3. 都沒有就退回 `inf` 的位元：對敵人／地面 → 打怪型，對自己／隊友 → 補助型。
+    4. 還是判不出來 → `UNKNOWN`，介面兩邊都不放。
+    """
+    legal = inf == (inf & _INF_KNOWN)
+    if legal and inf == 0:
+        return PASSIVE
+    hinted = (skill_table().get(skill_id) or {}).get("kind")
+    if hinted in (ACTIVE, BUFF):
+        return hinted
+    if legal and inf & (_INF_ENEMY | _INF_GROUND | _INF_TRAP):
+        return ACTIVE
+    if legal and inf & (_INF_SELF | _INF_SUPPORT):
+        return BUFF
+    return UNKNOWN
 
 
 def _table_arrays() -> tuple[np.ndarray, int]:
@@ -282,6 +339,7 @@ class SkillReader:
             level=int(u32[index + _I_LEVEL]),
             max_level=int(u32[index + _I_MAXLV]),
             sp=int(u32[index + _I_SP]),
+            kind=_classify(skill_id, int(u32[index + _I_INF])),
         )
 
     @staticmethod
