@@ -26,6 +26,7 @@ _ITEM_TABLE = ASSETS_DIR / "items.json.gz"
 _MOB_TABLE = ASSETS_DIR / "mobs.json.gz"
 _WARP_TABLE = ASSETS_DIR / "warps.json.gz"
 _MAP_NAME_TABLE = ASSETS_DIR / "mapnames.json.gz"
+_NPC_TABLE = ASSETS_DIR / "npcs.json.gz"
 
 
 #: 讀成功的表就留在記憶體裡，見 `_load()`。
@@ -268,3 +269,55 @@ def is_mob(class_id: int) -> bool:
     的 job 編號不在怪物表裡，就不會被當成怪去打（見 GAMEDATA [PKT-029]）。
     """
     return class_id in mob_names()
+
+
+# ---- NPC：誰在哪張圖的哪一格（`assets/npcs.json.gz`，來源 navi_npc_tw.lub）----
+#
+# ⚠ 這張表**只回答「人在哪」**。RO 的商店賣什麼、賣多少錢在**伺服器**上，
+# 開店那一刻才用 0x00C6 送過來（[PKT-074]）—— 客戶端資料裡沒有。
+#
+# ⚠ 也**沒有**「這個是商店」的欄位：型別欄實測只有 101/102/0 三個值，
+# 跟商不商店無關。所以「誰是道具商人」只能靠**名字**（那是遊戲自己的顯示名，
+# 不是我們推的）。名字換了就抓不到 —— 抓不到就不買，那是安全退化。
+
+
+@lru_cache(maxsize=1)
+def _npc_file() -> dict:
+    try:
+        with gzip.open(_NPC_TABLE, "rt", encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError) as exc:
+        log.warning("載入 %s 失敗：%s", _NPC_TABLE.name, exc)
+        return {}
+
+
+def npcs_on_map(map_name: str) -> list[tuple[int, int, str, int]]:
+    """這張圖上的 NPC：(x, y, 名字, 外觀編號)。查不到回空的。"""
+    rows = _npc_file().get("npc", {}).get(map_name, [])
+    return [(int(r[0]), int(r[1]), str(r[2]), int(r[3])) for r in rows if len(r) >= 4]
+
+
+#: 賣消耗品的商人，名字裡會有這幾個詞之一。
+#:
+#: ⚠ 這是**遊戲自己的顯示名**，不是我們替它分類。實測 9,585 個 NPC 裡有 122 個
+#: 命中，最多的是「道具商人」48、「工具商人」26、「戰術道具商人」25、
+#: 「高級藥水商人」10。命不中就是**不買**（安全退化），不准拿別的 NPC 去猜。
+POTION_SELLER_WORDS = ("道具商人", "工具商人", "藥水商人", "雜貨商人")
+
+
+def potion_sellers_on(map_name: str) -> list[tuple[int, int, str, int]]:
+    """這張圖上**可能賣藥水**的商人。名字比對，命不中就回空的。"""
+    return [
+        npc for npc in npcs_on_map(map_name)
+        if any(word in npc[2] for word in POTION_SELLER_WORDS)
+    ]
+
+
+def maps_with_potion_sellers() -> list[str]:
+    """哪些地圖上有賣藥水的商人（給尋路挑目的地用）。"""
+    table = _npc_file().get("npc", {})
+    out = []
+    for name, rows in table.items():
+        if any(any(w in str(r[2]) for w in POTION_SELLER_WORDS) for r in rows if len(r) >= 4):
+            out.append(name)
+    return sorted(out)

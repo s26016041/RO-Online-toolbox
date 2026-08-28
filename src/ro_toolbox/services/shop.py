@@ -1,0 +1,203 @@
+"""跟 NPC 商店買東西：封包版面 ＋ 「該買幾個」的算式。
+
+**這支不碰 socket、不碰記憶體、不開執行緒** —— 純粹是「位元組進、位元組出」
+加上一個算式，所以整段都測得起來。
+
+## 版面是實機量的，不是猜的
+
+來源：使用者 2026-08-28 在道具商人那裡**手動買 300 瓶藥水**的擷取
+（`封包/購買藥水.txt`，48 個封包）。細節與逐位元組推導見 GAMEDATA [PKT-074]。
+
+    ↑ 0x0090  跟 NPC 講話      GID(4) + 種類(1)=1
+    ↓ 0x00C4  「這是商店」      GID(4)                 ← 收到它才代表真的是商店
+    ↑ 0x00C5  選「買」          GID(4) + 種類(1)=0
+    ↓ 0x00C6  商品清單          長度(2) + N×13 位元組
+    ↑ 0x00C8  下單              長度(2) + N×6 位元組
+    ↓ 0x00CA  買賣結果          結果(1)，0 = 成功
+
+⚠ **道具編號是 4 位元組**（不是舊版的 2 位元組）：實機看到 `f6 01 00 00` = 502。
+照舊版寫成 2 位元組會**買到別的東西**，而且看起來像成功。
+
+## ⚠ 商店賣什麼、賣多少錢，客戶端**沒有**
+
+那是伺服器的資料，開店那一刻才用 0x00C6 送過來。所以流程只能是
+**走過去 → 開店 → 讀清單 → 才知道買不買得到**，不能事先算好。
+清單裡沒有我們要的道具就**不買**（安全退化），不准挑一個「看起來像」的。
+
+## ⚠ 負重的原始值是畫面上的 10 倍
+
+實機對照：封包 `45304 / 48100`，畫面顯示 `4530 / 4810`。所有計算一律用
+**原始值**，只有要給人看的時候才除以 10 —— 兩種單位混用會算出十倍的量。
+"""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass
+
+#: ↑ 跟 NPC 講話（CZ_CONTACTNPC）
+OP_CONTACT_NPC = 0x0090
+#: ↓ 「這個 NPC 是商店，選買還是賣」（ZC_SELECT_DEALTYPE）
+OP_DEAL_TYPE = 0x00C4
+#: ↑ 選買／賣（CZ_ACK_SELECT_DEALTYPE）
+OP_ACK_DEAL_TYPE = 0x00C5
+#: ↓ 商品清單（ZC_PC_PURCHASE_ITEMLIST）
+OP_SHOP_LIST = 0x00C6
+#: ↑ 下單（CZ_PC_PURCHASE_ITEMLIST）
+OP_BUY = 0x00C8
+#: ↓ 買賣結果（ZC_PC_PURCHASE_RESULT）
+OP_BUY_RESULT = 0x00CA
+#: ↓ 數值變動（ZC_PAR_CHANGE，type u16 + value u32）
+OP_PAR_CHANGE = 0x00B0
+#: ↓ 數值變動的大數版（ZC_LONGPAR_CHANGE，type u16 + value i32）
+OP_LONGPAR_CHANGE = 0x00B1
+
+#: `0x00B0` / `0x00B1` 的 type 欄。實機在這份擷取裡看到 5 / 20 / 24 / 25。
+SP_HP = 5
+SP_ZENY = 20
+SP_WEIGHT = 24
+SP_MAX_WEIGHT = 25
+
+#: 選「買」。1 是賣。
+DEAL_BUY = 0
+#: 跟 NPC 講話的種類欄，實機看到的值。
+CONTACT_TALK = 1
+#: 買賣結果 0 = 成功（實機那一次買 300 瓶收到的就是 0）。
+RESULT_OK = 0
+
+#: 商品清單一筆幾個位元組：價錢(4) + 折扣價(4) + 種類(1) + 道具編號(4)。
+#: 實機驗算：宣告長度 225 − 2(opcode) − 2(長度欄) = 221 = 13 × 17 筆。
+_SHOP_ENTRY = 13
+#: 下單一筆幾個位元組：數量(2) + 道具編號(4)。實機 len=10 = 2+2+6，一筆。
+_BUY_ENTRY = 6
+
+#: 負重原始值 ÷ 這個 = 畫面上看到的數字。
+WEIGHT_SCALE = 10
+#: 買到負重的幾成為止（使用者指定）。
+FILL_RATIO = 0.8
+#: 一次下單的數量欄是 u16。
+_MAX_AMOUNT = 0xFFFF
+
+
+@dataclass(frozen=True, slots=True)
+class ShopItem:
+    """商店賣的一項：編號、單價、種類。"""
+
+    item_id: int
+    price: int
+    kind: int
+
+
+@dataclass(frozen=True, slots=True)
+class Purchase:
+    """這一次該買幾個，以及是被什麼卡住的。
+
+    `limited_by`：
+        ``"weight"`` 負重滿了（正常結束）
+        ``"zeny"``   錢不夠 —— 呼叫端要**停掉自動打怪並跳通知**（使用者指定）
+        ``"none"``   兩個都還有餘裕（理論上不會出現，買的量本來就是取兩者小的）
+    """
+
+    amount: int
+    limited_by: str
+
+
+def contact_npc(gid: int) -> bytes:
+    """↑ 0x0090：跟這隻 NPC 講話。"""
+    return struct.pack("<HIB", OP_CONTACT_NPC, gid, CONTACT_TALK)
+
+
+def choose_buy(gid: int) -> bytes:
+    """↑ 0x00C5：在「買／賣」的選單選買。"""
+    return struct.pack("<HIB", OP_ACK_DEAL_TYPE, gid, DEAL_BUY)
+
+
+def buy_packet(orders: list[tuple[int, int]]) -> bytes:
+    """↑ 0x00C8：下單。`orders` 是 [(道具編號, 數量)]。
+
+    ⚠ 數量是 u16、道具編號是 **u32**（實機驗過，見檔頭）。
+    """
+    body = b"".join(
+        struct.pack("<HI", min(max(int(amount), 0), _MAX_AMOUNT), int(item_id))
+        for item_id, amount in orders
+    )
+    return struct.pack("<HH", OP_BUY, len(body) + 4) + body
+
+
+def parse_shop_list(payload: bytes) -> list[ShopItem]:
+    """↓ 0x00C6：商品清單。版面不合就回空的（**不猜**）。
+
+    `payload` 是**去掉 opcode 之後**的位元組，開頭兩個仍是封包宣告的總長度
+    （擷取端就是這樣給的）。
+    """
+    if len(payload) < 2:
+        return []
+    declared = struct.unpack_from("<H", payload, 0)[0]
+    body = payload[2:]
+    # 宣告長度含 opcode 的 2 個位元組。對不上就是版面變了 —— 寧可不買。
+    if declared - 4 != len(body) or len(body) % _SHOP_ENTRY:
+        return []
+    out = []
+    for offset in range(0, len(body), _SHOP_ENTRY):
+        price, _discount, kind, item_id = struct.unpack_from("<IIBI", body, offset)
+        out.append(ShopItem(item_id=item_id, price=price, kind=kind))
+    return out
+
+
+def parse_buy_result(payload: bytes) -> int | None:
+    """↓ 0x00CA：買賣結果。0 = 成功。讀不到回 None。"""
+    return payload[0] if payload else None
+
+
+def parse_par_change(opcode: int, payload: bytes) -> tuple[int, int] | None:
+    """↓ 0x00B0 / 0x00B1：(type, value)。不是這兩個或長度不對就回 None。"""
+    if len(payload) < 6:
+        return None
+    if opcode == OP_PAR_CHANGE:
+        return struct.unpack_from("<HI", payload, 0)
+    if opcode == OP_LONGPAR_CHANGE:
+        return struct.unpack_from("<Hi", payload, 0)
+    return None
+
+
+def find_item(items: list[ShopItem], item_id: int) -> ShopItem | None:
+    """清單裡有沒有這個道具。**沒有就是沒有**，不准挑一個像的。"""
+    for item in items:
+        if item.item_id == item_id:
+            return item
+    return None
+
+
+def plan_purchase(
+    weight: int,
+    max_weight: int,
+    unit_weight: int,
+    zeny: int,
+    price: int,
+    ratio: float = FILL_RATIO,
+) -> Purchase:
+    """買到「現在負重 ＋ 買下去的重量」達到上限的 `ratio` 為止（使用者指定）。
+
+    全部用**原始值**（畫面上的十倍，見檔頭）。
+
+    ⚠ `unit_weight` 要是**量出來的**：先買 1 個、看負重跳多少。
+    道具表裡的重量只寫在說明文字（「重量 : 10」）—— 靠解說明字串就是
+    CLAUDE.md 禁止的那種「很有自信的錯」，而量一次就準。
+
+    ⚠ 沒有數量上限（使用者指定），但下單欄位是 u16，所以還是夾在 65535。
+    """
+    if unit_weight <= 0 or price <= 0 or max_weight <= 0:
+        return Purchase(0, "weight")
+    room = int(max_weight * ratio) - weight
+    if room <= 0:
+        return Purchase(0, "weight")
+    by_weight = room // unit_weight
+    by_zeny = zeny // price
+    amount = min(by_weight, by_zeny, _MAX_AMOUNT)
+    limited = "zeny" if by_zeny < by_weight else "weight"
+    return Purchase(max(amount, 0), limited)
+
+
+def display_weight(raw: int) -> int:
+    """原始負重換成畫面上看到的數字（給人看的字才用，算式一律用原始值）。"""
+    return raw // WEIGHT_SCALE
