@@ -63,29 +63,51 @@ class QtLogHandler(logging.Handler):
             pass
 
 
+#: 「執行日誌」面板與 app.log **至少**收到這個層級。
+#:
+#: ⚠⚠ **設定裡的 `log_level` 不准壓過它。** 那個設定預設是 `WARNING`，
+#: 而所有功能的進度都是 `INFO`（自動尋路的 `TravelBot._note()`、自動登入的
+#: 每一步、自動打怪的回報…）—— 於是使用者的面板與 app.log **一行進度都沒有**。
+#:
+#: 實際踩過兩次：
+#:   1. 自動登入卡住時去撈 app.log，登入步驟全空，完全看不出卡在哪。
+#:   2. 使用者回報「自動尋路都沒有提示文字出現，他在計算還是壞掉我都不知道」。
+#:
+#: 面板存在的唯一理由就是給人看進度；被記錄層級關掉等於這個功能不存在。
+#: `log_level` 現在的意思是「**主控台**的層級，以及要不要更囉唆（DEBUG）」。
+_UI_FLOOR = logging.INFO
+
+
 def setup_logging(level: str = "INFO") -> LogBridge:
     """初始化 root logger，回傳供 UI 綁定的 bridge。"""
     _enable_crash_log()
     formatter = logging.Formatter(_FORMAT, datefmt=_DATEFMT)
 
+    asked = getattr(logging, level.upper(), logging.INFO)
+    # 面板與檔案至少 INFO；使用者想要更囉唆（DEBUG）就照他的。
+    kept = min(asked, _UI_FLOOR)
+
     root = logging.getLogger()
-    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root.setLevel(kept)
     for handler in list(root.handlers):
         root.removeHandler(handler)
 
     console = logging.StreamHandler()
     console.setFormatter(formatter)
+    console.setLevel(asked)          # 主控台照設定，安靜就安靜
     root.addHandler(console)
 
     file_handler = RotatingFileHandler(
         log_dir() / "app.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
+    file_handler.setLevel(kept)      # 檔案是唯一的事後線索，不准比 INFO 安靜
     root.addHandler(file_handler)
 
     bridge = LogBridge()
     qt_handler = QtLogHandler(bridge)
     qt_handler.setFormatter(formatter)
+    qt_handler.setLevel(kept)        # 面板就是給人看進度的
     root.addHandler(qt_handler)
 
     return bridge

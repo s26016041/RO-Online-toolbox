@@ -561,3 +561,73 @@ def test_a_failed_reconnect_registers_nothing_to_restore(qtbot, monkeypatch):
     page._reconnect_decider = ReconnectDecider()
     page._reconnect_done(0, "狐狐狸", _Snap(farming=True), "開遊戲失敗")
     assert page._pending_restore == {}
+
+
+# ---- 進度與失敗一定要看得到 ---------------------------------------------
+#
+# 使用者回報：「自動尋路都沒有提示文字出現，他在計算還是壞掉或什麼讀不到
+# 我都不知道」。原因是設定裡的 log_level 預設是 WARNING，而所有進度都是 INFO
+# —— 執行日誌面板掛在 root logger 底下，INFO 根本流不到。
+
+
+def test_the_log_panel_still_gets_progress_when_the_level_is_warning(tmp_path,
+                                                                     monkeypatch):
+    """⚠ 面板存在的唯一理由就是給人看進度，不准被記錄層級關掉。"""
+    import logging
+
+    from ro_toolbox.config import paths
+    from ro_toolbox.utils import logging as mod
+
+    monkeypatch.setattr(paths, "log_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod, "log_dir", lambda: tmp_path)
+    bridge = mod.setup_logging("WARNING")
+    seen = []
+    bridge.message.connect(lambda level, text: seen.append((level, text)))
+    logging.getLogger("ro_toolbox.services.travel_bot").info("正在計算路線…")
+    assert any("正在計算路線" in text for _level, text in seen), seen
+
+
+def test_a_louder_setting_is_still_honoured(tmp_path, monkeypatch):
+    """設 DEBUG 就要更囉唆 —— 下限只是下限，不是上限。"""
+    import logging
+
+    from ro_toolbox.config import paths
+    from ro_toolbox.utils import logging as mod
+
+    monkeypatch.setattr(paths, "log_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod, "log_dir", lambda: tmp_path)
+    bridge = mod.setup_logging("DEBUG")
+    seen = []
+    bridge.message.connect(lambda level, text: seen.append(level))
+    logging.getLogger("ro_toolbox.services.travel_bot").debug("細節")
+    assert "DEBUG" in seen
+
+
+def test_travel_failures_are_warnings_not_progress(caplog):
+    """⚠ 「角色座標定位失敗，自動尋路停用」這種**硬失敗**要大聲。
+
+    以前它跟一般進度一樣走 INFO，於是在使用者的設定下一個字都看不到，
+    症狀就是「按了沒反應，不知道是在算還是壞了」。
+    CLAUDE.md：失效模式只准「大聲停用」或「安全退化」。
+    """
+    import logging
+
+    from ro_toolbox.services.travel_bot import TravelBot
+
+    bot = TravelBot(1234)
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.services.travel_bot"):
+        bot._fail("⚠ 角色座標定位失敗（遊戲可能已改版），自動尋路停用")
+    levels = [r.levelname for r in caplog.records]
+    assert "WARNING" in levels, levels
+
+
+def test_ordinary_progress_stays_at_info(caplog):
+    """進度還是 INFO —— 不要為了看得到就把所有東西都變成警告。"""
+    import logging
+
+    from ro_toolbox.services.travel_bot import TravelBot
+
+    bot = TravelBot(1234)
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.services.travel_bot"):
+        bot._note("正在計算 a → c 的路線…")
+    assert [r.levelname for r in caplog.records] == ["INFO"]

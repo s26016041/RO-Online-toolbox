@@ -3340,6 +3340,66 @@ A1  <全域>        mov  eax, [某全域]
   `_ReconnectWorker.run`）。測試 `tests/test_farm_page.py`
   （6 條，含「一拍不算」「行程還在不算」「沒勾不做」「我的網路斷了不做」）。
 
+### [ENV-008] ★★★ 功能的進度全是 INFO，而預設記錄層級是 WARNING —— 面板與 app.log **一行都沒有**
+
+- **狀態**：已驗證（讀程式碼＋使用者實際回報）＋ 已修
+- **日期**：2026-08-28
+- **使用者回報**：「自動尋路都沒有提示文字出現，他在計算還是壞掉或什麼讀不到
+  我都不知道」。
+
+**成因**：`setup_logging()` 直接 `root.setLevel(設定的層級)`，而
+`AppSettings.log_level` 預設是 **WARNING**。所有功能的進度都是 `INFO`：
+
+    TravelBot._note()      自動尋路每一步
+    AutoLogin.progress.note()  自動登入每一步
+    farm_bot / travel      路線規劃、傳點、NPC 對話…
+
+「執行日誌」面板是掛在 root logger 底下的 `QtLogHandler`，root 是 WARNING 就
+**流不到**。所以面板永遠空的，`app.log` 也一樣 —— 而那是事後唯一的線索。
+
+⚠ 同一個病之前已經吃過一次虧：自動登入卡住時去撈 `app.log`，
+登入步驟**全空**，完全看不出卡在哪（見 [INP-013] 最後一段）。
+
+**更糟的一半：連硬失敗也是 INFO。** `TravelBot._fail()` 走的是同一個
+`_note()`，所以
+
+    ⚠ 角色座標定位失敗（遊戲可能已改版），自動尋路停用
+    找不到遊戲 socket，無法送封包
+    找不到伺服器連線（還沒登入？）
+
+這些**停用等級**的訊息在使用者的設定下一個字都看不到 ——
+症狀就是「按了沒反應，不知道是在算還是壞了」。
+這違反 CLAUDE.md：定位失敗要**大聲**，失效模式只准「大聲停用」或「安全退化」。
+
+**修法**：
+
+1. `setup_logging()` 改成**分層**：root 與「面板／檔案」至少 `INFO`
+   （`kept = min(設定, INFO)`），**主控台**照設定。
+   `log_level` 的意思改成「主控台的層級，以及要不要更囉唆（DEBUG）」——
+   設 DEBUG 照樣全部變 DEBUG，下限只是下限不是上限。
+2. `TravelBot._note()` 加 `level` 參數，`_fail()` 用 **WARNING**。
+   一般進度**維持 INFO**（不要為了看得到就把所有東西變成警告，那等於沒有分級）。
+
+### [ENV-009] ★★ 跑測試會把日誌寫進**使用者真實的 app.log**，而且會誤導診斷
+
+- **狀態**：已驗證（從使用者的 app.log 反查出來）＋ 已修
+- **日期**：2026-08-28
+- **怎麼發現的**：使用者把 `app.log` 貼過來診斷斷線問題，裡面有這種行：
+
+      03:25:08 | INFO | travel | 路線算好了：2 段 —— a → b → c
+      03:25:08 | INFO | travel | 正在計算 a 上從 (5, 5) 到 b 傳點 (10, 10) 的路徑…
+
+  `a → b → c`、`(5,5)`、`(10,10)` 是 `tests/test_travel.py` 的**假地圖**，
+  不是真的在跑圖。⚠ **診斷的人（含 AI）會直接讀錯** —— 實際發生過。
+
+- **成因**：`tests/test_smoke.py` 呼叫 `create_app([])` →
+  `setup_logging(settings.log_level)` → 在 root logger 掛上一個指向
+  使用者 AppData 底下 `logs/app.log` 的 `RotatingFileHandler`，
+  而且**整個 pytest 過程都留著**。於是後面每一條測試的日誌都被寫進去。
+- **修法**：`tests/conftest.py` 加一個 session 級的 autouse fixture，
+  把 `config.paths.log_dir` 與 `utils.logging.log_dir` 導到暫存目錄。
+  production 程式碼不動。
+
 ### [ENV-007] ★★★ 另一支 onefile 程式開場清 `%TEMP%\_MEI*`，**把我們正在用的解壓目錄挖空**
 
 - **狀態**：已驗證（實機，兩支程式的 PID 與環境變數都對得起來）＋ 已修

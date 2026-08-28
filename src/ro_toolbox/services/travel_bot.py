@@ -235,8 +235,15 @@ class TravelBot:
         return True
 
     def _fail(self, message: str) -> bool:
+        """整條停掉，並且**大聲**講。
+
+        ⚠ 以前這裡跟一般進度一樣走 `INFO`，於是「角色座標定位失敗，自動尋路停用」
+        這種硬失敗在使用者的設定下**一個字都看不到** —— 症狀就是
+        「按了沒反應、不知道是在算還是壞了」（使用者實際回報）。
+        CLAUDE.md：定位失敗要大聲，失效模式只准「大聲停用」或「安全退化」。
+        """
         self._stats.running = False
-        self._note(message)
+        self._note(message, logging.WARNING)
         return False
 
     def _on_packet(self, packet) -> None:  # noqa: ANN001 - RoPacket，避免循環匯入
@@ -559,11 +566,16 @@ class TravelBot:
         """
         return self._destination
 
-    def _note(self, text: str) -> None:
-        # 提示字一律進**執行日誌**，不放介面（使用者指定）。
-        # 只在內容變動時記一筆 —— 這支每拍都會被呼叫，照記會把日誌洗成幾百行一樣的字。
+    def _note(self, text: str, level: int = logging.INFO) -> None:
+        """提示字一律進**執行日誌**，不放介面（使用者指定）。
+
+        只在內容變動時記一筆 —— 這支每拍都會被呼叫，照記會把日誌洗成幾百行一樣的字。
+
+        `level`：**停用等級的壞消息要用 `WARNING`**（見 `_fail`）。
+        進度用 INFO 就好。
+        """
         if text and text != self._stats.note:
-            log.info("%s", text)
+            log.log(level, "%s", text)
         self._stats.note = text
         self._emit()
 
