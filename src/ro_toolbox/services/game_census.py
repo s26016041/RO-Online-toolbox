@@ -108,6 +108,24 @@ def _account_of(pid: int, attempts: int = 3) -> str | None:
     return None
 
 
+def close(pid: int) -> bool:
+    """關掉指定的一個實例。回傳有沒有真的關掉。
+
+    ⚠ 給「這個客戶端已經沒救了」用（回連時登入沒完成就是這種）。
+    `close_idle()` 是照連線狀態掃全部，這支是**指名**關一個 ——
+    留一個半死的遊戲在那裡，下一次回連還要先繞過它。
+    """
+    import psutil
+
+    try:
+        psutil.Process(pid).terminate()
+    except Exception as exc:  # noqa: BLE001 - 關不掉要留紀錄，不能吞掉
+        log.warning("關不掉 PID %s：%s", pid, exc)
+        return False
+    log.info("關掉實例 PID %s", pid)
+    return True
+
+
 def close_idle(instances: list[Instance] | None = None) -> list[int]:
     """關掉所有**沒有連線**的實例。回傳關掉的 PID。
 

@@ -37,13 +37,21 @@ from ro_toolbox.services.gamedata import (
     item_name,
     item_names,
     mob_name,
-    warps_on_map,
 )
 from ro_toolbox.services.mapdata import GatError, MapTerrain, load_terrain
 from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel import Traveler
 from ro_toolbox.services.walker import MAX_STEP, Walker, line_cells
+from ro_toolbox.services.warpzone import (
+    KEEP_OUT as _WARP_KEEP_OUT,
+)
+from ro_toolbox.services.warpzone import (
+    keep_out as _keep_out,
+)
+from ro_toolbox.services.warpzone import (
+    warp_cells as _warp_cells_of,
+)
 from ro_toolbox.services.world import Monster, WorldTracker
 
 log = logging.getLogger(__name__)
@@ -119,22 +127,10 @@ _RESEND_NEAR = 3
 _PATH_SLACK = 3
 #: 那個確認用的 A* 節點上限。只走幾格，不該花時間；超過就當「繞太遠」。
 _NEAR_BUDGET = 3000
-#: 傳點周圍幾格內一律不去。
-#:
-#: ⚠ **踩到傳點會被傳到別張地圖。** 那不只是走錯路 —— 新地圖可能有打不動的怪，
-#: 而且 bot 會在那裡繼續打（使用者實測回報「怪在傳點裡面或旁邊，追過去就被傳走」）。
-#: 傳點資料（`navi_link_tw.lub` → `assets/warps.json.gz`）只給一格，
-#: 但實際的傳點是一片區域，所以要留餘裕。
-_WARP_KEEP_OUT = 3
-#: 同一張圖上通往**同一張地圖**、又共線、又靠得這麼近的兩個傳點，
-#: 當成**同一條傳點帶**，中間整段都不准踩。
-#:
-#: ⚠ 依據是實測的資料形狀：`navi_link` 對一條傳點帶只取樣幾個點 ——
-#: `moc_fild01` 往 `moc_fild02` 是 (301,16)/(321,16)/(341,16) **三筆指向
-#: 同一個目的地格**，中間 20 格一段完全沒有資料。只擋取樣點周圍 3 格，
-#: 等於在傳點帶上留了兩個 14 格寬的洞，走過去就被傳走。
-#: 實測代價很小：prt_fild08 禁區 0.2%→0.3%、moc_fild01 0.2%→0.3%。
-_WARP_STRIP_MAX = 60
+#: ⚠ 「傳點周圍不准踩」與「一條傳點帶要補起來」現在**只有一份定義**，
+#: 在 `services/warpzone.py`（`KEEP_OUT` / `STRIP_MAX` / `warp_strips`）。
+#: 以前自動打怪有、自動尋路沒有 —— 尋路的 A* 因此大方地穿過傳點，
+#: 出門就在門邊、下一步又踩回去，來回刷到被伺服器斷線（使用者實測）。
 #: 脫離禁區時，最遠往外找幾格。禁區半徑之外再留一點，免得剛好停在邊界上。
 _ESCAPE_MARGIN = 4
 #: 被傳走之後，走回原本那張圖最多花多久。逾時就大聲停用。
@@ -170,35 +166,6 @@ _RESYNC_SEC = 2.0  # 多久檢查一次「地圖／連線有沒有換掉」
 # 傷害／動作封包：payload[0:4]=攻擊者 GID、[4:8]=目標 GID
 _DAMAGE_OPS = (0x08C8, 0x02E1)
 _OP_MOVE_ACK = 0x0087  # 伺服器確認「我」要移動：payload[4:10] = 起點+終點
-
-
-def _warp_strips(by_dest: dict[str, list[tuple[int, int]]]) -> set[tuple[int, int]]:
-    """把「同一張圖上通往同一個目的地、又共線、又靠得夠近」的傳點連成一條帶。
-
-    ⚠ 這不是猜的，是**資料形狀本身**告訴我們的：`navi_link_tw.lub` 對一條
-    傳點帶只取樣幾個點。實測 `moc_fild01` 往 `moc_fild02` 有三筆
-    (301,16)/(321,16)/(341,16) **指向同一個目的地格** —— 那顯然是一條約 40 格
-    寬的傳點帶，只被取樣三次。只擋取樣點周圍 3 格的話，中間留了兩個 14 格的洞，
-    人走過去照樣被傳走（使用者實測回報「自動打怪走一走被傳到別的地圖」）。
-
-    只連**共線**且距離 `_WARP_STRIP_MAX` 以內的兩點：距離遠的多半是兩個各自
-    獨立、剛好通往同一張圖的傳點（實測 `ayo_dun02` 有兩個相隔 252 格的），
-    連起來會擋掉一整條沒事的路。
-    """
-    strip: set[tuple[int, int]] = set()
-    for cells in by_dest.values():
-        spots = sorted(set(cells))
-        for i, a in enumerate(spots):
-            for b in spots[i + 1:]:
-                if a[0] != b[0] and a[1] != b[1]:
-                    continue  # 不共線 = 不是同一條帶
-                if max(abs(a[0] - b[0]), abs(a[1] - b[1])) > _WARP_STRIP_MAX:
-                    continue
-                if a[0] == b[0]:
-                    strip.update((a[0], y) for y in range(min(a[1], b[1]), max(a[1], b[1]) + 1))
-                else:
-                    strip.update((x, a[1]) for x in range(min(a[0], b[0]), max(a[0], b[0]) + 1))
-    return strip
 
 
 @dataclass
@@ -1014,26 +981,15 @@ class FarmBot:
 
         查不到就是空的 —— 安全退化成「跟以前一樣會踩到」，不會因此不能走路。
         """
-        cells: set[tuple[int, int]] = set()
-        by_dest: dict[str, list[tuple[int, int]]] = {}
-        for x, y, dest, _dx, _dy in warps_on_map(map_name):
-            cells.add((x, y))
-            by_dest.setdefault(dest, []).append((x, y))
-        strip = _warp_strips(by_dest)
-        cells |= strip
+        from_data = _warp_cells_of(map_name)     # 取樣點 ＋ 補起來的傳點帶
         learned = self._learned.get(map_name, set())
-        cells |= learned
-        zone: set[tuple[int, int]] = set()
-        for x, y in cells:
-            for dx in range(-_WARP_KEEP_OUT, _WARP_KEEP_OUT + 1):
-                for dy in range(-_WARP_KEEP_OUT, _WARP_KEEP_OUT + 1):
-                    zone.add((x + dx, y + dy))
-        self._warp_zone = frozenset(zone)
+        cells = set(from_data) | learned
+        self._warp_zone = _keep_out(cells)
         # 傳點**本體**那一格。禁區是「不想去」，本體是「踩到就被傳走」——
         # 從禁區裡面往外走時只避開本體，避開整片禁區的話就永遠走不出來。
         self._warp_cells = frozenset(cells)
-        log.info("%s 的傳點 %d 格（帶狀補了 %d、實際踩過學到 %d）、禁區 %d 格",
-                 map_name, len(self._warp_cells), len(strip), len(learned),
+        log.info("%s 的傳點 %d 格（資料＋帶狀 %d、實際踩過學到 %d）、禁區 %d 格",
+                 map_name, len(self._warp_cells), len(from_data), len(learned),
                  len(self._warp_zone))
 
     def _learn_warp(self, old_map: str) -> None:

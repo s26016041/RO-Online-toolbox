@@ -738,6 +738,7 @@ class _ReconnectWorker(Worker):
         from ro_toolbox.services import game_census, game_launcher
         from ro_toolbox.services.auto_login import AutoLogin
 
+        fresh = 0     # 已經開起來的新遊戲；失敗時要把它關掉（見 `_give_up`）
         try:
             account = self._find_account(account_store)
             if account is None:
@@ -756,15 +757,35 @@ class _ReconnectWorker(Worker):
             if problem:
                 self.done.emit(0, self._who, self._snap, problem)
                 return
-            pid = game_launcher.launch_game_directly(paths)
-            progress = AutoLogin(account, pid, lambda t: log.info("回連：%s", t)).run()
+            fresh = game_launcher.launch_game_directly(paths)
+            progress = AutoLogin(account, fresh, lambda t: log.info("回連：%s", t)).run()
             if not getattr(progress, "ok", True):
-                self.done.emit(0, self._who, self._snap, "重新登入沒有完成")
+                self._give_up(fresh, "重新登入沒有完成")
                 return
-            self.done.emit(pid, self._who, self._snap, "")
+            self.done.emit(fresh, self._who, self._snap, "")
         except Exception as exc:  # noqa: BLE001 - 背景失敗要回報，不能吞掉
             log.exception("自動回連失敗")
-            self.done.emit(0, self._who, self._snap, str(exc))
+            self._give_up(fresh, str(exc))
+
+    def _give_up(self, pid: int, why: str) -> None:
+        """這次回連失敗 —— **把剛開起來的那個遊戲關掉**再回報。
+
+        ⚠ 使用者實測回報：「回連失敗當斷線應該直接關閉再開重新連線，
+        現在卻卡在那邊一直按 ENTER。」登入沒完成的客戶端是**沒救的**
+        （多半是卡登：角色還掛在伺服器上，怎麼打都不會過），留著只有壞處：
+
+        1. 畫面上就停在那個半死的登入畫面，看起來像程式當掉了；
+        2. 它還佔著帳號，下一次重登更容易再卡一次；
+        3. 分頁是照「有連線的遊戲行程」建的 —— 它永遠不會有分頁，
+           等於一個沒人看得到、也沒人會收拾的殭屍。
+
+        關掉它，退避時間到了再開一個乾淨的（`_reconnect_done` 會把觀察接回去）。
+        """
+        if pid:
+            from ro_toolbox.services import game_census
+
+            game_census.close(pid)
+        self.done.emit(0, self._who, self._snap, why)
 
     def _find_account(self, account_store):
         """用**角色名**找帳號（身分），不是用 pid（位置）。"""
@@ -805,6 +826,8 @@ class FarmPage(BasePage):
         self._reconnecting = False
         self._reconnect_thread = None
         self._reconnect_decider = None
+        #: 正在回連的那個舊 PID。失敗時放回 `_watching` 讓退避重試接得下去。
+        self._reconnect_pid = 0
         self._bag_workers: dict[int, BagWorker] = {}
         self._bag_loaded: set[int] = set()
         # 每個角色最近一次讀到的背包 {格號: (道具編號, 數量)}
@@ -1198,12 +1221,22 @@ class FarmPage(BasePage):
         self._reconnecting = True
         self._reconnect_thread = thread
         self._reconnect_decider = decider
+        self._reconnect_pid = pid       # 失敗時要放回 `_watching`，見 `_reconnect_done`
         thread.start()
 
     def _reconnect_done(self, new_pid: int, who: str, snap, why: str) -> None:
         if new_pid <= 0:
             # ⚠ 失敗要退避，不能無腦一直重開（伺服器維修時我們分不出來）
             self._reconnect_decider.note_attempt_failed(time.monotonic())
+            # ⚠⚠ **失敗之後還要繼續看著他，不然這一趟就此永遠停住。**
+            # `_begin_reconnect` 把 `_watching[who]` 拿掉了（那個行程一定會消失），
+            # 而分頁是照「**有連線的**遊戲行程」建的 —— 登入沒完成就沒有分頁。
+            # 所以不放回去的話：`_cards` 裡沒有他、`_watching` 裡也沒有他，
+            # 退避時間到了也**沒有任何一拍會再試一次**。使用者看到的正是
+            # 「回連失敗之後就卡在那裡」。
+            # 放回去的是那個已經關掉的 PID：下一拍照樣判定「行程不見了」，
+            # 走同一個 decider，退避到期就自動再重連一次。
+            self._watching[who] = self._reconnect_pid
             log.warning("「%s」自動回連失敗：%s；%s", who, why,
                         self._reconnect_decider.note)
             return

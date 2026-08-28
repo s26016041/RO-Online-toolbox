@@ -35,6 +35,7 @@ from ro_toolbox.services.gamedata import (
 )
 from ro_toolbox.services.mapdata import GatError, MapTerrain, load_terrain
 from ro_toolbox.services.walker import Walker
+from ro_toolbox.services.warpzone import KEEP_OUT, keep_out, warp_cells
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +70,22 @@ BOUNCE_WINDOW_SEC = 40.0
 BOUNCE_LIMIT = 4
 #: 座標落在不可走格時，往旁邊找可走格當起點的半徑（gat type 5 的語意未確認）。
 START_SNAP = 3
+#: 我們**要踩的**那道門，周圍這個半徑內不列入「繞開別的傳點」的禁區。
+#:
+#: ⚠ 不留這個洞的話，禁區會把終點自己包起來 —— A* 連門口都到不了，
+#: 每一道門都變成「走不到」，症狀跟資料壞掉一模一樣。
+DOOR_CLEAR = KEEP_OUT + 1
+#: 路線規劃最多退讓幾次「落地之後走不到下一道門」（見 `_dead_end`）。
+#:
+#: ⚠ 每退一次要多跑一次 BFS，所以要有上限。用完**不是失敗**：照原本的路線走，
+#: 每進一張圖之前都會再驗一次（見 `_replan`）。
+ROUTE_TRIES = 8
+#: 一次規劃裡最多做幾次**沒算過的**泛洪。一次約 0.1 秒（實測 400×400），
+#: 整條路線幾十段都現算的話換一次圖就要卡好幾秒。
+#:
+#: ⚠ 這是**看多遠**的預算，不是「驗不完就當它是好的」的藉口 ——
+#: 沒驗到的段落等真的走到那張圖再驗，那時它會變成第一段。
+FILL_BUDGET = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,6 +284,10 @@ class Traveler:
         #: 房間，挑門要靠它（見 `_gate_options`）。換圖就作廢。
         self._reach: frozenset[tuple[int, int]] | None = None
         self._stale_since = 0.0  # 座標還停在上一張圖的起算時間（[MEM-022]）
+        #: 「這張圖的這個落地點走得到哪些格」的快取（見 `_dead_end`）。
+        #: 一次泛洪 0.1 秒，換一次目的地就作廢 —— 地形是靜態的，同一趟不必重算。
+        self._entry_reach: dict[tuple[str, tuple[int, int]], frozenset] = {}
+        self._fills = 0          # 這一次規劃還剩幾次泛洪額度（見 `FILL_BUDGET`）
         self.note = ""
 
     def _settle(self, pos: tuple[int, int]) -> tuple[int, int] | None:
@@ -330,6 +351,7 @@ class Traveler:
         self._replans = 0
         self._stale_since = 0.0
         self._hops.clear()
+        self._entry_reach.clear()
         self._clear_warp()
         self._walker.clear()
         self.note = f"準備前往 {map_name}"
@@ -440,6 +462,145 @@ class Traveler:
 
     # ---- 內部 -------------------------------------------------------
 
+    def _warp_avoid(
+        self, map_name: str, keep: tuple[int, int] | None, *, wide: bool
+    ) -> frozenset[tuple[int, int]]:
+        """這張圖上「走過去的路上不准踩」的格子 —— 我們要踩的那道門除外。
+
+        `wide=True` 是連傳點周圍都繞開（`warpzone.KEEP_OUT`），
+        `wide=False` 只繞開傳點本體。分兩階是因為**擋過頭比不擋更糟**：
+        禁區把窄路封死時整段會變成「走不到」，看起來就像地圖資料壞掉。
+        """
+        cells = warp_cells(map_name)
+        if not cells:
+            return frozenset()
+        zone = keep_out(cells) if wide else frozenset(cells)
+        if keep is None:
+            return zone
+        return zone - keep_out({keep}, radius=DOOR_CLEAR)
+
+    def _path_to(
+        self,
+        terrain: MapTerrain,
+        map_name: str,
+        pos: tuple[int, int],
+        goal: tuple[int, int],
+    ) -> tuple[list[tuple[int, int]] | None, frozenset[tuple[int, int]]]:
+        """算路徑，而且**不准穿過別的傳點**。回 (路徑, 這一段要避開的格子)。
+
+        ⚠⚠ 使用者實測的斷線鏈就是從這裡開始的（細節見 `services/warpzone.py`
+        檔頭）：A* 不知道傳點的存在，而**從門裡出來時人就站在門邊** ——
+        只要目標在門的另一側，路徑第一格就是那道門。被傳回去、走出來、
+        再被傳回去，來回刷到伺服器把連線切斷（WSA 10054）。
+
+        擋不動就一階一階退（整片禁區 → 只擋傳點本體 → 完全不擋）：
+        寧可繞遠也不能因為擋過頭就走不了路。**每退一階都留下紀錄** ——
+        安靜地退回舊行為，等於這個修正沒發生過。
+        """
+        plans: list[frozenset[tuple[int, int]]] = []
+        for wide in (True, False):
+            avoid = self._warp_avoid(map_name, goal, wide=wide)
+            if avoid and avoid not in plans:
+                plans.append(avoid)
+        plans.append(frozenset())
+        for index, avoid in enumerate(plans):
+            path = terrain.find_path(
+                pos, goal, node_budget=NODE_BUDGET, blocked=avoid or None
+            )
+            if path is None:
+                continue
+            if not avoid and index:
+                log.warning(
+                    "⚠ %s 上從 %s 到 %s 只有**穿過別的傳點**才走得到 —— "
+                    "這一段可能被傳到計畫外的地圖（真的被傳走會自動重新規劃）",
+                    map_name, pos, goal,
+                )
+            return path, avoid
+        return None, frozenset()
+
+    def _plan(self, map_name: str, avoid: set[tuple[str, int, int]]):
+        """算一條路線。**先試純走路**，走不到才把要對話的 NPC 連結算進來 ——
+        BFS 只看換圖次數，不擋的話它會為了少換一張圖就叫你去搭船。"""
+        route = plan_route(map_name, self._goal_map, avoid)
+        if route is None:
+            route = plan_route(map_name, self._goal_map, avoid, allow_npc=True)
+        return route
+
+    def _dead_end(self, route: list[Hop]) -> Hop | None:
+        """路線上哪一段**落地之後走不到下一道門**？沒有就回 None。
+
+        ⚠⚠ 這是使用者實測「自動尋路走進一間店又走出來」的**根因**。
+        `plan_route` 是**地圖層級**的 BFS：看到 `s_atelier` 上有一道門通往
+        `rachel`，就以為「進得去 s_atelier 就走得到 rachel」。
+        實際上 `s_atelier`（思念的工房）是**一張地圖裡四個互不相連的房間**，
+        每間各自通往一座城，房間之間要再踩一次同圖內的傳點才過得去。實測：
+
+            從 prontera 落在 (13,119)，這一塊只有 282 格 / 全圖 2179 格。
+            走得到的門只有 (10,119)→prontera 與 (31,128)→s_atelier；
+            (131,75)→rachel、(106,121)→yuno、(18,79)→lighthalzen 全部走不到。
+
+        所以進去之後每一道門都算不出路，只能原路走回 prontera —— 那就是
+        「進房子又回頭出來」。而落地點就在門邊，回頭那一步又踩回同一道門，
+        來回刷到 **WSA 10054**（伺服器把連線切掉）。
+
+        要在**還沒走過去之前**就發現，判斷用的是手上已經有的資料
+        （`assets/terrain` ＋ `assets/warps.json.gz`），不是猜的。
+
+        ⚠ 通往同一張圖的門要**全部**看過（常常有好幾道，見 `_gate_options`），
+        只看 BFS 任意挑中的那一道會把好路誤判成死路。
+        ⚠ 判斷不了（地形讀不到、泛洪預算用完）就**不擋**：「不確定」不等於
+        「走不到」。沒驗到的段落等真的走到那張圖再驗 —— 那時它就是第一段。
+        """
+        for index, hop in enumerate(route):
+            if self._fills <= 0:
+                break  # 這一拍看到這裡為止，剩下的等走到那張圖再說
+            if hop.npc:
+                continue  # 要跟人講話才過得去：過去之後落在哪裡我們不知道
+            nxt = route[index + 1] if index + 1 < len(route) else None
+            if nxt is None:
+                if self._goal_cell is None:
+                    return None  # 進得了那張圖就算抵達，不必判斷房間
+                wanted = [self._goal_cell]
+            else:
+                wanted = [nxt.cell]
+                if not nxt.npc:
+                    wanted += [
+                        (x, y)
+                        for x, y, dest, _dx, _dy in warps_on_map(hop.to_map)
+                        if dest == nxt.to_map
+                    ]
+            if self._lands_within_reach(hop, wanted) is False:
+                return hop
+        return None
+
+    def _lands_within_reach(
+        self, hop: Hop, wanted: list[tuple[int, int]]
+    ) -> bool | None:
+        """踩完 `hop` 落地之後，`wanted` 裡有任何一格走得到嗎？不確定回 None。
+
+        泛洪結果快取起來（同一趟裡同一個落地點只算一次），並且吃 `_fills` 預算。
+        """
+        try:
+            terrain = self._load(hop.to_map)
+        except GatError:
+            return None
+        land = nearest_walkable(terrain, (hop.to_x, hop.to_y), radius=START_SNAP)
+        if land is None:
+            return None
+        key = (hop.to_map, land)
+        reach = self._entry_reach.get(key)
+        if reach is None:
+            self._fills -= 1
+            reach = terrain.reachable_from(land)
+            self._entry_reach[key] = reach
+        if not reach:
+            return None
+        for cell in wanted:
+            spot = nearest_walkable(terrain, cell)
+            if spot is not None and spot in reach:
+                return True
+        return False
+
     def _replan(self, map_name: str) -> bool:
         self._replans += 1
         if self._replans > MAX_REPLANS:
@@ -450,14 +611,46 @@ class Traveler:
         log.info("正在計算 %s → %s 的路線…（第 %d 次規劃）",
                  map_name, self._goal_map, self._replans)
         self.note = f"正在計算前往 {self._goal_map} 的路線…"
-        # 先試**純走路**走得到的路線。走得到就別麻煩人 ——
-        # BFS 只看換圖次數，不擋的話它會為了少換一張圖就叫你去搭船。
-        route = plan_route(map_name, self._goal_map, self._avoid)
+        # ⚠ BFS 是**地圖層級**的，它以為「進得去那張圖就走得到圖上任何一道門」。
+        # 室內圖不是這樣（`s_atelier` 是一張圖四個互不相連的房間），所以算完
+        # 要再問一次 `_dead_end`：落地之後真的走得到下一道門嗎？走不到就把
+        # 那道門排除再算一次 —— **在還沒走過去之前**，不是走進去才發現。
+        keep = set(self._avoid)   # 這一輪之前就有的黑名單（真的踩過去失敗的那些）
+        self._fills = FILL_BUDGET
+        route = None
+        for _ in range(ROUTE_TRIES):
+            route = self._plan(map_name, self._avoid)
+            if route is None:
+                break            # 繞不開了 —— 下面退回原本那條
+            dead = self._dead_end(route)
+            if dead is None:
+                break
+            log.info(
+                "%s 的落地點 (%d,%d) 走不到接下來要走的門"
+                "（一張地圖裡好幾個互不相連的房間）—— 不走 %s (%d,%d) 這道門，重算",
+                dead.to_map, dead.to_x, dead.to_y, dead.from_map, dead.x, dead.y,
+            )
+            self._avoid.add(dead.key)
+        else:
+            route = None         # 試完 `ROUTE_TRIES` 條都是死路，一樣退回原本那條
         if route is None:
-            route = plan_route(map_name, self._goal_map, self._avoid, allow_npc=True)
-        if route is None:
-            self.note = _no_route_note(map_name, self._goal_map)
-            return False
+            # ⚠ 繞不開「落地在走不出去的房間」。**不要因此停掉整趟** ——
+            # 那代表 `plan_route` 這種地圖層級的 BFS 表達不出「同一張圖裡要再踩
+            # 一次內部傳點換房間」（GAMEDATA [DAT-032]），**不代表路真的不通**。
+            # 退回原本那條照走：途中每進一張圖都會再驗一次，真的踩不過去還有
+            # `_give_up_leg` 的黑名單與 `_bouncing` 收尾。
+            excluded = self._avoid - keep
+            self._avoid = keep
+            route = self._plan(map_name, keep)
+            if route is None:
+                self.note = _no_route_note(map_name, self._goal_map, excluded=bool(keep))
+                return False
+            if excluded:
+                log.warning(
+                    "⚠ 到 %s 的路線繞不開「落地在走不出去的房間」（排除了 %d 道門"
+                    "還是繞不掉）—— 先照原路走，進每一張圖之前會再驗一次",
+                    self._goal_map, len(excluded),
+                )
         self._route = route
         self._route_map = map_name
         # ⚠ 不清 `_terrain`：這支現在是在地形載好、座標確認過之後才被呼叫的，
@@ -612,11 +805,11 @@ class Traveler:
             if max(abs(goal[0] - pos[0]), abs(goal[1] - pos[1])) <= ARRIVE_RADIUS:
                 return self._on_leg_done(pos)
             log.info("正在計算 %s 上從 %s 到目的地 %s 的路徑…", map_name, pos, goal)
-            path = terrain.find_path(pos, goal, node_budget=NODE_BUDGET)
+            path, avoid = self._path_to(terrain, map_name, pos, goal)
             if not path:
                 self.note = f"⚠ {map_name} 上走不到 {goal}"
                 return self._give_up_leg(map_name)
-            self._walker.set_path(path)
+            self._walker.set_path(path, avoid=avoid)
             self._walker.update(pos)
             self.note = self._progress_note()
             return "walking"
@@ -638,13 +831,15 @@ class Traveler:
                 return self._on_leg_done(pos)
             log.info("正在計算 %s 上從 %s 到 %s 傳點 %s 的路徑…",
                      map_name, pos, hop.to_map, goal)
-            path = terrain.find_path(pos, goal, node_budget=NODE_BUDGET)
+            # ⚠ 路上**不准穿過別的傳點**：出門就站在門邊，不擋的話第一步就
+            # 踩回去，來回刷到被伺服器斷線（見 `_path_to`）。
+            path, avoid = self._path_to(terrain, map_name, pos, goal)
             if path:
                 if hop != self._route[0]:
                     log.info("%s 上通往 %s 的門有 %d 道，從這裡走得到的是 %s",
                              map_name, hop.to_map, doors, goal)
                 self._route[0] = hop
-                self._walker.set_path(path)
+                self._walker.set_path(path, avoid=avoid)
                 self._walker.update(pos)
                 self.note = self._progress_note()
                 return "walking"

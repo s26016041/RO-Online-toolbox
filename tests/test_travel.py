@@ -43,6 +43,8 @@ class FakeWalker:
 
     def __init__(self) -> None:
         self.paths: list[list[tuple[int, int]]] = []
+        #: 每一段被交代「這些格不准經過」的集合（尋路用它繞開別的傳點）
+        self.avoids: list[frozenset[tuple[int, int]]] = []
         self.state = "idle"
         self.cleared = 0
 
@@ -50,8 +52,9 @@ class FakeWalker:
         self.cleared += 1
         self.state = "idle"
 
-    def set_path(self, cells) -> None:
+    def set_path(self, cells, avoid=None) -> None:
         self.paths.append(list(cells))
+        self.avoids.append(frozenset(avoid or ()))
         self.state = "walking"
 
     def update(self, pos):  # noqa: ANN001, ARG002
@@ -845,3 +848,110 @@ def test_a_new_goal_forgets_the_old_bouncing():
         traveler._bouncing("s_atelier" if i % 2 == 0 else "prontera")
     traveler.set_goal("geffen")
     assert traveler._hops == []
+
+
+# ---- 走進房子又回頭出來（使用者實測：來回刷到被伺服器斷線）-----------------
+#
+# 兩個獨立的洞，缺一條都還是會斷線：
+#   1. `plan_route` 是**地圖層級**的 BFS，以為「進得去那張圖就走得到圖上任何
+#      一道門」。室內圖不是這樣（`s_atelier` 是一張圖四個互不相連的房間）。
+#   2. A* 不知道傳點的存在。**出門就站在門邊**，只要目標在門的另一側，
+#      路徑第一格就是那道門 —— 被傳回去、走出來、又被傳回去。
+
+#: a 有兩道門：進 b 會落在「跟出口隔著一道牆」的房間，進 d 沒問題。
+SEALED_WARPS = {
+    "a": [(10, 10, "b", 90, 90), (12, 12, "d", 50, 50)],
+    "b": [(30, 30, "c", 70, 70)],
+    "d": [(60, 60, "c", 71, 71)],
+    "c": [],
+}
+
+
+def sealed_terrain(name: str) -> MapTerrain:
+    """x=40 一整排牆，把落地點 (90,90) 跟出口 (30,30) 隔開。"""
+    terrain = open_terrain(name)
+    terrain.types[:, 40] = 1
+    return terrain
+
+
+def _sealed(monkeypatch, warps=SEALED_WARPS):
+    monkeypatch.setattr(travel, "warps_on_map", lambda m: warps.get(m, []))
+    monkeypatch.setattr(travel, "warp_cells", lambda _m: frozenset())
+    return make(lambda name: sealed_terrain(name) if name == "b" else open_terrain(name))
+
+
+def test_a_route_landing_in_a_sealed_room_is_dropped_before_walking_in(monkeypatch):
+    """⚠ 重點是**還沒走過去之前**就換路，不是走進去發現走不出來才回頭。
+
+    實機那一次就是走進 s_atelier（落地 (13,119)，那一塊只有 282/2179 格），
+    往 rachel／yuno／lighthalzen 的門全部走不到，只好原路走回 prontera。
+    """
+    traveler, walker, _clock = _sealed(monkeypatch)
+    traveler.set_goal("c")
+
+    assert traveler.update("a", (5, 5)) == "walking"
+    assert [hop.to_map for hop in traveler.route] == ["d", "c"], "應該改走 d 那道門"
+    assert walker.paths, "要真的開始走，不是停在那裡"
+
+
+def test_no_alternative_route_still_walks_instead_of_stopping(monkeypatch):
+    """繞不開的時候**照原路走**，不要把整趟停掉。
+
+    地圖層級的 BFS 表達不出「同一張圖裡再踩一次內部傳點換房間」
+    （`s_atelier` 的房間之間就是這樣連的），所以「驗不過」不等於「路不通」。
+    真的踩不過去還有傳點黑名單與來回偵測收尾。
+    """
+    only = {"a": [(10, 10, "b", 90, 90)], "b": [(30, 30, "c", 70, 70)], "c": []}
+    traveler, walker, _clock = _sealed(monkeypatch, only)
+    traveler.set_goal("c")
+
+    assert traveler.update("a", (5, 5)) == "walking"
+    assert [hop.to_map for hop in traveler.route] == ["b", "c"]
+
+
+#: a 上有兩道門：(10,10) 是我們要走的，(50,50) 是**別人的**，踩到就被傳走。
+CROSSING_WARPS = {
+    "a": [(10, 10, "b", 90, 90), (50, 50, "dead_end", 5, 5)],
+    "b": [(30, 30, "c", 70, 70)],
+    "c": [],
+    "dead_end": [(6, 6, "a", 51, 50)],
+}
+
+
+def test_the_path_refuses_to_cross_another_warp(monkeypatch):
+    """⚠ 這是斷線那一整串的起點。
+
+    實機日誌：人剛從 s_atelier 走出來站在 prontera (271,108)，要去
+    prt_fild06 的門 (289,203) —— 而 s_atelier 的門就在 (272,108)。
+    舊版的 A* 不知道傳點的存在，第一步就踩回去，再走出來、再踩回去，
+    來回刷到 `send 失敗，WSA 錯誤 10054`。
+    """
+    monkeypatch.setattr(travel, "warps_on_map", lambda m: CROSSING_WARPS.get(m, []))
+    monkeypatch.setattr(
+        travel,
+        "warp_cells",
+        lambda m: frozenset((x, y) for x, y, *_ in CROSSING_WARPS.get(m, [])),
+    )
+    traveler, walker, _clock = make()
+    traveler.set_goal("c")
+
+    # 站在別人那道門的正旁邊，目標在門的另一側 —— 直線會直接穿過去
+    assert traveler.update("a", (51, 50)) == "walking"
+    assert (50, 50) not in walker.paths[0], "路徑踩到別的傳點＝會被傳到別張地圖"
+    assert (50, 50) in walker.avoids[0], "走路那一層也要知道這格不准經過"
+
+
+def test_the_door_we_are_heading_for_is_not_blocked(monkeypatch):
+    """⚠ 只擋**別的**門。連要踩的那道都擋掉的話，每一道門都變成「走不到」。"""
+    monkeypatch.setattr(travel, "warps_on_map", lambda m: CROSSING_WARPS.get(m, []))
+    monkeypatch.setattr(
+        travel,
+        "warp_cells",
+        lambda m: frozenset((x, y) for x, y, *_ in CROSSING_WARPS.get(m, [])),
+    )
+    traveler, walker, _clock = make()
+    traveler.set_goal("c")
+
+    assert traveler.update("a", (80, 80)) == "walking"
+    assert walker.paths[0][-1] == (10, 10), "最後一步就是要踩上那道門"
+    assert (10, 10) not in walker.avoids[0]

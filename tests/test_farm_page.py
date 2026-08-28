@@ -563,6 +563,50 @@ def test_a_failed_reconnect_registers_nothing_to_restore(qtbot, monkeypatch):
     assert page._pending_restore == {}
 
 
+# ---- 回連失敗：關掉那個沒救的客戶端，而且要**繼續看著他** -------------------
+#
+# 使用者實測回報：「回連失敗當斷線應該直接關閉再開重新連線，
+# 現在卻卡在那邊一直按 ENTER。」
+
+
+def test_a_failed_login_closes_the_client_it_just_opened(qtbot, monkeypatch):
+    """⚠ 登入沒完成的客戶端是沒救的（多半是卡登）。留著只會佔著帳號、
+    停在半死的登入畫面，而且**永遠不會有分頁**（分頁要有連線才建）。"""
+    from ro_toolbox.services import game_census
+    from ro_toolbox.ui.pages.farm_page import _ReconnectWorker
+
+    closed: list[int] = []
+    monkeypatch.setattr(game_census, "close", lambda pid: closed.append(pid) or True)
+    worker = _ReconnectWorker(1234, "狐狐狸", _Snap(farming=True))
+    seen: list[tuple] = []
+    worker.done.connect(lambda *args: seen.append(args))
+
+    worker._give_up(5678, "重新登入沒有完成")
+
+    assert closed == [5678], "剛開起來的那個要當場關掉"
+    assert seen and seen[0][0] == 0, "還是要回報失敗，讓退避接手"
+
+
+def test_a_failed_reconnect_keeps_watching_so_the_retry_can_fire(qtbot, monkeypatch):
+    """⚠⚠ 不放回 `_watching` 的話，退避時間到了也**沒有任何一拍會再試**。
+
+    `_begin_reconnect` 會把舊 PID 拿掉（那個行程一定會消失），而分頁是照
+    「**有連線的**遊戲行程」建的 —— 登入沒完成就沒有分頁。兩邊都沒有他，
+    就是使用者說的「回連失敗之後卡在那裡」。
+    """
+    from ro_toolbox.services.reconnect import ReconnectDecider
+
+    page = _page(qtbot)
+    page._reconnect_decider = ReconnectDecider()
+    page._reconnect_pid = 1234
+    page._watching.pop("狐狐狸", None)
+
+    page._reconnect_done(0, "狐狐狸", _Snap(farming=True), "重新登入沒有完成")
+
+    assert page._watching.get("狐狐狸") == 1234
+    assert page._reconnect_decider.failures == 1, "還是要退避，不能無腦連開"
+
+
 # ---- 進度與失敗一定要看得到 ---------------------------------------------
 #
 # 使用者回報：「自動尋路都沒有提示文字出現，他在計算還是壞掉或什麼讀不到

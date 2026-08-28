@@ -438,7 +438,7 @@ def _bot_in_warp_zone(monkeypatch, *, warp=(30, 30)):
     from ro_toolbox.services import farm_bot as mod
 
     bot = _bot_with_terrain(monkeypatch)
-    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [(*warp, "x", 0, 0)])
+    monkeypatch.setattr(mod, "_warp_cells_of", lambda _m: frozenset({warp}))
     bot._load_warps("t")
     return bot
 
@@ -496,7 +496,7 @@ def test_sampled_warp_strip_is_filled_in():
     """`navi_link` 對一條傳點帶只取樣幾個點 —— 實測 moc_fild01 往 moc_fild02
     是 (301,16)/(321,16)/(341,16) **三筆指向同一個目的地格**。
     只擋取樣點周圍 3 格的話，中間留了兩個 14 格寬的洞，走過去照樣被傳走。"""
-    from ro_toolbox.services.farm_bot import _warp_strips
+    from ro_toolbox.services.warpzone import warp_strips as _warp_strips
 
     strip = _warp_strips({"moc_fild02": [(301, 16), (321, 16), (341, 16)]})
     assert (311, 16) in strip, "取樣點之間那一段也是傳點"
@@ -507,7 +507,7 @@ def test_sampled_warp_strip_is_filled_in():
 def test_two_far_apart_portals_are_not_joined():
     """相隔很遠、剛好通往同一張圖的兩個傳點是**各自獨立**的
     （實測 ayo_dun02 有兩個相隔 252 格的）。連起來會擋掉一整條沒事的路。"""
-    from ro_toolbox.services.farm_bot import _warp_strips
+    from ro_toolbox.services.warpzone import warp_strips as _warp_strips
 
     assert _warp_strips({"ayo_dun01": [(24, 22), (276, 22)]}) == set()
 
@@ -531,7 +531,7 @@ def test_learned_cells_go_into_the_no_go_zone(monkeypatch):
     from ro_toolbox.services import farm_bot as mod
 
     bot = FarmBot(1234)
-    monkeypatch.setattr(mod, "warps_on_map", lambda _m: [])
+    monkeypatch.setattr(mod, "_warp_cells_of", lambda _m: frozenset())
     bot._learned["prt_fild08"] = {(100, 100)}
     bot._load_warps("prt_fild08")
     assert (100, 100) in bot._warp_cells
