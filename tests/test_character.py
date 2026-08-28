@@ -316,6 +316,48 @@ def test_falls_back_to_the_map_entry_position():
     assert pos.read() == (112, 179)
 
 
+def test_once_it_has_moved_here_the_entry_position_is_never_used_again():
+    """⚠ 這張圖上讀到過元件 = 角色已經動過 = **進圖座標早就過期**。
+
+    這時候元件壞掉就要回 None。退回去用進圖座標的話，就是換個地方重演
+    [MEM-047]：回一個範圍內、站得住、看起來完全合理的**錯**座標。
+    """
+    pos, mem = _position_at(0x5000, dest=(65, 99), entry=(65, 87))
+    assert pos.read() == (65, 99)          # 讀到元件了
+
+    dead, _ = _component(777, dest=(65, 99), state=0)   # 元件被回收
+    mem.blocks[0x5000] = dead
+    pos._candidates = [0x5000]
+    assert pos.read() is None, "不准退回進圖座標"
+
+
+def test_it_complains_loudly_if_the_component_never_shows_up(caplog):
+    """改版把結構偏移弄壞時，元件永遠驗不過 —— 那時 `read()` 會一直回進圖座標，
+    範圍內、站得住、看起來完全合理，但角色早就走到別的地方了（[MEM-047] 的形狀）。
+
+    站著不動也會走到這條路，所以**只警告一次、不停用**（安全退化 ＋ 大聲）。
+    """
+    import logging
+
+    from ro_toolbox.services.player_position import STALE_WARN_SEC
+
+    clock = [500.0]
+    pos, _mem = _position_at(0x5000, dest=(0, 0), state=0, entry=(112, 179))
+    pos._now = lambda: clock[0]
+    pos._addr = None          # 從來沒找到過元件（剛換圖，或改版把偏移弄壞了）
+    pos._candidates = [0x5000]
+    with caplog.at_level(logging.WARNING):
+        assert pos.read() == (112, 179)
+        assert not caplog.records, "剛開始沒有元件是正常的，不准立刻嚷嚷"
+        clock[0] += STALE_WARN_SEC + 1
+        assert pos.read() == (112, 179)
+        assert len(caplog.records) == 1
+        assert "進圖座標" in caplog.records[0].getMessage()
+        clock[0] += 999
+        assert pos.read() == (112, 179)
+        assert len(caplog.records) == 1, "只講一次，不准洗版"
+
+
 def test_component_wins_over_the_map_entry_position():
     """走過之後就以移動元件為準 —— 進圖座標不會跟著走路更新。"""
     pos, _mem = _position_at(0x5000, dest=(65, 99), entry=(65, 87))

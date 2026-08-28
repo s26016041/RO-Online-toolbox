@@ -58,6 +58,9 @@ from ro_toolbox.services.mapdata import has_terrain, load_terrain  # noqa: E402
 from ro_toolbox.services.memory_scan import MemoryScanner  # noqa: E402
 from ro_toolbox.services.signatures import (  # noqa: E402
     CHAR_STATUS,
+    MAP_ENTRY_X_SIGS,
+    MAP_ENTRY_XY_GAP,
+    MAP_ENTRY_Y_SIGS,
     NAVI_GOAL_SIGS,
     SELECT_CURSOR_SIGS,
     SELECT_NAME_SIGS,
@@ -569,6 +572,19 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
         report.skip("出現第二組骨架時看得見兩個候選",
                     "真骨架之前找不到夠大的零填補可以放誘餌")
 
+    # 進圖座標的 x 與 y 是**兩組特徵**，彼此的關係要另外驗：
+    # 兩邊都定位得到，而且一定相鄰。任何一邊解錯都會讓差值不等於 4。
+    ex = locate_global(SnapshotScanner(snap), MAP_ENTRY_X_SIGS)
+    ey = locate_global(SnapshotScanner(snap), MAP_ENTRY_Y_SIGS)
+    if ex is None and ey is None:
+        report.skip("進圖座標：x 與 y 相鄰", "這份快照裡沒有這組骨架")
+    else:
+        report.add(
+            "進圖座標：x 與 y 相鄰（y - x == 4）",
+            ex is not None and ey is not None and ey - ex == MAP_ENTRY_XY_GAP,
+            f"x={ex and hex(ex)} y={ey and hex(ey)}",
+        )
+
     # --- 封包長度表 ---
     truth_table = packet_table.extract(0, SnapshotScanner(snap))
     report.add("基準：快照上抽得到封包長度表", len(truth_table) > 1000,
@@ -595,7 +611,15 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
     # 這兩個是自動選角的眼睛：移游標之前要讀得到「現在在第幾格」，
     # 按下 Enter 之後要讀得到「客戶端選了誰」。定位錯了會選到別人，
     # 所以位移不變、骨架壞掉要退成 None，兩件事都要驗。
-    for label, sigs in (("選角游標", SELECT_CURSOR_SIGS), ("角色名字", SELECT_NAME_SIGS)):
+    #
+    # 進圖座標（`MAP_ENTRY_*`）是換圖之後唯一知道「人在哪」的來源
+    # （[MEM-048]）—— 定位錯了會拿別的全域當座標，A* 從錯的起點算路。
+    for label, sigs in (
+        ("選角游標", SELECT_CURSOR_SIGS),
+        ("角色名字", SELECT_NAME_SIGS),
+        ("進圖座標 x", MAP_ENTRY_X_SIGS),
+        ("進圖座標 y", MAP_ENTRY_Y_SIGS),
+    ):
         truth = locate_global(SnapshotScanner(snap), sigs)
         if truth is None:
             # 舊的快照可能是在這兩條特徵存在之前存的 —— 那不算不合格。

@@ -35,6 +35,11 @@
 而「沒有移動元件」與「還沒在這張圖上走過」是同一件事，所以這個退化是**準的**，
 不是將就。
 
+⚠ 但這個「準」有時效：**這張圖上一旦讀到過元件，進圖座標就永遠不能再用了**
+（角色已經動過）。所以 `read()` 記著 `_moved_here` —— 之後元件再壞掉一律回 None，
+不准退回去。少了這一條就是換個地方重演 [MEM-047]：回一個範圍內、站得住、
+看起來完全合理的**錯**座標。
+
 ## 進圖座標全域（`ragexe` 靜態，用程式碼特徵定位）
 
 寫入端有三處，兩處拿來當骨架（見 `signatures.MAP_ENTRY_X/Y_SIGS`）。
@@ -146,6 +151,13 @@ MAX_STATE = 8
 MAX_CELL = 512
 #: 路徑不可能有這麼多節點（單次移動上限 17 格）。用來擋「指標像陣列但其實是垃圾」。
 MAX_PATH_NODES = 256
+#: 一直找不到元件多久之後要大聲抱怨一次。
+#:
+#: ⚠ 這是**改版時唯一的警報**：結構偏移壞掉的話元件永遠驗不過，
+#: `read()` 會一直回進圖座標 —— 範圍內、站得住、看起來完全合理，
+#: 但角色早就走到別的地方了。那正是 [MEM-047] 的形狀。
+#: 站在原地不動也會走到這條路，所以**只警告一次、不停用**（安全退化 ＋ 大聲）。
+STALE_WARN_SEC = 30.0
 #: 重驗候選的間隔。實測 67 個候選重驗一輪只要 **0.30 ms**，所以可以很密。
 RELOCATE_COOLDOWN = 0.3
 #: 還是找不到元件時，多久才准重新全掃一次。全掃實測 **0.6~0.8 秒**
@@ -183,6 +195,13 @@ class PlayerPosition:
         #: ⚠ 這是整個設計的關鍵，見 `_locate_component()` 的說明。
         self._candidates: list[int] = []
         self._last_full = 0.0
+        #: 從什麼時候開始「這張圖上一直沒有元件」（None = 現在有）。
+        self._missing_since: float | None = None
+        self._warned_missing = False
+        #: 在**這張圖**上讀到過移動元件了嗎？
+        #: 讀到過就代表角色已經在這張圖上動過 —— 那一刻起「進圖座標」就過期了，
+        #: 元件再壞掉也**不准**退回去用它（見 `read()`）。
+        self._moved_here = False
         #: 地形快取：驗證「這一格站得住嗎」用，換圖才重載
         self._terrain_map = ""
         self._terrain = None
@@ -292,6 +311,10 @@ class PlayerPosition:
         #   舊的候選清單裡沒有它（第一版就是漏了這一步，害整整 15 秒讀到舊值）。
         self._candidates = []
         self._last_full = 0.0
+        # 新的一張圖：進圖座標又變成可信的了，直到角色在這裡走第一步。
+        self._moved_here = False
+        self._missing_since = None
+        self._warned_missing = False
 
     def forget(self) -> None:
         """完全重置（換行程／收攤時用）。"""
@@ -315,11 +338,38 @@ class PlayerPosition:
             self._locate_component()
             pos = self._component_pos()
         if pos is not None and self._on_map(pos, map_name):
+            self._moved_here = True
+            self._missing_since = None
+            self._warned_missing = False
             return pos
+        if self._moved_here:
+            # ⚠⚠ 這張圖上已經讀到過元件 = 角色已經動過 = **進圖座標早就過期了**。
+            #    這時候退回去用它，就是換一個地方重演 [MEM-047]：
+            #    回一個範圍內、站得住、看起來完全合理的**錯**座標。
+            #    寧可回 None 讓呼叫端停下來。
+            return None
         entry = self._entry_pos()
         if entry is not None and self._on_map(entry, map_name):
+            self._note_missing()
             return entry
         return None
+
+    def _note_missing(self) -> None:
+        """一直沒有元件 → 講一次話。改版把結構偏移弄壞時這是唯一的警報。"""
+        now = self._now()
+        if self._missing_since is None:
+            self._missing_since = now
+            return
+        if self._warned_missing or now - self._missing_since < STALE_WARN_SEC:
+            return
+        self._warned_missing = True
+        log.warning(
+            "已經 %.0f 秒找不到角色的移動元件，現在回報的是**進圖座標** ——"
+            "角色如果有在移動，這個值就是錯的。"
+            "站著不動的話這是正常的；一直出現代表遊戲改版讓結構偏移失效了"
+            "（見 GAMEDATA [MEM-048]）",
+            now - self._missing_since,
+        )
 
     def _component_pos(self) -> tuple[int, int] | None:
         """從記著的元件位址讀一次；驗不過就把位址丟掉（下一拍重找）。"""
