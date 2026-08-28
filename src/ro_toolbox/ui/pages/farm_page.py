@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
 from ro_toolbox.config.paths import in_selftest
 from ro_toolbox.config.settings import current_settings
 from ro_toolbox.core.worker import Worker, WorkerThread
-from ro_toolbox.services import bag, icons, potion_store, window_list
+from ro_toolbox.services import bag, icons, potion_store, skill_store, window_list
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
 from ro_toolbox.services.gamedata import (
@@ -58,8 +58,10 @@ from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.process_monitor import local_network_up
 from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
 from ro_toolbox.services.ro_capture import find_server
+from ro_toolbox.services.skills import SkillReader
 from ro_toolbox.services.travel_bot import TravelBot
 from ro_toolbox.ui.pages.base_page import BasePage
+from ro_toolbox.ui.widgets.skill_panel import SkillPanel
 from ro_toolbox.ui.widgets.toast import show_notice
 
 log = logging.getLogger(__name__)
@@ -120,6 +122,32 @@ class BagWorker(QThread):
         except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
             log.debug("PID %s 讀背包失敗：%s", self._pid, exc)
             rows = {}
+        self.done.emit(self._pid, rows)
+
+
+class SkillWorker(QThread):
+    """在背景掃技能表（實測 1.8~2.6 秒），絕不能放 UI 執行緒。
+
+    掃出來的是這隻角色**現在真的有的**技能（見 `services/skills.py`）。
+    停在選角畫面時會回 None —— 那時記憶體裡的是上一次登入的殘留（[MEM-050]）。
+    """
+
+    done = Signal(int, object)  # pid, list[Skill] 或 None
+
+    def __init__(self, pid: int) -> None:
+        super().__init__()
+        self._pid = pid
+
+    def run(self) -> None:
+        reader = SkillReader()
+        rows = None
+        try:
+            if reader.attach(self._pid):
+                rows = reader.read(should_stop=self.isInterruptionRequested)
+        except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
+            log.debug("PID %s 讀技能失敗：%s", self._pid, exc)
+        finally:
+            reader.close()
         self.done.emit(self._pid, rows)
 
 
@@ -190,6 +218,8 @@ class CharacterCard(QWidget):
     travel_pause_pressed = Signal()
     #: 背景 TravelBot 回報狀態。
     travel_stats = Signal(object)
+    #: 技能面板的勾選或等級有變動（要存設定、要通知 FarmBot）。
+    skills_changed = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -331,6 +361,12 @@ class CharacterCard(QWidget):
 
         # ---- 自動補水 ----
         layout.addWidget(self._build_potion_panel())
+
+        # ---- 技能 ----
+        # 內容要等背景掃完才進來（掃一趟 1.8~2.6 秒，[MEM-050]）。
+        self.skills = SkillPanel()
+        self.skills.changed.connect(self.skills_changed)
+        layout.addWidget(self.skills)
 
         self.farm_stats.connect(self._apply_farm_stats)
         self.potion_stats.connect(self._apply_potion_stats)
@@ -977,6 +1013,9 @@ class FarmPage(BasePage):
         self._reconnect_pid = 0
         self._bag_workers: dict[int, BagWorker] = {}
         self._bag_loaded: set[int] = set()
+        #: 技能只有加點時才會變，所以掃一次就好（掃一趟 1.8~2.6 秒）。
+        self._skill_workers: dict[int, SkillWorker] = {}
+        self._skill_loaded: set[int] = set()
         # 每個角色最近一次讀到的背包 {格號: (道具編號, 數量)}
         self._bags: dict[int, dict[int, tuple[int, int]]] = {}
         self._names: dict[int, str] = {}
@@ -1189,6 +1228,7 @@ class FarmPage(BasePage):
         card.potion_changed.connect(lambda p=pid: self._apply_potion_config(p))
         card.travel_toggled.connect(lambda on, p=pid: self._toggle_travel(p, on))
         card.travel_pause_pressed.connect(lambda p=pid: self._pause_travel(p))
+        card.skills_changed.connect(lambda p=pid: self._apply_skill_config(p))
 
         self._readers[pid] = reader
         self._cards[pid] = card
@@ -1199,6 +1239,8 @@ class FarmPage(BasePage):
             card.apply_saved_potion(saved)
             if saved.enabled:
                 self._toggle_potion(pid, True)
+        # 技能面板的勾選也一樣：套用**在接上 signal 之後**，格子等背景掃完才長出來。
+        card.skills.apply_saved(skill_store.get(status.name))
         self._failures[pid] = 0
         self._names[pid] = status.name
         self.tabs.addTab(card, status.name or f"PID {pid}")
@@ -1207,6 +1249,7 @@ class FarmPage(BasePage):
         # 只讀正在看的那一頁，切過去再讀。
         if self._current_pid() == pid:
             self._load_bag(pid)
+            self._load_skills(pid)
         log.info("自動掛機：加入 %s（PID %s）", status.name, pid)
 
         # ⚠⚠ **一建卡就開始看著他。** 舊版只在 `_watch_connections` 的
@@ -1247,6 +1290,13 @@ class FarmPage(BasePage):
         worker = self._bag_workers.pop(pid, None)
         if worker is not None:
             worker.wait(3000)
+        self._skill_loaded.discard(pid)
+        # ⚠ 一定要等它結束再往下 —— QThread 還在跑就被解構會**殺掉整支程式**
+        # （[ENV-006]，收尾用等待不是丟掉）。
+        skill_worker = self._skill_workers.pop(pid, None)
+        if skill_worker is not None:
+            skill_worker.requestInterruption()
+            skill_worker.wait(5000)
 
         card = self._cards.pop(pid, None)
         if card is not None:
@@ -1485,6 +1535,11 @@ class FarmPage(BasePage):
             # start() 只起執行緒就返回（設定在背景做，UI 不卡）；成敗看回報的 note。
             bot = FarmBot(pid, on_update=lambda s, c=card: c.farm_stats.emit(s))
             self._bots[pid] = bot
+            if card is not None:
+                # 勾起來的補助技能要在 `start()` **之前**交給它 ——
+                # 之後才給的話第一輪不會補，使用者會以為勾了沒用。
+                saved = card.skills.snapshot()
+                bot.set_buffs(card.skills.buff_plans(), saved.learned)
             reader = self._readers.get(pid)
             status = reader.read() if reader is not None else None
             if status is not None and status.has_exp:
@@ -1494,6 +1549,10 @@ class FarmPage(BasePage):
             bot = self._bots.pop(pid, None)
             if bot is not None:
                 self._keep_loot(pid, bot)
+                # 收攤前把它學到的「技能 → 狀態」對應存下來（那是知識不是設定）。
+                if card is not None and card.character:
+                    card.skills.remember_learned(bot.buff_learned)
+                    skill_store.save(card.character, card.skills.snapshot())
                 bot.stop()
             self._exp_start.pop(pid, None)
             if card is not None:
@@ -1566,10 +1625,58 @@ class FarmPage(BasePage):
             self._refresh_bag(pid)
 
     def _on_tab_changed(self) -> None:
-        """切到某個角色時才讀它的背包（之後由每秒的計時器自己更新）。"""
+        """切到某個角色時才讀它的背包與技能（之後由每秒的計時器自己更新）。"""
         pid = self._current_pid()
         if pid is not None and pid not in self._bag_loaded:
             self._load_bag(pid)
+        if pid is not None:
+            self._load_skills(pid)
+
+    def _load_skills(self, pid: int, again: bool = False) -> None:
+        """在背景掃技能表（1.8~2.6 秒）。
+
+        ⚠ **沒登入就不掃**（同 `_load_bag`）：停在選角畫面時記憶體裡是上一次
+        登入的殘留，`SkillReader` 自己會擋，但連掃都不要掃比較省事。
+        技能只有加點時才會變，所以**掃一次就好** —— 每秒重掃是 [MEM-043]
+        那種「一個功能自己把整頁拖慢」的做法。
+        """
+        if pid in self._skill_workers or (pid in self._skill_loaded and not again):
+            return
+        if find_server(pid) is None:
+            return
+        self._skill_loaded.add(pid)
+        worker = SkillWorker(pid)
+        worker.done.connect(self._skills_ready)
+        worker.finished.connect(lambda p=pid: self._skill_workers.pop(p, None))
+        self._skill_workers[pid] = worker
+        worker.start()
+
+    def _skills_ready(self, pid: int, rows: object) -> None:
+        card = self._cards.get(pid)
+        if card is None:
+            return
+        if rows is None:
+            # 讀不到（多半是回到選角畫面）—— 讓它下次再試，不要清掉已經顯示的。
+            self._skill_loaded.discard(pid)
+            return
+        card.skills.set_skills(rows)
+        self._apply_skill_config(pid, save=False)
+
+    def _apply_skill_config(self, pid: int, save: bool = True) -> None:
+        """勾選變了：存回設定，並告訴正在跑的 FarmBot 要補哪些 buff。"""
+        card = self._cards.get(pid)
+        if card is None:
+            return
+        bot = self._bots.get(pid)
+        if bot is not None:
+            # 把 bot 學到的「技能 → 狀態」對應收回來再存 —— 那是知識，
+            # 丟掉的話下次開程式又要重放一次才知道要檢查什麼。
+            card.skills.remember_learned(bot.buff_learned)
+        snapshot = card.skills.snapshot()
+        if save and card.character:
+            skill_store.save(card.character, snapshot)
+        if bot is not None:
+            bot.set_buffs(card.skills.buff_plans(), snapshot.learned)
 
     def _load_bag(self, pid: int, again: bool = False) -> None:
         """在背景讀背包（實測 22 ms）。數量會自己一直更新，不需要任何按鈕。

@@ -20,6 +20,7 @@ CZ_ITEM_PICKUP = 0x0362   # 撿地上道具，payload = 道具實體ID(4)
 CZ_CHANGE_DIR = 0x0361    # 轉向，payload = headDir(2) + bodyDir(1)
 CZ_ITEM_THROW = 0x0363    # 丟掉道具，payload = 背包索引(2) + 數量(2)
 CZ_USE_ITEM = 0x00A7      # 使用道具，payload = 背包索引(2) + 角色AID(4)
+CZ_USE_SKILL = 0x0438     # 對目標放技能，payload = 等級(2) + 技能ID(2) + 目標GID(4)
 
 # CZ_REQUEST_ACT 的動作代碼（RO 社群通用，本服 0x07 已實測為連續攻擊）
 ACT_ATTACK_ONCE = 0x00
@@ -93,6 +94,27 @@ def build_use_item(index: int, aid: int) -> bytes:
         CZ_USE_ITEM.to_bytes(2, "little")
         + index.to_bytes(2, "little")
         + aid.to_bytes(4, "little")
+    )
+
+
+def build_use_skill(level: int, skill_id: int, target_id: int) -> bytes:
+    """對 `target_id` 放技能（見 GAMEDATA [PKT-081]）。
+
+    版面是使用者實際擷取的兩包解出來的：施放「雙手劍攻擊速度增加」Lv7 送
+    `07 00 3C 00 0B516B01`，施放「加速術」Lv3 送 `03 00 1D 00 1C907C01`
+    —— 等級在前、技能編號在後，兩包都對得上。
+
+    **對自己放就把 `target_id` 填自己的 AID**（自己的 GID 就是 AID，[PKT-041]）。
+    只能對自己放的補助技能也是走這一包，沒有另一種「對自己」的封包。
+
+    ⚠ 客戶端在使用者按快捷鍵時還會順便送 `0x0B21`（把技能綁到快捷列第幾格），
+    那是**介面狀態不是施放**，不要跟著送。
+    """
+    return (
+        CZ_USE_SKILL.to_bytes(2, "little")
+        + level.to_bytes(2, "little")
+        + skill_id.to_bytes(2, "little")
+        + target_id.to_bytes(4, "little")
     )
 
 

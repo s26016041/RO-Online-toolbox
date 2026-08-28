@@ -15,7 +15,6 @@ import logging
 from ro_toolbox.services.aob import locate_global
 from ro_toolbox.services.memory_scan import VALUE_TYPES, MemoryScanner
 from ro_toolbox.services.player_position import PlayerPosition
-from ro_toolbox.services.status_effects import ActiveStatus, StatusEffects
 from ro_toolbox.services.signatures import (
     CHAR_STATUS_SIGS,
     MAP_NAME_ENCODING,
@@ -26,6 +25,7 @@ from ro_toolbox.services.signatures import (
     SELECT_NAME_SIGS,
     STATUS_OFFSETS,
 )
+from ro_toolbox.services.status_effects import ActiveStatus, StatusEffects
 from ro_toolbox.utils.logging import StateLog
 
 log = logging.getLogger(__name__)

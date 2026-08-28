@@ -27,7 +27,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import lub_parse as L  # noqa: E402
+import lub_parse as L  # noqa: E402, N812
 
 ROOT = Path(__file__).resolve().parents[1]
 STATEICON = ROOT / "RODATA" / "data" / "data" / "luafiles514" / "lua files" / "stateicon"
