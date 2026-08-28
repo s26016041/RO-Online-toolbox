@@ -939,27 +939,55 @@ def test_no_window_message_after_a_key_in_the_same_batch(monkeypatch, wired):
 # 送出後才驗的代價是：跳錯誤框 → 關掉 → 翻面 → 整輪重打 ≈ 25 秒。
 
 
-def test_the_account_being_findable_means_we_typed_into_the_right_box(
+def _bot_seeing(monkeypatch, on_screen: set[str]):
+    """做一個 AutoLogin，並決定「哪些字串在堆積上找得到」。"""
+    bot = AutoLogin(_account(), 4242)
+    monkeypatch.setattr(
+        auto_login.input_helper, "field_addresses",
+        lambda pid, text: [0x18254788] if text in on_screen else [],
+    )
+    return bot
+
+
+def test_finding_the_account_confirms_we_typed_into_the_right_box(
     monkeypatch, wired
 ):
-    """[MEM-032]：打進**帳號欄**的字在堆積上找得到，打進密碼欄的搜不到。"""
-    bot = _bot(monkeypatch, [0x18254788])
+    """[MEM-032]：打進**帳號欄**的字在堆積上找得到 → 確定打對。"""
+    bot = _bot_seeing(monkeypatch, {"demo01"})
     assert bot._fields_look_right() is True
 
 
-def test_not_finding_the_account_flips_instead_of_submitting(monkeypatch, wired):
-    """搜不到自己的帳號 = 它被打進密碼欄了 —— 翻面重打，**不要送出**。"""
-    bot = _bot(monkeypatch, [])
+def test_finding_the_password_on_the_heap_means_it_went_into_the_account_box(
+    monkeypatch, wired
+):
+    """打進**密碼欄**的字整個記憶體都搜不到（[MEM-032]）——
+    所以密碼只要現身在堆積，就一定是被打進帳號欄了 → 確定打反。"""
+    bot = _bot_seeing(monkeypatch, {"pw"})
     bot._tab_first = False
     assert bot._fields_look_right() is False
     assert bot._tab_first is True, "要翻面"
     assert any("打反了" in step for step in bot.progress.steps)
 
 
+def test_seeing_neither_is_not_a_verdict_and_it_submits_anyway(monkeypatch, wired):
+    """⚠⚠ **這一條是修過的 bug。**
+
+    第一版是「搜不到自己的帳號就翻面」。但搜不到有兩種原因：真的打反了，
+    或記憶體那一拍讀不到。把後者也當成打反，就會在**本來打對**的時候
+    把它翻成錯的 —— 使用者實測回報「輸入帳號是我的密碼」就是這個。
+
+    現在兩個都搜不到＝**不知道**，照舊送出去讓送出後的閉環驗證兜底。
+    最壞情況跟沒有這一支時完全一樣。
+    """
+    bot = _bot_seeing(monkeypatch, set())
+    bot._tab_first = True
+    assert bot._fields_look_right() is True, "不知道就不准擋"
+    assert bot._tab_first is True, "不知道就**不准翻面**"
+
+
 def test_it_only_flips_once_before_submitting(monkeypatch, wired):
-    """⚠ 「搜不到」也可能是記憶體讀不到 —— 翻過一次就照樣送出去，
-    讓送出後的閉環驗證兜底。不准在這裡卡死（安全退化）。"""
-    bot = _bot(monkeypatch, [])
+    """⚠ 只准翻一次，避免兩邊互相推來推去。"""
+    bot = _bot_seeing(monkeypatch, {"pw"})
     bot._tab_first = False
     assert bot._fields_look_right() is False      # 第一次：翻面
     assert bot._fields_look_right() is True       # 第二次：放行
