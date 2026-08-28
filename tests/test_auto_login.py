@@ -802,32 +802,129 @@ def test_focus_is_measured_once_not_every_attempt(monkeypatch, wired):
     assert bot._tab_first is False, "已經有結論就不准再量"
 
 
-# ---- 批數：越少越好，因為打包後開一次子行程要 2.7 秒 --------------------
+# ---- 空的欄位不要清（每一次清空都是一個子行程）--------------------------
+#
+# 使用者實測的規則：剛進登入畫面時，**有焦點的那一格是空的**，
+# 而客戶端只會把記住的帳號預填在帳號欄。
 
 
-def test_credentials_go_out_in_two_batches(monkeypatch, wired):
-    """六批 → 兩批。
-
-    每一批都是一個子行程（[INP-009]：送過 SendInput 之後視窗訊息會被封鎖），
-    而打包後開一次子行程實測 **2593~2773 ms**（onefile 每次重新解壓 82 MB）。
-    六批光開行程就 16 秒 —— 那些空檔也正是 [INP-009] 警告
-    「中間的行程啟動時間就足以讓封鎖生效」的東西。
-    """
-    bot = _bot(monkeypatch, [0x18254788])
+def test_starting_in_the_account_box_needs_no_clearing_after_tab(monkeypatch, wired):
+    """焦點在帳號欄 → Tab 過去是**空的密碼欄**，不用清。"""
+    bot = _bot(monkeypatch, [0x18254788])          # 探針找得到 = 焦點在帳號欄
     batches = bot._credential_batches(0x1234)
-    assert len(batches) == 2, f"應該只剩兩批，實際 {len(batches)}"
+    assert bot._tab_first is False
+    # 清空 / 打字 / Tab / 打字 / Enter —— 中間**沒有**第二次清空
+    assert len(batches) == 5, [len(b) for b in batches]
+
+
+def test_starting_in_the_password_box_still_clears_the_prefilled_account(
+    monkeypatch, wired
+):
+    """焦點在密碼欄 → Tab 過去是**有預填的帳號欄**，那一格要清。"""
+    bot = _bot(monkeypatch, [])                    # 探針找不到 = 焦點在密碼欄
+    batches = bot._credential_batches(0x1234)
+    assert bot._tab_first is True
+    assert len(batches) == 6, [len(b) for b in batches]
+
+
+def test_a_retry_always_clears_because_our_own_text_is_still_there(monkeypatch, wired):
+    """重試時欄位裡是上一輪我們自己打的字 —— 一定要清，不能沿用「它是空的」。"""
+    bot = _bot(monkeypatch, [0x18254788])
+    bot._credential_batches(0x1234)                # 第一輪
+    again = bot._credential_batches(0x1234)        # 第二輪
+    assert len(again) == 6, "重試時兩格都要清"
+
+
+def test_the_probe_does_not_clear_first(monkeypatch, wired):
+    """探針前面不用清 —— 剛進去那一格本來就是空的。"""
+    bot = AutoLogin(_account(), 4242)
+    monkeypatch.setattr(
+        auto_login.input_helper, "field_addresses", lambda pid, text: [1]
+    )
+    batches = _raw_batches(monkeypatch)
+    bot._probe_focus(0x1234)
+    assert len(batches) == 1, "探針只要一批（打字），不要先清空"
+    assert any("text_fg" in a for a in batches[0])
 
 
 def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
-    """Enter **維持視窗訊息**，不准跟著改成按鍵。
+    """Enter **維持視窗訊息**，不准改成按鍵。
 
     [INP-010] 實測過它很挑：`KEYDOWN+CHAR+KEYUP` 會送出、
     `KEYDOWN+KEYUP`（無 CHAR）**不會送出**，而且失敗時毫無錯誤訊息。
     """
     bot = _bot(monkeypatch, [0x18254788])
-    keys, enter = bot._credential_batches(0x1234)
+    enter = bot._credential_batches(0x1234)[-1]
     assert len(enter) == 1 and enter[0]["key"] == 0x0D, enter
     # ★ 那個 char 就是 [INP-010] 的重點：少帶它，帳密全打對也永遠不會送出。
     assert enter[0]["char"] == 0x0D, "Enter 一定要帶字元碼"
-    assert all("key" not in a for a in keys), "第一批不准有視窗訊息按鍵"
-    assert any("key_fg" in a for a in keys), "清空與 Tab 要走真的按鍵"
+
+
+# ---- SendInput 打的是「前景視窗」，不是我們指定的 hwnd -------------------
+
+
+def _raw_batches(monkeypatch):
+    """把送出去的**原始動作清單**一批一批收下來（`wired` 只收攤平後的摘要）。"""
+    batches: list[list[dict]] = []
+    monkeypatch.setattr(
+        auto_login.input_helper, "send",
+        lambda hwnd, actions: batches.append(list(actions)),
+    )
+    return batches
+
+
+def _assert_focus_before_foreground(batch: list[dict]) -> None:
+    seen_focus = False
+    for action in batch:
+        if "focus" in action:
+            seen_focus = True
+        if "text_fg" in action or "key_fg" in action:
+            assert seen_focus, f"前景動作前面沒有 focus()：{action}"
+
+
+def test_every_foreground_action_has_a_focus_before_it(monkeypatch, wired):
+    """⚠ v0.2.5 踩過，整個自動登入爛掉。
+
+    清空從視窗訊息改成真的按鍵之後，忘了它也需要 `focus()` ——
+    視窗訊息是直接指名 hwnd 的，`SendInput` 不是，它送給**當下的前景視窗**。
+    於是那 24 個 Backspace 打進使用者正在用的視窗，而遊戲那一格根本沒清到，
+    字就接在舊值後面送出去。
+
+    測試當時沒抓到，是因為假的 `send` 不會模擬「前景」這件事 ——
+    所以這裡改成檢查**動作清單本身的形狀**。
+    """
+    bot = _bot(monkeypatch, [0x18254788])
+    for batch in bot._credential_batches(0x1234):
+        _assert_focus_before_foreground(batch)
+
+
+def test_the_probe_batch_also_focuses_first(monkeypatch, wired):
+    """探針那一批同樣是先清空再打字，一樣不能少了 focus()。"""
+    bot = AutoLogin(_account(), 4242)
+    monkeypatch.setattr(
+        auto_login.input_helper, "field_addresses", lambda pid, text: [1]
+    )
+    batches = _raw_batches(monkeypatch)
+    bot._probe_focus(0x1234)
+    assert batches, "探針要真的送出去"
+    for batch in batches:
+        _assert_focus_before_foreground(batch)
+
+
+def test_no_window_message_after_a_key_in_the_same_batch(monkeypatch, wired):
+    """[INP-009]：同一個行程送過 `SendInput` 之後，它的**視窗訊息會被封鎖**。
+
+    所以一批裡面只要出現過前景按鍵／打字，後面就不准再有視窗訊息動作 ——
+    要換一個乾淨的子行程。這條規則就是「為什麼帳密要分成好幾批」的全部理由。
+
+    ⚠ v0.2.5 為了省子行程把清空也改成按鍵、六批併成兩批，自動登入整個爛掉
+    （實跑 11 次，欄位都填對了但 Enter 一次都沒送出去）。已還原。
+    """
+    bot = _bot(monkeypatch, [0x18254788])
+    for batch in bot._credential_batches(0x1234):
+        seen_key = False
+        for action in batch:
+            if "text_fg" in action or "key_fg" in action:
+                seen_key = True
+            if "text" in action or "key" in action:
+                assert not seen_key, f"按鍵之後又送視窗訊息：{batch}"

@@ -220,6 +220,8 @@ class AutoLogin:
         # 這一輪要不要先按一次 Tab（＝焦點在密碼欄）。
         # 一開始用記憶體判斷，判斷不出來就先假設不用；**送出去發現打反就翻面**。
         self._tab_first: bool | None = None
+        #: 已經打過一輪了嗎。重試時欄位裡有上一輪的字，一定要清空。
+        self._typed_once = False
         self.progress = LoginProgress()
 
     # ---- 對外 -------------------------------------------------------
@@ -410,21 +412,19 @@ class AutoLogin:
         客戶端會記住上次的帳號，直接打字是接在後面；而且 `Home`+`Delete` 不夠
         （那個欄位不見得吃 Home），要再補 `End`+`Backspace`。
 
-        ⚠ **用真的按鍵（`SendInput`），不用視窗訊息。** 這不是為了可靠性 ——
-        兩種都清得掉 —— 是為了**少開子行程**。同一個行程送過 `SendInput`
-        之後它的視窗訊息就會被封鎖（[INP-009]），所以每換一次通道就要多開
-        一個子行程；而打包後開一次子行程要 **2.7 秒**（onefile 每次重新解壓
-        82 MB，實測 2593~2773 ms）。原本「清空(訊息)→打字(按鍵)→Tab(按鍵)→
-        清空(訊息)→打字(按鍵)→Enter(訊息)」六批就是六個子行程，光開行程
-        就 16 秒。全部統一成按鍵之後只剩「一批按鍵 ＋ 一批 Enter」。
-
-        而且那些空檔本身就是 [INP-009] 警告的東西：
-        「中間的行程啟動時間就足以讓封鎖生效」—— 慢跟打不進去是同一個病。"""
+        ⚠⚠ **走視窗訊息，不要改成真的按鍵。** v0.2.5 為了少開子行程把它改成
+        `key_foreground`，結果自動登入**整個爛掉**：實跑 11 次，合約書明明過了
+        （畫面判定＝登入畫面）、欄位也填對了（ID 欄看得到帳號、密碼欄 9 個星號），
+        但**客戶端一次都沒有連上伺服器** —— 最後那個 Enter 送不出去，
+        `submitted_account()` 全程是 None。改回來就好了。
+        機制沒有查清楚，但結論很清楚：**這條路驗過會動，不要為了省時間去動它。**
+        真正該省的是子行程的啟動成本（[INP-013]），不是送法。
+        """
         return [
-            input_helper.key_foreground(_VK_HOME),
-            input_helper.key_foreground(_VK_DELETE, _CLEAR_KEYS),
-            input_helper.key_foreground(_VK_END),
-            input_helper.key_foreground(_VK_BACKSPACE, _CLEAR_KEYS),
+            input_helper.key(_VK_HOME),
+            input_helper.key(_VK_DELETE, _CLEAR_KEYS),
+            input_helper.key(_VK_END),
+            input_helper.key(_VK_BACKSPACE, _CLEAR_KEYS),
         ]
 
     def _type_actions(self, text: str) -> list[dict]:
@@ -475,9 +475,11 @@ class AutoLogin:
         而且送出之後的閉環驗證照舊留著兜底。
         """
         try:
-            input_helper.send(
-                hwnd, self._clear_actions() + self._type_actions(self._PROBE)
-            )
+            # ⚠ **不先清空。** 使用者實測：剛進登入畫面時，有焦點的那一格
+            # 本來就是空的（客戶端記住帳號時焦點會落在空的密碼欄，
+            # 沒記住時落在空的帳號欄）。白清一次就是白開一個子行程。
+            # 就算真的接在既有文字後面也不影響判斷 —— 我們搜的是探針**子字串**。
+            input_helper.send(hwnd, self._type_actions(self._PROBE))
         except input_helper.InputHelperError as exc:
             log.debug("探針送不進去：%s", exc)
             return None
@@ -508,48 +510,62 @@ class AutoLogin:
             )
 
     def _credential_batches(self, hwnd: int) -> list[list[dict]]:
-        """組出整組輸入動作。**批數越少越好，見下面。**
+        """組出整組輸入動作，**一批一個子行程**。
 
-        順序由 `self._tab_first` 決定，都只需要一次 Tab：
+        順序由 `self._tab_first` 決定（`_decide_focus` 量出來的），都只需要一次 Tab：
 
             焦點在密碼欄：打密碼 → Tab 到帳號欄 → 清空 → 打帳號
             焦點在帳號欄：打帳號 → Tab 到密碼欄 → 清空 → 打密碼
 
-        ## 為什麼是兩批，不是六批
+        ## 為什麼要分成六批
 
-        同一個行程送過 `SendInput` 之後，它後續的**視窗訊息**會被封鎖
-        （[INP-009]），所以每換一次通道就得換一個乾淨的子行程。
-        舊版清空與 Enter 走視窗訊息、打字與 Tab 走按鍵，六個動作剛好交錯成
-        **六批＝六個子行程**；而打包後開一次子行程要 **2.7 秒**
-        （onefile 每次重新解壓 82 MB），光開行程就 16 秒。
+        Tab 與文字要送真的按鍵（`SendInput`），清空與 Enter 走視窗訊息，
+        而**同一個行程送過 `SendInput` 之後，它後續的視窗訊息會被封鎖**
+        （[INP-009]）。所以每種通道各自一個乾淨的子行程。
 
-        清空改成按鍵之後（見 `_clear_actions`），只剩兩批：
-
-            1. 全部按鍵：清空 → 打第一格 → Tab → 清空 → 打第二格
-            2. Enter（**維持視窗訊息**）
-
-        ⚠ **Enter 不要跟著改成按鍵。** [INP-010] 實測過它的送法很挑：
-        `KEYDOWN+CHAR+KEYUP` 會送出、`KEYDOWN+KEYUP`（無 CHAR）**不會送出**，
-        而且失敗時完全沒有錯誤訊息 —— 那條路已經驗過會動，不要為了再省
-        2.7 秒去動它。
+        ⚠⚠ **不要為了少開子行程去合併。** v0.2.5 把清空也改成按鍵、六批併成
+        兩批，結果自動登入**整個爛掉**（實跑 11 次，合約書過了、欄位也填對了，
+        但客戶端一次都沒連上伺服器 —— 見 `_clear_actions`）。
+        打包後每批要 2.7 秒是真的很痛，但**答案是讓子行程變便宜（[INP-013]），
+        不是改送法**。
         """
         self._decide_focus(hwnd)
-        clear = self._clear_actions()
         if self._tab_first:
             first, second = self._account.password, self._account.username
         else:
             first, second = self._account.username, self._account.password
-        keys = (
-            clear
-            + self._type_actions(first)
-            + self._tab_actions()
-            + clear
-            + self._type_actions(second)
-        )
-        return [
-            keys,
-            [input_helper.key(_VK_RETURN)],   # Enter 走視窗訊息（[INP-010] 實測）
+        batches = [
+            # 第一格一定要清：探針剛剛就打在這裡（重試時則是上一輪打的）。
+            self._clear_actions(),
+            self._type_actions(first),
+            self._tab_actions(),
         ]
+        if self._needs_clear_after_tab():
+            batches.append(self._clear_actions())
+        batches.append(self._type_actions(second))
+        batches.append([input_helper.key(_VK_RETURN)])  # Enter 走視窗訊息
+        self._typed_once = True
+        return batches
+
+    def _needs_clear_after_tab(self) -> bool:
+        """Tab 過去那一格要不要先清空。
+
+        使用者實測的規則：**剛進登入畫面時，有焦點的那一格是空的**，
+        而客戶端只會把記住的帳號預填在**帳號欄**。所以：
+
+            Tab 過去是帳號欄 → 有預填，**要清**
+            Tab 過去是密碼欄 → 是空的，**不用清**
+
+        ⚠ **重試時一律要清** —— 那時候欄位裡是上一輪我們自己打進去的字。
+
+        為什麼值得為了一次清空多寫這段：清空只能走視窗訊息，而打字走按鍵，
+        兩種通道不能同行程（[INP-009]）—— 所以**每一次清空就是一個子行程**，
+        打包後就是 2.7 秒（[INP-013]）。白清一次就是白等 2.7 秒。
+        """
+        if self._typed_once:
+            return True
+        # tab_first＝True 代表第一格是密碼欄，Tab 過去的第二格就是帳號欄。
+        return self._tab_first
 
     def _dismiss_error(self, hwnd: int) -> None:
         """關掉「帳密錯誤」對話框。按一次 Enter 就回到登入畫面（使用者實測）。
