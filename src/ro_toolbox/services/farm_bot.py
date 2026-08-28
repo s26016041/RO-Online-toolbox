@@ -62,7 +62,7 @@ _BAD_GOAL_RADIUS = 8  # 走不到的目標附近多少格內都別再挑
 #: ⛔ **試過放寬到 13 格，失敗了，不要再試。**
 #: 想法是「攻擊封包只帶 GID 不帶座標，最後一段交給伺服器帶」——
 #: 單獨實驗確實成立（站穩後從 9~14 格送攻擊，伺服器 4/5 會自己走過去，
-#: 見 GAMEDATA [PKT-065]）。但**放進 bot 就壞了**，原因是實驗漏掉的差異：
+#: 見 GAMEDATA [PKT-072]）。但**放進 bot 就壞了**，原因是實驗漏掉的差異：
 #:
 #:   實驗：角色**站穩**才送攻擊 → 伺服器接手帶路
 #:   bot ：角色多半**正在走**的時候跨過門檻，`_walker.clear()` 之後
@@ -355,9 +355,12 @@ class FarmBot:
             self._fail("找不到伺服器連線（還沒登入？）")
             return False
 
-        sock = game_socket.find_game_socket(self._pid, server[0], server[1])
+        # ⚠ 剛連上的那幾秒複製不到，要重試（[PKT-072]）。
+        sock = game_socket.open_game_socket(
+            self._pid, server[0], server[1], should_stop=self._stop.is_set,
+        )
         if not sock:
-            self._fail("找不到遊戲 socket，無法送封包")
+            self._fail("找不到遊戲 socket，無法送封包（等了也沒出現）")
             return False
         self._sock = sock
         self._server = server
@@ -540,7 +543,10 @@ class FarmBot:
             if self._sock is not None:
                 game_socket.close_socket(self._sock)
                 self._sock = None
-            sock = game_socket.find_game_socket(self._pid, server[0], server[1])
+            sock = game_socket.open_game_socket(
+                self._pid, server[0], server[1],
+                timeout=game_socket.SOCKET_REBIND_SEC, should_stop=self._stop.is_set,
+            )
             if not sock:
                 self._fail("⚠ 換頻道後找不到新的遊戲 socket，自動打怪已停止")
                 return False

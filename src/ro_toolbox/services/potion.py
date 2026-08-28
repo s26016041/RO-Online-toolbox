@@ -584,7 +584,10 @@ class PotionBot:
         if self._sock is not None:
             game_socket.close_socket(self._sock)
             self._sock = None
-        sock = game_socket.find_game_socket(self._pid, server[0], server[1])
+        sock = game_socket.open_game_socket(
+            self._pid, server[0], server[1],
+            timeout=game_socket.SOCKET_REBIND_SEC, should_stop=self._stop.is_set,
+        )
         if not sock:
             self._fail("⚠ 換頻道後找不到新的遊戲 socket，自動補水已停止")
             return False

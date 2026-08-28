@@ -177,9 +177,14 @@ class TravelBot:
         server = find_server(self._pid)
         if server is None:
             return self._fail("找不到伺服器連線（還沒登入？）")
-        sock = game_socket.find_game_socket(self._pid, server[0], server[1])
+        # ⚠ 剛連上的那幾秒複製不到，要重試（[PKT-072]）——
+        # 舊版叫一次就放棄，症狀是「按下自動尋路就死在這裡」。
+        self._note("正在複製遊戲連線（剛上線的幾秒可能要等一下）…")
+        sock = game_socket.open_game_socket(
+            self._pid, server[0], server[1], should_stop=self._stop.is_set,
+        )
         if not sock:
-            return self._fail("找不到遊戲 socket，無法送封包")
+            return self._fail("找不到遊戲 socket，無法送封包（等了也沒出現）")
         self._sock, self._server = sock, server
 
         # AOB 定位要一秒上下。不講一聲的話這段就是完全的沉默，
@@ -520,7 +525,10 @@ class TravelBot:
         if self._sock is not None:
             game_socket.close_socket(self._sock)
             self._sock = None
-        sock = game_socket.find_game_socket(self._pid, server[0], server[1])
+        sock = game_socket.open_game_socket(
+            self._pid, server[0], server[1],
+            timeout=game_socket.SOCKET_REBIND_SEC, should_stop=self._stop.is_set,
+        )
         if not sock:
             return self._fail("⚠ 換頻道後找不到新的遊戲 socket，自動尋路已停止")
         self._sock, self._server = sock, server

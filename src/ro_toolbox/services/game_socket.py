@@ -18,6 +18,7 @@ from __future__ import annotations
 import ctypes
 import logging
 import socket
+import time
 from ctypes import wintypes
 
 log = logging.getLogger(__name__)
@@ -156,6 +157,52 @@ def find_game_socket(pid: int, server_ip: str, server_port: int) -> int | None:
         return None
     finally:
         _k32.CloseHandle(source)
+
+
+#: 複製不到 socket 時要重試多久（開機／換頻道那幾秒）。
+#:
+#: ⚠ **這不是「等一下再說」的敷衍，是實測出來的事實**：剛連上伺服器的那幾秒
+#: 遊戲那條 socket **複製不到**（實測：列舉得到 773 個 handle、複製成功 552 個，
+#: 但裡面只有 GameGuard 那條 443），過一會兒再找就 0.1 秒找到。
+SOCKET_WAIT_SEC = 20.0
+#: 換頻道／換地圖之後重綁的等待。比開機短 —— 那時整個 bot 的迴圈都卡在這裡。
+SOCKET_REBIND_SEC = 10.0
+_SOCKET_POLL = 0.3
+
+
+def open_game_socket(
+    pid: int,
+    server_ip: str,
+    server_port: int,
+    timeout: float = SOCKET_WAIT_SEC,
+    should_stop=None,
+) -> int | None:
+    """`find_game_socket()` 的重試版。**呼叫端一律用這支，不要自己叫一次就放棄。**
+
+    ⚠ 這是實際踩過的坑：`find_game_socket()` 在剛連上／剛換頻道的那幾秒
+    會回 None（見 `SOCKET_WAIT_SEC`）。`auto_login` 與 `potion` 各自寫了重試迴圈，
+    但 `travel_bot` 與 `farm_bot` 是**叫一次就放棄** —— 使用者按下自動尋路
+    只會看到「找不到遊戲 socket，無法送封包」，而且一按就死
+    （實機日誌：10:51:49、10:51:58、10:52:08 連續三次，[PKT-072]）。
+    同一條知識散在四個地方寫，就會有人漏掉；集中成一支。
+
+    找不到回 None，並且**放棄時才記一次 WARNING**（迴圈裡每次都記的話
+    兩秒就洗版一百行）。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        sock = find_game_socket(pid, server_ip, server_port)
+        if sock:
+            return sock
+        if should_stop is not None and should_stop():
+            return None
+        if time.monotonic() >= deadline:
+            log.warning(
+                "%.0f 秒內複製不到 PID %s 連到 %s:%s 的 socket",
+                timeout, pid, server_ip, server_port,
+            )
+            return None
+        time.sleep(_SOCKET_POLL)
 
 
 def send_on_socket(sock: int, data: bytes) -> int:

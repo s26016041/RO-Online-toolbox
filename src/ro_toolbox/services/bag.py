@@ -42,6 +42,8 @@ log = logging.getLogger(__name__)
 
 #: 這支被輪詢得很兇（每一秒多一次），失敗訊息要降噪 —— 見 StateLog。
 _notes = StateLog(log)
+#: 成功訊息同理：只在「容器位址／格數」變動時講一次。
+_reads = StateLog(log)
 
 #: 「除以 34」的魔術乘數。34 是背包清單封包的記錄大小（[PKT-039]）。
 #: 這是指令骨架的錨，不是答案 —— 容器位址是從指令的立即值讀出來的。
@@ -136,7 +138,10 @@ def find_container_sites(scanner: MemoryScanner) -> list[tuple[int, int, int]]:
             if base <= value < base + len(blob):
                 continue          # 指向程式碼的不是容器
             if 0x400000 < value < 0x10000000:
-                log.info("背包容器 AOB 命中：0x%X（解析函式 0x%X）", value, parser)
+                # ⚠ DEBUG：這支每秒多會被叫一次，而且一次可能命中好幾個候選。
+                # 用 INFO 的話光這一行就把執行日誌洗滿（使用者實際回報）。
+                # 真正該講的是下面「讀到幾格」那一行，而且只在變動時講。
+                log.debug("背包容器 AOB 命中：0x%X（解析函式 0x%X）", value, parser)
                 if value not in seen:
                     seen.add(value)
                     found.append((base + k, parser, value))
@@ -242,7 +247,12 @@ def read_bag(pid: int, scanner: MemoryScanner | None = None) -> list[BagItem]:
         if site is None:
             return []
         container, offset, best = site
-        log.info("背包讀到 %d 格（容器 %#x + %#x）", len(best), container, offset)
+        # ⚠ 只在**變動時**講一次。這支每秒多一次，照記就是每秒一行
+        # 「背包讀到 40 格」把日誌洗掉（使用者實際回報）。
+        _reads.changed(
+            f"{container:#x}+{offset:#x}:{len(best)}", logging.INFO,
+            "背包讀到 %d 格（容器 %#x + %#x）", len(best), container, offset,
+        )
         return best
     finally:
         if own:

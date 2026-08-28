@@ -128,13 +128,21 @@ class StateLog:
         self._log = logger
         self._last: str | None = None
 
-    def problem(self, key: str, level: int, msg: str, *args) -> None:
-        """回報一個問題。`key` 一樣就當成「還是同一件事」。"""
+    def changed(self, key: str, level: int, msg: str, *args) -> None:
+        """**狀態變了才講一次**；`key` 一樣就當成「還是同一件事」，降到 DEBUG。
+
+        成功與失敗都適用：被輪詢的東西（背包每秒多一次）照實記的話，
+        真正該看的訊息會被自己洗掉。
+        """
         if self._last == key:
             self._log.debug(msg, *args)
             return
         self._last = key
         self._log.log(level, msg, *args)
+
+    def problem(self, key: str, level: int, msg: str, *args) -> None:
+        """`changed()` 的別名（早期命名，只用在失敗路徑）。"""
+        self.changed(key, level, msg, *args)
 
     def ok(self, msg: str | None = None, *args) -> None:
         """回報恢復正常。之前有講過問題才需要說一聲。"""

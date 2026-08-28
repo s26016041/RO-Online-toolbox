@@ -631,3 +631,93 @@ def test_ordinary_progress_stays_at_info(caplog):
     with caplog.at_level(logging.INFO, logger="ro_toolbox.services.travel_bot"):
         bot._note("正在計算 a → c 的路線…")
     assert [r.levelname for r in caplog.records] == ["INFO"]
+
+
+# ---- 複製遊戲 socket 要重試，不能叫一次就放棄 ---------------------------
+#
+# 使用者實機日誌（自動尋路一按就死）：
+#   10:51:49 | WARNING | travel_bot | 找不到遊戲 socket，無法送封包
+#   10:51:58 | WARNING | travel_bot | 找不到遊戲 socket，無法送封包
+#   10:52:08 | WARNING | travel_bot | 找不到遊戲 socket，無法送封包
+#
+# GAMEDATA 早就記過「剛連上的那幾秒複製不到，過一會兒就 0.1 秒找到」，
+# 但那條知識只活在 auto_login 與 potion 各自的迴圈裡 ——
+# travel_bot 與 farm_bot 是叫一次就放棄。
+
+
+def test_the_socket_is_retried_not_given_up_on(monkeypatch):
+    """第一次失敗不算數：重試到成功。"""
+    from ro_toolbox.services import game_socket
+
+    tries = []
+
+    def _flaky(pid, ip, port):
+        tries.append((pid, ip, port))
+        return 0 if len(tries) < 3 else 4242
+
+    monkeypatch.setattr(game_socket, "find_game_socket", _flaky)
+    monkeypatch.setattr(game_socket, "_SOCKET_POLL", 0.0)
+    got = game_socket.open_game_socket(1234, "1.2.3.4", 6900, timeout=5.0)
+    assert got == 4242
+    assert len(tries) == 3
+
+
+def test_giving_up_says_it_once_not_every_try(monkeypatch, caplog):
+    """⚠ 迴圈裡每次都記的話兩秒就洗版一百行 —— 放棄時才講一次。"""
+    import logging
+
+    from ro_toolbox.services import game_socket
+
+    monkeypatch.setattr(game_socket, "find_game_socket", lambda *a: 0)
+    monkeypatch.setattr(game_socket, "_SOCKET_POLL", 0.0)
+    with caplog.at_level(logging.WARNING, logger="ro_toolbox.services.game_socket"):
+        assert game_socket.open_game_socket(1234, "1.2.3.4", 6900, timeout=0.05) is None
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+
+
+def test_stopping_the_bot_aborts_the_wait(monkeypatch):
+    """bot 被關掉就不要傻等 —— 使用者按了停止就該停。"""
+    from ro_toolbox.services import game_socket
+
+    monkeypatch.setattr(game_socket, "find_game_socket", lambda *a: 0)
+    monkeypatch.setattr(game_socket, "_SOCKET_POLL", 0.0)
+    got = game_socket.open_game_socket(
+        1234, "1.2.3.4", 6900, timeout=60.0, should_stop=lambda: True,
+    )
+    assert got is None
+
+
+def test_every_bot_goes_through_the_retrying_opener():
+    """⚠ 同一條知識散在四個地方寫，就會有人漏掉（實際發生過）。
+
+    除了 potion 那個本來就有自己的重試迴圈的地方，其他呼叫端一律走
+    `open_game_socket`。
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "src/ro_toolbox/services"
+    for name in ("travel_bot.py", "farm_bot.py"):
+        body = (root / name).read_text(encoding="utf-8")
+        assert "find_game_socket(" not in body, f"{name} 還在直接叫一次就放棄"
+
+
+# ---- 每秒輪詢的東西不准洗版 ---------------------------------------------
+
+
+def test_reading_the_bag_only_speaks_when_something_changed(caplog):
+    """⚠ 背包每秒多讀一次；照實記就是每秒一行「背包讀到 40 格」。
+
+    使用者實際回報過（把面板下限拉到 INFO 之後才浮現）。
+    """
+    import logging
+
+    from ro_toolbox.utils.logging import StateLog
+
+    notes = StateLog(logging.getLogger("ro_toolbox.services.bag"))
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.services.bag"):
+        for _ in range(20):
+            notes.changed("0x15d2ac8+0x1738:40", logging.INFO, "背包讀到 40 格")
+        notes.changed("0x15d2ac8+0x1738:39", logging.INFO, "背包讀到 39 格")
+    said = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
+    assert said == ["背包讀到 40 格", "背包讀到 39 格"], said
