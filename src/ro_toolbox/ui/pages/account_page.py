@@ -295,6 +295,8 @@ class AccountPage(BasePage):
         # 兩份不一致的話這裡存的遊戲路徑會被安靜地蓋掉（見 current_settings）。
         self._settings = current_settings()
         # 勾選存**帳號名稱**不存列號 —— 增刪或排序之後列號會挪動。
+        #: 目前勾起來的帳號名稱。**真正的存檔在 `Account.selected`** ——
+        #: 這裡只是為了查得快，每次重建清單都從帳號重新算出來。
         self._checked: set[str] = set()
 
         self.notice = QLabel()
@@ -470,6 +472,10 @@ class AccountPage(BasePage):
         # 欄位順序一改，上一輪那根進度條就卡在別的欄位上跟文字疊在一起。
         self.table.setRowCount(0)
         self.table.setRowCount(len(self._store.accounts))
+        # ⚠ **要在填格子之前算好。** 勾選狀態的真身是 `Account.selected`；
+        # 這個集合只是查得快的快取。放到迴圈後面算的話，第一次建表時它還是空的
+        # —— 每一格都會畫成沒勾（踩過）。順便把已刪掉的帳號自然排除。
+        self._checked = {a.name for a in self._store.accounts if a.selected}
         # 填表期間 itemChanged 會一直觸發，先擋掉才不會把勾選狀態洗掉。
         self.table.blockSignals(True)
         for row, account in enumerate(self._store.accounts):
@@ -481,7 +487,7 @@ class AccountPage(BasePage):
             )
             check.setCheckState(
                 Qt.CheckState.Checked
-                if account.name in self._checked
+                if account.selected
                 else Qt.CheckState.Unchecked
             )
             self.table.setItem(row, _CHECK, check)
@@ -518,8 +524,6 @@ class AccountPage(BasePage):
             bar.setMaximum(account.secret.period)
             self.table.setCellWidget(row, _LEFT, bar)
         self.table.blockSignals(False)
-        # 勾選集合裡可能還留著已經被刪掉的帳號，清乾淨。
-        self._checked &= {a.name for a in self._store.accounts}
         self._tick()
         self._refresh_buttons()
 
@@ -529,11 +533,17 @@ class AccountPage(BasePage):
         row = item.row()
         if row >= len(self._store.accounts):
             return
-        name = self._store.accounts[row].name
-        if item.checkState() == Qt.CheckState.Checked:
-            self._checked.add(name)
+        account = self._store.accounts[row]
+        checked = item.checkState() == Qt.CheckState.Checked
+        if checked:
+            self._checked.add(account.name)
         else:
-            self._checked.discard(name)
+            self._checked.discard(account.name)
+        # ⚠ 使用者要求「要記住我勾選的紀錄」。存在帳號自己身上，
+        # 下次開程式就照樣是勾好的（見 `Account.selected`）。
+        if account.selected != checked:
+            account.selected = checked
+            self._persist()
         self._refresh_buttons()
 
     def checked_accounts(self) -> list:

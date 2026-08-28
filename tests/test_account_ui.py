@@ -614,3 +614,57 @@ def test_login_stores_the_password_blob(page, monkeypatch):
     worker.run()
 
     assert account.password_blob == "ab" * 24
+
+
+# ---- 勾選要記住（使用者要求）---------------------------------------------
+
+
+def test_ticking_an_account_is_remembered_on_the_account_itself(page, monkeypatch):
+    """⚠ 勾選存在 `Account.selected`，**不是另外存一份名字清單**。
+
+    專案鐵則是「存身分，不存位置」；而另存一份名字清單等於又多一個要同步的
+    東西 —— 改名、刪帳號、換順序都得記得去修它，漏掉就是安靜地勾錯人。
+    """
+    saved = []
+    monkeypatch.setattr(page, "_persist", lambda: saved.append(True) or True)
+    page.table.item(0, page_module._CHECK).setCheckState(Qt.CheckState.Checked)
+    assert page._store.accounts[0].selected is True
+    assert saved, "勾了要當場存檔，不然關掉就沒了"
+
+
+def test_unticking_is_remembered_too(page, monkeypatch):
+    monkeypatch.setattr(page, "_persist", lambda: True)
+    item = page.table.item(0, page_module._CHECK)
+    item.setCheckState(Qt.CheckState.Checked)
+    item.setCheckState(Qt.CheckState.Unchecked)
+    assert page._store.accounts[0].selected is False
+
+
+def test_a_saved_tick_comes_back_after_a_restart(qtbot, offline, monkeypatch):
+    """下次開程式，勾好的還是勾好的。"""
+    account = _account()
+    account.selected = True
+    monkeypatch.setattr(
+        account_store, "load", lambda *a, **k: AccountStore([account])
+    )
+    widget = AccountPage()
+    qtbot.addWidget(widget)
+    try:
+        assert (
+            widget.table.item(0, page_module._CHECK).checkState()
+            == Qt.CheckState.Checked
+        )
+        assert [a.name for a in widget.checked_accounts()] == [account.name]
+    finally:
+        widget.shutdown()
+
+
+def test_the_selection_survives_a_round_trip_through_the_file():
+    """存檔／讀檔要帶得過去，舊存檔沒有這個欄位就是沒勾。"""
+    account = _account()
+    account.selected = True
+    assert Account.from_dict(account.to_dict()).selected is True
+
+    old = account.to_dict()
+    del old["selected"]
+    assert Account.from_dict(old).selected is False

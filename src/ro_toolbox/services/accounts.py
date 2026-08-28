@@ -148,6 +148,13 @@ class Account:
     #: 合併會把已經刪掉的角色永遠留在選單裡。
     known_characters: list[KnownCharacter] = field(default_factory=list)
     note: str = ""
+    #: 這個帳號在帳號頁上有沒有被勾起來（批次登入要登哪幾個）。
+    #:
+    #: ⚠ **存在帳號自己身上，不是另外存一份名字清單。** 專案鐵則是
+    #: 「存身分，不存位置」—— 而另存一份名字清單等於又多了一個要同步的東西：
+    #: 改名、刪帳號、換順序都得記得去修它，漏掉就是安靜地勾錯人。
+    #: 旗標跟著帳號走就沒有這個問題。
+    selected: bool = False
 
     def slot_of(self, name: str, server: str = "") -> int | None:
         """拿角色名稱查現在的格號。查不到回 None —— 呼叫端要拒絕登入。
@@ -201,6 +208,7 @@ class Account:
             "char_slot": self.char_slot,
             "known_characters": [c.to_dict() for c in self.known_characters],
             "note": self.note,
+            "selected": self.selected,
         }
 
     @classmethod
@@ -225,6 +233,8 @@ class Account:
             char_slot=int(slot) if slot is not None else None,
             known_characters=known,
             note=data.get("note", ""),
+            # 後來才加的欄位 —— 舊存檔沒有就是沒勾。
+            selected=bool(data.get("selected", False)),
         )
 
     @property
