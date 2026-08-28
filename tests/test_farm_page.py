@@ -721,3 +721,65 @@ def test_reading_the_bag_only_speaks_when_something_changed(caplog):
         notes.changed("0x15d2ac8+0x1738:39", logging.INFO, "背包讀到 39 格")
     said = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
     assert said == ["背包讀到 40 格", "背包讀到 39 格"], said
+
+
+# ---- 一建卡就開始看著他（不要等「連線正常」那一拍）----------------------
+#
+# 使用者實測：「我把遊戲關閉他沒回連。」實機日誌：
+#   13:03:04  狐狐狸：尚未登入（回到選角畫面？）   ← find_server() 這一拍是 None
+#   13:03:04  自動掛機：加入 狐狐狸（PID 54656）
+#   13:03:04  自動掛機：移除 PID 54656（遊戲行程已結束）
+# 分頁沒活過一拍「連線正常」，`_watching` 從頭到尾是空的 —— 閃退偵測沒被啟用。
+
+
+def test_a_new_tab_is_watched_immediately(qtbot, monkeypatch):
+    """⚠ **建得出卡就代表那一刻是連線正常的**（`_scan()` 只在有連線時才 attach）。
+
+    所以身分與快照要在建卡那一刻就記下來，不要等下一拍 —— 那一拍可能
+    永遠不會來（客戶端還在換到地圖伺服器，或使用者立刻把遊戲關了）。
+    """
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    page._names[1234] = "狐狐狸"
+    monkeypatch.setattr(mod, "find_server", lambda _pid: None)   # 還沒連上
+    # 直接呼叫建卡尾端那段（`_on_attached` 的最後幾行）
+    page._watching["狐狐狸"] = 1234
+    page._snaps.setdefault("狐狐狸", page.snapshot_for(1234))
+    assert page._watching == {"狐狐狸": 1234}
+    assert "狐狐狸" in page._snaps, "沒有快照的話回連會直接放棄"
+
+
+def test_the_attach_path_records_the_identity(qtbot, monkeypatch):
+    """釘住原始碼：`_on_attached` 一定要記 `_watching` 與 `_snaps`。
+
+    這條用掃原始碼而不是跑整條 attach —— attach 要真的去讀遊戲記憶體。
+    """
+    import inspect
+
+    from ro_toolbox.ui.pages.farm_page import FarmPage
+
+    body = inspect.getsource(FarmPage._on_attached)
+    assert "self._watching[status.name]" in body, "建卡時要記住他住在哪個 PID"
+    assert "_snaps.setdefault" in body, "建卡時要留一份快照（且不准蓋掉舊的）"
+
+
+def test_the_snapshot_taken_at_attach_never_clobbers_the_old_one(qtbot):
+    """⚠ 回連之後卡是新建的，這時 `_snaps` 裡放的是**斷線前**那一份。
+
+    用 setdefault 而不是直接指派 —— 被一份空的蓋掉的話就接不回去了。
+    """
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    card.auto_hunt.setChecked(True)
+    before = page.snapshot_for(1234)
+    page._snaps["狐狐狸"] = before
+
+    card.auto_hunt.setChecked(False)          # 新卡什麼都沒開
+    page._snaps.setdefault("狐狐狸", page.snapshot_for(1234))
+    assert page._snaps["狐狐狸"] is before, "舊快照不准被新的空快照蓋掉"

@@ -1037,11 +1037,27 @@ class FarmPage(BasePage):
         if self._current_pid() == pid:
             self._load_bag(pid)
         log.info("自動掛機：加入 %s（PID %s）", status.name, pid)
+
+        # ⚠⚠ **一建卡就開始看著他。** 舊版只在 `_watch_connections` 的
+        # 「連線正常」那一拍才記 `_watching` 與快照 —— 但分頁剛建好的那幾秒
+        # `find_server()` 常常還是 None（客戶端還在換到地圖伺服器）。
+        # 使用者要是在那段時間關掉遊戲，就**完全沒有人在看**，
+        # 閃退偵測從頭到尾沒被啟用（實機日誌：分頁 13:03:04 加入、
+        # **同一秒**移除，中間一拍「連線正常」都沒有）。
+        #
+        # 這裡記得起來是因為 `_scan()` 只在 `find_server(pid) is not None`
+        # 時才去 attach —— 也就是說**建得出卡就代表那一刻是連線正常的**。
+        self._watching[status.name] = pid
+        # 快照用 setdefault：回連之後卡是新建的，這時 `_snaps` 裡放的是
+        # 斷線前那一份（要接回去的那份），不能被一份空的蓋掉。
+        self._snaps.setdefault(status.name, self.snapshot_for(pid))
         # ⚠ 一定要放在最後：`restore_into` 會去勾那些開關，而勾選要能真的把
         # bot 帶起來，得先接好 signal、套過存檔的補水設定。
         self._restore_if_pending(pid)
 
     def _remove(self, pid: int, reason: str) -> None:
+        # 角色名要在清掉 _names 之前拿 —— 日誌上沒有身分就對不上 `_watching`。
+        who = self._names.get(pid)
         bot = self._bots.pop(pid, None)
         if bot is not None:
             self._keep_loot(pid, bot)
@@ -1074,7 +1090,7 @@ class FarmPage(BasePage):
 
         self._failures.pop(pid, None)
         self._update_empty_state()
-        log.info("自動掛機：移除 PID %s（%s）", pid, reason)
+        log.info("自動掛機：移除 %s（PID %s，%s）", who or "—", pid, reason)
 
     # ---- 自動打怪 ---------------------------------------------------
 
