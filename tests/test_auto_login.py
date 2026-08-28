@@ -741,102 +741,61 @@ def test_another_accounts_login_packet_is_ignored(fast):
     assert bot.password_blob == ""
 
 
-# ---- 焦點在哪一格：用量的，不用猜 --------------------------------------
+# ---- 焦點在哪一格：用預設假設，**不做任何探測** ------------------------
 #
-# 使用者回報：「輸入帳密會卡在輸入帳密，一直打反，然後發現打反又重打，
-# 或者根本沒發現單純一直重打。」規則他自己講得很清楚 ——
-# 帳號欄有預填→焦點在密碼欄；帳號欄是空的→焦點在帳號欄。
-# 舊版讀的訊號（「上次送出去的帳號」那塊靜態緩衝）**兩種情況都是空的**
-# （[MEM-032]：那塊送出之後才有值），所以那個判斷根本不帶資訊。
+# ⛔⛔ 這裡試過兩種「量出來」的做法，兩種都讓事情變糟，都已移除：
+#   1. 讀「上次送出的帳號」靜態緩衝 —— [MEM-032] 明寫它送出後才有值，
+#      兩種情況都是空的，等於沒在判斷。
+#   2. 打探針進去再搜記憶體 —— 使用者實測「剛開始在密碼時還會莫名打出
+#      一些字然後自己刪掉」（那就是探針，看得見），而且判斷照樣會錯
+#      （「他都會相反一次」）。
+#
+# 教訓：[MEM-032] 那條不對稱是**一次**特定量測下成立的。拿它當「判斷焦點」
+# 的唯一依據，等於把整條登入押在沒有反覆驗證過的前提上。
 
 
-def _bot(monkeypatch, found: list[int] | None):
-    """做一個 AutoLogin，並決定「探針在記憶體裡找不找得到」。"""
+def _bot(monkeypatch, findable=()):
+    """做一個 AutoLogin，並決定「哪些字串在堆積上找得到」（只影響觀察用的日誌）。"""
     bot = AutoLogin(_account(), 4242)
     monkeypatch.setattr(
         auto_login.input_helper, "field_addresses",
-        lambda pid, text: list(found or []),
+        lambda pid, text: [0x18254788] if text in set(findable) else [],
     )
     return bot
 
 
-def _bot_probing(monkeypatch, findable: set[str]):
-    """做一個 AutoLogin，並決定「哪些探針會在堆積上被找到」。"""
-    bot = AutoLogin(_account(), 4242)
-    monkeypatch.setattr(
-        auto_login.input_helper, "field_addresses",
-        lambda pid, text: [0x18254788] if text in findable else [],
-    )
-    return bot
+def test_it_assumes_the_password_box_and_says_so(monkeypatch, wired):
+    """客戶端記住帳號時焦點就在密碼欄（使用者實測，實務上幾乎永遠如此）。"""
+    bot = _bot(monkeypatch)
+    bot._decide_focus(0x1234)
+    assert bot._tab_first is True
+    assert any("假設焦點在密碼欄" in step for step in bot.progress.steps)
 
 
-def test_the_first_probe_landing_means_we_are_in_the_account_box(monkeypatch, wired):
-    """[MEM-032] 的不對稱：帳號欄打進去的字在堆積上找得到。"""
-    bot = _bot_probing(monkeypatch, {AutoLogin._PROBE})
-    assert bot._probe_focus(0x1234) is False        # False = 不用先打密碼
-    assert f"type:{AutoLogin._PROBE}" in wired, "探針要真的打進去"
+def test_nothing_extra_is_ever_typed_into_the_boxes(monkeypatch, wired):
+    """⚠ 使用者實測：「還會莫名打出一些字然後自己刪掉」——那是探針。
 
-
-def test_the_second_probe_gives_the_other_direction_a_positive_answer(
-    monkeypatch, wired
-):
-    """⚠⚠ **只做第一段是不夠的**（第一版就是這樣）。
-
-    那時「搜不到」同時代表「在密碼欄」與「記憶體讀不到」，把後者當成前者
-    就會賭錯 —— 使用者實測「一直打反」「輸入帳號是我的密碼」都是這個。
-
-    補上第二段：Tab 到另一格再打一個**不同的**探針，搜得到就證明
-    那一格才是帳號欄 → 原本在密碼欄。兩個方向都有正面證據。
+    現在**只准打帳號與密碼**，不准打任何使用者看得見卻不屬於他的字。
     """
-    bot = _bot_probing(monkeypatch, {AutoLogin._PROBE_B})
-    assert bot._probe_focus(0x1234) is False        # Tab 之後現在在帳號欄
-    assert f"type:{AutoLogin._PROBE_B}" in wired
-    assert "key:9" in wired, "要 Tab 到另一格"
-    assert any("原本在密碼欄" in step for step in bot.progress.steps)
+    bot = _bot(monkeypatch)
+    typed = [
+        action["text_fg"]
+        for batch in bot._credential_batches(0x1234)
+        for action in batch
+        if "text_fg" in action
+    ]
+    assert typed == ["pw", "demo01"], typed
 
 
-def test_the_two_probes_must_be_different():
-    """一樣的話「搜到了」就分不出它是打在哪一格。"""
-    assert AutoLogin._PROBE != AutoLogin._PROBE_B
-
-
-def test_neither_probe_landing_is_unknown_not_a_verdict(monkeypatch, wired):
-    """兩個都搜不到＝記憶體讀不到＝**不知道**，不准當成任何一邊。"""
-    bot = _bot_probing(monkeypatch, set())
-    assert bot._probe_focus(0x1234) is None
-
-
-def test_unmeasurable_focus_accounts_for_the_tab_it_already_did(monkeypatch, wired):
-    """⚠ 走到「不知道」時**已經 Tab 過一次**，位置跟一開始不一樣了。
-
-    預設假設是「客戶端記住帳號 → 一開始在密碼欄」，加上那一次 Tab，
-    結論是「現在在帳號欄」。
-    """
-    bot = _bot_probing(monkeypatch, set())
+def test_the_focus_guess_is_made_once_not_every_attempt(monkeypatch, wired):
+    """重試時的翻面由送出後的閉環驗證負責，不要每輪重猜。"""
+    bot = _bot(monkeypatch)
+    bot._tab_first = False
     bot._decide_focus(0x1234)
-    assert bot._tab_first is False
-    assert any("Tab 之後現在在帳號欄" in step for step in bot.progress.steps)
+    assert bot._tab_first is False, "已經有結論就不准再猜"
 
 
-def test_a_measured_focus_is_recorded(monkeypatch, wired):
-    bot = _bot_probing(monkeypatch, {AutoLogin._PROBE})
-    bot._decide_focus(0x1234)
-    assert bot._tab_first is False
-    assert any("就在帳號欄" in step for step in bot.progress.steps)
-
-
-def test_focus_is_measured_once_not_every_attempt(monkeypatch, wired):
-    """量一次就好 —— 每次都掃記憶體會讓重試更慢。翻面由閉環驗證負責。"""
-    bot = _bot_probing(monkeypatch, set())
-    bot._tab_first = True
-    bot._decide_focus(0x1234)
-    assert bot._tab_first is True, "已經有結論就不准再量"
-
-
-# ---- 空的欄位不要清（每一次清空都是一個子行程）--------------------------
-#
-# 使用者實測的規則：剛進登入畫面時，**有焦點的那一格是空的**，
-# 而客戶端只會把記住的帳號預填在帳號欄。
+# ---- Tab 過去那一格一律清空 ---------------------------------------------
 
 
 def test_the_field_after_tab_is_always_cleared(monkeypatch, wired):
@@ -845,38 +804,21 @@ def test_the_field_after_tab_is_always_cleared(monkeypatch, wired):
     使用者實測：「輸入完密碼移動到帳號應該要刪除帳號再打入真帳號，
     可是他沒刪除舊帳，ENTER 導致錯誤。」
 
-    那個最佳化有兩個洞：
-      1. 我們對「Tab 過去是哪一格」的把握來自探針，而探針**可能判錯**。
-      2. 登入畫面有「存檔」選項，「密碼欄一定是空的」從來不是驗過的事實。
-
-    省下 2.7 秒 vs 一次打錯送出（錯誤框＋整輪重打 ≈ 25 秒）—— 完全不對稱。
+    我們對「Tab 過去是哪一格」根本沒有把握 —— 那只是預設假設。
+    省下 2.7 秒 vs 一次打錯送出（錯誤框＋整輪重打 ≈ 25 秒），完全不對稱。
     """
-    for found in ([0x18254788], []):          # 兩種焦點判定都要清
-        bot = _bot(monkeypatch, found)
-        batches = bot._credential_batches(0x1234)
-        assert len(batches) == 6, [len(b) for b in batches]
-        # 清空／打字／Tab／**清空**／打字／Enter
-        assert all("key" in a for a in batches[3]), batches[3]
+    bot = _bot(monkeypatch)
+    batches = bot._credential_batches(0x1234)
+    assert len(batches) == 6, [len(b) for b in batches]
+    assert all("key" in a for a in batches[3]), batches[3]
 
 
 def test_a_retry_always_clears_because_our_own_text_is_still_there(monkeypatch, wired):
-    """重試時欄位裡是上一輪我們自己打的字 —— 一定要清，不能沿用「它是空的」。"""
-    bot = _bot(monkeypatch, [0x18254788])
-    bot._credential_batches(0x1234)                # 第一輪
-    again = bot._credential_batches(0x1234)        # 第二輪
+    """重試時欄位裡是上一輪我們自己打的字 —— 一定要清。"""
+    bot = _bot(monkeypatch)
+    bot._credential_batches(0x1234)
+    again = bot._credential_batches(0x1234)
     assert len(again) == 6, "重試時兩格都要清"
-
-
-def test_the_probe_does_not_clear_first(monkeypatch, wired):
-    """探針前面不用清 —— 剛進去那一格本來就是空的。"""
-    bot = AutoLogin(_account(), 4242)
-    monkeypatch.setattr(
-        auto_login.input_helper, "field_addresses", lambda pid, text: [1]
-    )
-    batches = _raw_batches(monkeypatch)
-    bot._probe_focus(0x1234)
-    assert len(batches) == 1, "探針只要一批（打字），不要先清空"
-    assert any("text_fg" in a for a in batches[0])
 
 
 def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
@@ -885,11 +827,45 @@ def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
     [INP-010] 實測過它很挑：`KEYDOWN+CHAR+KEYUP` 會送出、
     `KEYDOWN+KEYUP`（無 CHAR）**不會送出**，而且失敗時毫無錯誤訊息。
     """
-    bot = _bot(monkeypatch, [0x18254788])
+    bot = _bot(monkeypatch)
     enter = bot._credential_batches(0x1234)[-1]
     assert len(enter) == 1 and enter[0]["key"] == 0x0D, enter
-    # ★ 那個 char 就是 [INP-010] 的重點：少帶它，帳密全打對也永遠不會送出。
     assert enter[0]["char"] == 0x0D, "Enter 一定要帶字元碼"
+
+
+# ---- 送出前只**觀察**，不做決定 -----------------------------------------
+#
+# ⚠⚠ 這裡也試過兩版「送出前自己判斷有沒有打反」，兩版都會把**本來正確**的
+# 輸入弄壞（v0.3.1「搜不到帳號就翻面」、v0.3.3「搜到密碼就翻面」）。
+# 使用者實測：「他都會相反一次，雖然後來修正了，但這是不對的。」
+# 唯一會觸發翻面的依據是送出**之後**那個確定的訊號（submitted_account）。
+
+
+def test_the_observation_never_changes_anything(monkeypatch, wired):
+    """只寫日誌，不回傳決定、不改狀態 —— 這是這一支存在的全部理由。"""
+    for findable in ((), ("demo01",), ("pw",), ("demo01", "pw")):
+        bot = _bot(monkeypatch, findable)
+        bot._tab_first = True
+        assert bot._note_field_placement() is None
+        assert bot._tab_first is True, "觀察不准改任何決定"
+
+
+def test_the_observation_records_what_it_saw(monkeypatch, wired):
+    """留下證據，下次實測才看得出那條不對稱到底成不成立。"""
+    bot = _bot(monkeypatch, ("demo01",))
+    bot._note_field_placement()
+    assert any("帳號在堆積上找得到" in step and "密碼找不到" in step
+               for step in bot.progress.steps), bot.progress.steps
+
+
+def test_a_failed_observation_is_harmless(monkeypatch, wired):
+    """記憶體讀不到就算了 —— 純觀察，不該影響登入。"""
+    def _boom(pid, text):
+        raise RuntimeError("讀不到")
+
+    monkeypatch.setattr(auto_login.input_helper, "field_addresses", _boom)
+    bot = AutoLogin(_account(), 4242)
+    assert bot._note_field_placement() is None
 
 
 # ---- SendInput 打的是「前景視窗」，不是我們指定的 hwnd -------------------
@@ -925,21 +901,8 @@ def test_every_foreground_action_has_a_focus_before_it(monkeypatch, wired):
     測試當時沒抓到，是因為假的 `send` 不會模擬「前景」這件事 ——
     所以這裡改成檢查**動作清單本身的形狀**。
     """
-    bot = _bot(monkeypatch, [0x18254788])
+    bot = _bot(monkeypatch)
     for batch in bot._credential_batches(0x1234):
-        _assert_focus_before_foreground(batch)
-
-
-def test_the_probe_batch_also_focuses_first(monkeypatch, wired):
-    """探針那一批同樣是先清空再打字，一樣不能少了 focus()。"""
-    bot = AutoLogin(_account(), 4242)
-    monkeypatch.setattr(
-        auto_login.input_helper, "field_addresses", lambda pid, text: [1]
-    )
-    batches = _raw_batches(monkeypatch)
-    bot._probe_focus(0x1234)
-    assert batches, "探針要真的送出去"
-    for batch in batches:
         _assert_focus_before_foreground(batch)
 
 
@@ -952,7 +915,7 @@ def test_no_window_message_after_a_key_in_the_same_batch(monkeypatch, wired):
     ⚠ v0.2.5 為了省子行程把清空也改成按鍵、六批併成兩批，自動登入整個爛掉
     （實跑 11 次，欄位都填對了但 Enter 一次都沒送出去）。已還原。
     """
-    bot = _bot(monkeypatch, [0x18254788])
+    bot = _bot(monkeypatch)
     for batch in bot._credential_batches(0x1234):
         seen_key = False
         for action in batch:
@@ -960,74 +923,3 @@ def test_no_window_message_after_a_key_in_the_same_batch(monkeypatch, wired):
                 seen_key = True
             if "text" in action or "key" in action:
                 assert not seen_key, f"按鍵之後又送視窗訊息：{batch}"
-
-
-# ---- 送出**之前**就抓到打反，不要讓伺服器拒絕 ---------------------------
-#
-# 使用者實測：「雖然最後還是成功的，但不該有那個錯誤。」
-# 送出後才驗的代價是：跳錯誤框 → 關掉 → 翻面 → 整輪重打 ≈ 25 秒。
-
-
-def _bot_seeing(monkeypatch, on_screen: set[str]):
-    """做一個 AutoLogin，並決定「哪些字串在堆積上找得到」。"""
-    bot = AutoLogin(_account(), 4242)
-    monkeypatch.setattr(
-        auto_login.input_helper, "field_addresses",
-        lambda pid, text: [0x18254788] if text in on_screen else [],
-    )
-    return bot
-
-
-def test_finding_the_account_confirms_we_typed_into_the_right_box(
-    monkeypatch, wired
-):
-    """[MEM-032]：打進**帳號欄**的字在堆積上找得到 → 確定打對。"""
-    bot = _bot_seeing(monkeypatch, {"demo01"})
-    assert bot._fields_look_right() is True
-
-
-def test_finding_the_password_on_the_heap_means_it_went_into_the_account_box(
-    monkeypatch, wired
-):
-    """打進**密碼欄**的字整個記憶體都搜不到（[MEM-032]）——
-    所以密碼只要現身在堆積，就一定是被打進帳號欄了 → 確定打反。"""
-    bot = _bot_seeing(monkeypatch, {"pw"})
-    bot._tab_first = False
-    assert bot._fields_look_right() is False
-    assert bot._tab_first is True, "要翻面"
-    assert any("打反了" in step for step in bot.progress.steps)
-
-
-def test_seeing_neither_is_not_a_verdict_and_it_submits_anyway(monkeypatch, wired):
-    """⚠⚠ **這一條是修過的 bug。**
-
-    第一版是「搜不到自己的帳號就翻面」。但搜不到有兩種原因：真的打反了，
-    或記憶體那一拍讀不到。把後者也當成打反，就會在**本來打對**的時候
-    把它翻成錯的 —— 使用者實測回報「輸入帳號是我的密碼」就是這個。
-
-    現在兩個都搜不到＝**不知道**，照舊送出去讓送出後的閉環驗證兜底。
-    最壞情況跟沒有這一支時完全一樣。
-    """
-    bot = _bot_seeing(monkeypatch, set())
-    bot._tab_first = True
-    assert bot._fields_look_right() is True, "不知道就不准擋"
-    assert bot._tab_first is True, "不知道就**不准翻面**"
-
-
-def test_it_only_flips_once_before_submitting(monkeypatch, wired):
-    """⚠ 只准翻一次，避免兩邊互相推來推去。"""
-    bot = _bot_seeing(monkeypatch, {"pw"})
-    bot._tab_first = False
-    assert bot._fields_look_right() is False      # 第一次：翻面
-    assert bot._fields_look_right() is True       # 第二次：放行
-    assert bot._tab_first is True, "第二次不准再翻"
-
-
-def test_enter_is_held_back_until_the_fields_check_out(monkeypatch, wired):
-    """打反的時候 Enter **一個都不准送出去**。"""
-    bot = _bot(monkeypatch, [])
-    bot._tab_first = False
-    *typing, enter = bot._credential_batches(0x1234)
-    assert enter[0]["key"] == 0x0D
-    assert all(a.get("key") != 0x0D for batch in typing for a in batch), \
-        "Enter 不准混在打字的批次裡"

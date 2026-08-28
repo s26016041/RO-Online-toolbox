@@ -128,19 +128,8 @@ _PIN_SOCKET_TIMEOUT = 20.0
 #: 一直「缺料」（踩過：15 秒不夠）。
 _PIN_SEED_TIMEOUT = 40.0
 _POLL = 0.4
-#: 送出**之前**確認「字打到哪一格」的等待上限。整條登入只跑這一次。
-#: 一次記憶體搜尋約 0.4 秒（[MEM-032]），而每一圈搜兩次（帳號、密碼），
-#: 所以這裡大約是三圈。
-#: ⚠ 逾時**不是判決**：兩個都搜不到代表「讀不到」，照舊送出去
-#: —— 絕不能拿它當「打反了」用（見 `_fields_look_right` 的第一版錯誤）。
-_FIELD_CHECK_TIMEOUT = 3.0
-#: 探針打進去之後，最多等這麼久去記憶體裡找它。
-#:
-#: 找得到＝焦點在帳號欄（[MEM-032]：帳號欄的字在堆積上找得到，密碼欄的**整個
-#: 記憶體都搜不到**）。一次掃描約 0.4 秒（只掃 private 可寫區段），所以這裡
-#: 大約是掃 5 次。⚠ **逾時不代表「在密碼欄」是確定的** —— 讀不到也會逾時，
-#: 那時就退回舊的預設假設，並且照舊有送出後的閉環驗證兜底。
-_PROBE_TIMEOUT = 2.5
+
+
 
 _VK_HOME, _VK_DELETE = 0x24, 0x2E
 _VK_END, _VK_BACKSPACE = 0x23, 0x08
@@ -228,8 +217,6 @@ class AutoLogin:
         self._tab_first: bool | None = None
         #: 已經打過一輪了嗎。重試時欄位裡有上一輪的字，一定要清空。
         self._typed_once = False
-        #: 送出前的檢查已經翻過一次面了嗎。只准翻一次 —— 見 `_fields_look_right`。
-        self._presubmit_flipped = False
         self.progress = LoginProgress()
 
     # ---- 對外 -------------------------------------------------------
@@ -411,11 +398,6 @@ class AutoLogin:
             log.debug("判斷畫面失敗：%s", exc)
             return False
 
-    #: 探測焦點用的兩個標記。挑不會跟遊戲內容撞的組合，而且**兩個必須不一樣** ——
-    #: 一樣的話「搜到了」就分不出它是打在哪一格。
-    _PROBE = "ZQ7X4K"
-    _PROBE_B = "VM3H8T"
-
     def _clear_actions(self) -> list[dict]:
         """把目前這一格清乾淨，**兩個方向都清**。
 
@@ -454,108 +436,40 @@ class AutoLogin:
         """
         return [input_helper.focus(), input_helper.key_foreground(_VK_TAB)]
 
-    def _probe_focus(self, hwnd: int) -> bool | None:
-        """量出焦點在哪一格。回「接下來要不要先打密碼」，量不出來回 None。
-
-        ## 為什麼要量，不能猜
-
-        使用者實測的規則本身沒錯：**帳號欄有預填 → 焦點在密碼欄；
-        帳號欄是空的 → 焦點在帳號欄。** 問題是舊版拿來判斷的訊號
-        **根本分不出這兩種情況**：它讀的是「上次送出去的帳號」那塊
-        靜態緩衝（`input_helper.submitted_account()`），而 [MEM-032] 白紙黑字寫著
-        那塊**送出之後才有值**、「不能拿來判斷現在框裡有什麼」。
-        遊戲剛開還沒送出過任何東西，兩種情況讀到的都是空的 ——
-        於是每次都賭同一邊，賭錯就整輪重來（使用者回報「一直打反」）。
-
-        ## 怎麼量：兩段式，**兩個方向都要正面訊號**
-
-        [MEM-032] 量過一個**不對稱**，這裡拿它當判準：
-
-            打進帳號欄的字 → 輪詢幾拍就能在**堆積**上找到（ASCII）
-            打進密碼欄的字 → **整個記憶體都搜不到**
-
-        所以：
-
-            ① 往現在有焦點的那一格打探針 A → 搜得到 → **現在就在帳號欄**
-            ② 搜不到 → Tab 到另一格、打探針 B → 搜得到 → **現在在帳號欄**
-            ③ 兩個都搜不到 → 真的讀不到 → 不知道
-
-        ⚠⚠ **只做①是不夠的**（第一版就是這樣）：那時「搜不到」同時代表
-        「在密碼欄」與「讀不到」，把後者當成前者就會賭錯。
-        補上②之後，兩個方向都有**正面**證據。
-
-        **①②結束時我們都站在帳號欄**，所以兩種情況都回 `False`
-        （＝不用先打密碼），後面的順序永遠固定：
-        清空 → 打帳號 → Tab → 清空 → 打密碼 → Enter。
-
-        ⚠ 走到③時我們**已經 Tab 過一次**，位置跟一開始不一樣了。
-        呼叫端的預設假設（客戶端記住帳號 → 一開始在密碼欄）搭配那一次 Tab，
-        結論同樣是「現在在帳號欄」—— 見 `_decide_focus`。
-
-        探針用固定字串而不是帳號本身：客戶端會把記住的帳號預填進帳號欄，
-        拿帳號去搜的話，就算焦點在密碼欄也會搜到那個預填值 —— 永遠是「找得到」。
-        """
-        if self._type_probe(hwnd, self._PROBE) and self._probe_landed(self._PROBE):
-            self._step(f"量到現在就在帳號欄（探針 {self._PROBE} 在堆積上找得到）")
-            return False
-        # 搜不到 → 可能在密碼欄，也可能是讀不到。**再往另一格打一個探針**，
-        # 讓「在密碼欄」也拿得出正面證據。
-        self._step("這一格搜不到探針，Tab 到另一格再確認一次")
-        if not self._type_probe(hwnd, self._PROBE_B, tab_first=True):
-            return None
-        if self._probe_landed(self._PROBE_B):
-            self._step(
-                f"量到 Tab 過來這一格是帳號欄（探針 {self._PROBE_B} 找得到）"
-                " —— 原本在密碼欄"
-            )
-            return False
-        return None
-
-    def _type_probe(self, hwnd: int, text: str, tab_first: bool = False) -> bool:
-        """把探針打進去。**不先清空** —— 剛進登入畫面時那一格本來就是空的，
-        而且就算接在既有文字後面也不影響判斷（我們搜的是**子字串**）。"""
-        actions = self._tab_actions() if tab_first else []
-        try:
-            input_helper.send(hwnd, actions + self._type_actions(text))
-        except input_helper.InputHelperError as exc:
-            log.debug("探針送不進去：%s", exc)
-            return False
-        return True
-
-    def _probe_landed(self, text: str) -> bool:
-        """這個探針有沒有出現在**堆積上的欄位緩衝**裡。
-
-        ⚠ 找不到**不代表它在密碼欄** —— 也可能是記憶體那一拍讀不到。
-        呼叫端要自己補上另一個方向的正面證據。
-        """
-        deadline = time.monotonic() + _PROBE_TIMEOUT
-        while True:
-            if input_helper.field_addresses(self._pid, text):
-                return True
-            if time.monotonic() >= deadline:
-                return False
-            time.sleep(_POLL)
-
     def _decide_focus(self, hwnd: int) -> None:
-        """決定 `self._tab_first`（要不要先打密碼）。只在第一次做。"""
+        """決定 `self._tab_first`（要不要先打密碼）。只在第一次做。
+
+        ## 現在的做法：**用預設假設，不做任何探測**
+
+        使用者實測的規則：客戶端記住帳號時焦點落在**密碼欄**，
+        沒記住時落在帳號欄。實務上幾乎永遠是前者，所以預設「先打密碼」。
+        猜錯不會卡死：送出後有閉環驗證（`submitted_account()` 與擷取到的
+        `0x0064` 明文帳號），錯了就翻面重打。
+
+        ## ⛔⛔ 試過兩種「量出來」的做法，**兩種都讓事情變糟，都已移除**
+
+        1. **讀「上次送出的帳號」那塊靜態緩衝** —— [MEM-032] 明寫它**送出後才有值**，
+           所以兩種情況讀到的都是空的，等於沒在判斷（本條目上半段）。
+        2. **打探針進去再搜記憶體**（`ZQ7X4K` / `VM3H8T`）——
+           想法是靠 [MEM-032] 的不對稱「帳號欄的字找得到、密碼欄的搜不到」。
+           但使用者實測回報 **「剛開始在密碼時，還會莫名打出一些字然後自己刪掉」**
+           ——那就是探針，它會出現在使用者眼前；而且判斷結果照樣會錯
+           （「他都會相反一次」）。
+
+        **教訓**：那條不對稱是在**一次**特定量測下成立的，拿它當「判斷焦點」
+        的唯一依據，等於把整條登入押在一個沒有反覆驗證過的前提上。
+        現在只拿它**記錄觀察**（見 `_note_field_placement`），不拿它做決定。
+        """
         if self._tab_first is not None:
             return
-        measured = self._probe_focus(hwnd)
-        if measured is None:
-            # ⚠ 量不出來（記憶體讀不到）。預設假設是「客戶端記住帳號 →
-            # 一開始在密碼欄」（使用者實測，實務上幾乎永遠如此）；
-            # 而探針的第二段**已經 Tab 過一次**，所以現在應該在帳號欄。
-            # 猜錯也不會卡死：送出前後都有閉環驗證。
-            self._tab_first = False
-            self._step("量不出焦點在哪一格（記憶體讀不到），沿用預設："
-                       "一開始在密碼欄、Tab 之後現在在帳號欄")
-        else:
-            self._tab_first = measured
+        self._tab_first = True
+        self._step("假設焦點在密碼欄（客戶端記住帳號時就是這樣）；"
+                   "打錯的話送出後的驗證會翻面重打")
 
     def _credential_batches(self, hwnd: int) -> list[list[dict]]:
         """組出整組輸入動作，**一批一個子行程**。
 
-        順序由 `self._tab_first` 決定（`_decide_focus` 量出來的），都只需要一次 Tab：
+        順序由 `self._tab_first` 決定（`_decide_focus` 的**預設假設**），都只需要一次 Tab：
 
             焦點在密碼欄：打密碼 → Tab 到帳號欄 → 清空 → 打帳號
             焦點在帳號欄：打帳號 → Tab 到密碼欄 → 清空 → 打密碼
@@ -590,58 +504,38 @@ class AutoLogin:
         self._typed_once = True
         return batches
 
-    def _fields_look_right(self) -> bool:
-        """兩格都打完、**還沒按 Enter** 時檢查。**只在確定打反時才回 False。**
+    def _note_field_placement(self) -> None:
+        """把「帳號／密碼現在在不在堆積上」記進日誌。**只觀察，不做任何決定。**
 
-        ## ⚠ 這一支第一版是錯的，錯法很值得記住
+        ## 為什麼只觀察
 
-        第一版是「搜不到自己的帳號就翻面」。但「搜不到」有**兩種**原因：
-        真的打反了，或**記憶體那一拍讀不到**。把後者也當成打反的後果是：
+        [MEM-032] 量到「打進帳號欄的字找得到、打進密碼欄的字搜不到」。
+        照這個不對稱，送出前應該可以判斷有沒有打反 —— 我照著做了，**結果更糟**：
 
-            第 1 次：其實打對了 → 但搜不到 → 翻面（把對的改成錯的）
-            第 2 次：真的打反了 → 已經翻過一次 → 照樣送出去
+            v0.3.1  「搜不到帳號」就翻面 → 讀不到的那一拍把**對的**翻成錯的
+            v0.3.3  改成「搜到密碼」才翻面 → 使用者實測仍然「都會相反一次」
 
-        使用者實測回報：「當初始在密碼，流程應該要直接輸入密碼→Tab→刪除帳號
-        →輸入帳號，但是他現在輸入帳號是我的密碼」—— 就是這個。
-        **不確定的時候去「修」一個本來是對的東西，是最糟的失效方式。**
+        兩次都是同一個病：**拿一個沒有反覆驗證過的前提去觸發修正動作**，
+        於是它會主動把本來正確的輸入弄壞。CLAUDE.md：驗不過要退安全預設，
+        「安靜地做錯事」一律當 bug —— 而「大聲地做錯事」也不會比較好。
 
-        ## 現在的做法：兩個都是**正面**訊號，分不出來就放行
-
-        [MEM-032] 的不對稱給了兩個方向都能確定的訊號：
-
-            自己的帳號出現在堆積 → 它在帳號欄 → **確定打對**
-            自己的密碼出現在堆積 → 密碼被打進帳號欄 → **確定打反**
-            兩個都搜不到         → 讀不到，**不知道** → 照舊送出去
-
-        （打進密碼欄的字整個記憶體都搜不到，所以密碼只要現身就一定在帳號欄。
-        而帳號欄在打之前一定清過，搜到的不會是客戶端預填的舊值。）
-
-        最壞情況因此**跟沒有這一支時完全一樣**：照舊送出，由送出後的閉環驗證
-        （`submitted_account()`）兜底。它只會幫忙，不會把對的弄成錯的。
-
-        ⚠ 送出前**只准翻面一次**，避免兩邊互相推來推去。
+        所以現在這一支**不回傳任何東西、不改任何狀態**，只留下一行日誌，
+        讓下一次實測有證據可以看：那條不對稱在使用者的客戶端上到底成不成立。
+        送出後的閉環驗證（`submitted_account()` ＋ 擷取到的 `0x0064` 明文帳號）
+        才是唯一會觸發翻面的依據 —— 那個訊號是**確定**的。
         """
-        if self._presubmit_flipped:
-            return True
-        deadline = time.monotonic() + _FIELD_CHECK_TIMEOUT
-        while True:
-            if input_helper.field_addresses(self._pid, self._account.username):
-                return True                       # 確定打對
-            if input_helper.field_addresses(self._pid, self._account.password):
-                # 密碼現身在堆積 = 它被打進帳號欄 = 確定打反
-                self._presubmit_flipped = True
-                self._tab_first = not self._tab_first
-                self._step(
-                    f"送出前發現密碼被打進帳號欄（打反了）—— 不送出，改成先打"
-                    f"{'密碼' if self._tab_first else '帳號'}重打一次"
-                )
-                return False
-            if time.monotonic() >= deadline:
-                # 兩個都搜不到 = 讀不到，**不知道**。照舊送出去，
-                # 讓送出後的閉環驗證兜底 —— 不准在這裡亂猜。
-                self._step("送出前驗不出字打到哪一格（記憶體讀不到），照舊送出")
-                return True
-            time.sleep(_POLL)
+        try:
+            user_at = bool(input_helper.field_addresses(
+                self._pid, self._account.username))
+            pw_at = bool(input_helper.field_addresses(
+                self._pid, self._account.password))
+        except Exception as exc:  # noqa: BLE001 - 純觀察，失敗不該影響登入
+            log.debug("觀察欄位落點失敗：%s", exc)
+            return
+        self._step(
+            f"（觀察）送出前：帳號在堆積上{'找得到' if user_at else '找不到'}、"
+            f"密碼{'找得到' if pw_at else '找不到'}"
+        )
 
     def _needs_clear_after_tab(self) -> bool:
         """Tab 過去那一格要不要先清空。**答案永遠是要。**
@@ -655,9 +549,9 @@ class AutoLogin:
 
         **但那個推論有兩個洞**：
 
-        1. **我們對「Tab 過去是哪一格」的把握，來自探針**（`_probe_focus`），
-           而探針**可能判錯**（找不到時分不出「在密碼欄」與「記憶體讀不到」）。
-           判錯的時候「不用清」就會讓舊值留著，直接送出去。
+        1. **我們對「Tab 過去是哪一格」根本沒有把握** —— 那只是預設假設
+           （見 `_decide_focus`）。假設錯的時候「不用清」就會讓舊值留著，
+           直接送出去。
         2. 登入畫面上有「**存檔**」選項，客戶端不見得只記帳號 ——
            「密碼欄一定是空的」本來就不是我們驗過的事實。
 
@@ -667,8 +561,7 @@ class AutoLogin:
         **代價完全不對稱**：省下 2.7 秒 vs 一次打錯送出（伺服器拒絕、跳錯誤框、
         關掉、翻面、整輪重打 ≈ 25 秒）。所以一律清。
 
-        （探針**之前**那一次仍然不用清 —— 那一格是空的與否都不影響判斷，
-        我們搜的是探針**子字串**，見 `_probe_focus`。）
+        （第一格照樣要清：重試時裡面是上一輪我們自己打的字。）
         """
         return True
 
@@ -1183,15 +1076,12 @@ class AutoLogin:
             # 探針判焦點之後重試本來就少了，多點那一下落在背景圖上是無害的。
             self._click_agree(hwnd)
             try:
-                # ⚠ **Enter 單獨留到最後**：送出去之前先確認字打到對的格子。
-                # 打反了就翻面重打，不要送出去讓伺服器拒絕 —— 那會跳錯誤框、
-                # 要關掉、再整輪重來（使用者實測：「雖然最後還是成功，
-                # 但不該有那個錯誤」）。
+                # Enter 單獨留到最後，中間插一次**純觀察**的記錄
+                # （只寫日誌，不做決定 —— 見 `_note_field_placement`）。
                 *typing, enter = self._credential_batches(hwnd)
                 for batch in typing:
                     input_helper.send(hwnd, batch)
-                if not self._fields_look_right():
-                    continue
+                self._note_field_placement()
                 input_helper.send(hwnd, enter)
             except input_helper.InputHelperError as exc:
                 log.debug("第 %d 次送不進去：%s", attempt, exc)
