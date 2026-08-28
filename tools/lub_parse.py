@@ -197,7 +197,7 @@ class Index:
 
 
 _SUPPORTED = {
-    "LOADK", "LOADNIL", "NEWTABLE", "SETTABLE", "SETLIST",
+    "LOADK", "LOADBOOL", "LOADNIL", "NEWTABLE", "SETTABLE", "SETLIST",
     "GETGLOBAL", "SETGLOBAL", "GETTABLE", "MOVE", "RETURN",
 }
 
@@ -224,6 +224,12 @@ def simulate(p: Proto):
             raise ValueError(f"unsupported opcode {ins.op} at {i} in {p.source}")
         if ins.op == "LOADK":
             reg[ins.a] = p.consts[ins.bx]
+        elif ins.op == "LOADBOOL":
+            # lvm.c：R(A) := (Bool)B；C 非 0 時再跳過下一條指令。
+            # skillinfolist.lub 用它寫 `SpAmount = false` 之類的欄位。
+            reg[ins.a] = bool(ins.b)
+            if ins.c:
+                i += 1
         elif ins.op == "LOADNIL":
             for r in range(ins.a, ins.b + 1):
                 reg[r] = None

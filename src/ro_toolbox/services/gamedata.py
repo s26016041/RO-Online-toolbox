@@ -27,6 +27,7 @@ _MOB_TABLE = ASSETS_DIR / "mobs.json.gz"
 _WARP_TABLE = ASSETS_DIR / "warps.json.gz"
 _MAP_NAME_TABLE = ASSETS_DIR / "mapnames.json.gz"
 _NPC_TABLE = ASSETS_DIR / "npcs.json.gz"
+_SKILL_TABLE = ASSETS_DIR / "skills.json.gz"
 
 
 #: 讀成功的表就留在記憶體裡，見 `_load()`。
@@ -121,6 +122,34 @@ def mob_name(class_id: int | None) -> str:
     if class_id is None:
         return "未知"
     return mob_names().get(class_id, f"#{class_id}")
+
+
+@lru_cache(maxsize=1)
+def skill_table() -> dict[int, dict]:
+    """技能 ID → `{key, name, maxlv, sp[], range[]}`。來源 tools/build_skill_table.py。
+
+    `sp`／`range` 是每一級一個值（索引 0 = Lv1），拿來跟記憶體讀到的欄位
+    交叉比對（見 `services/skills.py`）。
+    """
+    return {int(k): v for k, v in _load(_SKILL_TABLE).items()}
+
+
+@lru_cache(maxsize=1)
+def skill_codes() -> dict[str, int]:
+    """技能英文代號（`SM_BASH`）→ ID。
+
+    記憶體裡的技能結構帶著英文代號的字串指標，這張表是「字串與 ID 對不對得上」
+    那一道交叉驗證的另一半 —— 沒有它就只能靠數值範圍猜，那會誤中一堆堆積垃圾。
+    """
+    return {v["key"]: k for k, v in skill_table().items() if v.get("key")}
+
+
+def skill_name(skill_id: int | None) -> str:
+    """查不到就回 `#編號` —— 安全退化，不會假裝知道。"""
+    if skill_id is None:
+        return "未知"
+    entry = skill_table().get(skill_id)
+    return (entry or {}).get("name") or f"#{skill_id}"
 
 
 @lru_cache(maxsize=1)
