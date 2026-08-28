@@ -405,6 +405,39 @@ def test_place_of_strips_the_price():
     assert nd.place_of("取消") == "取消"
 
 
+def test_a_price_glued_on_with_a_dash_is_still_stripped():
+    """⚠ **不是每隻 NPC 都用 `->`**。實機 2026-08-28 的船長寫成
+    「發樂斯燈塔-2800z」，只切 `->` 的話價錢會黏在地名後面，怎麼比都比不中。"""
+    assert nd.place_of("發樂斯燈塔-2800z") == "發樂斯燈塔"
+    assert nd.place_of("柏伊亞嵐島 - 150 金幣") == "柏伊亞嵐島"
+
+
+def test_a_dash_that_is_not_a_price_is_left_alone():
+    """只在**真的長得像價錢**（數字＋幣別）時才切，不然會誤傷名字裡的連字號。"""
+    assert nd.place_of("康-奇麗娜號") == "康-奇麗娜號"
+
+
+def test_the_captain_menu_from_the_real_log_is_understood():
+    """實機卡住的那一次（使用者日誌 2026-08-28 20:00:57）：
+
+        我們要去 cmd_fild07（我們的表寫「發樂斯 燈塔島」）
+        選單是 ['發樂斯燈塔-2800z', '下次再搭']
+        舊版：「選單裡沒有『燈塔島』」→ 停在那裡等人，等了 10 分鐘
+
+    價錢切掉之後「發樂斯燈塔」就包含在「發樂斯燈塔島」裡面，對得上了。
+    """
+    index, why = nd.pick_option(["發樂斯燈塔-2800z", "下次再搭"], "發樂斯 燈塔島")
+    assert index == 1, why
+
+
+def test_next_time_is_treated_as_an_exit_option():
+    """「下次再搭」是實機看到的取消字樣 —— 只通一個地方時要排得掉它，
+    才找得出「唯一不是離開的選項」。"""
+    assert "下次再搭" in nd.EXIT_OPTIONS
+    index, why = nd.pick_confirm(["搭船前往", "下次再搭"])
+    assert index == 1, why
+
+
 # ---- 只通一個地方的 NPC：選單是「確定嗎」，不是「選去哪」------------------
 #
 # 使用者實測回報（2026-08-27）：只能傳去依斯魯得島的那隻，選單是

@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import logging
+import re
 
 log = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ CONFIRM_OPTIONS = ("使用", "回去")
 #: 「離開對話」的選項。⛔ **永遠不准選** —— 選了等於自己把對話關掉還以為成功了。
 #: 也是「排除法」的依據：只通一個地方、而且**只剩一個不是離開的選項**時，
 #: 那個必然就是「做這件事」，不必每遇到一個新的確認詞就回來加白名單。
-EXIT_OPTIONS = ("結束", "取消")
+EXIT_OPTIONS = ("結束", "取消", "下次再搭")
 
 #: 一次對話最多回答幾層選單。
 #:
@@ -176,18 +177,27 @@ def _squash(text: str) -> str:
     return text.replace("　", "").replace(" ", "")
 
 
-def place_of(option: str) -> str:
-    """選項裡的**地名部分**：`->` 之前那一段，空白去掉。
+#: 選項尾巴的價錢。**不是所有 NPC 都用 `->` 分隔** —— 實機的船長寫成
+#: 「發樂斯燈塔-2800z」，只切 `->` 的話價錢會黏在地名後面，怎麼比都比不中。
+#:
+#: ⚠ 只在**真的長得像價錢**（數字 ＋ 幣別）時才切。單純看到 `-` 就切會誤傷
+#: 名字裡本來就有連字號的地方。
+_PRICE_TAIL = re.compile(r"[\s\-–—－]*\d[\d,]*\s*(?:z|zeny|金幣)\s*$", re.IGNORECASE)
 
-    實機看過的長相（船員／卡普拉）：
+
+def place_of(option: str) -> str:
+    """選項裡的**地名部分**：切掉 `->` 之後那一段與尾巴的價錢，空白去掉。
+
+    實機看過的長相（船員／卡普拉／船長）：
 
         '普隆德拉 -> 120 z'      → '普隆德拉'
         '吉芬        -> 120 z'   → '吉芬'
         '艾爾貝塔 港口-> 500金幣' → '艾爾貝塔港口'
         '柏伊亞嵐島 -> 150 金幣'  → '柏伊亞嵐島'
-        '取消'                   → '取消'
+        '發樂斯燈塔-2800z'        → '發樂斯燈塔'   ← 沒有箭頭的那種
+        '下次再搭'               → '下次再搭'
     """
-    return _squash(option.split("->")[0])
+    return _squash(_PRICE_TAIL.sub("", option.split("->")[0]))
 
 
 def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]:
