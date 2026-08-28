@@ -783,3 +783,65 @@ def test_a_failed_dialog_does_not_loop_back_to_cannot_see_him(monkeypatch, caplo
     said = " ".join(r.getMessage() for r in caplog.records)
     assert "站在他旁邊" not in said, "不該再講認不出他"
     assert bot._shake is None, "不該再來回走位"
+
+
+# ---- 在兩張圖之間來回刷會把自己刷到斷線 ---------------------------------
+#
+# 使用者實測：自動尋路走進一間店（s_atelier）之後又馬上出來、再進去…
+# 來回刷換圖，最後**整個連線被伺服器斷掉**，接著才是回連、卡登那一串。
+#
+# 會這樣是因為換圖之後立刻重新規劃，而腳下那道門就是新路線的第一段。
+# 正確的路線修法還沒有足夠證據，但「把自己刷到斷線」這件事本身就該擋。
+
+
+def test_bouncing_between_two_maps_stops_loudly():
+    """⚠ 一直做會造成傷害的動作，既不是「大聲停用」也不是「安全退化」。"""
+    from ro_toolbox.services import travel as mod
+
+    traveler, _walker_, clock = make()
+    traveler._route_map = "prontera"
+    seen = []
+    for i in range(mod.BOUNCE_LIMIT + 1):
+        clock.now += 2.0
+        other = "s_atelier" if i % 2 == 0 else "prontera"
+        seen.append(traveler._bouncing(other))
+        traveler._route_map = other
+    assert seen[-1] is True, f"來回 {mod.BOUNCE_LIMIT} 次就該喊停：{seen}"
+    assert seen[0] is False, "第一次換圖不算來回"
+
+
+def test_normal_map_changes_are_not_bouncing():
+    """一路往前走過好幾張圖不是來回 —— 不准把正常跨圖砍掉。"""
+
+    traveler, _walker_, clock = make()
+    traveler._route_map = "prontera"
+    for nxt in ("prt_fild05", "prt_fild08", "geffen", "gef_fild00", "cmd_fild03"):
+        clock.now += 5.0
+        assert traveler._bouncing(nxt) is False, f"{nxt} 被誤判成來回"
+        traveler._route_map = nxt
+
+
+def test_slow_back_and_forth_is_allowed():
+    """⚠ 隔很久的來回是正常的（例如先去買東西再回來）—— 只擋短時間內的刷。"""
+    from ro_toolbox.services import travel as mod
+
+    traveler, _walker_, clock = make()
+    traveler._route_map = "prontera"
+    for i in range(6):
+        clock.now += mod.BOUNCE_WINDOW_SEC + 1
+        other = "s_atelier" if i % 2 == 0 else "prontera"
+        assert traveler._bouncing(other) is False
+        traveler._route_map = other
+
+
+def test_a_new_goal_forgets_the_old_bouncing():
+    """換目的地就是新的一趟，舊的換圖紀錄不該跟著。"""
+    from ro_toolbox.services import travel as mod
+
+    traveler, _walker_, clock = make()
+    traveler._route_map = "prontera"
+    for i in range(mod.BOUNCE_LIMIT):
+        clock.now += 1.0
+        traveler._bouncing("s_atelier" if i % 2 == 0 else "prontera")
+    traveler.set_goal("geffen")
+    assert traveler._hops == []

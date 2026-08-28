@@ -128,6 +128,12 @@ _PIN_SOCKET_TIMEOUT = 20.0
 #: 一直「缺料」（踩過：15 秒不夠）。
 _PIN_SEED_TIMEOUT = 40.0
 _POLL = 0.4
+#: 登入途中「一條伺服器連線都沒有」持續多久就當這次登入死了。
+#:
+#: ⚠ 要有一點寬限：**換伺服器的那一瞬間會短暫沒有連線**（登入台 → 角色台）。
+#: 但真的被踢掉（卡登、帳號在別處登入、伺服器關閉）之後它不會自己回來 ——
+#: 那時候繼續送 OTP 就是使用者說的「無意義等待」。
+_LOGIN_LOST_SEC = 4.0
 
 
 
@@ -239,6 +245,8 @@ class AutoLogin:
         self._tab_first: bool | None = None
         #: 已經打過一輪了嗎。重試時欄位裡有上一輪的字，一定要清空。
         self._typed_once = False
+        #: 連線是什麼時候不見的（0 = 還在）。見 `_connection_lost`。
+        self._lost_since = 0.0
         self.progress = LoginProgress()
 
     # ---- 對外 -------------------------------------------------------
@@ -586,6 +594,33 @@ class AutoLogin:
         （第一格照樣要清：重試時裡面是上一輪我們自己打的字。）
         """
         return True
+
+    def _connection_lost(self) -> bool:
+        """這次登入是不是已經死了（客戶端一條伺服器連線都沒有）？
+
+        ⚠⚠ **這跟「遊戲被關掉」是不同的失敗** —— 遊戲還開著，
+        但它已經被伺服器踢掉了，再怎麼打字送 OTP 都不會有結果。
+
+        使用者實測回報：尋路進出房子造成斷線 → 回連重開 → 帳密打對了，
+        但**卡登**（角色還掛在線上，伺服器不讓進）→ 登入失敗 →
+        然後「**卡死了一直按 ENTER 不輸入密碼**」。他的要求很明確：
+
+            正常要一次輸入成功；如果失敗那應該要關閉重登。
+
+        「關閉重登」由回連那一層負責（`_ReconnectWorker` 會關掉重開）——
+        這裡要做的是**當場承認失敗並交棒**，而不是把整段預算送完。
+
+        ⚠ 要連續幾拍都沒有連線才算數：**換伺服器的那一瞬間**（登入台 → 角色台）
+        本來就會短暫沒有連線，看到一次就放棄會把正常流程砍掉。
+        """
+        if find_server(self._pid) is not None:
+            self._lost_since = 0.0
+            return False
+        now = time.monotonic()
+        if not self._lost_since:
+            self._lost_since = now
+            return False
+        return now - self._lost_since >= _LOGIN_LOST_SEC
 
     def _game_gone(self, hwnd: int | None = None) -> bool:
         """遊戲已經不在了嗎（行程結束、或視窗關掉）？
@@ -1317,6 +1352,15 @@ class AutoLogin:
         attempt = 0
         while time.monotonic() < deadline:
             if self._stop_if_gone(hwnd, "送出 OTP"):
+                return False
+            if self._connection_lost():
+                # 遊戲還開著，但這次登入已經死了（被踢掉／卡登）。
+                # 再送幾次 OTP 也不會有結果 —— 交給回連那一層關掉重開。
+                self.progress.fail(
+                    "送出 OTP",
+                    "客戶端已經沒有連線了（被伺服器踢掉？卡登？）—— "
+                    "不再重試，交給自動回連關掉重開。",
+                )
                 return False
             left = self._remaining(secret)
             if left < _OTP_MIN_SECONDS:

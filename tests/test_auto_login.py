@@ -1003,3 +1003,54 @@ def test_waiting_stops_early_when_the_game_dies(monkeypatch, wired):
     began = time.monotonic()
     assert bot._wait_connection(30.0) is None
     assert time.monotonic() - began < 2.0, "不該等滿 30 秒"
+
+
+# ---- 登入已經死了就交棒，不要把預算送完 ---------------------------------
+#
+# 使用者實測：尋路進出房子造成斷線 → 回連重開 → 帳密打對了，但**卡登**
+# （角色還掛在線上，伺服器不讓進）→ 登入失敗 →「卡死了一直按 ENTER 不輸入密碼」。
+# 他的要求：「正常要一次輸入成功；如果失敗那應該要關閉重登。」
+# 「關閉重登」是回連那一層的事 —— 這裡要做的是**當場承認失敗並交棒**。
+
+
+def test_a_dropped_connection_ends_the_otp_phase_at_once(monkeypatch, wired):
+    """遊戲還開著，但客戶端已經沒有連線 —— 再送 OTP 不會有結果。"""
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
+    sends = []
+    monkeypatch.setattr(
+        auto_login.input_helper, "send",
+        lambda hwnd, actions: sends.append(actions),
+    )
+    bot = AutoLogin(_account(), 4242)
+    bot._lost_since = time.monotonic() - auto_login._LOGIN_LOST_SEC - 1
+    assert bot._send_otp(0x1234) is False
+    assert sends == [], f"連線都沒了還送了 {len(sends)} 批"
+    assert "沒有連線" in bot.progress.detail
+
+
+def test_one_missing_tick_is_not_a_dead_login(monkeypatch, wired):
+    """⚠ **換伺服器的那一瞬間本來就會短暫沒有連線**（登入台 → 角色台）。
+
+    看到一次就放棄會把正常流程砍掉。
+    """
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
+    bot = AutoLogin(_account(), 4242)
+    assert bot._connection_lost() is False, "第一拍只能開始計時"
+    assert bot._connection_lost() is False, "還沒滿寬限就不准判死"
+
+
+def test_the_connection_coming_back_resets_the_clock(monkeypatch, wired):
+    """連線回來就要把計時歸零，不然它會一路累積到誤判。"""
+    seen = {"server": None}
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: seen["server"])
+    bot = AutoLogin(_account(), 4242)
+    bot._connection_lost()                       # 開始計時
+    seen["server"] = ("1.2.3.4", 6900)
+    assert bot._connection_lost() is False
+    assert bot._lost_since == 0.0, "回來了就要歸零"
+
+
+def test_a_live_connection_never_looks_dead(monkeypatch, wired):
+    bot = AutoLogin(_account(), 4242)
+    for _ in range(20):
+        assert bot._connection_lost() is False

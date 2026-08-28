@@ -60,6 +60,13 @@ GOAL_SNAP = 12
 ARRIVE_RADIUS = 2
 #: 換圖後座標會停在上一張圖（[MEM-022]），等它更新的上限。超過就大聲停用。
 STALE_POS_SEC = 10.0
+#: 「在兩張圖之間來回刷」的判準：這麼久之內來回這麼多次就停手。
+#:
+#: ⚠ 這不是效率問題，是**會把自己刷到斷線**（使用者實測：走進一間店又馬上
+#: 出來、來回刷換圖，最後整個連線被伺服器斷掉）。
+#: 正常跨圖不會在 40 秒內同一對地圖來回 4 次 —— 走路本身就要花時間。
+BOUNCE_WINDOW_SEC = 40.0
+BOUNCE_LIMIT = 4
 #: 座標落在不可走格時，往旁邊找可走格當起點的半徑（gat type 5 的語意未確認）。
 START_SNAP = 3
 
@@ -249,6 +256,8 @@ class Traveler:
         self._route_map = ""  # 這條路線是從哪張圖算出來的
         self._avoid: set[tuple[str, int, int]] = set()
         self._replans = 0
+        #: 最近幾次換圖：[(從哪張, 到哪張, 什麼時候)]。用來抓「來回刷」。
+        self._hops: list[tuple[str, str, float]] = []
         self._warp_since = 0.0  # 開始踩這個傳點的時間
         self._warp_try = 0  # 換過幾格
         self._warp_cell: tuple[int, int] | None = None
@@ -320,6 +329,7 @@ class Traveler:
         self._avoid.clear()
         self._replans = 0
         self._stale_since = 0.0
+        self._hops.clear()
         self._clear_warp()
         self._walker.clear()
         self.note = f"準備前往 {map_name}"
@@ -334,6 +344,28 @@ class Traveler:
         self._walker.clear()
 
     # ---- 主迴圈每拍呼叫 ---------------------------------------------
+
+    def _bouncing(self, to_map: str) -> bool:
+        """是不是在兩張圖之間來回刷？
+
+        ⚠⚠ 這不是「效率不好」，是**會把自己刷到斷線**。使用者實測：
+        自動尋路走進一間店（`s_atelier`）之後又馬上出來、再進去…
+        來回刷換圖，最後**整個連線被伺服器斷掉**，接著才是回連、卡登那一串。
+
+        會這樣是因為換圖之後我們立刻重新規劃，而**腳下那道門就是新路線的
+        第一段** —— 踩回去、被傳回來、再踩回去。
+
+        正確的路線修法還沒有足夠證據（要看那幾拍的日誌），但
+        「**把自己刷到斷線**」這件事本身就該擋 ——
+        CLAUDE.md：失效模式只准「大聲停用」或「安全退化」，
+        而一直做會造成傷害的動作兩種都不是。
+        """
+        now = self._now()
+        self._hops.append((self._route_map, to_map, now))
+        self._hops[:] = [h for h in self._hops if now - h[2] <= BOUNCE_WINDOW_SEC]
+        pair = {self._route_map, to_map}
+        back_and_forth = [h for h in self._hops if {h[0], h[1]} == pair]
+        return len(back_and_forth) >= BOUNCE_LIMIT
 
     def update(self, map_name: str, pos: tuple[int, int]) -> str:
         if not self._goal_map:
@@ -373,6 +405,14 @@ class Traveler:
         if map_name != self._route_map:
             if self._route_map:
                 log.info("換圖 %s → %s，重新規劃", self._route_map, map_name)
+                if self._bouncing(map_name):
+                    self.note = (
+                        f"⚠ 在 {self._route_map} 與 {map_name} 之間來回了"
+                        f" {len(self._hops)} 次 —— 多半是踩到腳下那道門又被傳回來。"
+                        "已停止（再刷下去會被伺服器斷線）。"
+                    )
+                    self.clear()
+                    return "blocked"
             if not self._replan(map_name):
                 return "blocked"
             if not self._route and self._goal_cell is None:
