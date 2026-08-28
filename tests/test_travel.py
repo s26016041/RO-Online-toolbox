@@ -1066,3 +1066,59 @@ def test_no_goal_reachable_returns_none(fake_warps):
 def test_the_avoid_list_is_respected(fake_warps):
     """踩不過去的傳點在這裡也要繞開，否則會挑到一條已知走不通的路。"""
     assert travel.nearest_map_with("a", {"dead_end"}, avoid={("a", 20, 20)}) is None
+
+
+# ---- 一步都沒動就不要一直重算（使用者實測：izlu2dun 磨了一分鐘）------------
+
+
+def _fail_leg(traveler, walker, pos):
+    """讓走路那一層回一次 blocked。
+
+    ⚠ 每一拍都要重設：`_replan()` 會 `walker.clear()`，假的走路器就回 idle 了。
+    """
+    walker.state = "blocked"
+    return traveler.update("a", pos)
+
+
+def test_repeated_failures_without_moving_stop_loudly(fake_warps):
+    """⚠ 使用者實測：路徑算得出來（172 格）、封包也送了，角色卻一步都沒動，
+    座標一分鐘停在同一格。舊版每次只是「重新規劃」→ 同一條路 → 同一批封包 →
+    再失敗，磨到 MAX_REPLANS 才停，而且那句話還在講「路線」。
+
+    一步都沒動 = 不是路的問題，重算幾次都一樣。
+
+    ⚠ 失敗與重算是**輪流**發生的（重算那一拍會把走路器清掉再送新的一段），
+    所以連續三次失敗要花六拍左右 —— 這裡只釘住「會停」與「停下來說了什麼」。
+    """
+    traveler, walker, _clock = make()
+    traveler.set_goal("c")
+    traveler.update("a", (5, 5))
+
+    states = [_fail_leg(traveler, walker, (5, 5)) for _ in range(8)]
+    assert "blocked" in states, f"人一步都沒動，不該一直重算：{states}"
+    assert "一步都沒動" in traveler.note
+    assert "背包太重" in traveler.note, "要講人能處理的事，不是只說走不成"
+
+
+def test_making_progress_resets_the_counter(fake_warps):
+    """中間真的往前走了就重新起算 —— 那種是「路上被打斷」，本來就該重新規劃。"""
+    traveler, walker, _clock = make()
+    traveler.set_goal("c")
+    traveler.update("a", (5, 5))
+
+    for step in range(6):
+        state = _fail_leg(traveler, walker, (5 + step, 5 + step))
+        assert state == "walking", f"第 {step + 1} 拍：有在前進就不該放棄"
+
+
+def test_a_new_goal_starts_the_count_again(fake_warps):
+    traveler, walker, _clock = make()
+    traveler.set_goal("c")
+    traveler.update("a", (5, 5))
+    for _ in range(4):
+        _fail_leg(traveler, walker, (5, 5))
+
+    traveler.set_goal("c")
+    traveler.update("a", (5, 5))
+    states = [_fail_leg(traveler, walker, (5, 5)) for _ in range(3)]
+    assert "blocked" not in states, f"換目的地要重新起算：{states}"

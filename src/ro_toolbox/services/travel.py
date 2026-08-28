@@ -70,6 +70,14 @@ BOUNCE_WINDOW_SEC = 40.0
 BOUNCE_LIMIT = 4
 #: 座標落在不可走格時，往旁邊找可走格當起點的半徑（gat type 5 的語意未確認）。
 START_SNAP = 3
+#: 同一段連續失敗幾次、而且**角色一步都沒動**，就大聲停用。
+#:
+#: ⚠ 使用者實測（2026-08-28，izlu2dun）：路徑算得出來（172 格），封包也送了，
+#: 但角色**完全沒動**，座標一分鐘都停在 (107,50)。舊版只是「重新規劃」——
+#: 算出同一條路、送同一批封包、再失敗，磨到 `MAX_REPLANS` 才停，
+#: 而且最後那句「重新規劃 40 次仍到不了」完全沒講到真正的原因。
+#: 一步都沒動 = 不是路的問題，重算幾次都一樣。
+LEG_BLOCK_LIMIT = 3
 #: 我們**要踩的**那道門，周圍這個半徑內不列入「繞開別的傳點」的禁區。
 #:
 #: ⚠ 不留這個洞的話，禁區會把終點自己包起來 —— A* 連門口都到不了，
@@ -328,6 +336,11 @@ class Traveler:
         #: 一次泛洪 0.1 秒，換一次目的地就作廢 —— 地形是靜態的，同一趟不必重算。
         self._entry_reach: dict[tuple[str, tuple[int, int]], frozenset] = {}
         self._fills = 0          # 這一次規劃還剩幾次泛洪額度（見 `FILL_BUDGET`）
+        #: 同一段連續走不成幾次，以及上一次失敗時人在哪（見 `LEG_BLOCK_LIMIT`）。
+        #: 判準是**位置有沒有變**，不是時間 —— 有進展就重新起算。
+        self._blocks = 0
+        self._block_pos: tuple[int, int] | None = None
+        self._here: tuple[int, int] = (0, 0)
         self.note = ""
 
     def _settle(self, pos: tuple[int, int]) -> tuple[int, int] | None:
@@ -391,6 +404,8 @@ class Traveler:
         self._replans = 0
         self._stale_since = 0.0
         self._hops.clear()
+        self._blocks = 0
+        self._block_pos = None
         self._entry_reach.clear()
         self._clear_warp()
         self._walker.clear()
@@ -484,6 +499,7 @@ class Traveler:
             self._stale_since = 0.0
             self.note = self._progress_note()
         pos = here
+        self._here = pos
 
         # 地圖名變了（或第一次跑）：這是唯一被承認的「過去了」訊號。
         if map_name != self._route_map:
@@ -1043,6 +1059,36 @@ class Traveler:
         return "walking"
 
     def _on_leg_blocked(self, map_name: str) -> str:
+        """走路那一層說這段走不成。**連續失敗而且人沒動就停手**。
+
+        ⚠ 使用者實測（2026-08-28，izlu2dun）：路徑算得出來（172 格）、封包也送了，
+        角色卻**一步都沒動**，座標整整一分鐘停在 (107,50)。
+        舊版每次都只是「重新規劃」→ 算出同一條路 → 送同一批封包 → 再失敗，
+        磨到 `MAX_REPLANS` 才停，而且最後那句話還在講「路線」，完全沒講到原因。
+
+        **一步都沒動 = 不是路的問題**，重算幾次都一樣。RO 的移動被拒絕是
+        **靜默**的（[PKT-030]：伺服器不回任何錯誤，就是不動），所以這裡是我們
+        唯一能發現它的地方 —— 發現了就要講人聽得懂的話。
+
+        判準是**位置有沒有變**（讀得到的訊號），不是失敗了幾秒。
+        中間只要真的往前走了一格，就重新起算 —— 那種是「路上被打斷」，
+        本來就該重新規劃。
+        """
+        if self._block_pos == self._here:
+            self._blocks += 1
+        else:
+            self._blocks = 1
+            self._block_pos = self._here
+        if self._blocks >= LEG_BLOCK_LIMIT:
+            x, y = self._here
+            self.note = (
+                f"⚠ 在 {map_name} ({x},{y}) 送出去的移動連續被伺服器忽略，"
+                f"角色一步都沒動。路本身算得出來，所以多半不是地形問題 ——"
+                f"最常見的是**背包太重**（重到一定程度就走不動），"
+                f"其次是狀態異常或被定身。處理完再按一次自動尋路。"
+            )
+            self.clear()
+            return "blocked"
         self.note = f"⚠ {map_name} 上這條路走不成，重新規劃"
         self._route_map = ""  # 下一拍重新規劃
         self._walker.clear()
