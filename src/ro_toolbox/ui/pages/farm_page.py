@@ -725,6 +725,8 @@ class _ReconnectWorker(Worker):
         self._snap = snap
 
     def run(self) -> None:
+        from pathlib import Path
+
         from ro_toolbox.services import accounts as account_store
         from ro_toolbox.services import game_census, game_launcher
         from ro_toolbox.services.auto_login import AutoLogin
@@ -736,9 +738,16 @@ class _ReconnectWorker(Worker):
                                f"帳號設定裡找不到角色「{self._who}」")
                 return
             game_census.close_idle()
-            paths = game_launcher.GamePaths(current_settings().game_path)
-            if paths.problem:
-                self.done.emit(0, self._who, self._snap, paths.problem)
+            # ⚠⚠ 這兩行以前都是錯的，而且錯得**完全沒有徵兆**：
+            #   1. `GamePaths` 要吃 `Path`，餵字串進去的話 `.parent`／`.name` 會炸。
+            #   2. `problem` 是**方法不是屬性** —— `if paths.problem:` 永遠為真，
+            #      於是每一次回連都在這裡提前放棄，回報的「原因」還是一個
+            #      bound method 的字串。自動回連因此**從來不可能成功過**。
+            # 這段沒有測試會踩到（要真的去開遊戲），只有實跑才看得出來。
+            paths = game_launcher.GamePaths(Path(current_settings().game_path))
+            problem = paths.problem()
+            if problem:
+                self.done.emit(0, self._who, self._snap, problem)
                 return
             pid = game_launcher.launch_game_directly(paths)
             progress = AutoLogin(account, pid, lambda t: log.info("回連：%s", t)).run()
@@ -778,6 +787,9 @@ class FarmPage(BasePage):
         self._deciders: dict = {}
         #: 已經講過「沒有快照」的角色。那條路每拍都會走到，不擋會洗版。
         self._no_snapshot_said: set = set()
+        #: 角色 → 他上次連線正常時住在哪個 PID。**閃退偵測靠它** ——
+        #: 分頁會跟著行程一起消失，只看分頁的話最需要救的情況沒人在看。
+        self._watching: dict = {}
         #: 勾了自動補水、但背包還沒讀到 —— 等背包回來再啟動
         self._pending_potion: set[int] = set()
         self._reconnecting = False
@@ -1054,13 +1066,22 @@ class FarmPage(BasePage):
     # ---- 自動回連 ---------------------------------------------------
 
     def _watch_connections(self) -> None:
-        """每拍檢查一次連線。真的要重連時把工作丟到背景執行緒。
+        """每拍檢查一次。真的要重連時把工作丟到背景執行緒。
+
+        ## 兩種都要救，而且**閃退那種看不到分頁**
+
+        1. **斷線**：遊戲還在，但沒有連線 —— 走 `self._cards`。
+        2. **閃退／被關掉**：遊戲行程整個不見了。分頁是照行程建的，行程沒了
+           分頁也會被 `_scan()` 收掉 —— **所以絕對不能只看 `self._cards`**，
+           那樣最需要救的情況反而沒有人在看（使用者回報漏掉這一塊）。
+           改成另外記一份「我在看哪個角色、他在哪個 PID」（`self._watching`），
+           那個 PID 從遊戲行程清單裡消失就是閃退。
+
+        兩種都餵給同一個 `ReconnectDecider`：**不憑一拍的讀數就重開遊戲**
+        （行程清單也會有讀不到的那一拍）。
 
         ⚠ **重連會關掉並重開遊戲**，所以只有使用者在帳號頁勾了「自動回連」
-        才會動作。`ReconnectDecider` 負責分辨「你的網路斷了」「換地圖的過渡」
-        「真的斷線」——這裡只負責照著做。
-
-        ⚠ 關遊戲＋重新登入要三十秒級，**絕不能放在 UI 執行緒**。
+        才會動作。⚠ 關遊戲＋重新登入要三十秒級，**絕不能放在 UI 執行緒**。
         """
         if not current_settings().auto_reconnect or self._reconnecting:
             return
@@ -1074,6 +1095,7 @@ class FarmPage(BasePage):
                 self._snaps[who] = self.snapshot_for(pid)
                 self._deciders.pop(who, None)
                 self._no_snapshot_said.discard(who)
+                self._watching[who] = pid      # 記住他現在住在哪個行程
                 continue
             decider = self._deciders.setdefault(who, ReconnectDecider())
             state = decider.decide(False, local_network_up(), now)
@@ -1081,6 +1103,45 @@ class FarmPage(BasePage):
                 self._begin_reconnect(pid, who, decider)
                 return
             log.info("「%s」%s", who, decider.note)
+
+        if self._watch_for_crashes(now):
+            return
+
+    def _watch_for_crashes(self, now: float) -> bool:
+        """遊戲行程整個不見了（閃退／被關掉）也要重開。回傳有沒有開始重連。
+
+        ⚠ **不能用「分頁還在不在」判斷**：分頁是照行程建的，行程沒了分頁也沒了，
+        於是最需要救的情況反而沒有人在看。用的是「我記下來的那個 PID 還在不在
+        遊戲行程清單裡」。
+
+        ⚠ 也**不能只憑一拍**就重開 —— 行程清單一樣有讀不到的時候。
+        所以照樣走 `ReconnectDecider`（`has_server=False`），連續幾拍都不見才動手。
+        """
+        if not self._watching:
+            return False
+        try:
+            from ro_toolbox.services import game_launcher
+
+            alive = set(game_launcher.game_pids())
+        except Exception as exc:  # noqa: BLE001 - 查不到就別亂關人家的遊戲
+            log.debug("查不到遊戲行程清單，這一拍不判斷閃退：%s", exc)
+            return False
+        if not alive:
+            # 一個遊戲都查不到有兩種可能：真的全掛了，或 psutil 沒裝／查不到。
+            # 後者在 `game_pids()` 裡回的也是空清單 —— 分不出來，所以只在
+            # 「本來就有在看的行程」不見時才算數，下面那個迴圈自然會處理。
+            log.debug("目前查不到任何遊戲行程")
+        for who, pid in list(self._watching.items()):
+            if pid in alive:
+                continue
+            decider = self._deciders.setdefault(who, ReconnectDecider())
+            state = decider.decide(False, local_network_up(), now)
+            if state == RECONNECT:
+                log.warning("「%s」的遊戲不見了（PID %s）—— 當成閃退，重開", who, pid)
+                self._begin_reconnect(pid, who, decider)
+                return True
+            log.info("「%s」的遊戲不見了：%s", who, decider.note)
+        return False
 
     def _begin_reconnect(self, pid: int, who: str, decider) -> None:
         """把「關遊戲→重開→登入」丟到背景，完成後回 UI 執行緒接回設定。"""
@@ -1096,6 +1157,9 @@ class FarmPage(BasePage):
                 self._no_snapshot_said.add(who)
                 log.warning("「%s」斷線了，但沒有斷線前的快照，先不自動回連", who)
             return
+        # ⚠ 先忘掉舊 PID：接下來那個行程一定會消失（我們自己關的／已經掛了），
+        # 留著會讓下一拍又判定一次閃退。等新的遊戲連上線再重新記。
+        self._watching.pop(who, None)
         worker = _ReconnectWorker(pid, who, snap)
         thread = WorkerThread(worker)   # ⚠ 只吃一個參數，沒有 parent
         worker.done.connect(self._reconnect_done)

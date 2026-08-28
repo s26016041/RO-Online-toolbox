@@ -3277,6 +3277,46 @@ A1  <全域>        mov  eax, [某全域]
   `ui/pages/farm_page.py`（`_watch_connections`／`snapshot_for`／`restore_into`／
   `_ReconnectWorker`）、`ui/pages/account_page.py`（勾選）、`config/settings.py`。
 
+### [DAT-030] ★★★ 自動回連的兩個致命錯：**它從來不可能成功過**，而且閃退沒人在看
+
+- **狀態**：已驗證（讀程式碼確認）＋ 已修
+- **日期**：2026-08-28
+- **背景**：`[DAT-028]` 記著自動回連「已實作、尚未實跑」。**實跑就會發現它是死的。**
+
+**錯誤 1：回連的工人一定會在同一行提前失敗**（`farm_page._ReconnectWorker.run`）
+
+      paths = game_launcher.GamePaths(current_settings().game_path)
+      if paths.problem:
+          self.done.emit(0, self._who, self._snap, paths.problem)
+          return
+
+  - `GamePaths.launcher` 要的是 `Path`，這裡餵的是 **str** ——
+    後面 `.parent`／`.name` 一定炸。
+  - `problem` 是**方法不是屬性**（`directory`／`game` 有 `@property`，它沒有）。
+    所以 `if paths.problem:` **永遠為真**，每一次回連都在這裡放棄，
+    而且回報的「原因」是一個 bound method 的字串。
+  - 正確寫法在 `account_page` 就有：`GamePaths(Path(text)).problem()`。
+  - ⚠ **測試不會抓到這種**：那一段要真的去開遊戲，單元測試碰不到。
+    只有實跑才看得出來 —— 這就是「已實作、尚未實跑」最危險的地方。
+
+**錯誤 2：閃退（遊戲行程整個不見）完全沒有人在看**
+
+  - 使用者要求：「閃退也要幫我重開，我直接關閉遊戲應該會被當成閃退」。
+  - 舊版的看門狗只走 `self._cards`，而**分頁是照遊戲行程建的** ——
+    行程沒了，`_scan()` 會把分頁收掉，於是迴圈裡根本沒有這個角色。
+    **最需要救的情況反而沒人管。**
+  - 修法：另外記一份 `self._watching`（角色 → 他連線正常時住在哪個 PID），
+    每拍拿它跟 `game_launcher.game_pids()` 對。那個 PID 不在清單裡就是閃退。
+  - ⚠ **不能憑一拍就重開**：行程清單一樣有讀不到的時候。所以照樣走
+    `ReconnectDecider`（`has_server=False`），連續幾拍都不見才動手 ——
+    跟斷線共用同一條規則，也自動繼承「我的網路斷了就什麼都不做」。
+  - ⚠ **開始重連時要先忘掉舊 PID**：接下來那個行程一定會消失
+    （我們自己關的，或它本來就掛了），留著會讓下一拍又判定一次閃退。
+
+- **影響**：`ui/pages/farm_page.py`（`_watch_for_crashes`、`_watching`、
+  `_ReconnectWorker.run`）。測試 `tests/test_farm_page.py`
+  （6 條，含「一拍不算」「行程還在不算」「沒勾不做」「我的網路斷了不做」）。
+
 ### [ENV-007] ★★★ 另一支 onefile 程式開場清 `%TEMP%\_MEI*`，**把我們正在用的解壓目錄挖空**
 
 - **狀態**：已驗證（實機，兩支程式的 PID 與環境變數都對得起來）＋ 已修

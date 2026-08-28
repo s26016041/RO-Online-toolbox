@@ -359,3 +359,122 @@ def test_a_genuinely_empty_setting_still_says_so(qtbot):
     page._toggle_potion(1234, True)
     assert card.auto_potion.isChecked() is False
     assert 1234 not in page._pending_potion
+
+
+# ---- 閃退（遊戲行程整個不見）也要重開 -----------------------------------
+#
+# 使用者要求：「閃退也要幫我重開，我直接關閉遊戲應該會被當成閃退」。
+# ⚠ 這一塊本來整個沒有人在看：分頁是照行程建的，行程沒了分頁也會被收掉，
+# 而舊版的看門狗只走 `self._cards` —— 最需要救的情況反而沒人管。
+
+
+def _crash_page(qtbot, monkeypatch, alive_pids):
+    """一個已經在看「狐狐狸／PID 1234」的頁面，並決定遊戲行程清單長怎樣。
+
+    回 (page, mod, tick)。`tick()` 跑一拍**並且把時鐘往前推 3 秒** ——
+    觀察期是用真實時間算的，在迴圈裡連跑 50 次時鐘根本不會動。
+    """
+    from ro_toolbox.config.settings import AppSettings
+    from ro_toolbox.services import game_launcher
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    card.character = "狐狐狸"
+    page._cards[1234] = card
+    monkeypatch.setattr(mod, "current_settings", lambda: AppSettings(auto_reconnect=True))
+    monkeypatch.setattr(mod, "local_network_up", lambda: True)
+    monkeypatch.setattr(game_launcher, "game_pids", lambda: list(alive_pids))
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+
+    def tick(times: int = 1) -> None:
+        for _ in range(times):
+            page._watch_connections()
+            clock["now"] += 3.0
+
+    return page, mod, tick
+
+
+def _remember_where_he_lives(page, mod, monkeypatch, tick):
+    """先跑一拍「連線正常」，讓看門狗記住這個角色住在 PID 1234。"""
+    monkeypatch.setattr(mod, "find_server", lambda _pid: ("1.2.3.4", 6900))
+    tick()
+    assert page._watching.get("狐狐狸") == 1234
+    page._cards.clear()          # 行程沒了，分頁也會被 _scan() 收掉
+
+
+def test_a_vanished_game_is_treated_as_a_crash(qtbot, monkeypatch):
+    """遊戲行程不見了 → 當成閃退，重開。"""
+    page, mod, tick = _crash_page(qtbot, monkeypatch, alive_pids=[])
+    _remember_where_he_lives(page, mod, monkeypatch, tick)
+    called = []
+    monkeypatch.setattr(page, "_begin_reconnect", lambda *a: called.append(a))
+    tick(5)
+    assert called, "遊戲不見了要重開"
+    assert called[0][1] == "狐狐狸"
+
+
+def test_one_missing_tick_is_not_a_crash(qtbot, monkeypatch):
+    """⚠ 不准憑一拍就重開 —— 行程清單也有讀不到的時候。
+
+    跟斷線走同一個 `ReconnectDecider`：連續幾拍都不見才算數。
+    """
+    page, mod, tick = _crash_page(qtbot, monkeypatch, alive_pids=[])
+    _remember_where_he_lives(page, mod, monkeypatch, tick)
+    called = []
+    monkeypatch.setattr(page, "_begin_reconnect", lambda *a: called.append(a))
+    tick(1)
+    assert called == [], "第一拍只能開始觀察，不准動手"
+
+
+def test_a_game_that_is_still_running_is_not_a_crash(qtbot, monkeypatch):
+    """行程還在就不是閃退（那是別的問題，交給連線那條路）。"""
+    page, mod, tick = _crash_page(qtbot, monkeypatch, alive_pids=[1234])
+    _remember_where_he_lives(page, mod, monkeypatch, tick)
+    called = []
+    monkeypatch.setattr(page, "_begin_reconnect", lambda *a: called.append(a))
+    tick(20)
+    assert called == []
+
+
+def test_a_crash_does_nothing_when_the_switch_is_off(qtbot, monkeypatch):
+    """沒勾自動回連就一步都不准做 —— 它會開遊戲。"""
+    from ro_toolbox.config.settings import AppSettings
+
+    page, mod, tick = _crash_page(qtbot, monkeypatch, alive_pids=[])
+    _remember_where_he_lives(page, mod, monkeypatch, tick)
+    monkeypatch.setattr(mod, "current_settings", lambda: AppSettings(auto_reconnect=False))
+    called = []
+    monkeypatch.setattr(page, "_begin_reconnect", lambda *a: called.append(a))
+    tick(20)
+    assert called == []
+
+
+def test_my_network_being_down_is_not_a_crash_either(qtbot, monkeypatch):
+    """網路是我自己斷的時候，就算遊戲真的掛了也**先不要**重開 ——
+    重開照樣連不上，而且會把現場蓋掉。等網路回來再說。"""
+    page, mod, tick = _crash_page(qtbot, monkeypatch, alive_pids=[])
+    _remember_where_he_lives(page, mod, monkeypatch, tick)
+    monkeypatch.setattr(mod, "local_network_up", lambda: False)
+    called = []
+    monkeypatch.setattr(page, "_begin_reconnect", lambda *a: called.append(a))
+    tick(20)
+    assert called == []
+
+
+def test_the_old_pid_is_forgotten_once_a_reconnect_starts(qtbot, monkeypatch):
+    """重連期間那個行程一定會消失，留著會被重複判定成閃退。"""
+    page, mod, tick = _crash_page(qtbot, monkeypatch, alive_pids=[1234])
+    monkeypatch.setattr(mod, "find_server", lambda _pid: ("1.2.3.4", 6900))
+    tick()
+    page._snaps["狐狐狸"] = page.snapshot_for(1234)
+
+    class _Thread:
+        def start(self):
+            pass
+
+    monkeypatch.setattr(mod, "WorkerThread", lambda worker: _Thread())
+    page._begin_reconnect(1234, "狐狐狸", None)
+    assert "狐狐狸" not in page._watching
