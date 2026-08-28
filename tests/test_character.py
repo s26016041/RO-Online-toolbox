@@ -224,6 +224,7 @@ class FakeMemory:
 ENTRY_ADDR = 0xE000
 #: 重找的冷卻時間過了多久（比 RELOCATE_COOLDOWN 大就好）
 RELOCATE_GAP = 5.0
+#: ⚠ 這比 FULL_RESCAN_SEC 還大，會觸發全掃 —— 只想測「重驗候選」的用 0.5
 
 
 def _component(aid, dest, path=(), index=-1, path_at=0x9000, state=1):
@@ -454,40 +455,49 @@ def test_read_relocates_after_the_component_dies_but_not_every_tick():
     assert len(tries) == 1
 
 
-def test_relocating_only_rescans_the_hot_regions():
-    """剛換圖還沒走路的時候元件本來就不存在。那段期間每 2 秒全掃一次
-    （511 MB、0.7~0.8 秒）等於一直卡頓 —— 平常只掃上次有命中的區段。"""
-    from ro_toolbox.services.player_position import FULL_RESCAN_SEC, PlayerPosition
+def test_relocating_only_revalidates_the_cached_candidates():
+    """全掃只做一次：元件在**走第一步之前**就已經帶著 `GID == AID` 了。
 
-    mem = _one_region_memory()
+    ⚠ 第一版是「只掃上次有命中的區段、全掃 15 秒一次」，實機一換圖就中招：
+      新元件配在冷區段裡 → 整整 15 秒都讀進圖座標 → 角色明明在走，
+      travel_bot 卻判定「一步都沒動、可能是背包太重」把趕路停掉。
+      便宜的快取不能拿正確性去換。
+    """
+    from ro_toolbox.services.player_position import PlayerPosition
+
+    aid = 777
+    # 還沒走過路的元件：GID 在，但狀態欄位是 0（驗不過）
+    asleep, nodes = _component(aid, dest=(0, 0), state=0)
+    region = bytearray(0x1000)
+    region[0x600 : 0x600 + len(asleep)] = asleep
+    mem = FakeMemory({0x1000: bytes(region), 0x9000: nodes}, regions=[(0x1000, 0x1000)])
+
     clock = [1000.0]
     pos = PlayerPosition(mem, now=lambda: clock[0])
-    pos._aid = 777
-    assert pos._locate_component() is True
-    assert pos._hot == [(0x1000, 0x1000)], "命中的區段要記起來"
+    pos._aid = aid
+    assert pos._locate_component() is False, "狀態是 0，還驗不過"
+    assert pos._candidates == [0x1600], "候選要記起來（GID 已經在那裡了）"
 
     full = []
     real_regions = mem.regions
     mem.regions = lambda writable_only=True: (full.append(1), real_regions())[1]
 
-    # 元件還在 → 熱區段就找得到，完全不必列舉整份記憶體
+    # 角色走了第一步 → 同一塊記憶體填上狀態與終點，重驗候選就接上了
+    live, _ = _component(aid, dest=(65, 99), state=1)
+    region[0x600 : 0x600 + len(live)] = live
+    mem.blocks[0x1000] = bytes(region)
     pos._addr = None
-    clock[0] += RELOCATE_GAP
+    clock[0] += 0.5          # 過了重驗的冷卻，但遠不到全掃的間隔
     assert pos.read() == (65, 99)
-    assert full == []
+    assert full == [], "不必再全掃一次記憶體"
 
-    # 熱區段裡真的沒有了 → 全掃時間到才翻整份記憶體
-    mem.blocks[0x1000] = bytes(0x1000)
-    pos._addr = None
-    clock[0] += FULL_RESCAN_SEC + 1
-    assert pos.read() is None
-    assert len(full) == 1
 
-    # 下一次重找只隔了冷卻時間 → 不准再全掃一次
-    pos._addr = None
-    clock[0] += RELOCATE_GAP
-    assert pos.read() is None
-    assert len(full) == 1, f"{FULL_RESCAN_SEC} 秒內不准再全掃一次"
+def test_changing_map_throws_the_candidates_away_too():
+    """換圖之後客戶端會另外配一個新元件，舊的候選清單裡沒有它。"""
+    pos, _mem = _position_at(0x5000, dest=(65, 99))
+    pos._candidates = [0x5000]
+    pos.invalidate()
+    assert pos._candidates == [], "候選也要丟，不然新元件永遠找不到"
 
 
 def test_invalidate_forces_a_relocate():

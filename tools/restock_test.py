@@ -76,8 +76,14 @@ def walk_to(pid: int, where: str, cell: tuple[int, int] | None, log: list) -> bo
 
 
 def shop(pid: int, look: int, cell: tuple[int, int], order: RestockOrder,
-         log: list) -> Restocker:
-    """站在商人旁邊之後的那一段：認人 → 開店 → 量單位重 → 買到 80%。"""
+         log: list, known: dict | None = None) -> Restocker:
+    """站在商人旁邊之後的那一段：認人 → 開店 → 量單位重 → 買到 80%。
+
+    `known` 是**走路途中**看到的實體 `{gid: (外觀, x, y, ...)}`。
+    ⚠ 沒有它多半認不出商人：實體只在**進入視野**時送一次封包（[PKT-061]），
+      而那一包是走過去的路上來的 —— 這裡的擷取是走到了才開，接不到。
+      正式流程要由趕路那一段把 GID 帶過來（travel_bot 已經有同樣的機制）。
+    """
     link = GameLink(pid, on_packet=lambda pkt: feed(pkt))
     bot = Restocker(lambda data: link.send(data), time.monotonic, order)
 
@@ -93,6 +99,8 @@ def shop(pid: int, look: int, cell: tuple[int, int], order: RestockOrder,
         return bot
     try:
         bot.start(look, cell)
+        for gid, info in (known or {}).items():
+            bot.note_entity(gid, info[0], info[1], info[2])
         deadline = time.monotonic() + SHOP_GIVEUP
         last = ""
         while bot.active and time.monotonic() < deadline:

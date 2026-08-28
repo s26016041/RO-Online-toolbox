@@ -57,6 +57,17 @@ def walk_up_to_the_shop_list(bot, sent, *items):
     return sent
 
 
+def reopen(bot, *items):
+    """一次開店只能下一筆單，所以每一筆之前店都會被重開一次。
+
+    ⚠ 這不是測試的裝飾品：實機第二筆 `0x00C8` 送出去**石沉大海**，
+      一路等到逾時（兩次都是）。手上唯一那份真人擷取也只有一個 `0x00C8`。
+    """
+    assert bot.update() == "working"                   # 送 0x0090
+    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")   # 送 0x00C5
+    bot.feed(shop.OP_SHOP_LIST, shop_list(*items))     # 收清單 → 下一筆
+
+
 def test_it_only_talks_to_an_npc_that_matches_look_and_cell():
     """⚠ 認人要外觀編號 ＋ 座標**兩個都對上**，不是猜一個 GID。"""
     bot, sent, _clock = make()
@@ -98,12 +109,35 @@ def test_the_unit_weight_is_measured_not_guessed():
     bot.feed(*par(shop.SP_ZENY, 1_000_000))
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
+    reopen(bot, (HP_ITEM, 50))
     assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)]), "第二次還是 1 個"
 
     bot.feed(*par(shop.SP_WEIGHT, 20100))          # 一瓶 = 100
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
+    reopen(bot, (HP_ITEM, 50))
     # 上限 48100 × 80% = 38480，現在 20100 → 還有 18380 → 183 個
     assert sent[-1] == shop.buy_packet([(HP_ITEM, 183)])
+
+
+def test_every_order_reopens_the_shop_first():
+    """⚠ 一次開店只能下一筆單（實機兩次驗證：第二筆石沉大海）。
+
+    所以每買一次就要重來一輪 0x0090 → 0x00C4 → 0x00C5 → 0x00C6，
+    拿到清單才准送下一個 0x00C8。
+    """
+    bot, sent, _clock = make()
+    walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
+    assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)])
+
+    bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
+    bot.feed(*par(shop.SP_ZENY, 1_000_000))
+    bot.feed(*par(shop.SP_WEIGHT, 20000))
+    before = len(sent)
+    bot.feed(shop.OP_BUY_RESULT, b"\x00")
+    # ⚠ 收到結果之後**不准**直接再送 0x00C8
+    assert len(sent) == before, "第二筆不能直接送，要先重開店"
+    assert bot.update() == "working"
+    assert sent[-1] == shop.contact_npc(0x1F52), "要重新接觸 NPC"
 
 
 def test_running_out_of_money_is_reported_for_the_ui_to_act_on():
@@ -114,8 +148,10 @@ def test_running_out_of_money_is_reported_for_the_ui_to_act_on():
     bot.feed(*par(shop.SP_ZENY, 600))              # 只買得起 12 個
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
+    reopen(bot, (HP_ITEM, 50))
     bot.feed(*par(shop.SP_WEIGHT, 20100))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
+    reopen(bot, (HP_ITEM, 50))
 
     assert bot.stats.broke is True
     assert sent[-1] == shop.buy_packet([(HP_ITEM, 12)])
@@ -164,6 +200,7 @@ def test_it_will_not_buy_without_knowing_the_weight_limit():
     walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
+    reopen(bot, (HP_ITEM, 50))
     bot.feed(*par(shop.SP_WEIGHT, 20100))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")           # 沒有上限也沒有 zeny
     assert bot.update() == "blocked"
@@ -184,14 +221,19 @@ def test_buying_both_potions_reports_the_total():
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
     bot.feed(*par(shop.SP_ZENY, 10_000_000))
 
+    catalog = ((HP_ITEM, 50), (SP_ITEM, 100))
     for item, unit in ((HP_ITEM, 100), (SP_ITEM, 50)):
         base = 20000 if item == HP_ITEM else 30000
         bot.feed(*par(shop.SP_WEIGHT, base))
-        bot.feed(shop.OP_BUY_RESULT, b"\x00")
+        bot.feed(shop.OP_BUY_RESULT, b"\x00")       # 探路第一瓶
+        reopen(bot, *catalog)
         bot.feed(*par(shop.SP_WEIGHT, base + unit))
-        bot.feed(shop.OP_BUY_RESULT, b"\x00")
+        bot.feed(shop.OP_BUY_RESULT, b"\x00")       # 探路第二瓶
+        reopen(bot, *catalog)
         assert sent[-1].startswith(b"\xc8\x00")
         bot.feed(shop.OP_BUY_RESULT, b"\x00")       # 大單成交
+        if item == HP_ITEM:
+            reopen(bot, *catalog)                   # 換下一瓶也要重開店
 
     assert bot.update() == "done"
     assert set(bot.stats.bought) == {HP_ITEM, SP_ITEM}

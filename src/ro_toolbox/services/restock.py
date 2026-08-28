@@ -20,6 +20,16 @@
 而第二次的絕對值就是「現在的負重」—— 兩個未知數一次解決，不必事先知道任何
 東西。代價是兩瓶藥水，換到的是「絕不算錯十倍」（負重原始值是畫面的十倍）。
 
+## ⚠ 一次開店只能下一筆單 —— 每買一次都要重新接觸 NPC
+
+實機兩次驗證：第一筆 `0x00C8` 回了 `0x00CA`（成功），**第二筆送出去石沉大海**，
+一路等到逾時。手上唯一那份真人擷取（`封包/購買藥水.txt`，一口氣買 300 瓶）
+從頭到尾也**只有一個 `0x00C8`** —— 所以「同一次開店買第二筆」本來就沒被驗過，
+是我們自己假設出來的。
+
+所以每買一次就重來一輪 `0x0090 接觸 → 0x00C4 → 0x00C5 → 0x00C6 商品清單`，
+拿到清單才送下一筆 `0x00C8`。多花幾個來回，換到「不會安靜地停在半路」。
+
 ## 每一步都等讀得到的訊號
 
 送出去就等對應的回封包（`0x00C4` → `0x00C6` → `0x00CA`），逾時只是**放棄的
@@ -96,6 +106,9 @@ class Restocker:
         self._zeny: int | None = None
         self._probe: list[int] = []      # 每次探路量到的負重
         self._probing = True             # 這個道具還在探單位重量嗎
+        #: 重新開店之後要買幾個（None = 開店後照 `_next_item()` 走）。
+        #: 一次開店只能下一筆單，所以每一筆都要先把店重開一次。
+        self._want: int | None = None
         self._step = ""                  # 現在在等什麼
         self._since = 0.0
         self.stats = RestockStats()
@@ -115,6 +128,7 @@ class Restocker:
         self._items = []
         self._probe = []
         self._probing = True
+        self._want = None
         self.stats = RestockStats(running=True)
         self._enter("找商人")
 
@@ -153,7 +167,11 @@ class Restocker:
         elif opcode == shop.OP_SHOP_LIST and self._step == "等商品清單":
             self._items = shop.parse_shop_list(payload)
             log.info("商店有 %d 項商品", len(self._items))
-            self._next_item()
+            if self._want is not None:
+                amount, self._want = self._want, None
+                self._buy(amount)       # 這是「重開店來下一筆」
+            else:
+                self._next_item(fresh=True)
         elif opcode == shop.OP_BUY_RESULT and self._step == "等買賣結果":
             self._on_result(shop.parse_buy_result(payload))
 
@@ -162,7 +180,7 @@ class Restocker:
         if not self.stats.running:
             return "idle" if not self.stats.note else self._settled()
         moment = self._now() if now is None else now
-        if self._step == "找商人":
+        if self._step in ("找商人", "重新開店"):
             if self._gid is None:
                 return self._maybe_timeout(
                     moment, f"⚠ 走到了卻認不出商人（外觀 {self._look} @ {self._cell}）"
@@ -204,8 +222,12 @@ class Restocker:
         log.info("%s", why)
         return "done"
 
-    def _next_item(self) -> str:
-        """換下一個要買的道具。都買完了就結束。"""
+    def _next_item(self, fresh: bool = False) -> str:
+        """換下一個要買的道具。都買完了就結束。
+
+        `fresh=True` 代表**剛收到商品清單**（店是開著的），可以直接下單；
+        否則要先把店重開一次（一次開店只能下一筆單，見檔頭）。
+        """
         self._probe = []
         self._probing = True
         while self._queue:
@@ -217,15 +239,26 @@ class Restocker:
                 continue
             self._item = item_id
             self._price = found.price
-            self._buy(PROBE_AMOUNT)
-            return "working"
+            if fresh:
+                self._buy(PROBE_AMOUNT)
+                return "working"
+            return self._order_more(PROBE_AMOUNT)
         self._item = None
         total = sum(self.stats.bought.values())
         if not total:
             return self._fail("⚠ 這家店沒有你設定的藥水，什麼都沒買")
         return self._finish(f"補貨完成，共買了 {total} 個")
 
+    def _order_more(self, amount: int) -> str:
+        """再買一筆。**一次開店只能下一筆單**，所以先把店重開一次（見檔頭）。"""
+        if self._item is None or amount <= 0:
+            return "working"
+        self._want = amount
+        self._enter("重新開店")
+        return "working"
+
     def _buy(self, amount: int) -> None:
+        """送出下單封包。⚠ 只有在**剛拿到商品清單**之後呼叫才有用。"""
         if self._item is None or amount <= 0:
             return
         self._pending = amount
@@ -247,8 +280,7 @@ class Restocker:
             return self._fail("⚠ 買了卻讀不到負重（伺服器沒送 0x00B0），已停止")
         self._probe.append(self._weight)
         if len(self._probe) < PROBE_ROUNDS:
-            self._buy(PROBE_AMOUNT)
-            return "working"
+            return self._order_more(PROBE_AMOUNT)
         self._probing = False
         unit = (self._probe[-1] - self._probe[-2]) // PROBE_AMOUNT
         return self._buy_the_rest(unit)
@@ -272,5 +304,4 @@ class Restocker:
             self.stats.broke = True
         if plan.amount <= 0:
             return self._next_item()
-        self._buy(plan.amount)
-        return "working"
+        return self._order_more(plan.amount)

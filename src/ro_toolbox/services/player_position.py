@@ -146,12 +146,12 @@ MAX_STATE = 8
 MAX_CELL = 512
 #: 路徑不可能有這麼多節點（單次移動上限 17 格）。用來擋「指標像陣列但其實是垃圾」。
 MAX_PATH_NODES = 256
-#: 元件掉了之後多久才准重找一次。**每一拍都找會讓 bot 定格。**
-RELOCATE_COOLDOWN = 2.0
-#: 多久才准全掃一次。全掃一趟實測 0.7~0.8 秒（511 MB）——
-#: 剛換圖還沒走路的時候元件本來就不存在，每 2 秒全掃一次等於一直卡頓。
-#: 平常只掃**上次有命中的區段**（實測幾毫秒），全掃留給久久一次的兜底。
-FULL_RESCAN_SEC = 15.0
+#: 重驗候選的間隔。實測 67 個候選重驗一輪只要 **0.30 ms**，所以可以很密。
+RELOCATE_COOLDOWN = 0.3
+#: 還是找不到元件時，多久才准重新全掃一次。全掃實測 **0.6~0.8 秒**
+#: （508 MB，其中 0.57 秒是 ReadProcessMemory 本身，沒得再快）。
+#: 正常情況一張圖只會全掃一次（`invalidate()` 之後那一次）。
+FULL_RESCAN_SEC = 3.0
 
 
 def _cell_ok(x: int, y: int) -> bool:
@@ -162,8 +162,9 @@ class PlayerPosition:
     """角色現在站在哪一格。問不出可信答案就回 None —— **絕不回殘留值**。
 
     `locate()` 做兩件事：用程式碼特徵找進圖座標全域（很快），
-    再全掃一次記憶體找移動元件（0.7~0.8 秒；剛換圖時可能還不存在，不算失敗）。
-    之後重找只掃「上次有命中的區段」，全掃 `FULL_RESCAN_SEC` 才做一次。
+    再全掃一次記憶體找移動元件（0.6~0.8 秒；剛換圖時可能還驗不出來，不算失敗）。
+    **全掃只做一次**：元件在角色走第一步之前就帶著 `GID == AID` 了，
+    所以之後只重驗那份候選清單（0.3 ms）。
     `read()` 只讀 0x130 bytes，每次都重驗，所以換圖或元件被回收時會**當場發現**。
     """
 
@@ -178,9 +179,9 @@ class PlayerPosition:
         self._last_locate = 0.0
         #: 上一次是不是已經抱怨過元件失效了（別每一拍噴一行）
         self._complained = False
-        #: 上次掃到 GID 的記憶體區段。之後只掃這些（幾毫秒），
-        #: 全掃留給 `FULL_RESCAN_SEC` 一次的兜底 —— 元件通常配在同一塊堆積裡。
-        self._hot: list[tuple[int, int]] = []
+        #: 上次全掃找到的**所有** `GID == aid` 位址。之後只重驗這一份（0.3 ms）。
+        #: ⚠ 這是整個設計的關鍵，見 `_locate_component()` 的說明。
+        self._candidates: list[int] = []
         self._last_full = 0.0
         #: 地形快取：驗證「這一格站得住嗎」用，換圖才重載
         self._terrain_map = ""
@@ -227,26 +228,37 @@ class PlayerPosition:
         return x
 
     def _locate_component(self) -> bool:
-        """掃記憶體找 `GID == aid` 的移動元件。**通過驗證的必須剛好一個**。
+        """在候選裡找出角色的移動元件。**通過驗證的必須剛好一個**。
 
-        找不到**不是錯誤**：剛換圖、還沒在這張圖上走過的時候本來就沒有。
-        那時候由進圖座標全域回答，等角色走第一步之後再自己接上。
+        ## 為什麼只要全掃一次（實機量出來的關鍵事實）
+
+        **元件物件在角色走第一步之前就已經帶著 `GID == AID` 了** ——
+        只是狀態與終點欄位還沒填。實機兩次驗證：剛傳過去、還沒動的時候
+        先把所有 `GID == AID` 的位址拍下來，再送一個移動，
+        **真正動起來的那一塊本來就在那份快照裡**。
+
+        所以：換圖之後全掃**一次**把候選拍下來（0.6~0.8 秒），之後每次只重驗
+        那 60~70 個候選（**0.30 ms**）—— 角色一走第一步就會被接上。
+
+        ⚠⚠ 第一版不是這樣做的，是「只掃上次有命中的區段、全掃 15 秒一次」。
+        結果實機一換圖就中招：新元件配在冷區段裡，於是**整整 15 秒都讀進圖座標**，
+        而角色其實正在走 —— `travel_bot` 看到「位置一直沒變」就判定
+        「一步都沒動、可能是背包太重」把趕路停掉（[DAT-042] 那條判斷本身沒錯，
+        錯的是餵給它的座標）。**便宜的快取不能拿正確性去換。**
+
+        找不到元件**不是錯誤**：剛換圖、還沒在這張圖上走過的時候本來就找不到
+        （狀態欄位是 0）。那時候由進圖座標全域回答。
         """
         self._addr = None
         self._last_locate = self._now()
         if not (0 < self._aid < 0x7FFF_FFFF):
             log.error("角色 AID 讀不到（%r），移動元件無法定位", self._aid)
             return False
-        hits, hot = self._scan(self._aid, self._hot)
-        good = [addr for addr in hits if self._component_at(addr) is not None]
-        if not good and self._now() - self._last_full >= FULL_RESCAN_SEC:
-            # 熱區段裡沒有 —— 久久一次翻遍整份記憶體（新配置的可能落在別處）。
+        # 候選清單空了（換圖／第一次），或候選裡怎麼樣都驗不出來 —— 重新全掃。
+        if not self._candidates or self._now() - self._last_full >= FULL_RESCAN_SEC:
             self._last_full = self._now()
-            hits, hot = self._scan(self._aid, None)
-            self._hot = hot
-            good = [addr for addr in hits if self._component_at(addr) is not None]
-        elif hot:
-            self._hot = hot
+            self._candidates = self._scan(self._aid)
+        good = [a for a in self._candidates if self._component_at(a) is not None]
         if len(good) > 1:
             # 驗完還是不只一個＝真的分不出來。不准賭 —— 賭錯就是照著別人的位置走。
             log.error(
@@ -256,19 +268,19 @@ class PlayerPosition:
             return False
         if not good:
             log.info(
-                "還沒找到角色的移動元件（AID %d，%d 個 GID 命中）"
+                "還沒找到角色的移動元件（AID %d，%d 個候選）"
                 "—— 剛換圖還沒走過路的話這是正常的，先用進圖座標",
-                self._aid, len(hits),
+                self._aid, len(self._candidates),
             )
             return False
         self._addr = good[0]
         self._complained = False
-        log.info("角色移動元件定位於 %#x（AID %d，%d 個 GID 命中）",
-                 self._addr, self._aid, len(hits))
+        log.info("角色移動元件定位於 %#x（AID %d，%d 個候選）",
+                 self._addr, self._aid, len(self._candidates))
         return True
 
     def invalidate(self) -> None:
-        """丟掉記著的元件位址，下一次 `read()` 會重新找。
+        """丟掉記著的元件位址**與候選清單**，下一次 `read()` 會重新全掃。
 
         換地圖時一定要呼叫：客戶端會把舊元件回收，而**回收不等於清乾淨** ——
         GID 可能還在原地，只是不再更新（[MEM-047] 那個「很有自信的錯值」
@@ -276,14 +288,16 @@ class PlayerPosition:
         """
         self._addr = None
         self._last_locate = 0.0
+        # ⚠ 候選也要丟：換圖之後客戶端會另外配一個新元件，
+        #   舊的候選清單裡沒有它（第一版就是漏了這一步，害整整 15 秒讀到舊值）。
+        self._candidates = []
+        self._last_full = 0.0
 
     def forget(self) -> None:
         """完全重置（換行程／收攤時用）。"""
         self.invalidate()
         self._aid = 0
         self._entry = None
-        self._hot = []
-        self._last_full = 0.0
         self._terrain_map = ""
         self._terrain = None
         self._complained = False
@@ -406,28 +420,23 @@ class PlayerPosition:
 
     # ---- 掃描 -------------------------------------------------------
 
-    def _scan(self, aid: int, regions):
-        """找出所有 `u32 == aid` 的位址，順便回報哪些區段有命中。
+    def _scan(self, aid: int) -> list[int]:
+        """全掃：列出所有 `u32 == aid` 的位址。
 
-        `regions=None` 代表全掃（實測整份 511 MB 要 0.7~0.8 秒）；
-        給一份清單就只掃那些（熱區段，幾毫秒）。
+        實測 508 MB／1962 個區段要 **0.6~0.8 秒**，其中 **0.57 秒是
+        ReadProcessMemory 本身** —— 比對只佔 0.04 秒，換 regex 反而更慢（0.80 秒）。
+        也就是說這條路沒有「再優化一點」的空間，只能**少做幾次**（見 `_locate_component`）。
         """
-        if regions is None:
-            try:
-                regions = self._scanner.regions(writable_only=True)
-            except RuntimeError:
-                return [], []
         hits: list[int] = []
-        hot: list[tuple[int, int]] = []
+        try:
+            regions = self._scanner.regions(writable_only=True)
+        except RuntimeError:
+            return hits
         for base, size in regions:
             raw = self._scanner.read_region(base, size)
             if raw is None or len(raw) < 4:
                 continue
             words = np.frombuffer(raw, dtype="<u4", count=len(raw) // 4)
-            found = np.nonzero(words == aid)[0]
-            if not len(found):
-                continue
-            hot.append((base, size))
-            for i in found:
+            for i in np.nonzero(words == aid)[0]:
                 hits.append(base + int(i) * 4)
-        return hits, hot
+        return hits
