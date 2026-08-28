@@ -197,27 +197,28 @@ def test_hit_grace_scales_with_the_distance_we_attacked_from():
     assert far <= mod._GIVE_UP_SEC
 
 
-def test_attack_range_stays_close_enough_to_actually_walk_there():
-    """⛔ 放寬到 13 格試過，失敗了（GAMEDATA [PKT-065]）。
+def test_far_attack_threshold_is_paired_with_continuous_resends():
+    """遠距門檻與「持續發送」是**一組的**，只留一半就會退回罰站症狀。
 
-    `_fight()` 一旦送出攻擊就不再走路（移動會取消連續攻擊，[PKT-034]），
-    所以門檻多遠，角色就會在多遠的地方站著等。單獨實驗裡「站穩後遠距攻擊」
-    伺服器會接手帶路，但 bot 多半是**正在走**的時候跨過門檻，
-    攻擊在移動中送達就被忽略 —— 症狀是原地罰站（使用者實測回報）。
+    只送一次的話，角色跨過門檻那一刻多半還在走，那一擊被伺服器忽略之後
+    就沒有第二次機會 —— 站在遠處等到放棄計時器到期（[PKT-065]，使用者實測）。
+    所以門檻放遠的前提是：放棄額度內送得出好幾發。
     """
     from ro_toolbox.services import farm_bot as mod
 
-    assert mod._ATTACK_RANGE <= 4, "太遠就會變成站在遠處等，不會走過去"
-    assert mod._ATTACK_RANGE >= 2, "留一點餘裕給『讀座標』與『怪又走一步』的落差"
+    grace = mod._ATTACK_ACK_SEC + mod._ATTACK_RANGE * mod._WALK_SEC_PER_CELL
+    assert grace / mod._ATTACK_RETRY_SEC >= 5, "門檻放遠就要送得夠密，否則等於回到只送一次"
+    # 13 格使用者實測「有時打不到」（伺服器帶路會半途停下），退到 10 格。
+    assert mod._ATTACK_RANGE <= 12, "太遠伺服器不一定帶到位，會站在半路打空氣"
 
 
-# ---- 補送攻擊：只在「一筆傷害都還沒收到」時補 -----------------------------
+# ---- 攻擊是「一直送到牠死」，不是送一次 -----------------------------------
 
 
-def _bot_with_aim(monkeypatch, *, last_hit=0.0, dist=10, near=True):
-    """準備一個已經送出攻擊、但還沒確認打到的 bot。不會碰遊戲。
+def _bot_with_aim(monkeypatch, *, last_hit=0.0, dist=10, away=1):
+    """準備一個已經送出攻擊的 bot。不會碰遊戲。
 
-    `near` = 角色已經走到怪旁邊了（補送的前提之一）。
+    `away` = 角色現在離怪幾格（拿來確認「距離不再影響要不要送」）。
     """
     from ro_toolbox.services import farm_bot as mod
     from ro_toolbox.services.world import Monster
@@ -226,7 +227,6 @@ def _bot_with_aim(monkeypatch, *, last_hit=0.0, dist=10, near=True):
     sent: list[bytes] = []
     monkeypatch.setattr(bot, "_send", sent.append)
     monkeypatch.setattr(bot._world, "last_hit", lambda _gid: last_hit)
-    away = 1 if near else mod._RESEND_NEAR + 5
     monkeypatch.setattr(bot._world, "get", lambda _gid: Monster(777, 1002, away, 0))
     aim = _Aim(gid=777, since=T0)
     aim.attacked = True
@@ -236,48 +236,55 @@ def _bot_with_aim(monkeypatch, *, last_hit=0.0, dist=10, near=True):
     return bot, aim, sent, mod
 
 
-def test_resend_is_skipped_once_we_are_actually_hitting_it(monkeypatch):
-    """傷害封包一直進來就代表攻擊生效了 —— 重送會把攻速計時器重置，DPS 反而掉。"""
+def test_attack_keeps_being_sent_even_while_damage_is_landing(monkeypatch):
+    """⚠ 這是 2026-08-29 的實驗：正在互打也照樣補送。
+
+    代價是 `0x0437` 的攻速計時器可能被重置（DPS 掉）。
+    要是實測「擊殺變少、打空氣沒變多」，這條測試就是要一起改回去的地方。
+    """
     bot, aim, sent, mod = _bot_with_aim(monkeypatch, last_hit=T0 + 0.5)
-    bot._resend_attack(aim, T0 + 10.0, (0, 0))
-    assert sent == [], "已經打到了還補送，等於自己打斷自己"
+    bot._keep_attacking(aim, T0 + mod._ATTACK_RETRY_SEC + 0.01)
+    assert len(sent) == 1, "打到了也要繼續送 —— 這是這次改版的重點"
 
 
-def test_resend_waits_for_the_interval(monkeypatch):
+def test_attack_waits_for_the_interval(monkeypatch):
+    """間隔沒到就不要送 —— 不然變成每一拍（0.2 秒）都送。"""
     bot, aim, sent, mod = _bot_with_aim(monkeypatch)
-    bot._resend_attack(aim, T0 + mod._ATTACK_RETRY_SEC - 0.1, (0, 0))
+    bot._keep_attacking(aim, T0 + mod._ATTACK_RETRY_SEC - 0.1)
     assert sent == []
 
 
-def test_resend_fires_when_nothing_has_been_hit(monkeypatch):
-    """攻擊石沉大海（伺服器沒接、怪剛好走掉）—— 補一次比乾等到放棄划算。"""
+def test_attack_fires_once_the_interval_is_up(monkeypatch):
     bot, aim, sent, mod = _bot_with_aim(monkeypatch)
-    bot._resend_attack(aim, T0 + mod._ATTACK_RETRY_SEC, (0, 0))
+    bot._keep_attacking(aim, T0 + mod._ATTACK_RETRY_SEC + 0.01)
     assert len(sent) == 1
     assert aim.resends == 1
+    assert bot._stats.resent == 1
 
 
-def test_resend_holds_off_while_the_server_is_still_walking_us_over(monkeypatch):
-    """攻擊可以從 13 格外送出，伺服器要先把角色帶過去（約 2 秒）。
+def test_attack_is_sent_even_while_the_server_is_still_walking_us_over(monkeypatch):
+    """還在被伺服器帶過去的路上也要送 —— **那正是舊版漏掉的那一擊**。
 
-    還在路上就補送＝自己打斷自己的起手。實測 1 秒間隔、不看距離：
-    100 秒補送 17 次，擊殺反而比 2 秒那組略低。
+    舊版要求「已經走到旁邊」或「時間夠走完那段路」才補，遠距門檻下
+    等於整段路都不補，於是被忽略的起手沒人接。
     """
-    bot, aim, sent, mod = _bot_with_aim(monkeypatch, near=False, dist=20)
-    # 20 格 × 0.15 秒 = 3 秒的路；才過 2 秒，伺服器還在帶
-    bot._resend_attack(aim, T0 + mod._ATTACK_RETRY_SEC, (0, 0))
-    assert sent == [], "還在路上就補送，會打斷起手"
-
-    # 路走完了卻還是一筆傷害都沒有 —— 這一擊真的沒生效，補一次
-    bot._resend_attack(aim, T0 + 20 * mod._WALK_SEC_PER_CELL + 0.1, (0, 0))
+    bot, aim, sent, mod = _bot_with_aim(monkeypatch, away=10, dist=10)
+    bot._keep_attacking(aim, T0 + mod._ATTACK_RETRY_SEC + 0.01)
     assert len(sent) == 1
 
 
-def test_resend_stops_once_the_give_up_budget_is_spent(monkeypatch):
-    """補送也要在放棄額度內 —— 額度用完就該換人，不是無限補。"""
+def test_giving_up_is_check_hit_s_job_not_the_resend_gate(monkeypatch):
+    """額度用完不是靠「停止補送」收尾，是靠 `_check_hit()` 換目標。
+
+    兩邊都管的話會出現「不送了、但目標還鎖著」的安靜狀態。
+    """
     bot, aim, sent, mod = _bot_with_aim(monkeypatch, dist=0)
-    bot._resend_attack(aim, T0 + bot._hit_grace(aim) + 0.1, (0, 0))
-    assert sent == []
+    bot._aim = aim
+    bot._keep_attacking(aim, T0 + bot._hit_grace(aim) + 0.1)
+    assert len(sent) == 1, "補送本身沒有額度閘門"
+    bot._check_hit(aim, T0 + bot._hit_grace(aim) + 0.1)
+    assert bot._aim is None, "一筆傷害都沒有，額度用完就該換人"
+    assert bot._stats.missed == 1
 
 
 # ---- 黑名單會被「又看到它」推翻 --------------------------------------------
