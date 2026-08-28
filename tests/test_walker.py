@@ -222,3 +222,28 @@ def test_standing_inside_the_zone_still_moves():
     walker.set_path([(x, 50) for x in range(21, 45)], avoid=WARP)
     assert walker.update((20, 50)) == "walking"
     assert fake.sent, "站在禁區裡也必須走得出來"
+
+
+def test_the_resend_window_still_fits_inside_the_stuck_timeout():
+    """⚠ 重送變快，次數就要跟著變多。
+
+    判定「這條路走不成」要**重送用完 ＋ 停超過 STUCK_SEC** 兩個條件同時成立。
+    如果 `MAX_RESEND × RESEND_SEC` 遠小於 `STUCK_SEC`，重送早早用完，
+    後面那段時間就只是乾等 —— 等於**變相縮短了救援時間**，
+    跟「被怪打斷時要點快一點」的目的正好相反。
+    """
+    from ro_toolbox.services import walker as mod
+
+    window = mod.MAX_RESEND * mod.RESEND_SEC
+    assert window <= mod.STUCK_SEC, "重送不能拖過放棄時間"
+    assert window >= mod.STUCK_SEC * 0.6, "重送用完之後不該剩一大段乾等"
+
+
+def test_resending_is_fast_enough_to_out_pace_being_hit():
+    """使用者實測：被好幾隻怪同時打的時候 0.5 秒太慢，人一直站在原地。
+
+    走路速度約 1 格 / 0.15 秒 —— 重送間隔要接近那個尺度才追得上打斷。
+    """
+    from ro_toolbox.services import walker as mod
+
+    assert mod.RESEND_SEC <= 0.3
