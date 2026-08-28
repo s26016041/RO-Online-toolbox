@@ -25,7 +25,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ro_toolbox.core.ro_protocol import build_move, unpack_move, unpack_position
-from ro_toolbox.services import game_socket, npc_dialog
+from ro_toolbox.services import game_socket, mapdata, npc_dialog
 from ro_toolbox.services.character import CharacterReader
 from ro_toolbox.services.gamedata import map_display_name, npc_links_on_map
 from ro_toolbox.services.navigation import NavigationReader
@@ -39,6 +39,10 @@ log = logging.getLogger(__name__)
 _TICK = 0.2
 _RESYNC_SEC = 2.0  # 多久檢查一次「連線有沒有換掉」
 _OP_MOVE_ACK = 0x0087  # 伺服器確認「我」要移動：payload[4:10] = 起點+終點
+#: 為了問出自己的座標而「推一下」的間隔與次數上限。
+#: 逾時只是**放棄的上限**：真正的成功依據是伺服器回的 0x0087 起點。
+_NUDGE_EVERY_SEC = 2.0
+_NUDGE_TRIES = 5
 #: 實體進入視野的封包（版面見 services/world.py 的欄位表）
 _OP_ENTITY = (0x09FF, 0x09FE, 0x09FD)
 #: 走多遠才確定出了 NPC 的視野。RO 的視野約 14 格，抓 22 有餘裕。
@@ -111,6 +115,14 @@ class TravelBot:
         self._walker = Walker(self._send_move)
         self._traveler = Traveler(self._walker, time.monotonic)
         self._resync_at = 0.0
+        #: 伺服器最近一次在 0x0087 裡說「你在這裡」。換圖後記憶體座標會過期，
+        #: 那時只有這個可信（見 `_trusted_position`）。
+        self._server_pos: tuple[int, int] | None = None
+        #: 上次為了「問出自己在哪」而推一下的時間，以及推了幾次。
+        self._nudged_at = 0.0
+        self._nudges = 0
+        self._terrain_name = ""
+        self._terrain = None
         self._stats = TravelStats(
             goal=destination or "",
             goal_label=map_display_name(destination) if destination else "",
@@ -255,7 +267,11 @@ class TravelBot:
         if packet.outbound:
             return
         if packet.opcode == _OP_MOVE_ACK and len(packet.payload) >= 10:
-            _start, dest = unpack_move(packet.payload[4:10])
+            start, dest = unpack_move(packet.payload[4:10])
+            # ⚠ **起點不要丟掉。** 這是伺服器認定「我現在在哪」——
+            # 換地圖之後記憶體裡的座標會停在上一張圖（[MEM-022]），
+            # 那時候這個值是唯一可信的來源（見 `_trusted_position`）。
+            self._server_pos = start
             self._walker.note_move_ack(dest)
             return
         talk = self._talk
@@ -301,6 +317,11 @@ class TravelBot:
             # 座標讀不到（換圖中、或定位失效）就這一拍不動 ——
             # 絕不拿讀不到當成「在原點」，那正是 [MEM-039] 踩過的坑。
             if status is None or not status.map_name or pos is None:
+                self._stop.wait(_TICK)
+                continue
+
+            pos = self._trusted_position(status.map_name, pos)
+            if pos is None:
                 self._stop.wait(_TICK)
                 continue
 
@@ -550,6 +571,93 @@ class TravelBot:
             self._resync_at = 0.0
             return False
         return True
+
+    def _trusted_position(self, map_name: str, pos: tuple[int, int]):
+        """回一個**確定在這張圖上**的座標；問不出來回 None（這一拍不動）。
+
+        ## 為什麼需要
+
+        [MEM-022]：**換地圖之後記憶體裡的座標會停在上一張圖的最後位置**，
+        要等角色再走一步客戶端才會寫新的。被傳進一間店（或任何小圖）而人又
+        沒動的時候，那個舊值會一直掛在那裡。
+
+        使用者實機（2026-08-28）：被傳進 `s_atelier`（**200×140**）之後，
+        座標一直是 `(271, 108)` —— 那是上一張 prontera（312×392）的位置。
+        `Traveler` 正確地判斷「這座標不在這張圖上」，但反應是**停掉**：
+
+            ⚠ 進 s_atelier 後 10 秒，座標 (271, 108) 仍不在這張圖上，已停止
+
+        判斷沒錯，錯的是沒有辦法問出真正的位置。
+
+        ## 怎麼問
+
+        伺服器在 `0x0087` 裡同時給**起點**與終點 —— 起點就是它認定我們在哪。
+        本來我們只取終點，起點丟掉了。現在留著（見 `_on_packet`）。
+
+        站著不動的時候不會有 `0x0087`，所以**推一下**：往這張圖上任何一格
+        可走的地方送一次移動。伺服器回的那包就會告訴我們真正的起點。
+        推的那一步走去哪不重要 —— 知道位置之後 `Traveler` 會重新規劃。
+        """
+        terrain = self._terrain_for(map_name)
+        if terrain is None:
+            return pos          # 沒有地形就沒得驗，照舊用記憶體的值
+        # ⚠ 只看**在不在這張圖的範圍內**，不看走不走得過 ——
+        # 站在傳點上、站在邊界格上都是合法的位置。
+        if 0 <= pos[0] < terrain.width and 0 <= pos[1] < terrain.height:
+            self._nudges = 0
+            return pos
+        server = self._server_pos
+        if server is not None and (
+            0 <= server[0] < terrain.width and 0 <= server[1] < terrain.height
+        ):
+            self._note(f"記憶體座標 {pos} 不在 {map_name} 上，改用伺服器說的 {server}")
+            self._nudges = 0
+            return server
+        self._nudge(terrain, map_name)
+        return None
+
+    def _nudge(self, terrain, map_name: str) -> None:
+        """往任意一格可走的地方送一次移動，逼伺服器回報我們在哪。"""
+        now = time.monotonic()
+        if now - self._nudged_at < _NUDGE_EVERY_SEC:
+            return
+        self._nudged_at = now
+        if self._nudges >= _NUDGE_TRIES:
+            self._fail(
+                f"⚠ 進 {map_name} 之後問不出自己的座標（推了 {self._nudges} 次），"
+                "自動尋路已停止"
+            )
+            return
+        target = self._any_walkable(terrain)
+        if target is None:
+            self._fail(f"⚠ {map_name} 上找不到任何可走的格子，自動尋路已停止")
+            return
+        self._nudges += 1
+        self._note(f"座標還停在上一張圖，往 {target} 走一步問出真正的位置…")
+        self._send_move(*target)
+
+    @staticmethod
+    def _any_walkable(terrain):
+        """這張圖上離中心最近的一格可走的地方。找不到回 None。"""
+        import numpy as np
+
+        cells = np.argwhere(terrain.walkable)
+        if not len(cells):
+            return None
+        centre = np.array([terrain.height / 2, terrain.width / 2])
+        best = cells[np.argmin(((cells - centre) ** 2).sum(axis=1))]
+        return int(best[1]), int(best[0])
+
+    def _terrain_for(self, map_name: str):
+        """這張圖的地形（記著上一張，不要每拍重讀）。讀不到回 None。"""
+        if map_name != self._terrain_name:
+            self._terrain_name = map_name
+            self._terrain = None
+            try:
+                self._terrain = mapdata.load_terrain(map_name)
+            except Exception as exc:  # noqa: BLE001 - 沒地形就退回舊行為
+                log.debug("讀不到 %s 的地形：%s", map_name, exc)
+        return self._terrain
 
     def _send_move(self, x: int, y: int) -> None:
         self._send(build_move(x, y))

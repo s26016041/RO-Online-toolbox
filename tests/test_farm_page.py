@@ -783,3 +783,89 @@ def test_the_snapshot_taken_at_attach_never_clobbers_the_old_one(qtbot):
     card.auto_hunt.setChecked(False)          # 新卡什麼都沒開
     page._snaps.setdefault("狐狐狸", page.snapshot_for(1234))
     assert page._snaps["狐狐狸"] is before, "舊快照不准被新的空快照蓋掉"
+
+
+# ---- 換圖之後座標會停在上一張圖 —— 要問伺服器，不是停掉 ------------------
+#
+# 使用者實機（2026-08-28）：尋路被傳進 `s_atelier`（200×140）之後
+#   ⚠ 進 s_atelier 後 10 秒，座標 (271, 108) 仍不在這張圖上，已停止
+# (271,108) 是上一張 prontera（312×392）的位置 —— [MEM-022] 記過的那件事。
+# 判斷沒錯，錯的是沒有辦法問出真正的位置。
+
+
+class _Terrain:
+    """一張 200x140、全部可走的假地圖。"""
+
+    width, height = 200, 140
+
+    def is_walkable(self, x, y):
+        return 0 <= x < self.width and 0 <= y < self.height
+
+    @property
+    def walkable(self):
+        import numpy as np
+
+        return np.ones((self.height, self.width), dtype=bool)
+
+
+def _travel_bot(monkeypatch):
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234)
+    monkeypatch.setattr(bot, "_terrain_for", lambda name: _Terrain())
+    sent = []
+    monkeypatch.setattr(bot, "_send_move", lambda x, y: sent.append((x, y)))
+    return bot, sent
+
+
+def test_a_position_inside_the_map_is_taken_as_is(monkeypatch):
+    bot, sent = _travel_bot(monkeypatch)
+    assert bot._trusted_position("s_atelier", (100, 70)) == (100, 70)
+    assert sent == [], "座標沒問題就不要亂送封包"
+
+
+def test_a_stale_position_falls_back_to_what_the_server_said(monkeypatch):
+    """⚠ 伺服器在 0x0087 裡同時給起點與終點 —— 起點就是「我在哪」。
+
+    本來我們只取終點，起點丟掉了。那是換圖後唯一可信的來源。
+    """
+    bot, sent = _travel_bot(monkeypatch)
+    bot._server_pos = (40, 30)
+    assert bot._trusted_position("s_atelier", (271, 108)) == (40, 30)
+    assert sent == [], "已經知道位置就不用再推"
+
+
+def test_with_no_answer_it_nudges_instead_of_giving_up(monkeypatch):
+    """站著不動不會有 0x0087 —— 往任意一格可走的地方走一步問出來。"""
+    bot, sent = _travel_bot(monkeypatch)
+    assert bot._trusted_position("s_atelier", (271, 108)) is None
+    assert sent, "要送一次移動把伺服器問出來"
+    x, y = sent[0]
+    assert 0 <= x < 200 and 0 <= y < 140, f"推的目標要在這張圖上：{sent[0]}"
+
+
+def test_nudging_is_throttled(monkeypatch):
+    """每拍都送等於洗封包 —— 而且伺服器也不會因此回快一點。"""
+    bot, sent = _travel_bot(monkeypatch)
+    for _ in range(10):
+        bot._trusted_position("s_atelier", (271, 108))
+    assert len(sent) == 1, f"節流沒生效：{sent}"
+
+
+def test_it_gives_up_loudly_after_enough_tries(monkeypatch):
+    """問不出來還是要**大聲停用**，不能無聲無息一直推。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    bot, sent = _travel_bot(monkeypatch)
+    monkeypatch.setattr(mod, "_NUDGE_EVERY_SEC", 0.0)
+    for _ in range(mod._NUDGE_TRIES + 2):
+        bot._trusted_position("s_atelier", (271, 108))
+    assert "問不出自己的座標" in bot.stats.note, bot.stats.note
+
+
+def test_no_terrain_means_we_do_not_second_guess_the_memory(monkeypatch):
+    """沒有那張圖的地形就沒得驗 —— 照舊用記憶體的值，不要亂推。"""
+    bot, sent = _travel_bot(monkeypatch)
+    monkeypatch.setattr(bot, "_terrain_for", lambda name: None)
+    assert bot._trusted_position("nowhere", (271, 108)) == (271, 108)
+    assert sent == []
