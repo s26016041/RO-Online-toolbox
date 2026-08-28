@@ -170,6 +170,43 @@ class MapTerrain:
                     heapq.heappush(open_heap, (ng + heuristic(nx, ny), ng, nxt))
         return None
 
+    def line_clear(self, start: tuple[int, int], goal: tuple[int, int]) -> bool:
+        """從 `start` 直直走到 `goal`，中間**每一格都可走**嗎？
+
+        用 Bresenham 走一遍那條直線（不含起點、含終點），有任何一格不可走
+        就回 False。判斷「有沒有障礙物」用它，不要用 `find_path()` 的長度 ——
+        A* 會安靜地繞過去，繞完長度可能還是一樣（8 方向格子裡斜著閃開一格
+        石頭不會多花步數），於是「中間有牆」就被算成「直直走得過去」。
+
+        斜走沿用 `find_path()` 的**不穿角**規則：兩側都是牆就過不去。
+        兩邊規則不一致的話，會出現「這裡說走得過去、走路那邊說不行」。
+        """
+        x, y = start
+        gx, gy = goal
+        if (x, y) == (gx, gy):
+            return True
+        dx, dy = abs(gx - x), abs(gy - y)
+        sx = 1 if gx > x else -1
+        sy = 1 if gy > y else -1
+        err = dx - dy
+        while (x, y) != (gx, gy):
+            e2 = 2 * err
+            step_x = e2 > -dy
+            step_y = e2 < dx
+            if step_x:
+                err -= dy
+                x += sx
+            if step_y:
+                err += dx
+                y += sy
+            if not self.is_walkable(x, y):
+                return False
+            if step_x and step_y and not (
+                self.is_walkable(x, y - sy) or self.is_walkable(x - sx, y)
+            ):
+                return False  # 穿角：斜走的兩側都是牆，實際過不去
+        return True
+
     def reachable_from(self, start: tuple[int, int]) -> frozenset[tuple[int, int]]:
         """從 `start` **走得到**的所有格子。起點不可走就回空集合。
 

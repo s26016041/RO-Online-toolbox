@@ -366,6 +366,82 @@ def test_close_enough_rejects_a_monster_behind_a_wall(monkeypatch):
     assert bot._close_enough((10, 10), (12, 10), 2) is False
 
 
+def test_one_rock_in_the_way_is_not_close_enough(monkeypatch):
+    """中間**只有一顆石頭**也不算數 —— 條件是「直線上乾淨」，不是「繞得過去」。
+
+    這是舊版（路徑步數 ≤ 直線 + 3）唯一漏掉的形狀：8 方向格子裡斜著閃開
+    一格石頭**不會多花步數**，所以「中間有障礙」照樣被判成貼到了。
+    """
+    bot = _bot_with_terrain(monkeypatch, blocked=[(11, 10)])
+    assert bot._close_enough((10, 10), (13, 10), 3) is False
+
+
+def test_a_detour_is_not_close_enough_either(monkeypatch):
+    """繞得過去、但要繞 —— 也不打，先走近。"""
+    wall = [(11, y) for y in range(5, 15)]
+    bot = _bot_with_terrain(monkeypatch, blocked=wall)
+    assert bot._close_enough((10, 10), (12, 10), 2) is False
+
+
+def test_a_clear_diagonal_line_is_close_enough(monkeypatch):
+    """斜的直線也算直線：整條乾淨就可以打。"""
+    bot = _bot_with_terrain(monkeypatch)
+    assert bot._close_enough((10, 10), (16, 16), 6) is True
+
+
+def test_a_monster_on_an_unwalkable_cell_uses_the_cell_beside_it(monkeypatch):
+    """怪站在不可走的格上（斜坡邊之類）：改看緊鄰牠、離我最近的可走格。"""
+    bot = _bot_with_terrain(monkeypatch, blocked=[(14, 10)])
+    assert bot._close_enough((10, 10), (14, 10), 4) is True
+
+
+def test_a_diagonal_that_has_to_squeeze_through_a_corner_is_rejected(monkeypatch):
+    """斜線的兩側都是牆＝穿角，實際過不去。規則跟 A* 的不穿角一致。"""
+    bot = _bot_with_terrain(monkeypatch, blocked=[(11, 10), (10, 11)])
+    assert bot._close_enough((10, 10), (13, 13), 3) is False
+
+
+def test_no_attack_is_sent_through_a_wall(monkeypatch):
+    """走不過去就**不送攻擊**。
+
+    舊版在這裡「算不出路就直接打」，等於隔著牆對空氣送封包，然後站著等
+    10 秒的放棄計時器（使用者回報「走過去站著發呆」）。
+    """
+    sent: list[bytes] = []
+    bot = _bot_with_terrain(monkeypatch, blocked=[(11, y) for y in range(60)])
+    bot._world.set_map_size((60, 60))
+    bot._send = sent.append
+    see(bot, 5, 13, 10)
+    bot._update_aim(T0, (10, 10))
+    bot._fight(T0, (10, 10))
+    assert bot._aim is not None, "目標還在，交給放棄計時器收尾"
+    assert sent == [], "隔著牆一個封包都不該送"
+    assert bot._aim.attacked is False
+
+
+def test_attack_is_sent_once_the_line_is_clear(monkeypatch):
+    """同樣的距離，牆拿掉就要打得出去 —— 別把條件收到連正常情況都不打。"""
+    sent: list[bytes] = []
+    bot = _bot_with_terrain(monkeypatch)
+    bot._world.set_map_size((60, 60))
+    bot._send = sent.append
+    see(bot, 5, 13, 10)
+    bot._update_aim(T0, (10, 10))
+    bot._fight(T0, (10, 10))
+    assert [int.from_bytes(p[:2], "little") for p in sent] == [0x0368, 0x0437]
+
+
+def test_line_clear_is_what_answers_the_obstacle_question(monkeypatch):
+    """`line_clear()` 自己的單元測試：乾淨、被擋、穿角。"""
+    bot = _bot_with_terrain(monkeypatch, blocked=[(11, 10), (10, 11)])
+    terrain = bot._terrain
+    assert terrain.line_clear((10, 10), (10, 10)) is True     # 原地
+    assert terrain.line_clear((20, 10), (20, 20)) is True     # 垂直乾淨
+    assert terrain.line_clear((10, 10), (20, 10)) is False    # 水平被石頭擋
+    assert terrain.line_clear((10, 10), (13, 13)) is False    # 穿角
+    assert terrain.line_clear((20, 20), (26, 23)) is True     # 斜的乾淨
+
+
 def test_adjacent_never_needs_a_path_check(monkeypatch):
     """貼身就是貼身，不必再花時間算路徑。"""
     bot = _bot_with_terrain(monkeypatch, blocked=[(11, 10)])

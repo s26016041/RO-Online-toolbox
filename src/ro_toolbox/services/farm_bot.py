@@ -64,6 +64,7 @@ _ROAM_BUDGET = 150_000  # A* 節點上限（150 格的路實測遠低於這個�
 _BAD_GOAL_SEC = 90.0  # 走不到的目標區域冷卻多久
 _BAD_GOAL_RADIUS = 8  # 走不到的目標附近多少格內都別再挑
 #: 走到離怪這麼近才送攻擊。**攻擊封包只帶 GID、不帶座標**，最後那一段由伺服器帶。
+#: ⚠ 距離只是條件之一 —— **那條直線上還不能有障礙物**，見 `_close_enough()`。
 #:
 #: 🔬 **2026-08-29 改成 10 格（使用者要求），還沒完整實測 —— 變差先懷疑這裡。**
 #: 先試 13 格，使用者實測回報「有時打不到」，退到 10 格。
@@ -107,13 +108,7 @@ _WALK_SEC_PER_CELL = 0.15
 #: 回測一定要用「打空氣 ÷ 擊殺」並在同一個地點比：
 #: 單輪 100 秒的擊殺數雜訊很大（同樣的程式碼跑出 3~16，光怪的密度就有這個落差）。
 _ATTACK_RETRY_SEC = 0.5
-#: 用**真的路徑**確認「夠近了」時，允許比直線多繞幾格。
-#:
-#: ⚠ `distance_from()` 是契比雪夫距離（直線），**中間隔著牆也照樣算得很近**。
-#: 只看直線的話，隔著石頭的怪會被判成「貼到了」→ 送出攻擊 → 站著打空氣
-#: （使用者實測回報）。所以直線夠近之後，再用 A* 確認實際要走的步數也夠近。
-_PATH_SLACK = 3
-#: 那個確認用的 A* 節點上限。只走幾格，不該花時間；超過就當「繞太遠」。
+#: 走近用的 A* 節點上限（脫離傳點禁區也用它）。只走幾格，不該花時間。
 _NEAR_BUDGET = 3000
 #: ⚠ 「傳點周圍不准踩」與「一條傳點帶要補起來」現在**只有一份定義**，
 #: 在 `services/warpzone.py`（`KEEP_OUT` / `STRIP_MAX` / `warp_strips`）。
@@ -701,8 +696,9 @@ class FarmBot:
         使用者提供的實測封包（[PKT-015]）：左鍵點怪送 `0x0368`(查詢) →
         `0x035F`(走近) → `0x0437`(連續攻擊)，之後客戶端自己打到死。
 
-        「走近」只要走到 `_ATTACK_RANGE` 格內就夠了 —— 最後那一段由伺服器帶，
-        它知道怪真正在哪（見 `_ATTACK_RANGE` 的實測說明）。
+        「走近」只要走到 `_ATTACK_RANGE` 格內、**而且中間那條直線沒有障礙物**
+        就夠了 —— 最後那一段由伺服器帶，它知道怪真正在哪
+        （見 `_ATTACK_RANGE` 的實測說明與 `_close_enough()`）。
 
         **攻擊送出後絕對不能再送移動**：移動會取消連續攻擊，
         症狀就是「打一下就跑掉」。所以 attacked 之後這裡不走路，只做兩件事：
@@ -724,9 +720,13 @@ class FarmBot:
         distance = mob.distance_from(pos) if (mob is not None and pos is not None) else None
         if (distance is not None and pos is not None
                 and not self._close_enough(pos, mob.pos, distance)):
-            if self._approach(pos, mob.pos):
-                return  # 還太遠（或中間有牆要繞），先走近一點
-        # 貼到了（或算不出路，那就直接打，打不到會被放棄計時器換掉）
+            # 還太遠、或中間有障礙 —— 先走近。**走不成也不准打**：
+            # 舊版在這裡「算不出路就直接打」，等於隔著牆對空氣送封包，
+            # 然後站著等 10 秒的放棄計時器（使用者回報「走過去站著發呆」）。
+            # 走不成就讓放棄計時器換目標，不要送一發注定打不到的攻擊。
+            self._approach(pos, mob.pos)
+            return
+        # 貼到了：直線 _ATTACK_RANGE 格內，而且中間乾淨
         self._walker.clear()
         self._world.note_attacking(aim.gid)
         self._send(build_query(aim.gid))
@@ -768,15 +768,22 @@ class FarmBot:
     def _close_enough(
         self, pos: tuple[int, int], goal: tuple[int, int], straight: int
     ) -> bool:
-        """真的夠近了嗎？**直線不算數，要用實際走得到的步數。**
+        """可以送攻擊了嗎？條件是**直線 `_ATTACK_RANGE` 格內，而且中間沒有障礙物**
+        （使用者 2026-08-29 指定的條件）。
 
         `distance_from()` 是契比雪夫距離，中間隔著石頭、水、牆也照樣算 3 格。
         只看直線的話，隔著障礙的怪會被判成「貼到了」→ 送出攻擊 → 站著打空氣
-        （使用者實測回報）。所以直線夠近之後，再用 A* 確認繞過去的步數也夠近。
+        （使用者實測回報）。所以直線夠近之後，還要 `line_clear()` 確認那條直線
+        每一格都能走。
 
-        貼身（1 格內）直接算數，不必再算路徑。算不出路徑（被牆完全隔開）
-        就回 False，讓呼叫端去走 —— 走不成的話 `_approach` 會回 False，
-        那時才會直接打，由放棄計時器收尾。
+        ⚠ **不要退回用 A* 的長度來判斷。** 舊版是「路徑步數 ≤ 直線 + 3」，
+        兩個問題：一是允許繞路，二是 8 方向格子裡斜著閃開一顆石頭**不會多花步數**，
+        所以「中間有障礙」照樣通過。要問的是「這條直線乾不乾淨」，
+        那就直接量直線（`MapTerrain.line_clear()`），不要拿別的東西近似。
+
+        貼身（1 格內）直接算數。怪站在不可走的格上（斜坡邊之類）就改看
+        緊鄰牠、離我最近的可走格。驗不過一律回 False，呼叫端會走近再說 ——
+        **不准隔著牆送攻擊**。
         """
         if straight > _ATTACK_RANGE:
             return False
@@ -784,17 +791,17 @@ class FarmBot:
             return True
         terrain = self._terrain
         if terrain is None:
-            return True  # 沒地形就只能信直線
-        path = terrain.find_path(pos, goal, node_budget=_NEAR_BUDGET)
-        if path is None:
-            # 怪站的那格可能不可走（牠站在斜坡邊之類）—— 改看牠旁邊那格
-            beside = self._beside(goal, pos)
-            if beside is None or beside == pos:
-                return True
-            path = terrain.find_path(pos, beside, node_budget=_NEAR_BUDGET)
-        if path is None:
-            return False
-        return len(path) <= _ATTACK_RANGE + _PATH_SLACK
+            # 沒地形＝驗不了障礙物。這是啟動時就大聲說過的降級模式
+            # （狀態列會寫「沒有地形」），不是安靜地放行。
+            return True
+        if terrain.is_walkable(*goal) and terrain.line_clear(pos, goal):
+            return True
+        beside = self._beside(goal, pos)
+        if beside is None:
+            return False  # 牠站的那格跟周圍九格都不可走 —— 過不去
+        if max(abs(beside[0] - pos[0]), abs(beside[1] - pos[1])) <= 1:
+            return True
+        return terrain.line_clear(pos, beside)
 
     def _check_hit(self, aim: _Aim, now: float) -> None:
         """攻擊送出後有沒有真的打到？沒有就是對著**過時的座標**打空氣。
