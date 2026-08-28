@@ -448,17 +448,3 @@ def field_addresses(pid: int, text: str) -> list[int]:
             scanner.close()
         except Exception:  # noqa: BLE001
             pass
-
-
-def remembered_account(pid: int) -> str | None:
-    """客戶端**記住的帳號**（登入畫面一開始就填在帳號欄裡的那串）。
-
-    就是 `submitted_account()` 讀的同一個位置 —— 客戶端記的是「上次送出去的帳號」，
-    而登入畫面會拿它預先填進帳號欄。
-
-    ⚠ 它記的**不一定是正確的帳號**：上一次要是打錯了（例如把密碼打進帳號欄），
-    它記住的就是那個錯的值。所以判斷欄位時要用「它記住的那串」去找，
-    **不能拿設定檔裡的帳號去找** —— 那樣會搜不到、誤判成「沒記住帳號」，
-    然後少按一次 Tab、又打反一次（踩過）。
-    """
-    return submitted_account(pid)

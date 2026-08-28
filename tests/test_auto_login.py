@@ -737,3 +737,97 @@ def test_another_accounts_login_packet_is_ignored(fast):
     bot._packets.append(FakePacket(0x0064, _login_payload("someoneelse")))
     bot._grab_password_blob()
     assert bot.password_blob == ""
+
+
+# ---- 焦點在哪一格：用量的，不用猜 --------------------------------------
+#
+# 使用者回報：「輸入帳密會卡在輸入帳密，一直打反，然後發現打反又重打，
+# 或者根本沒發現單純一直重打。」規則他自己講得很清楚 ——
+# 帳號欄有預填→焦點在密碼欄；帳號欄是空的→焦點在帳號欄。
+# 舊版讀的訊號（「上次送出去的帳號」那塊靜態緩衝）**兩種情況都是空的**
+# （[MEM-032]：那塊送出之後才有值），所以那個判斷根本不帶資訊。
+
+
+def _bot(monkeypatch, found: list[int] | None):
+    """做一個 AutoLogin，並決定「探針在記憶體裡找不找得到」。"""
+    bot = AutoLogin(_account(), 4242)
+    monkeypatch.setattr(
+        auto_login.input_helper, "field_addresses",
+        lambda pid, text: list(found or []),
+    )
+    return bot
+
+
+def test_probe_found_on_the_heap_means_the_caret_is_in_the_account_box(
+    monkeypatch, wired
+):
+    """[MEM-032] 的不對稱：帳號欄打進去的字在堆積上找得到。"""
+    bot = _bot(monkeypatch, [0x18254788])
+    assert bot._probe_focus(0x1234) is False        # False = 不用先打密碼
+    assert f"type:{bot._PROBE}" in wired, "探針要真的打進去"
+
+
+def test_probe_never_showing_up_means_the_caret_is_in_the_password_box(
+    monkeypatch, wired
+):
+    """密碼欄打進去的字**整個記憶體都搜不到**（[MEM-032]）。
+
+    ⚠ 但「搜不到」也可能是記憶體讀不到，所以 `_probe_focus` 回 None
+    （不知道），由 `_decide_focus` 去套預設值 —— 不准把「量不到」當成定論。
+    """
+    bot = _bot(monkeypatch, [])
+    assert bot._probe_focus(0x1234) is None
+
+
+def test_unmeasurable_focus_falls_back_to_the_password_box(monkeypatch, wired):
+    """量不出來時沿用舊的預設（焦點在密碼欄）＋ 送出後的閉環驗證兜底。"""
+    bot = _bot(monkeypatch, [])
+    bot._decide_focus(0x1234)
+    assert bot._tab_first is True
+    assert any("沿用預設" in step for step in bot.progress.steps)
+
+
+def test_a_measured_focus_beats_the_default(monkeypatch, wired):
+    bot = _bot(monkeypatch, [0x18254788])
+    bot._decide_focus(0x1234)
+    assert bot._tab_first is False
+    assert any("量到焦點在帳號欄" in step for step in bot.progress.steps)
+
+
+def test_focus_is_measured_once_not_every_attempt(monkeypatch, wired):
+    """量一次就好 —— 每次都掃記憶體會讓重試更慢。翻面由閉環驗證負責。"""
+    bot = _bot(monkeypatch, [])
+    bot._tab_first = False
+    bot._decide_focus(0x1234)
+    assert bot._tab_first is False, "已經有結論就不准再量"
+
+
+# ---- 批數：越少越好，因為打包後開一次子行程要 2.7 秒 --------------------
+
+
+def test_credentials_go_out_in_two_batches(monkeypatch, wired):
+    """六批 → 兩批。
+
+    每一批都是一個子行程（[INP-009]：送過 SendInput 之後視窗訊息會被封鎖），
+    而打包後開一次子行程實測 **2593~2773 ms**（onefile 每次重新解壓 82 MB）。
+    六批光開行程就 16 秒 —— 那些空檔也正是 [INP-009] 警告
+    「中間的行程啟動時間就足以讓封鎖生效」的東西。
+    """
+    bot = _bot(monkeypatch, [0x18254788])
+    batches = bot._credential_batches(0x1234)
+    assert len(batches) == 2, f"應該只剩兩批，實際 {len(batches)}"
+
+
+def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
+    """Enter **維持視窗訊息**，不准跟著改成按鍵。
+
+    [INP-010] 實測過它很挑：`KEYDOWN+CHAR+KEYUP` 會送出、
+    `KEYDOWN+KEYUP`（無 CHAR）**不會送出**，而且失敗時毫無錯誤訊息。
+    """
+    bot = _bot(monkeypatch, [0x18254788])
+    keys, enter = bot._credential_batches(0x1234)
+    assert len(enter) == 1 and enter[0]["key"] == 0x0D, enter
+    # ★ 那個 char 就是 [INP-010] 的重點：少帶它，帳密全打對也永遠不會送出。
+    assert enter[0]["char"] == 0x0D, "Enter 一定要帶字元碼"
+    assert all("key" not in a for a in keys), "第一批不准有視窗訊息按鍵"
+    assert any("key_fg" in a for a in keys), "清空與 Tab 要走真的按鍵"

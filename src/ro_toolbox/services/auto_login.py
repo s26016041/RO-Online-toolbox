@@ -128,6 +128,13 @@ _PIN_SOCKET_TIMEOUT = 20.0
 #: 一直「缺料」（踩過：15 秒不夠）。
 _PIN_SEED_TIMEOUT = 40.0
 _POLL = 0.4
+#: 探針打進去之後，最多等這麼久去記憶體裡找它。
+#:
+#: 找得到＝焦點在帳號欄（[MEM-032]：帳號欄的字在堆積上找得到，密碼欄的**整個
+#: 記憶體都搜不到**）。一次掃描約 0.4 秒（只掃 private 可寫區段），所以這裡
+#: 大約是掃 5 次。⚠ **逾時不代表「在密碼欄」是確定的** —— 讀不到也會逾時，
+#: 那時就退回舊的預設假設，並且照舊有送出後的閉環驗證兜底。
+_PROBE_TIMEOUT = 2.5
 
 _VK_HOME, _VK_DELETE = 0x24, 0x2E
 _VK_END, _VK_BACKSPACE = 0x23, 0x08
@@ -144,6 +151,9 @@ class LoginProgress:
     """一次自動登入的過程記錄。失敗時它就是診斷報告。"""
 
     steps: list[str] = field(default_factory=list)
+    #: 這次登入是什麼時候開始的（`time.monotonic()`）。每一步都會標上經過秒數 ——
+    #: 使用者回報「卡卡的、每個流程有點慢」時，沒有時間戳就只能猜是哪一步。
+    started: float = field(default_factory=time.monotonic)
     ok: bool = False
     failed_at: str = ""
     detail: str = ""
@@ -152,8 +162,9 @@ class LoginProgress:
     stopped_at_character: str = ""
 
     def note(self, text: str) -> None:
-        log.info("[自動登入] %s", text)
-        self.steps.append(text)
+        stamped = f"[{time.monotonic() - self.started:5.1f}s] {text}"
+        log.info("[自動登入] %s", stamped)
+        self.steps.append(stamped)
 
     def fail(self, where: str, detail: str) -> LoginProgress:
         self.failed_at = where
@@ -398,12 +409,22 @@ class AutoLogin:
 
         客戶端會記住上次的帳號，直接打字是接在後面；而且 `Home`+`Delete` 不夠
         （那個欄位不見得吃 Home），要再補 `End`+`Backspace`。
-        """
+
+        ⚠ **用真的按鍵（`SendInput`），不用視窗訊息。** 這不是為了可靠性 ——
+        兩種都清得掉 —— 是為了**少開子行程**。同一個行程送過 `SendInput`
+        之後它的視窗訊息就會被封鎖（[INP-009]），所以每換一次通道就要多開
+        一個子行程；而打包後開一次子行程要 **2.7 秒**（onefile 每次重新解壓
+        82 MB，實測 2593~2773 ms）。原本「清空(訊息)→打字(按鍵)→Tab(按鍵)→
+        清空(訊息)→打字(按鍵)→Enter(訊息)」六批就是六個子行程，光開行程
+        就 16 秒。全部統一成按鍵之後只剩「一批按鍵 ＋ 一批 Enter」。
+
+        而且那些空檔本身就是 [INP-009] 警告的東西：
+        「中間的行程啟動時間就足以讓封鎖生效」—— 慢跟打不進去是同一個病。"""
         return [
-            input_helper.key(_VK_HOME),
-            input_helper.key(_VK_DELETE, _CLEAR_KEYS),
-            input_helper.key(_VK_END),
-            input_helper.key(_VK_BACKSPACE, _CLEAR_KEYS),
+            input_helper.key_foreground(_VK_HOME),
+            input_helper.key_foreground(_VK_DELETE, _CLEAR_KEYS),
+            input_helper.key_foreground(_VK_END),
+            input_helper.key_foreground(_VK_BACKSPACE, _CLEAR_KEYS),
         ]
 
     def _type_actions(self, text: str) -> list[dict]:
@@ -423,62 +444,111 @@ class AutoLogin:
         """
         return [input_helper.focus(), input_helper.key_foreground(_VK_TAB)]
 
-    def _credential_batches(self, hwnd: int) -> list[list[dict]]:
-        """組出整組輸入動作，**一批一個子行程**。
+    def _probe_focus(self, hwnd: int) -> bool | None:
+        """量出焦點現在在哪一格。回「是不是在密碼欄」，量不出來回 None。
 
-        ## 焦點在哪一格：看客戶端有沒有記住帳號
+        ## 為什麼要量，不能猜
 
-        使用者實測：**帳號欄有值（客戶端記住了帳號）→ 焦點預設在密碼欄；
-        帳號欄是空的 → 焦點在帳號欄。**
+        使用者實測的規則本身沒錯：**帳號欄有預填 → 焦點在密碼欄；
+        帳號欄是空的 → 焦點在帳號欄。** 問題是舊版拿來判斷的訊號
+        **根本分不出這兩種情況**：它讀的是「上次送出去的帳號」那塊
+        靜態緩衝（`input_helper.submitted_account()`），而 [MEM-032] 白紙黑字寫著
+        那塊**送出之後才有值**、「不能拿來判斷現在框裡有什麼」。
+        遊戲剛開還沒送出過任何東西，兩種情況讀到的都是空的 ——
+        於是每次都賭同一邊，賭錯就整輪重來（使用者回報「一直打反」）。
 
-        而「有沒有記住」不必去猜堆積上的欄位位址 —— 客戶端把記住的帳號同時
-        留在 `Ragexe+0x11D2ACC`（見 `input_helper.remembered_account`），
-        直接讀那裡就知道。
+        ## 怎麼量
 
-        於是兩種情況各走各的順序，都只需要一次 Tab：
+        [MEM-032] 量過一個**不對稱**，這裡拿它當判準：
 
-            記住了（焦點在密碼欄）：打密碼 → Tab 到帳號欄 → 清空 → 打帳號
-            沒記住（焦點在帳號欄）：打帳號 → Tab 到密碼欄 → 清空 → 打密碼
+            打進帳號欄的字 → 輪詢幾拍就能在**堆積**上找到（ASCII）
+            打進密碼欄的字 → **整個記憶體都搜不到**
 
-        ⚠ 讀不到就當作「沒記住」，而且送出後會用
-        `input_helper.submitted_account()` 回頭驗；驗到打反就**把假設翻面**再來一次
-        （兩格在記憶體裡長得一模一樣，事前分不出來，這是唯一確定的依據）。
+        所以往現在有焦點的那一格打一個探針字串，再去記憶體裡找它：
+        找得到＝在帳號欄，找不到＝在密碼欄。**不必送出去讓伺服器拒絕才知道。**
 
-        ## 為什麼要分批
+        探針用固定字串而不是帳號本身：客戶端會把記住的帳號預填進帳號欄，
+        拿帳號去搜的話，就算焦點在密碼欄也會搜到那個預填值 —— 永遠是「找得到」。
 
-        Tab 與文字要送真的按鍵（`SendInput`），清空與 Enter 走視窗訊息，
-        而**同一個行程送過 `SendInput` 之後，它後續的視窗訊息會被封鎖**
-        （[INP-009]）。所以每種通道各自一個乾淨的子行程。
+        ⚠ **逾時不等於「在密碼欄」是確定的**：記憶體讀不到（GameGuard、
+        行程權限）也會逾時。所以回 None 讓呼叫端沿用舊的預設假設，
+        而且送出之後的閉環驗證照舊留著兜底。
         """
-        if self._tab_first is None:
-            # ⚠ **預設「焦點在密碼欄」，不要猜。**
-            # 客戶端只要登入過一次就會記住帳號，之後焦點都落在密碼欄
-            # （使用者實測；實務上幾乎永遠是這個狀態）。
-            # 早期版本先去讀「記住的帳號」再決定，但那個讀取在遊戲剛開的
-            # 十幾秒內拿不到值（GameGuard 擋著），於是每次都猜成「在帳號欄」、
-            # 每次都白白錯一輪才翻面 —— 使用者看到的就是「每次都先錯一次」。
-            #
-            # 猜錯也不會卡死：送出後會用客戶端記下的「送出去的帳號」回頭驗，
-            # 錯了就關掉錯誤框、翻面重打。
-            remembered = input_helper.remembered_account(self._pid)
-            self._tab_first = True if remembered is None else bool(remembered)
+        try:
+            input_helper.send(
+                hwnd, self._clear_actions() + self._type_actions(self._PROBE)
+            )
+        except input_helper.InputHelperError as exc:
+            log.debug("探針送不進去：%s", exc)
+            return None
+        deadline = time.monotonic() + _PROBE_TIMEOUT
+        while True:
+            if input_helper.field_addresses(self._pid, self._PROBE):
+                return False              # 找得到 → 焦點在帳號欄
+            if time.monotonic() >= deadline:
+                return None               # 找不到，但也可能是讀不到 —— 別當定論
+            time.sleep(_POLL)
+
+    def _decide_focus(self, hwnd: int) -> None:
+        """決定 `self._tab_first`（要不要先打密碼）。只在第一次做。"""
+        if self._tab_first is not None:
+            return
+        measured = self._probe_focus(hwnd)
+        if measured is None:
+            # ⚠ 量不出來時**預設「焦點在密碼欄」**。客戶端只要登入過一次就會
+            # 記住帳號，之後焦點都落在密碼欄（使用者實測，實務上幾乎永遠如此）。
+            # 猜錯也不會卡死：送出後有閉環驗證，錯了就翻面重打。
+            self._tab_first = True
+            self._step("量不出焦點在哪一格（記憶體讀不到），沿用預設：焦點在密碼欄")
+        else:
+            self._tab_first = measured
             self._step(
-                f"焦點假設在{'密碼欄' if self._tab_first else '帳號欄'}"
-                f"（客戶端記住的帳號 = {remembered!r}）"
+                f"量到焦點在{'密碼欄' if measured else '帳號欄'}"
+                f"（探針 {self._PROBE} 在堆積上{'找不到' if measured else '找得到'}）"
             )
 
+    def _credential_batches(self, hwnd: int) -> list[list[dict]]:
+        """組出整組輸入動作。**批數越少越好，見下面。**
+
+        順序由 `self._tab_first` 決定，都只需要一次 Tab：
+
+            焦點在密碼欄：打密碼 → Tab 到帳號欄 → 清空 → 打帳號
+            焦點在帳號欄：打帳號 → Tab 到密碼欄 → 清空 → 打密碼
+
+        ## 為什麼是兩批，不是六批
+
+        同一個行程送過 `SendInput` 之後，它後續的**視窗訊息**會被封鎖
+        （[INP-009]），所以每換一次通道就得換一個乾淨的子行程。
+        舊版清空與 Enter 走視窗訊息、打字與 Tab 走按鍵，六個動作剛好交錯成
+        **六批＝六個子行程**；而打包後開一次子行程要 **2.7 秒**
+        （onefile 每次重新解壓 82 MB），光開行程就 16 秒。
+
+        清空改成按鍵之後（見 `_clear_actions`），只剩兩批：
+
+            1. 全部按鍵：清空 → 打第一格 → Tab → 清空 → 打第二格
+            2. Enter（**維持視窗訊息**）
+
+        ⚠ **Enter 不要跟著改成按鍵。** [INP-010] 實測過它的送法很挑：
+        `KEYDOWN+CHAR+KEYUP` 會送出、`KEYDOWN+KEYUP`（無 CHAR）**不會送出**，
+        而且失敗時完全沒有錯誤訊息 —— 那條路已經驗過會動，不要為了再省
+        2.7 秒去動它。
+        """
+        self._decide_focus(hwnd)
         clear = self._clear_actions()
         if self._tab_first:
             first, second = self._account.password, self._account.username
         else:
             first, second = self._account.username, self._account.password
+        keys = (
+            clear
+            + self._type_actions(first)
+            + self._tab_actions()
+            + clear
+            + self._type_actions(second)
+        )
         return [
-            clear,
-            self._type_actions(first),
-            self._tab_actions(),
-            clear,
-            self._type_actions(second),
-            [input_helper.key(_VK_RETURN)],   # Enter 走視窗訊息（實測會送出）
+            keys,
+            [input_helper.key(_VK_RETURN)],   # Enter 走視窗訊息（[INP-010] 實測）
         ]
 
     def _dismiss_error(self, hwnd: int) -> None:
@@ -968,7 +1038,8 @@ class AutoLogin:
 
         逾時只是放棄的上限，不是成功的依據。
         """
-        deadline = time.monotonic() + _INPUT_TIMEOUT
+        started = time.monotonic()
+        deadline = started + _INPUT_TIMEOUT
 
         attempt = 0
         asked = False
@@ -981,11 +1052,14 @@ class AutoLogin:
                 self._learn_agree_button(hwnd, min(_AGREE_LEARN_SEC,
                                                    deadline - time.monotonic()))
             self._step(f"按同意、輸入帳號密碼並送出（第 {attempt} 次）")
-            # 每一輪都先按一次同意（自己一個子行程）。
             # ⚠ 不能用「字打不打得進去」判斷合約書過了沒 —— 實測合約書還在時
             # 打進去的字**照樣會進到欄位裡**（只是看不見、Enter 也送不出去），
             # 那個判定會回報「已經好了」然後從此不再按同意（踩過）。
-            # 真正的訊號只有一個：客戶端有沒有連上伺服器。
+            #
+            # ⚠ 想過用畫面判斷「合約書已經不在了就別點」來省兩個子行程，
+            # **否決**：那要在主行程截圖，而 tests/test_auto_login.py 明確釘著
+            # 「AutoLogin 不准自己截圖（[INP-009]）」。省下來的時間也有限 ——
+            # 探針判焦點之後重試本來就少了，多點那一下落在背景圖上是無害的。
             self._click_agree(hwnd)
             try:
                 for batch in self._credential_batches(hwnd):
@@ -1040,6 +1114,13 @@ class AutoLogin:
                     continue
                 self._login_server = server
                 self._step(f"客戶端連上了 {server[0]}:{server[1]} —— 帳密送出去了")
+                # ⚠ 用 WARNING：預設 log_level 就是 WARNING，前面每一步的 INFO
+                # 在使用者的日誌裡**一行都看不到**（實際查過，全空）。
+                # 這一行是「這次到底花了多久、打了幾次」唯一留得下來的紀錄。
+                log.warning(
+                    "[自動登入] 帳密階段完成：%.1f 秒、打了 %d 次",
+                    time.monotonic() - started, attempt,
+                )
                 break
             if time.monotonic() >= deadline:
                 # ⚠ 這一關卡住最常見的原因是**合約書沒被按掉**：那個畫面不吃
