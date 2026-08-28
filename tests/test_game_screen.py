@@ -134,3 +134,48 @@ def test_agree_button_ratio_matches_the_measurement():
 def test_full_screen_capture_flag_is_the_working_one():
     """PrintWindow 要用 flag 2，用 0 的話 DirectX 內容不會被畫進來。"""
     assert game_screen.PW_RENDERFULLCONTENT == 2
+
+
+# ---- 收尾（GDI）------------------------------------------------------------
+
+
+class _Explodes:
+    """每一個收尾動作都失敗的假物件。"""
+
+    def __init__(self, log_):
+        self._log = log_
+
+    def DeleteDC(self):                      # noqa: N802 - 對齊 pywin32 命名
+        self._log.append("dc")
+        raise RuntimeError("DeleteDC failed")
+
+    def GetHandle(self):                     # noqa: N802 - 對齊 pywin32 命名
+        return 1234
+
+
+def test_releasing_the_capture_never_raises(monkeypatch):
+    """**收尾失敗不准把程式帶走。**
+
+    使用者朋友的機器上，`win32ui.error: DeleteDC failed` 從 `capture()` 的
+    `finally` 一路炸穿自動登入的工作執行緒 —— 那時他正被要求手動按「同意」，
+    結果按了也沒人在等他（2026-08-29 的實機日誌）。
+    收尾失敗頂多是資源沒還乾淨，不該讓抓圖失敗，更不該讓登入死掉。
+    """
+    calls: list[str] = []
+
+    class _Gui:
+        @staticmethod
+        def DeleteObject(handle):            # noqa: N802 - 對齊 pywin32 命名
+            calls.append("bitmap")
+            raise RuntimeError("DeleteObject failed")
+
+        @staticmethod
+        def ReleaseDC(hwnd, dc):             # noqa: N802 - 對齊 pywin32 命名
+            calls.append("release")
+            raise RuntimeError("ReleaseDC failed")
+
+    monkeypatch.setattr(game_screen, "win32gui", _Gui)
+    broken = _Explodes(calls)
+    game_screen._release_capture(1, 99, broken, broken)
+    # 三步都要試過 —— 前面失敗不能讓後面的沒機會還。
+    assert calls == ["dc", "bitmap", "release"]

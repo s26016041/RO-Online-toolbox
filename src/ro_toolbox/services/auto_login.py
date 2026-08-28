@@ -434,10 +434,13 @@ class AutoLogin:
             + (f"（畫面已存到 {shot}）" if shot else "")
         )
 
-        def learn(point: tuple[int, int], why: str) -> bool:
+        def learn(point: tuple[int, int], why: str, shot=None) -> bool:
             ratio = game_screen.window_ratio_of(hwnd, *point)
             if ratio is None or not (0.0 < ratio[0] < 1.0 and 0.0 < ratio[1] < 1.0):
                 return False
+            # ★ 先學**長什麼樣**（那才是換一台電腦還能用的東西），
+            #   比例只是它找不到時的最後退路。
+            self._learn_look(hwnd, shot, point)
             settings = current_settings()
             settings.agree_button = [round(ratio[0], 4), round(ratio[1], 4)]
             try:
@@ -454,7 +457,17 @@ class AutoLogin:
         last: tuple[int, int] | None = None
         seen_eula = False
         was_down = bool(user32.GetAsyncKeyState(_VK_LBUTTON) & 0x8000)
+        before = None            # 上一拍的畫面（＝他按下去**之前**的樣子）
         while time.monotonic() < deadline:
+            # ⚠ 畫面要在看按鍵**之前**抓：按下去的當下按鈕已經變成按下的樣子，
+            # 放開之後對話框就整個不見了 —— 兩者都學不出原本那顆按鈕。
+            shot = None
+            try:
+                shot = game_screen.capture(hwnd)
+                stage = game_screen.detect(shot)
+            except game_screen.ScreenError as exc:
+                log.debug("學按鈕時抓不到畫面：%s", exc)
+                stage = None
             point = wintypes.POINT()
             here: tuple[int, int] | None = None
             if user32.GetCursorPos(ctypes.byref(point)):
@@ -464,23 +477,40 @@ class AutoLogin:
             # ★ 主訊號：左鍵的**按下緣**，而且要按在遊戲視窗裡。
             down = bool(user32.GetAsyncKeyState(_VK_LBUTTON) & 0x8000)
             pressed, was_down = (down and not was_down), down
-            if pressed and here is not None and learn(here, "看到你按下去"):
+            if pressed and here is not None and learn(
+                    here, "看到你按下去", before if before is not None else shot):
                 return True
-            try:
-                stage = game_screen.detect(game_screen.capture(hwnd))
-            except game_screen.ScreenError:
-                stage = None
+            if shot is not None:
+                before = shot
             seen_eula = seen_eula or stage is game_screen.Stage.EULA
             # 輔助訊號：**真的看過合約書**之後它消失了 —— 那一瞬間游標在哪。
             if seen_eula and stage is not None and stage is not game_screen.Stage.EULA:
                 if last is None:
                     self._step("合約書過了，但沒看到你按在哪 —— 這次不學")
                     return True
-                learn(last, "合約書消失時游標在那裡")
+                learn(last, "合約書消失時游標在那裡", before)
                 return True
             time.sleep(_POLL)
         self._step("等不到你按「同意」—— 位置沒學到，下次還是只能用預設值")
         return False
+
+    @staticmethod
+    def _learn_look(hwnd: int, shot, point: tuple[int, int]) -> None:
+        """把使用者按下去的那一塊**長什麼樣**記起來。學不起來就算了（有退路）。
+
+        ⚠ 這一步才是「換一台電腦也能用」的關鍵。只學比例的話存的是**位置**，
+        而合約書是可拖動的小視窗、解析度又人人不同 —— 使用者朋友的機器上
+        教過的位置 (940,749) 照樣點不到，而且點空了完全不會報錯。
+        學了樣子之後，下一次是**當場在畫面上把它找出來**，視窗搬到哪都算得對。
+        """
+        if shot is None:
+            return
+        try:
+            where = game_screen.window_point_of(hwnd, *point)
+            if where is not None:
+                game_screen.save_learned_agree(shot, *where)
+        except Exception as exc:  # noqa: BLE001 - 學不起來不該讓登入失敗
+            log.debug("記不住按鈕的樣子：%s", exc)
 
     def _save_screen(self, hwnd: int) -> str | None:
         """把現在的畫面存成 PNG，回傳路徑。存不了回 None（不該讓登入失敗）。

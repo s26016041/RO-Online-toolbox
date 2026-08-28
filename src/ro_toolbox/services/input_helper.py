@@ -165,6 +165,12 @@ def _environment() -> dict[str, str]:
 
 #: 子行程回報找到的按鈕座標時用的開頭。
 _AGREE_PREFIX = "AGREE "
+#: 子行程回報「為什麼找到／為什麼沒找到」時用的開頭。
+#:
+#: ⚠ 這一行不是裝飾。找按鈕跑在子行程裡（[INP-009]），它的 `log` **不會**
+#: 進到主程式的日誌 —— 使用者朋友的機器上「找不到按鈕」查了兩輪都沒有線索，
+#: 就是因為主行程這邊只看得到「找到了／沒找到」，看不到分數、倍率、畫面亮度。
+_AGREE_NOTE = "AGREENOTE "
 
 
 def send(hwnd: int, actions: list[dict]) -> None:
@@ -231,14 +237,22 @@ def agree_button(hwnd: int) -> tuple[int, int] | None:
     except InputHelperError as exc:
         log.debug("找同意按鈕的子行程失敗：%s", exc)
         return None
+    spot = None
+    note = ""
     for line in (output or "").splitlines():
-        if line.startswith(_AGREE_PREFIX):
+        if line.startswith(_AGREE_NOTE):
+            note = line[len(_AGREE_NOTE):]
+        elif line.startswith(_AGREE_PREFIX):
             try:
-                x, y = (int(v) for v in line[len(_AGREE_PREFIX):].split())
+                spot = tuple(int(v) for v in line[len(_AGREE_PREFIX):].split())
             except ValueError:
-                return None
-            log.info("子行程從畫面找到同意按鈕：(%d, %d)", x, y)
-            return x, y
+                spot = None
+    if spot is not None and len(spot) == 2:
+        log.info("子行程從畫面找到同意按鈕：%s（%s）", spot, note or "沒有說明")
+        return spot[0], spot[1]
+    # 找不到不是錯誤（畫面可能還沒到合約書），但**一定要留下原因** ——
+    # 別人的機器上這一句是唯一查得到的東西。
+    log.info("子行程在畫面上找不到同意按鈕（%s）", note or "沒有說明")
     return None
 
 
@@ -276,10 +290,11 @@ def _report_agree(hwnd: int) -> None:
     try:
         from ro_toolbox.services import game_screen
 
-        spot = game_screen.agree_button_by_look(hwnd)
+        spot, note = game_screen.agree_button_report(hwnd)
     except Exception as exc:  # noqa: BLE001 - 找不到不該讓整串動作失敗
-        print(f"找同意按鈕失敗（略過）：{exc}", file=sys.stderr)
+        print(f"{_AGREE_NOTE}找同意按鈕失敗（略過）：{exc}")
         return
+    print(f"{_AGREE_NOTE}{note}")
     if spot is not None:
         print(f"{_AGREE_PREFIX}{spot[0]} {spot[1]}")
 
