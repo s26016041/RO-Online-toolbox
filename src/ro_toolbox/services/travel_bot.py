@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import random
+import struct
 import threading
 import time
 from collections.abc import Callable
@@ -32,17 +33,35 @@ from ro_toolbox.services.navigation import NavigationReader
 from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel import Traveler
-from ro_toolbox.services.walker import Walker
+from ro_toolbox.services.walker import MAX_STEP, Walker
 
 log = logging.getLogger(__name__)
 
 _TICK = 0.2
 _RESYNC_SEC = 2.0  # 多久檢查一次「連線有沒有換掉」
 _OP_MOVE_ACK = 0x0087  # 伺服器確認「我」要移動：payload[4:10] = 起點+終點
+#: 伺服器把「你被移到哪張圖的哪一格」直接告訴客戶端的那幾包。
+#:
+#: 版面前綴都一樣：`地圖名[16] x(2) y(2)`（payload 不含 opcode）。
+#: 長度取自客戶端自己的長度表，實機對過：
+#:
+#:     0x0091  22 bytes  同一台伺服器內換圖（ZC_NPCACK_MAPMOVE）
+#:     0x0092  28 bytes  換伺服器（後面多 IP(4) port(2)）
+#:     0x0AC7 156 bytes  換伺服器的新版（後面是主機名字串，同 0x0AC5）
+#:
+#: ★ 有了這個就**不必猜座標** —— 換圖那一刻就知道自己站在哪。
+_OP_MAP_MOVE = (0x0091, 0x0092, 0x0AC7)
+
 #: 為了問出自己的座標而「推一下」的間隔與次數上限。
+#: 只有「開始尋路時人就已經在別張圖上」才會用到（那時換圖那一包早就過去了）。
 #: 逾時只是**放棄的上限**：真正的成功依據是伺服器回的 0x0087 起點。
-_NUDGE_EVERY_SEC = 2.0
-_NUDGE_TRIES = 5
+_NUDGE_EVERY_SEC = 0.5
+_NUDGE_TRIES = 60
+#: 推的目標彼此至少隔這麼遠就夠了 —— 移動封包超過這個距離伺服器直接忽略
+#: （[PKT-030] 實測 ≤17 接受、18 被忽略），所以每一格可走的地方都會落在
+#: 某個目標的 17 格內。室內圖是一間一間互不相連的房間（[DAT-029]），
+#: **只挑「離中心最近的那一格」等於只賭一間房**（實機踩過：推 5 次全部沒回應）。
+_NUDGE_SPACING = MAX_STEP
 #: 實體進入視野的封包（版面見 services/world.py 的欄位表）
 _OP_ENTITY = (0x09FF, 0x09FE, 0x09FD)
 #: 走多遠才確定出了 NPC 的視野。RO 的視野約 14 格，抓 22 有餘裕。
@@ -118,11 +137,16 @@ class TravelBot:
         #: 伺服器最近一次在 0x0087 裡說「你在這裡」。換圖後記憶體座標會過期，
         #: 那時只有這個可信（見 `_trusted_position`）。
         self._server_pos: tuple[int, int] | None = None
+        #: 上面那個座標是**哪張圖**的。不同圖的座標不能拿來用。
+        self._server_pos_map = ""
         #: 上次為了「問出自己在哪」而推一下的時間，以及推了幾次。
         self._nudged_at = 0.0
         self._nudges = 0
         self._terrain_name = ""
         self._terrain = None
+        #: 「問位置」的目標清單（純幾何，同一張圖算一次就好）。
+        self._nudge_map = ""
+        self._nudge_list = None
         self._stats = TravelStats(
             goal=destination or "",
             goal_label=map_display_name(destination) if destination else "",
@@ -266,12 +290,24 @@ class TravelBot:
     def _on_packet(self, packet) -> None:  # noqa: ANN001 - RoPacket，避免循環匯入
         if packet.outbound:
             return
+        if packet.opcode in _OP_MAP_MOVE and len(packet.payload) >= 20:
+            # ★ 伺服器直接說「你現在在這張圖的這一格」。
+            # 換圖之後記憶體裡的座標會停在上一張圖（[MEM-022]），
+            # 這一包是**當場就知道**的來源，不必等、不必猜。
+            name = packet.payload[:16].split(b"\x00")[0].decode("ascii", "ignore")
+            name = name.removesuffix(".gat")
+            x, y = struct.unpack_from("<HH", packet.payload, 16)
+            self._server_pos = (x, y)
+            self._server_pos_map = name
+            log.info("伺服器說我被移到 %s (%d, %d)", name, x, y)
+            return
         if packet.opcode == _OP_MOVE_ACK and len(packet.payload) >= 10:
             start, dest = unpack_move(packet.payload[4:10])
             # ⚠ **起點不要丟掉。** 這是伺服器認定「我現在在哪」——
             # 換地圖之後記憶體裡的座標會停在上一張圖（[MEM-022]），
             # 那時候這個值是唯一可信的來源（見 `_trusted_position`）。
             self._server_pos = start
+            self._server_pos_map = self._stats.here
             self._walker.note_move_ack(dest)
             return
         talk = self._talk
@@ -607,8 +643,12 @@ class TravelBot:
             self._nudges = 0
             return pos
         server = self._server_pos
-        if server is not None and (
-            0 <= server[0] < terrain.width and 0 <= server[1] < terrain.height
+        # ⚠ 一定要確認那個座標是**這張圖**的 —— 不同圖的座標拿來用等於亂走。
+        if (
+            server is not None
+            and self._server_pos_map == map_name
+            and 0 <= server[0] < terrain.width
+            and 0 <= server[1] < terrain.height
         ):
             self._note(f"記憶體座標 {pos} 不在 {map_name} 上，改用伺服器說的 {server}")
             self._nudges = 0
@@ -617,36 +657,69 @@ class TravelBot:
         return None
 
     def _nudge(self, terrain, map_name: str) -> None:
-        """往任意一格可走的地方送一次移動，逼伺服器回報我們在哪。"""
+        """往可走的地方送移動，逼伺服器回報我們在哪。
+
+        ⚠ **不能只挑一格。** 兩件事湊在一起讓「挑離中心最近的可走格」必敗：
+
+        1. 移動封包**超過 `MAX_STEP` 格伺服器直接忽略**（[PKT-030] 實測
+           ≤17 接受、18 被忽略；我們用 14 這個保守值）。
+        2. 室內圖是**一間一間互不相連的房間**（[DAT-029]）——
+           離中心最近的那一格多半在別間房，離我們遠得很。
+
+        實機踩過：被傳進 `s_atelier`（可走率 7.8%、散成十幾塊）之後推 5 次
+        全部沒有回應，因為每一次都送到同一個（遠在別間房的）格子。
+
+        所以改成**掃過每一間房**：挑一組彼此至少隔 `MAX_STEP` 格的可走格，
+        依序送過去。這樣不管人在哪一間，總有一次會落在 `MAX_STEP` 之內。
+        """
         now = time.monotonic()
         if now - self._nudged_at < _NUDGE_EVERY_SEC:
             return
         self._nudged_at = now
-        if self._nudges >= _NUDGE_TRIES:
-            self._fail(
-                f"⚠ 進 {map_name} 之後問不出自己的座標（推了 {self._nudges} 次），"
-                "自動尋路已停止"
-            )
-            return
-        target = self._any_walkable(terrain)
-        if target is None:
+        targets = self._nudge_targets(terrain)
+        if not targets:
             self._fail(f"⚠ {map_name} 上找不到任何可走的格子，自動尋路已停止")
             return
+        if self._nudges >= min(_NUDGE_TRIES, len(targets)):
+            self._fail(
+                f"⚠ 進 {map_name} 之後問不出自己的座標（試過 {self._nudges} 個位置）。"
+                "換圖後座標要等角色走一步才會更新 —— "
+                "**請自己走一步再按一次**，我就接得下去。"
+            )
+            return
+        target = targets[self._nudges]
         self._nudges += 1
-        self._note(f"座標還停在上一張圖，往 {target} 走一步問出真正的位置…")
+        self._note(
+            f"座標還停在上一張圖，往 {target} 走一步問出真正的位置"
+            f"（第 {self._nudges}/{len(targets)} 個位置）…"
+        )
         self._send_move(*target)
 
-    @staticmethod
-    def _any_walkable(terrain):
-        """這張圖上離中心最近的一格可走的地方。找不到回 None。"""
+    def _nudge_targets(self, terrain):
+        """一組彼此至少隔 `MAX_STEP` 格的可走格，**由中心往外排**。
+
+        由中心往外是因為傳進來的落點多半不在角落；先試中間那幾間房比較快。
+        算一次就記著 —— 這是純幾何，同一張圖不會變。
+        """
         import numpy as np
 
-        cells = np.argwhere(terrain.walkable)
+        if self._nudge_map == terrain.name and self._nudge_list is not None:
+            return self._nudge_list
+        cells = np.argwhere(terrain.walkable)          # (y, x)
         if not len(cells):
-            return None
+            self._nudge_map, self._nudge_list = terrain.name, []
+            return []
         centre = np.array([terrain.height / 2, terrain.width / 2])
-        best = cells[np.argmin(((cells - centre) ** 2).sum(axis=1))]
-        return int(best[1]), int(best[0])
+        order = np.argsort(((cells - centre) ** 2).sum(axis=1))
+        picked: list[tuple[int, int]] = []
+        for index in order:
+            y, x = int(cells[index][0]), int(cells[index][1])
+            if all(max(abs(x - px), abs(y - py)) > _NUDGE_SPACING
+                   for px, py in picked):
+                picked.append((x, y))
+        self._nudge_map, self._nudge_list = terrain.name, picked
+        log.info("%s 上挑了 %d 個問位置的目標", terrain.name, len(picked))
+        return picked
 
     def _terrain_for(self, map_name: str):
         """這張圖的地形（記著上一張，不要每拍重讀）。讀不到回 None。"""

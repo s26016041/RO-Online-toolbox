@@ -796,6 +796,7 @@ def test_the_snapshot_taken_at_attach_never_clobbers_the_old_one(qtbot):
 class _Terrain:
     """一張 200x140、全部可走的假地圖。"""
 
+    name = "s_atelier"
     width, height = 200, 140
 
     def is_walkable(self, x, y):
@@ -831,17 +832,86 @@ def test_a_stale_position_falls_back_to_what_the_server_said(monkeypatch):
     """
     bot, sent = _travel_bot(monkeypatch)
     bot._server_pos = (40, 30)
+    bot._server_pos_map = "s_atelier"
     assert bot._trusted_position("s_atelier", (271, 108)) == (40, 30)
     assert sent == [], "已經知道位置就不用再推"
 
 
+def test_a_position_reported_for_another_map_is_not_used(monkeypatch):
+    """⚠ 不同圖的座標拿來用等於亂走 —— 一定要確認是**這張圖**報回來的。"""
+    bot, sent = _travel_bot(monkeypatch)
+    bot._server_pos = (40, 30)
+    bot._server_pos_map = "prontera"
+    assert bot._trusted_position("s_atelier", (271, 108)) is None
+    assert sent, "不能用就要去問"
+
+
+def test_the_map_move_packet_tells_us_where_we_landed(monkeypatch):
+    """★ 伺服器換圖時就把座標給了（0x0091，長度 22 = 地圖名[16]+x+y）。
+
+    有這一包就**完全不必猜**：換圖那一刻就知道自己站在哪。
+    我們原本沒收這包，才會落到「等座標更新…10 秒後放棄」。
+    """
+    import struct
+
+    from ro_toolbox.services import travel_bot as mod
+
+    bot, _sent = _travel_bot(monkeypatch)
+
+    class _Packet:
+        outbound = False
+        opcode = 0x0091
+        payload = b"s_atelier.gat".ljust(16, b"\x00") + struct.pack("<HH", 41, 33)
+
+    bot._on_packet(_Packet())
+    assert bot._server_pos == (41, 33)
+    assert bot._server_pos_map == "s_atelier", "副檔名 .gat 要去掉"
+    assert 0x0091 in mod._OP_MAP_MOVE
+
+
 def test_with_no_answer_it_nudges_instead_of_giving_up(monkeypatch):
-    """站著不動不會有 0x0087 —— 往任意一格可走的地方走一步問出來。"""
+    """站著不動不會有 0x0087 —— 往可走的地方走一步問出來。"""
     bot, sent = _travel_bot(monkeypatch)
     assert bot._trusted_position("s_atelier", (271, 108)) is None
     assert sent, "要送一次移動把伺服器問出來"
     x, y = sent[0]
     assert 0 <= x < 200 and 0 <= y < 140, f"推的目標要在這張圖上：{sent[0]}"
+
+
+def test_the_nudge_sweeps_every_room_not_just_one_spot(monkeypatch):
+    """⚠⚠ 實機踩過：只挑「離中心最近的可走格」，推 5 次全部沒有回應。
+
+    兩件事湊在一起讓那個做法必敗：
+      1. 移動封包超過 MAX_STEP 格伺服器**直接忽略**（[PKT-030]）。
+      2. 室內圖是一間一間**互不相連**的房間（[DAT-029]）——
+         離中心最近的那一格多半在別間房。
+    所以要挑一組彼此隔開的目標，掃過每一間房。
+    """
+    from ro_toolbox.services import travel_bot as mod
+
+    bot, sent = _travel_bot(monkeypatch)
+    monkeypatch.setattr(mod, "_NUDGE_EVERY_SEC", 0.0)
+    for _ in range(6):
+        bot._trusted_position("s_atelier", (271, 108))
+    assert len(set(sent)) > 1, f"每次都送同一格等於只賭一間房：{sent}"
+
+
+def test_the_nudge_targets_cover_every_walkable_cell():
+    """挑出來的目標要讓**每一格**可走的地方都落在 MAX_STEP 之內。
+
+    不然人在哪一間房是運氣問題 —— 那正是這一輪的 bug。
+    """
+
+    from ro_toolbox.services.travel_bot import TravelBot
+    from ro_toolbox.services.walker import MAX_STEP
+
+    terrain = _Terrain()
+    targets = TravelBot(1)._nudge_targets(terrain)
+    assert targets
+    for y in range(0, terrain.height, 7):
+        for x in range(0, terrain.width, 7):
+            near = min(max(abs(x - tx), abs(y - ty)) for tx, ty in targets)
+            assert near <= MAX_STEP, f"({x},{y}) 離最近的目標 {near} 格，太遠"
 
 
 def test_nudging_is_throttled(monkeypatch):
@@ -852,15 +922,17 @@ def test_nudging_is_throttled(monkeypatch):
     assert len(sent) == 1, f"節流沒生效：{sent}"
 
 
-def test_it_gives_up_loudly_after_enough_tries(monkeypatch):
-    """問不出來還是要**大聲停用**，不能無聲無息一直推。"""
+def test_it_gives_up_loudly_and_says_what_to_do(monkeypatch):
+    """問不出來還是要**大聲停用**，而且要講使用者能做的事。"""
     from ro_toolbox.services import travel_bot as mod
 
     bot, sent = _travel_bot(monkeypatch)
     monkeypatch.setattr(mod, "_NUDGE_EVERY_SEC", 0.0)
-    for _ in range(mod._NUDGE_TRIES + 2):
+    monkeypatch.setattr(mod, "_NUDGE_TRIES", 3)
+    for _ in range(6):
         bot._trusted_position("s_atelier", (271, 108))
     assert "問不出自己的座標" in bot.stats.note, bot.stats.note
+    assert "自己走一步" in bot.stats.note, "要講使用者能做什麼"
 
 
 def test_no_terrain_means_we_do_not_second_guess_the_memory(monkeypatch):
