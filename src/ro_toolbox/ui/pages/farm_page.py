@@ -67,6 +67,13 @@ PROCESS_NAME = "ragexe.exe"
 _SCAN_INTERVAL_MS = 3000  # 多久重掃一次視窗清單
 _READ_INTERVAL_MS = 1000  # 多久更新一次數值
 _RETRY_AFTER_SEC = 10.0  # 定位失敗後隔多久重試（多半是還沒登入）
+#: 回連之後，最多等這麼久讓新遊戲的分頁長出來。
+#:
+#: ⚠ **這是放棄的上限，不是成功的依據**（CLAUDE.md：不准拿「等幾秒」當機制）。
+#: 真正的訊號是 `_on_attached` —— 分頁建好的那一刻就接回去。
+#: 要撐得夠久：新遊戲登入完還要進圖，分頁要等「有連線」＋背景 AOB 定位成功，
+#: 而定位失敗的重試冷卻本身就是 10 秒。
+_RESTORE_TIMEOUT_SEC = 180.0
 _MAX_READ_FAILURES = 3  # 連續讀取失敗幾次就當它登出／關閉了
 
 
@@ -790,6 +797,9 @@ class FarmPage(BasePage):
         #: 角色 → 他上次連線正常時住在哪個 PID。**閃退偵測靠它** ——
         #: 分頁會跟著行程一起消失，只看分頁的話最需要救的情況沒人在看。
         self._watching: dict = {}
+        #: 回連之後還沒接回去的：新 PID → (快照, 角色名, 放棄時間)。
+        #: 等的是「分頁長出來」這個訊號，不是等秒數 —— 見 `_reconnect_done`。
+        self._pending_restore: dict = {}
         #: 勾了自動補水、但背包還沒讀到 —— 等背包回來再啟動
         self._pending_potion: set[int] = set()
         self._reconnecting = False
@@ -954,6 +964,8 @@ class FarmPage(BasePage):
         行程死活改問 GetExitCodeProcess，那是明確事實。
         視窗列舉只留著做一件事：發現還沒納入的新遊戲行程。
         """
+        self._expire_pending_restores(time.monotonic())
+
         for pid in list(self._cards):
             reader = self._readers.get(pid)
             if reader is not None and not reader.alive():
@@ -1025,6 +1037,9 @@ class FarmPage(BasePage):
         if self._current_pid() == pid:
             self._load_bag(pid)
         log.info("自動掛機：加入 %s（PID %s）", status.name, pid)
+        # ⚠ 一定要放在最後：`restore_into` 會去勾那些開關，而勾選要能真的把
+        # bot 帶起來，得先接好 signal、套過存檔的補水設定。
+        self._restore_if_pending(pid)
 
     def _remove(self, pid: int, reason: str) -> None:
         bot = self._bots.pop(pid, None)
@@ -1177,8 +1192,19 @@ class FarmPage(BasePage):
                         self._reconnect_decider.note)
             return
         self._deciders.pop(who, None)
-        self._scan()                      # 讓新的遊戲視窗長出分頁
-        QTimer.singleShot(3000, lambda: self.restore_into(new_pid, snap))
+        # ⚠ **不要用「等 N 秒再接」**（舊版是 `singleShot(3000, ...)`）。
+        # 分頁不是 `_scan()` 當場生出來的：要先有連線，再開背景 `AttachWorker`
+        # 做 AOB 定位，成功了才建卡；剛登入完客戶端還在進圖，三秒鐘通常不夠。
+        # 實際踩過：使用者的日誌出現「回連後找不到 PID 2788 的分頁，接不回去」——
+        # 遊戲確實重開也重登成功了，就只有最後這一步落空。
+        #
+        # 正確的形狀是**等一個讀得到的訊號**：分頁建好的那一刻（`_on_attached`）
+        # 就接回去。逾時只當放棄的上限。
+        self._pending_restore[new_pid] = (
+            snap, who, time.monotonic() + _RESTORE_TIMEOUT_SEC
+        )
+        log.info("等 PID %s 的分頁長出來再把設定接回去", new_pid)
+        self._scan()
 
     # ---- 拍下現在在跑什麼，回來之後接回去 -----------------------------
 
@@ -1209,6 +1235,30 @@ class FarmPage(BasePage):
             labels.append(f"前往 {map_display_name(dest) or dest}")
         return Snapshot(farming=farming, potion=potion,
                         destination=dest, labels=labels)
+
+    def _restore_if_pending(self, pid: int) -> None:
+        """這個分頁是回連後在等的那個嗎？是就把設定接回去。"""
+        waiting = self._pending_restore.pop(pid, None)
+        if waiting is None:
+            return
+        snap, who, _deadline = waiting
+        log.warning("「%s」的分頁回來了（PID %s），接回設定", who, pid)
+        self.restore_into(pid, snap)
+
+    def _expire_pending_restores(self, now: float) -> None:
+        """等太久還沒長出分頁就放棄，而且要**大聲**。
+
+        安靜地忘掉才是最糟的：使用者會以為東西都接回去了，實際上掛機沒開。
+        """
+        for pid, (snap, who, deadline) in list(self._pending_restore.items()):
+            if now < deadline:
+                continue
+            self._pending_restore.pop(pid, None)
+            log.warning(
+                "⚠「%s」回連後等了 %.0f 秒還沒出現分頁（PID %s），"
+                "沒能接回：%s —— 請自己開一下",
+                who, _RESTORE_TIMEOUT_SEC, pid, "、".join(snap.labels) or "（無）",
+            )
 
     def restore_into(self, pid: int, snap) -> None:
         """把快照接回**新開的**那個遊戲視窗上。"""

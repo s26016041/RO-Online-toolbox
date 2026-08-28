@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from ro_toolbox.ui.pages.farm_page import FarmPage
 
 
@@ -478,3 +480,84 @@ def test_the_old_pid_is_forgotten_once_a_reconnect_starts(qtbot, monkeypatch):
     monkeypatch.setattr(mod, "WorkerThread", lambda worker: _Thread())
     page._begin_reconnect(1234, "狐狐狸", None)
     assert "狐狐狸" not in page._watching
+
+
+# ---- 回連之後把設定接回去：等訊號，不等秒數 -----------------------------
+#
+# 使用者的日誌：「回連後找不到 PID 2788 的分頁，接不回去」。
+# 遊戲確實重開也重登成功了，只有最後這一步落空 —— 舊版是
+# `QTimer.singleShot(3000, ...)`，而分頁要先有連線、再背景 AOB 定位成功
+# 才建得出來，三秒鐘通常不夠。CLAUDE.md 也明文禁止拿「等幾秒」當機制。
+
+
+class _Snap:
+    def __init__(self, dest=None, farming=False):
+        self.destination = dest
+        self.farming = farming
+        self.potion = None
+        self.labels = ["自動打怪"] if farming else []
+
+
+def test_restore_waits_for_the_tab_instead_of_a_fixed_delay(qtbot, monkeypatch):
+    """分頁還沒長出來時**先記著**，不是當場放棄。"""
+    page = _page(qtbot)
+    monkeypatch.setattr(page, "_scan", lambda: None)
+    page._reconnect_decider = None
+    page._reconnect_done(2788, "狐狐狸", _Snap(farming=True), "")
+    assert 2788 in page._pending_restore, "應該先登記，等分頁出現"
+
+
+def test_the_tab_showing_up_is_what_triggers_the_restore(qtbot, monkeypatch):
+    """分頁建好的那一刻就接回去 —— 那才是讀得到的訊號。"""
+    page = _page(qtbot)
+    monkeypatch.setattr(page, "_scan", lambda: None)
+    page._reconnect_decider = None
+    snap = _Snap(farming=True)
+    page._reconnect_done(2788, "狐狐狸", snap, "")
+
+    restored = []
+    monkeypatch.setattr(page, "restore_into", lambda pid, s: restored.append((pid, s)))
+    page._restore_if_pending(2788)
+    assert restored == [(2788, snap)]
+    assert 2788 not in page._pending_restore, "接過就不要再接一次"
+
+
+def test_an_unrelated_tab_does_not_consume_the_pending_restore(qtbot, monkeypatch):
+    """別的遊戲視窗長出來不算 —— 認的是 PID。"""
+    page = _page(qtbot)
+    monkeypatch.setattr(page, "_scan", lambda: None)
+    page._reconnect_decider = None
+    page._reconnect_done(2788, "狐狐狸", _Snap(farming=True), "")
+    restored = []
+    monkeypatch.setattr(page, "restore_into", lambda pid, s: restored.append(pid))
+    page._restore_if_pending(9999)
+    assert restored == []
+    assert 2788 in page._pending_restore
+
+
+def test_waiting_forever_is_not_allowed_and_it_says_so(qtbot, monkeypatch, caplog):
+    """等太久要放棄，而且要**大聲** —— 安靜地忘掉最糟：
+    使用者會以為都接回去了，實際上掛機沒開。"""
+    import logging
+
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot)
+    monkeypatch.setattr(page, "_scan", lambda: None)
+    page._reconnect_decider = None
+    page._reconnect_done(2788, "狐狐狸", _Snap(farming=True), "")
+    later = time.monotonic() + mod._RESTORE_TIMEOUT_SEC + 1
+    with caplog.at_level(logging.WARNING, logger="ro_toolbox.ui.pages.farm_page"):
+        page._expire_pending_restores(later)
+    assert 2788 not in page._pending_restore
+    assert any("沒能接回" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failed_reconnect_registers_nothing_to_restore(qtbot, monkeypatch):
+    """重連本身就失敗的話沒有東西好接，也不該留下一筆等到逾時。"""
+    from ro_toolbox.services.reconnect import ReconnectDecider
+
+    page = _page(qtbot)
+    page._reconnect_decider = ReconnectDecider()
+    page._reconnect_done(0, "狐狐狸", _Snap(farming=True), "開遊戲失敗")
+    assert page._pending_restore == {}
