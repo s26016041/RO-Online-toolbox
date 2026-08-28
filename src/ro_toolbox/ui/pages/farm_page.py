@@ -164,6 +164,10 @@ class CharacterCard(QWidget):
     #: 讓它照內容自然長、只擋「不要太小」，字永遠不會被壓到。
     TRAVEL_BUTTON_MIN_W = 96
     TRAVEL_BUTTON_MIN_H = 34
+    #: 按鈕左右的裝飾寬度（qss：內距 18px×2 ＋ 外框 1px×2，再留一點餘裕）。
+    #: 寬度用「字寬 ＋ 這個」算出來，**不寫死像素** —— 字體與 DPI 一變，
+    #: 寫死的那一刻在別人的機器上就是切字或過寬。
+    TRAVEL_BUTTON_PAD = 42
     #: 道具小圖的邊長（解包出來的圖示是 24×24）。
     ICON_PX = 24
 
@@ -238,8 +242,10 @@ class CharacterCard(QWidget):
         side_box.setSpacing(0)
         # 往下推一行，讓按鈕大致對齊 Base 區塊而不是角色名字那一行
         side_box.addSpacing(self.ROW_HEIGHT)
-        side_box.addWidget(self._make_travel_button())
-        side_box.addWidget(self._make_pause_button())
+        # ⚠ 兩顆按鈕靠左：這一欄的寬度是下拉選單撐出來的，不指定對齊的話
+        # 按鈕會被放在整欄中間，看起來像浮在半空中。
+        side_box.addWidget(self._make_travel_button(), 0, Qt.AlignmentFlag.AlignLeft)
+        side_box.addWidget(self._make_pause_button(), 0, Qt.AlignmentFlag.AlignLeft)
         side_box.addWidget(self._make_destination_box())
         side_box.addStretch(1)
 
@@ -323,6 +329,14 @@ class CharacterCard(QWidget):
 
     # ---- 自動尋路 ---------------------------------------------------
 
+    def _label_width(self, button: QPushButton) -> int:
+        """剛好放得下這顆按鈕文字的寬度（字寬 ＋ qss 的內距）。
+
+        用字型度量算而不是寫死像素：字體大小、主題、DPI 一變，寫死的那一刻
+        在別人的機器上就是切字或過寬。
+        """
+        return button.fontMetrics().horizontalAdvance("自動尋路") + self.TRAVEL_BUTTON_PAD
+
     def _make_travel_button(self) -> QPushButton:
         """按下去就照**遊戲自己的尋路目標**走過去，會自己穿越多張地圖。
 
@@ -332,9 +346,10 @@ class CharacterCard(QWidget):
         """
         self.auto_travel = QPushButton("自動尋路")
         self.auto_travel.setCheckable(True)
-        self.auto_travel.setMinimumSize(
-            self.TRAVEL_BUTTON_MIN_W, self.TRAVEL_BUTTON_MIN_H
-        )
+        # ⚠ **固定**寬度，不是最小寬度：這一欄的寬度是下拉選單撐出來的
+        #（選單的建議寬度來自最長的那個地圖名），最小寬度的按鈕會被拉到跟它一樣長。
+        self.auto_travel.setFixedSize(self._label_width(self.auto_travel),
+                                      self.TRAVEL_BUTTON_MIN_H)
         self.auto_travel.setToolTip(
             "先在遊戲的尋路視窗設好目的地（箭頭出現），再按這裡。\n"
             "純趕路：途中不打怪、不撿東西，抵達就停。"
@@ -359,8 +374,11 @@ class CharacterCard(QWidget):
         """
         self.travel_pause = QPushButton("暫停")
         self.travel_pause.setEnabled(False)
-        self.travel_pause.setFixedHeight(self.ROW_HEIGHT)
-        self.travel_pause.setMinimumWidth(self.TRAVEL_BUTTON_MIN_W)
+        # ⚠ 高度要跟「自動尋路」一樣：qss 給 QPushButton 上下各 7px 內距 ＋ 外框，
+        # 用 ROW_HEIGHT(26) 的話只剩十來個像素給字，**字會被切掉**（使用者回報）。
+        # 寬度跟「自動尋路」對齊，兩顆並排才不會一長一短。
+        self.travel_pause.setFixedSize(self._label_width(self.auto_travel),
+                                       self.TRAVEL_BUTTON_MIN_H)
         self.travel_pause.setToolTip(
             "趕路中站住不動。要繼續就再按一次「自動尋路」，"
             "會從現在的位置接下去（連線與路線都留著）。"

@@ -1011,6 +1011,33 @@ def test_pause_button_is_only_live_while_travelling(qtbot):
     assert card.travel_pause.isEnabled() is False
 
 
+def test_the_buttons_are_only_as_wide_as_their_text(qtbot):
+    """⚠ 這一欄的寬度是**下拉選單**撐出來的（建議寬度來自最長的地圖名）。
+
+    按鈕如果只設「最小寬度」，就會被拉到跟選單一樣長 —— 使用者回報
+    「自動尋路跟暫停都太長」。所以兩顆都用**固定**寬度，剛好放得下四個字。
+    """
+    card = make_card(qtbot)
+    fits = card.auto_travel.fontMetrics().horizontalAdvance("自動尋路")
+
+    for button in (card.auto_travel, card.travel_pause):
+        assert button.width() >= fits, "至少要放得下四個字"
+        assert button.width() <= fits + card.TRAVEL_BUTTON_PAD, "不要比字寬多太多"
+        assert button.minimumWidth() == button.maximumWidth(), "固定寬，不准被拉長"
+
+    assert card.destination.minimumWidth() >= card.TRAVEL_BUTTON_MIN_W, "選單維持原寬"
+
+
+def test_the_pause_button_is_tall_enough_for_its_text(qtbot):
+    """⚠ qss 給 QPushButton 上下各 7px 內距 ＋ 外框 —— 用 ROW_HEIGHT(26) 的話
+    只剩十來個像素給字，**字會被切掉**（使用者回報）。"""
+    card = make_card(qtbot)
+    chrome = 16                      # 內距 7×2 ＋ 外框 1×2
+    text = card.travel_pause.fontMetrics().height()
+    assert card.travel_pause.height() - chrome >= text
+    assert card.travel_pause.height() == card.auto_travel.height(), "兩顆要一樣高"
+
+
 def test_the_pause_button_never_says_resume(qtbot):
     """使用者指定：這顆只做暫停，文字不准變成「繼續」。"""
     card = make_card(qtbot)
