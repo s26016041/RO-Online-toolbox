@@ -157,6 +157,46 @@ def plan_route(
     return None
 
 
+def nearest_map_with(
+    start_map: str,
+    goals: set[str] | frozenset[str],
+    avoid: set[tuple[str, int, int]] | None = None,
+    max_maps: int = 4000,
+    allow_npc: bool = True,
+) -> tuple[list[Hop], str] | None:
+    """從 `start_map` 出發，**最少換圖**就到得了的那一張 `goals`。到不了回 None。
+
+    回 `(路線, 那張圖)`。已經站在其中一張上就回 `([], 那張)`。
+
+    需要它是因為「回程之後去最近的藥水商人」：有商人的地圖有 43 張
+    （[DAT-037]），對每一張各算一次路線要跑 43 次 BFS。BFS 本來就是一層一層
+    往外走 —— **第一個碰到的就是最近的**，一次就夠。
+
+    `allow_npc` 預設**開著**：使用者要的是最近的商人，搭船比繞十幾張圖近
+    （[DAT-035] 同一個偏好）。
+    """
+    if start_map in goals:
+        return [], start_map
+    avoid = avoid or set()
+    came: dict[str, Hop] = {}
+    seen = {start_map}
+    queue: deque[str] = deque([start_map])
+    while queue and len(seen) < max_maps:
+        current = queue.popleft()
+        links = [(x, y, d, dx, dy, "", 0) for x, y, d, dx, dy in warps_on_map(current)]
+        if allow_npc:
+            links += list(npc_links_on_map(current))
+        for x, y, dest, dx, dy, who, who_id in links:
+            if dest in seen or (current, x, y) in avoid:
+                continue
+            came[dest] = Hop(current, x, y, dest, dx, dy, who, who_id)
+            if dest in goals:
+                return _trace(came, start_map, dest), dest
+            seen.add(dest)
+            queue.append(dest)
+    return None
+
+
 def why_no_route(start_map: str, goal_map: str) -> tuple[str, int, int, str, str] | None:
     """走不到的時候，找出**第一個卡住的 NPC 連結**：(地圖, x, y, 目的地, NPC 名)。
 

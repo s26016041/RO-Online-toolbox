@@ -1036,3 +1036,28 @@ def test_stopping_clears_the_pause():
     bot.pause()
     bot.stop()
     assert bot.paused is False
+
+
+# ---- 「最近的商人在哪張圖」：一次 BFS，不是對 43 張圖各算一次 ---------------
+
+
+def test_nearest_map_stops_at_the_first_goal_it_reaches(fake_warps):
+    """BFS 本來就一層一層往外走 —— **第一個碰到的就是最近的**。"""
+    found = travel.nearest_map_with("a", {"c", "dead_end"})
+    assert found is not None
+    route, where = found
+    assert where == "dead_end", "a 一步就到 dead_end，c 要兩步"
+    assert [hop.to_map for hop in route] == ["dead_end"]
+
+
+def test_standing_on_a_goal_map_needs_no_route(fake_warps):
+    assert travel.nearest_map_with("c", {"c", "a"}) == ([], "c")
+
+
+def test_no_goal_reachable_returns_none(fake_warps):
+    assert travel.nearest_map_with("a", {"nowhere"}) is None
+
+
+def test_the_avoid_list_is_respected(fake_warps):
+    """踩不過去的傳點在這裡也要繞開，否則會挑到一條已知走不通的路。"""
+    assert travel.nearest_map_with("a", {"dead_end"}, avoid={("a", 20, 20)}) is None

@@ -959,8 +959,16 @@ def test_the_nudge_targets_cover_every_walkable_cell():
 
 
 def test_nudging_is_throttled(monkeypatch):
-    """每拍都送等於洗封包 —— 而且伺服器也不會因此回快一點。"""
+    """每拍都送等於洗封包 —— 而且伺服器也不會因此回快一點。
+
+    ⚠ 節流間隔要**在測試裡放大**：真實值是 0.5 秒，而這 10 圈在忙碌的機器上
+    （整包測試同時跑）真的會超過 0.5 秒，於是第二次推送合法地送出去 ——
+    測試就會偶爾紅一次，而且看起來像程式壞了。實際踩過。
+    """
+    from ro_toolbox.services import travel_bot as mod
+
     bot, sent = _travel_bot(monkeypatch)
+    monkeypatch.setattr(mod, "_NUDGE_EVERY_SEC", 3600.0)
     for _ in range(10):
         bot._trusted_position("s_atelier", (271, 108))
     assert len(sent) == 1, f"節流沒生效：{sent}"
