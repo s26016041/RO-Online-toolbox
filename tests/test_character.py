@@ -565,7 +565,7 @@ def test_map_entry_signatures_cross_check_each_other():
     for sig in MAP_ENTRY_X_SIGS + MAP_ENTRY_Y_SIGS:
         assert "??" in sig.pattern, f"{sig.name} 把答案寫死了"
     # x 與 y 取的是**同一段程式碼裡不同的立即值**
-    for xs, ys in zip(MAP_ENTRY_X_SIGS, MAP_ENTRY_Y_SIGS):
+    for xs, ys in zip(MAP_ENTRY_X_SIGS, MAP_ENTRY_Y_SIGS, strict=True):
         assert xs.pattern == ys.pattern
         assert set(xs.operands).isdisjoint(ys.operands)
     assert MAP_ENTRY_XY_GAP == 4
