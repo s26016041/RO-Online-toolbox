@@ -26,12 +26,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ro_toolbox.core.ro_protocol import build_move, unpack_move, unpack_position
-from ro_toolbox.services import game_socket, mapdata, npc_dialog
-from ro_toolbox.services.character import CharacterReader
+from ro_toolbox.services import mapdata, npc_dialog
+from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import map_display_name, npc_links_on_map
 from ro_toolbox.services.navigation import NavigationReader
-from ro_toolbox.services.packet_capture import PacketCapture
-from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel import Traveler
 from ro_toolbox.services.walker import MAX_STEP, Walker
 
@@ -115,10 +113,16 @@ class TravelBot:
         self._pid = pid
         self._destination = destination
         self._on_update = on_update
-        self._sock: int | None = None
-        self._server: tuple[str, int] | None = None
-        self._reader: CharacterReader | None = None
-        self._capture: PacketCapture | None = None
+        #: socket ／ 角色定位 ／ 封包擷取三條線共用同一份規則（`services/game_link.py`）。
+        #: ⚠ 以前這一段是 farm_bot 抄一份、travel_bot 抄一份 —— [PKT-072] 就是
+        #: 因為「剛連上複製不到 socket 要重試」抄了四份、漏了兩份才炸的。
+        self._link = GameLink(
+            pid,
+            on_packet=self._on_packet,
+            should_stop=lambda: self._stop.is_set(),
+            note=self._note,
+            need_position=True,
+        )
         #: 正在跟哪隻 NPC 講話（None = 沒有）
         self._talk: npc_dialog.NpcTalk | None = None
         #: 要找的 NPC：(外觀編號, x, y)。認人要兩個欄位同時對上。
@@ -159,6 +163,40 @@ class TravelBot:
             goal=destination or "",
             goal_label=map_display_name(destination) if destination else "",
         )
+
+    # ⚠ 這四個是 `GameLink` 的門面。留著是因為**呼叫端與測試都這樣用**，
+    # 換掉等於為了搬家而改一堆沒必要的地方；真正的規則只有 GameLink 一份。
+    @property
+    def _sock(self):
+        return self._link.sock
+
+    @_sock.setter
+    def _sock(self, value) -> None:
+        self._link.sock = value
+
+    @property
+    def _server(self):
+        return self._link.server
+
+    @_server.setter
+    def _server(self, value) -> None:
+        self._link.server = value
+
+    @property
+    def _reader(self):
+        return self._link.reader
+
+    @_reader.setter
+    def _reader(self, value) -> None:
+        self._link.reader = value
+
+    @property
+    def _capture(self):
+        return self._link.capture
+
+    @_capture.setter
+    def _capture(self, value) -> None:
+        self._link.capture = value
 
     @property
     def running(self) -> bool:
@@ -250,39 +288,11 @@ class TravelBot:
         if self._destination is None and not self._read_navigation():
             return False
 
-        self._note("正在找遊戲連線…")
-        server = find_server(self._pid)
-        if server is None:
-            return self._fail("找不到伺服器連線（還沒登入？）")
-        # ⚠ 剛連上的那幾秒複製不到，要重試（[PKT-072]）——
-        # 舊版叫一次就放棄，症狀是「按下自動尋路就死在這裡」。
-        self._note("正在複製遊戲連線（剛上線的幾秒可能要等一下）…")
-        sock = game_socket.open_game_socket(
-            self._pid, server[0], server[1], should_stop=self._stop.is_set,
-        )
-        if not sock:
-            return self._fail("找不到遊戲 socket，無法送封包（等了也沒出現）")
-        self._sock, self._server = sock, server
-
-        # AOB 定位要一秒上下。不講一聲的話這段就是完全的沉默，
-        # 使用者按下按鈕之後看不到任何字，會以為是沒反應（CLAUDE.md：狀態要跟得上行為）。
-        self._note("正在定位角色（AOB 特徵掃描）…")
-        reader = CharacterReader()
-        if not reader.attach(self._pid, should_stop=self._stop.is_set):
-            return self._fail("角色定位失敗")
-        if not reader.position_located:
-            # 沒有座標就沒有「我在哪」，整條尋路都不成立。與其每一拍空轉，
-            # 不如立刻說清楚（CLAUDE.md：定位失敗要大聲）。
-            reader.close()
-            return self._fail("⚠ 角色座標定位失敗（遊戲可能已改版），自動尋路停用")
-        self._reader = reader
-
-        # Walker 靠 0x0087 判斷每一段有沒有被接受；沒有擷取就只能瞎送（[PKT-030]）
-        self._note("正在啟動封包擷取…")
-        capture = PacketCapture(self._pid, self._on_packet)
-        if not capture.start():
-            return self._fail("封包擷取啟動失敗（需要系統管理員）")
-        self._capture = capture
+        problem = self._link.open()
+        if problem:
+            return self._fail(
+                problem if problem.startswith("⚠") else problem,
+            )
 
         self._traveler.set_goal(self._destination)
         self._note(f"前往 {self._stats.goal_label or self._destination}"
@@ -629,24 +639,9 @@ class TravelBot:
         if now - self._resync_at < _RESYNC_SEC:
             return True
         self._resync_at = now
-        server = find_server(self._pid)
-        if server is None:
-            if self._server is not None:
-                return self._fail("⚠ 遊戲連線已中斷，自動尋路已停止")
-            return True
-        if server == self._server:
-            return True
-        log.info("連線 %s → %s，重新綁定", self._server, server)
-        if self._sock is not None:
-            game_socket.close_socket(self._sock)
-            self._sock = None
-        sock = game_socket.open_game_socket(
-            self._pid, server[0], server[1],
-            timeout=game_socket.SOCKET_REBIND_SEC, should_stop=self._stop.is_set,
-        )
-        if not sock:
-            return self._fail("⚠ 換頻道後找不到新的遊戲 socket，自動尋路已停止")
-        self._sock, self._server = sock, server
+        problem = self._link.resync()
+        if problem:
+            return self._fail(f"{problem}，自動尋路已停止")
         return True
 
     # ---- 雜項 -------------------------------------------------------
@@ -657,12 +652,8 @@ class TravelBot:
         走**複製出來的遊戲 socket**，全程不碰記憶體（CLAUDE.md：RO 掛
         GameGuard，寫記憶體會被反制）。
         """
-        if self._sock is None:
-            return False
-        if game_socket.send_on_socket(self._sock, data) < 0:
-            log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
-            self._server = None
-            self._resync_at = 0.0
+        if not self._link.send(data):
+            self._resync_at = 0.0     # 逼下一拍立刻重綁，不要等節流時間
             return False
         return True
 
@@ -794,15 +785,7 @@ class TravelBot:
         self._send(build_move(x, y))
 
     def _cleanup(self) -> None:
-        if self._capture is not None:
-            self._capture.stop()
-            self._capture = None
-        if self._sock is not None:
-            game_socket.close_socket(self._sock)
-            self._sock = None
-        if self._reader is not None:
-            self._reader.close()
-            self._reader = None
+        self._link.close()
 
     @property
     def destination(self) -> str | None:

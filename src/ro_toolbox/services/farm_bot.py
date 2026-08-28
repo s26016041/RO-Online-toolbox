@@ -29,9 +29,8 @@ from ro_toolbox.core.ro_protocol import (
     build_query,
     unpack_move,
 )
-from ro_toolbox.services import game_socket
-from ro_toolbox.services.character import CharacterReader
 from ro_toolbox.services.entities import EntityScanner
+from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import (
     is_farmable,
     item_name,
@@ -39,7 +38,6 @@ from ro_toolbox.services.gamedata import (
     mob_name,
 )
 from ro_toolbox.services.mapdata import GatError, MapTerrain, load_terrain
-from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel import Traveler
 from ro_toolbox.services.walker import MAX_STEP, Walker, line_cells
@@ -213,9 +211,15 @@ class FarmBot:
         self._on_update = on_update
         self._use_memory = use_memory
         self._world = WorldTracker(valid_item_ids=set(item_names()))
-        self._capture: PacketCapture | None = None
-        self._sock: int | None = None
-        self._reader: CharacterReader | None = None
+        #: socket ／ 角色定位 ／ 封包擷取三條線共用同一份規則
+        #: （`services/game_link.py`）。⚠ 以前這一段 travel_bot 抄一份、
+        #: 這裡抄一份 —— [PKT-072] 就是「剛連上複製不到 socket 要重試」
+        #: 抄了四份、漏了兩份才炸的。
+        self._link = GameLink(
+            pid,
+            on_packet=self._on_packet,
+            should_stop=lambda: self._stop.is_set(),
+        )
         self._terrain: MapTerrain | None = None
         self._entities: EntityScanner | None = None
         self._thread: threading.Thread | None = None
@@ -253,7 +257,6 @@ class FarmBot:
         self._warp_cells: frozenset[tuple[int, int]] = frozenset()
         #: 正在往哪裡脫離禁區（None = 沒在脫離）
         self._escape_goal: tuple[int, int] | None = None
-        self._server: tuple[str, int] | None = None  # 目前綁定的伺服器端點
         self._resync_at = 0.0
         # 傷害封包分析：學到自己的 GID 後，就能認出「正在打我的怪」優先反擊
         self._my_gid: int | None = None
@@ -261,6 +264,40 @@ class FarmBot:
         # 怪跑掉或被別人打死之後不該永遠留在優先清單裡。
         self._aggro: dict[int, float] = {}
         self._dmg_lock = threading.Lock()
+
+    # ⚠ 這四個是 `GameLink` 的門面。留著是因為呼叫端與測試都這樣用；
+    # 真正的規則（怎麼取得、怎麼重綁）只有 GameLink 一份。
+    @property
+    def _sock(self):
+        return self._link.sock
+
+    @_sock.setter
+    def _sock(self, value) -> None:
+        self._link.sock = value
+
+    @property
+    def _server(self):
+        return self._link.server
+
+    @_server.setter
+    def _server(self, value) -> None:
+        self._link.server = value
+
+    @property
+    def _reader(self):
+        return self._link.reader
+
+    @_reader.setter
+    def _reader(self, value) -> None:
+        self._link.reader = value
+
+    @property
+    def _capture(self):
+        return self._link.capture
+
+    @_capture.setter
+    def _capture(self, value) -> None:
+        self._link.capture = value
 
     @property
     def running(self) -> bool:
@@ -320,27 +357,12 @@ class FarmBot:
             self._cleanup()
 
     def _setup(self) -> bool:
-        server = find_server(self._pid)
-        if server is None:
-            self._fail("找不到伺服器連線（還沒登入？）")
+        problem = self._link.open()
+        if problem:
+            self._fail(problem)
             return False
-
-        # ⚠ 剛連上的那幾秒複製不到，要重試（[PKT-072]）。
-        sock = game_socket.open_game_socket(
-            self._pid, server[0], server[1], should_stop=self._stop.is_set,
-        )
-        if not sock:
-            self._fail("找不到遊戲 socket，無法送封包（等了也沒出現）")
-            return False
-        self._sock = sock
-        self._server = server
-
-        reader = CharacterReader()
-        if not reader.attach(self._pid, should_stop=self._stop.is_set):
-            self._fail("角色定位失敗")
-            return False
-        self._reader = reader
-        status = reader.read()
+        reader = self._link.reader
+        status = reader.read() if reader is not None else None
         if status is not None:
             # 自己的 GID 就是 AID（[MEM-017] 已用實測封包核對過）。
             # 一開始就知道，才認得出「怪先打我」—— 以前要等自己先出手才推導得出來，
@@ -367,11 +389,6 @@ class FarmBot:
                 else:
                     # 找新的怪放背景做，主迴圈只讀已知位址
                     self._entities.start_discovery(self._reader.read_position)
-
-        self._capture = PacketCapture(self._pid, self._on_packet)
-        if not self._capture.start():
-            self._fail("封包擷取啟動失敗（需要系統管理員）")
-            return False
 
         self._world.clear()
         self._note("自動打怪中" if self._terrain else "自動打怪中（沒有地形，不會漫遊）")
@@ -510,18 +527,12 @@ class FarmBot:
         log.info("環境變了（%s），重新綁定", "、".join(what))
 
         if server_changed:
-            if self._sock is not None:
-                game_socket.close_socket(self._sock)
-                self._sock = None
-            sock = game_socket.open_game_socket(
-                self._pid, server[0], server[1],
-                timeout=game_socket.SOCKET_REBIND_SEC, should_stop=self._stop.is_set,
-            )
-            if not sock:
-                self._fail("⚠ 換頻道後找不到新的遊戲 socket，自動打怪已停止")
+            # 上面已經讀過一次連線了，直接交給它 —— 再讀一次不只浪費，
+            # 兩次讀到的還可能不一樣（TCP 表是快照）。
+            problem = self._link.resync(server)
+            if problem:
+                self._fail(f"{problem}，自動打怪已停止")
                 return False
-            self._sock = sock
-            self._server = server
 
         if map_changed:
             # ⚠ 走回去的途中換圖是**我們自己要的**，不是意外，不能學也不能重來。
@@ -1157,26 +1168,14 @@ class FarmBot:
 
     def _send(self, data: bytes) -> None:
         """送封包。失敗代表 socket 已經失效（多半是換頻道），下一拍會重綁。"""
-        if self._sock is None:
-            return
-        if game_socket.send_on_socket(self._sock, data) < 0:
-            log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
-            self._server = None  # 下一拍 _keep_in_sync 會重抓
-            self._resync_at = 0.0
+        if not self._link.send(data):
+            self._resync_at = 0.0     # 逼下一拍立刻重綁，不要等節流時間
 
     def _cleanup(self) -> None:
-        if self._capture is not None:
-            self._capture.stop()
-            self._capture = None
-        if self._sock is not None:
-            game_socket.close_socket(self._sock)
-            self._sock = None
         if self._entities is not None:
             self._entities.close()
             self._entities = None
-        if self._reader is not None:
-            self._reader.close()
-            self._reader = None
+        self._link.close()
 
     def _note(self, text: str) -> None:
         # 提示字一律進**執行日誌**，不放介面（使用者指定）。

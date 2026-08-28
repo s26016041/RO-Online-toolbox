@@ -604,6 +604,7 @@ def test_the_bot_can_send_any_packet_not_just_moves():
 
 def test_every_packet_the_dialog_makes_can_be_sent(monkeypatch):
     """把對話會產生的每一種封包都餵一次，確認送出那條路吃得下。"""
+    from ro_toolbox.services import game_link
     from ro_toolbox.services import npc_dialog as nd
     from ro_toolbox.services import travel_bot as mod
 
@@ -611,7 +612,7 @@ def test_every_packet_the_dialog_makes_can_be_sent(monkeypatch):
     sent = []
     bot._sock = 42
     monkeypatch.setattr(
-        mod.game_socket, "send_on_socket",
+        game_link.game_socket, "send_on_socket",
         lambda _sock, data: (sent.append(data), len(data))[1],
     )
     for data in (nd.build_contact(91), nd.build_next(91), nd.build_choose(91, 1)):
@@ -625,11 +626,12 @@ def test_the_whole_dialog_step_runs_without_exploding(monkeypatch):
     把整個「停在 NPC 前面」那一步真的跑一遍（socket、記憶體全是假的），
     任何 AttributeError 都會在這裡炸出來，而不是在使用者的角色卡在卡普拉旁邊時。
     """
+    from ro_toolbox.services import game_link
     from ro_toolbox.services import travel_bot as mod
 
     bot = mod.TravelBot(1234)
     bot._sock = 42
-    monkeypatch.setattr(mod.game_socket, "send_on_socket", lambda *a: 8)
+    monkeypatch.setattr(game_link.game_socket, "send_on_socket", lambda *a: 8)
     bot._reader = FakeReader((109, 27))
     bot._traveler._terrain = open_terrain("t", side=200)
     bot._traveler._route_map = "t"
@@ -688,6 +690,7 @@ def test_the_shake_never_sends_a_move_the_server_will_ignore(monkeypatch):
     人站在卡普拉旁邊發呆，**一個錯誤訊息都沒有**。所以一定要走 Walker，
     它會把路徑切成 14 格一段。
     """
+    from ro_toolbox.services import game_link
     from ro_toolbox.services import travel_bot as mod
     from ro_toolbox.services.walker import MAX_STEP
 
@@ -701,7 +704,7 @@ def test_the_shake_never_sends_a_move_the_server_will_ignore(monkeypatch):
 
     sent = []
     monkeypatch.setattr(
-        mod.game_socket, "send_on_socket",
+        game_link.game_socket, "send_on_socket",
         lambda _sock, data: (sent.append(data), len(data))[1],
     )
     hop = Hop("t", 108, 27, "izlude", 1, 1, "船員", 100)
@@ -715,13 +718,14 @@ def test_the_shake_never_sends_a_move_the_server_will_ignore(monkeypatch):
 
 def test_the_shake_walks_all_the_way_out_then_back(monkeypatch):
     """出視野看**真的座標**，不是等秒數；回來也是。"""
+    from ro_toolbox.services import game_link
     from ro_toolbox.services import travel_bot as mod
 
     bot = mod.TravelBot(1234)
     bot._reader = FakeReader((109, 27))
     bot._traveler._terrain = open_terrain("t", side=200)
     bot._sock = 42
-    monkeypatch.setattr(mod.game_socket, "send_on_socket", lambda *a: 8)
+    monkeypatch.setattr(game_link.game_socket, "send_on_socket", lambda *a: 8)
     # 目標固定、Walker 一律回「還在走」—— 這條測的是**判斷分支**，
     # 不是 Walker（它自己有 test_walker.py）。不固定的話結果會隨機。
     monkeypatch.setattr(mod.random, "choice", lambda seq: seq[0])
@@ -755,11 +759,12 @@ def test_a_failed_dialog_does_not_loop_back_to_cannot_see_him(monkeypatch, caplo
     """
     import logging
 
+    from ro_toolbox.services import game_link
     from ro_toolbox.services import travel_bot as mod
 
     bot = mod.TravelBot(1234)
     bot._sock = 42
-    monkeypatch.setattr(mod.game_socket, "send_on_socket", lambda *a: 8)
+    monkeypatch.setattr(game_link.game_socket, "send_on_socket", lambda *a: 8)
     bot._reader = FakeReader((120, 63))
     bot._traveler._terrain = open_terrain("t", side=200)
     bot._traveler._route_map = "t"

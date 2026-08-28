@@ -11,6 +11,7 @@ import numpy as np
 import pytest
 
 from ro_toolbox.services import farm_bot as fb
+from ro_toolbox.services import game_link
 from ro_toolbox.services.entities import MemoryEntity
 from ro_toolbox.services.farm_bot import _RESYNC_SEC, FarmBot, _Aim
 from ro_toolbox.services.mapdata import MapTerrain
@@ -81,8 +82,8 @@ def test_channel_change_rebinds_socket(monkeypatch):
     bot = make_bot(monkeypatch)
     closed, found = [], []
     monkeypatch.setattr(fb, "find_server", lambda pid: ("9.9.9.9", 10004))
-    monkeypatch.setattr(fb.game_socket, "close_socket", closed.append)
-    monkeypatch.setattr(fb.game_socket, "find_game_socket",
+    monkeypatch.setattr(game_link.game_socket, "close_socket", closed.append)
+    monkeypatch.setattr(game_link.game_socket, "find_game_socket",
                         lambda pid, ip, port: found.append((ip, port)) or 222)
 
     assert bot._keep_in_sync(T0) is True
@@ -94,8 +95,11 @@ def test_channel_change_rebinds_socket(monkeypatch):
 def test_stops_loudly_when_new_socket_not_found(monkeypatch):
     bot = make_bot(monkeypatch)
     monkeypatch.setattr(fb, "find_server", lambda pid: ("9.9.9.9", 10004))
-    monkeypatch.setattr(fb.game_socket, "close_socket", lambda s: None)
-    monkeypatch.setattr(fb.game_socket, "find_game_socket", lambda pid, ip, port: 0)
+    monkeypatch.setattr(game_link.game_socket, "close_socket", lambda s: None)
+    monkeypatch.setattr(game_link.game_socket, "find_game_socket", lambda pid, ip, port: 0)
+    # ⚠ 重綁本來會重試 SOCKET_REBIND_SEC 秒（實機需要，剛換頻道複製不到）——
+    # 測試要把它縮掉，不然這一條自己會跑十秒。
+    monkeypatch.setattr(game_link.game_socket, "SOCKET_REBIND_SEC", 0.0)
 
     assert bot._keep_in_sync(T0) is False
     assert not bot._stats.running
@@ -113,7 +117,7 @@ def test_stops_loudly_when_connection_lost(monkeypatch):
 def test_send_failure_forces_rebind(monkeypatch):
     """送封包失敗＝socket 已失效，下一拍必須重綁，不能安靜地繼續。"""
     bot = make_bot(monkeypatch)
-    monkeypatch.setattr(fb.game_socket, "send_on_socket", lambda sock, data: -1)
+    monkeypatch.setattr(game_link.game_socket, "send_on_socket", lambda sock, data: -1)
     bot._send(b"\x00\x01")
     assert bot._server is None
     assert bot._resync_at == 0.0
