@@ -90,6 +90,8 @@ class TravelStats:
     hops_left: int = 0  # 還要換幾張圖
     note: str = ""
     arrived: bool = False
+    #: 使用者按了暫停。**還在跑**（連線、擷取、路線都留著），只是不送走路封包。
+    paused: bool = False
 
 
 class TravelBot:
@@ -131,6 +133,10 @@ class TravelBot:
         self._asked: tuple[str, int, int] | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        #: 使用者按下暫停。⚠ 跟 `_stop` 是**兩件事**：停是收攤（關 socket、關
+        #: 擷取、忘掉路線），暫停是站在原地什麼都不做，連線與路線都留著。
+        self._paused = threading.Event()
+        self._holding = False    # 暫停的那句話講過了沒（免得每拍洗版）
         self._walker = Walker(self._send_move)
         self._traveler = Traveler(self._walker, time.monotonic)
         self._resync_at = 0.0
@@ -181,8 +187,41 @@ class TravelBot:
         self._thread.start()
         return True
 
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
+
+    def pause(self) -> None:
+        """站在原地不動，但**不收攤**。
+
+        為什麼不是「停掉再按一次」：停掉會關 socket、關封包擷取、忘掉這一趟
+        學到的傳點黑名單，再開一次要重新 AOB 定位、重新複製 socket
+        （剛換頻道那幾秒常常複製不到，[PKT-072]）。暫停只是不送走路封包。
+
+        ⚠ 已經送出去的那一段走完為止：移動是伺服器帶的（[PKT-030]），
+        我們沒有「立刻站住」的封包。所以按下去之後角色還會走完最後幾格。
+        """
+        if self._paused.is_set():
+            return
+        self._paused.set()
+        self._stats.paused = True
+        self._note("⏸ 已暫停（連線與路線都留著，按繼續就從現在的位置接下去）")
+
+    def resume(self) -> None:
+        """繼續走。路線與黑名單留著，**位置從頭讀一次**（暫停期間可能被移動）。"""
+        if not self._paused.is_set():
+            return
+        self._paused.clear()
+        self._holding = False
+        self._stats.paused = False
+        # ⚠ 一定要通知 Traveler：它那三個「逾時＝放棄」的計時器是拿現在的時間
+        # 減起算時間算的，暫停多久就會被誤算成卡住多久（見 `Traveler.resume`）。
+        self._traveler.resume()
+        self._note("▶ 繼續趕路")
+
     def stop(self) -> None:
         self._stop.set()
+        self._paused.clear()
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(5.0)
@@ -362,6 +401,9 @@ class TravelBot:
                 continue
 
             self._stats.here = status.map_name
+            if self._paused.is_set():
+                self._hold()
+                continue
             self._watch_next_npc()
             state = self._traveler.update(status.map_name, pos)
             if state == "waiting":
@@ -389,6 +431,19 @@ class TravelBot:
 
             self._emit()
             self._stop.wait(_TICK)
+
+    def _hold(self) -> None:
+        """暫停中：不送任何走路封包，只把連線顧好（上面 `_keep_in_sync` 已經做了）。
+
+        ⚠ 走路那一段要**清掉一次**，不然 `Walker` 手上還握著上一段路徑，
+        一放開暫停就會沿著早就過期的路徑走（暫停期間人可能被伺服器帶完最後
+        幾格，也可能自己走開）。清掉之後 `resume()` 會從現在的位置重算。
+        """
+        if not self._holding:
+            self._holding = True
+            self._walker.clear()
+            self._emit()
+        self._stop.wait(_TICK)
 
     # ---- 自己跟 NPC 講話 --------------------------------------------
 

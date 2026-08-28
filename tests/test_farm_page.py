@@ -985,3 +985,70 @@ def test_no_terrain_means_we_do_not_second_guess_the_memory(monkeypatch):
     monkeypatch.setattr(bot, "_terrain_for", lambda name: None)
     assert bot._trusted_position("nowhere", (271, 108)) == (271, 108)
     assert sent == []
+
+
+# ---- 趕路中的「暫停」按鈕 -------------------------------------------------
+
+
+def test_pause_button_is_only_live_while_travelling(qtbot):
+    """⚠ 沒在趕路時**壓著不能按**（不是藏起來）：藏起來版面會跳，
+    而且看不到就不知道有這個功能。"""
+    card = make_card(qtbot)
+    assert card.travel_pause.isEnabled() is False
+
+    card.set_travel_busy(True)
+    assert card.travel_pause.isEnabled() is True
+
+    card.set_travel_busy(False)
+    assert card.travel_pause.isEnabled() is False
+
+
+def test_stopping_pops_the_pause_button_without_telling_the_bot(qtbot):
+    """⚠ 按鈕壓著卻沒在趕路是最糟的失效方式 —— 下一趟看起來像「一開始就暫停」。
+    彈回來的時候**不能反過來通知 bot**（那時候 bot 已經沒了）。"""
+    card = make_card(qtbot)
+    said: list[bool] = []
+    card.travel_paused.connect(said.append)
+
+    card.set_travel_busy(True)
+    card.travel_pause.setChecked(True)
+    assert said == [True]
+    assert card.travel_pause.text() == "繼續", "文字要跟著狀態走"
+
+    card.set_travel_busy(False)
+    assert card.travel_pause.isChecked() is False
+    assert said == [True], "程式自己彈回來的，不該再通知一次"
+    assert card.travel_pause.text() == "暫停"
+
+
+class _FakeTraveler:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def pause(self) -> None:
+        self.calls.append("pause")
+
+    def resume(self) -> None:
+        self.calls.append("resume")
+
+
+def test_the_button_actually_pauses_and_resumes_the_bot(qtbot):
+    page = _page(qtbot)
+    bot = _FakeTraveler()
+    page._travelers[1234] = bot
+
+    page._toggle_travel_pause(1234, True)
+    page._toggle_travel_pause(1234, False)
+    assert bot.calls == ["pause", "resume"]
+
+
+def test_pausing_with_no_bot_pops_the_button_back(qtbot):
+    """壓著卻沒有東西在暫停 = 騙人。找不到 bot 就把按鈕彈回去。"""
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    page._cards[1234] = card
+    card.set_travel_busy(True)
+    card.travel_pause.setChecked(True)
+
+    page._toggle_travel_pause(1234, True)   # _travelers 裡沒有 1234
+    assert card.travel_pause.isChecked() is False

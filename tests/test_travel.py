@@ -955,3 +955,84 @@ def test_the_door_we_are_heading_for_is_not_blocked(monkeypatch):
     assert traveler.update("a", (80, 80)) == "walking"
     assert walker.paths[0][-1] == (10, 10), "最後一步就是要踩上那道門"
     assert (10, 10) not in walker.avoids[0]
+
+
+# ---- 暫停：站著不動，但**不要把時間算在別人頭上** -------------------------
+
+
+def test_resume_does_not_blame_the_warp_for_time_we_paused(fake_warps):
+    """⚠⚠ 暫停五分鐘再回來，傳點不可以被誤判成「踩不過去」。
+
+    這支狀態機有三個「逾時＝放棄」的計時器（踩傳點、等座標、等 NPC），
+    全都是拿現在的時間減起算時間。暫停期間那段時間是**我們自己停掉的**，
+    不歸零的話一放開就會一次全部到期 —— 傳點被列黑名單、路線被判死。
+    """
+    traveler, walker, clock = make()
+    traveler.set_goal("c")
+    traveler.update("a", (5, 5))
+    walker.state = "arrived"
+    traveler.update("a", (10, 10))          # 走到傳點了，開始踩
+
+    clock.now += travel.WARP_GIVEUP_SEC * 20   # 暫停很久
+    traveler.resume()
+    assert traveler.update("a", (10, 10)) != "blocked", "暫停的時間不算在傳點頭上"
+
+    clock.now += travel.WARP_GIVEUP_SEC + 1     # 這次是真的踩不過去
+    assert traveler.update("a", (10, 10)) == "blocked"
+
+
+def test_resume_keeps_the_route_and_the_blacklist(fake_warps):
+    """暫停不是重來：路線與「這個傳點踩不過去」的黑名單都要留著。"""
+    traveler, walker, clock = make()
+    traveler.set_goal("c")
+    traveler.update("a", (5, 5))
+    before = [hop.to_map for hop in traveler.route]
+
+    traveler.resume()
+    assert [hop.to_map for hop in traveler.route] == before
+    assert traveler.goal_map == "c"
+
+
+def test_resume_drops_the_stale_path(fake_warps):
+    """暫停期間人可能被伺服器帶完最後幾格、也可能自己走開 ——
+    舊路徑不再有效，一定要重算，不能沿著過期的路走。"""
+    traveler, walker, clock = make()
+    traveler.set_goal("c")
+    traveler.update("a", (5, 5))
+    walked = len(walker.paths)
+
+    traveler.resume()
+    traveler.update("a", (7, 7))            # 暫停期間被移動到別的地方
+    assert len(walker.paths) > walked, "要從現在真的站的位置重算路徑"
+    assert walker.paths[-1][-1] == (10, 10)
+
+
+# ---- TravelBot 的暫停：不收攤 ---------------------------------------------
+
+
+def test_pause_does_not_tear_the_bot_down():
+    """⚠ 暫停 ≠ 取消。取消會關 socket、關封包擷取、忘掉這一趟學到的東西，
+    再開一次要重新 AOB 定位、重新複製 socket（剛換頻道那幾秒常常複製不到）。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234, destination="prontera")
+    assert bot.paused is False
+
+    bot.pause()
+    assert bot.paused is True
+    assert bot.stats.paused is True
+    assert bot.stats.goal == "prontera", "目的地要留著"
+
+    bot.resume()
+    assert bot.paused is False
+    assert bot.stats.paused is False
+
+
+def test_stopping_clears_the_pause():
+    """停掉之後再開新的一趟，不可以一開始就是暫停狀態。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = mod.TravelBot(1234, destination="prontera")
+    bot.pause()
+    bot.stop()
+    assert bot.paused is False

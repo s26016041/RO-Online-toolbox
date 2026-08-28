@@ -356,6 +356,28 @@ class Traveler:
         self._walker.clear()
         self.note = f"準備前往 {map_name}"
 
+    def resume(self) -> None:
+        """暫停回來了：把**用時間算的東西**歸零，路線與黑名單原封不動留著。
+
+        ⚠⚠ 非做不可。這支狀態機有三個「逾時＝放棄」的計時器，全都是拿現在的
+        時間減去起算時間：踩傳點放棄（`WARP_GIVEUP_SEC`）、等座標更新
+        （`STALE_POS_SEC`）、等 NPC（`NPC_GIVEUP_SEC`）。暫停五分鐘再回來，
+        它們會**一次全部到期** —— 症狀是傳點被誤判成踩不過去而列入黑名單、
+        地形被誤判成讀錯、NPC 被誤判成不見了。
+        那段時間是**我們自己停掉的**，不能算在它們頭上。
+
+        走路那一段直接清掉：暫停期間人可能被伺服器帶完最後一段、也可能自己
+        走開了，舊路徑不再有效。清掉之後下一拍會從**現在真的站的位置**重算。
+        """
+        now = self._now()
+        self._stale_since = 0.0
+        if self._warp_cell is not None:
+            self._warp_since = now
+            self._warp_try = 0
+        if self._npc_wait is not None:
+            self._npc_since = now
+        self._walker.clear()
+
     def clear(self) -> None:
         self._goal_map = ""
         self._goal_cell = None

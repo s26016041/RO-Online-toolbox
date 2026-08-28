@@ -179,6 +179,8 @@ class CharacterCard(QWidget):
     potion_stats = Signal(object)
     #: 使用者按下／取消「自動尋路」。參數：是否開啟。
     travel_toggled = Signal(bool)
+    #: 使用者按下／放開「暫停」。參數：是否暫停。
+    travel_paused = Signal(bool)
     #: 背景 TravelBot 回報狀態。
     travel_stats = Signal(object)
 
@@ -230,6 +232,7 @@ class CharacterCard(QWidget):
         # 往下推一行，讓按鈕大致對齊 Base 區塊而不是角色名字那一行
         side_box.addSpacing(self.ROW_HEIGHT)
         side_box.addWidget(self._make_travel_button())
+        side_box.addWidget(self._make_pause_button())
         side_box.addWidget(self._make_destination_box())
         side_box.addStretch(1)
 
@@ -332,6 +335,34 @@ class CharacterCard(QWidget):
         self.auto_travel.toggled.connect(self.travel_toggled)
         return self.auto_travel
 
+    def _make_pause_button(self) -> QPushButton:
+        """趕路中站住不動，再按一次接下去。
+
+        ⚠ 為什麼不叫人「取消再按一次」：取消是**收攤** —— 關 socket、關封包
+        擷取、忘掉這一趟學到的傳點黑名單，再開一次要重新 AOB 定位、重新複製
+        socket（剛換頻道那幾秒常常複製不到，[PKT-072]）。暫停只是不送走路封包。
+
+        沒在趕路時**壓著不能按**（不是藏起來）：藏起來會讓版面跳動，
+        而且看不到就不知道有這個功能。
+        """
+        self.travel_pause = QPushButton("暫停")
+        self.travel_pause.setCheckable(True)
+        self.travel_pause.setEnabled(False)
+        self.travel_pause.setFixedHeight(self.ROW_HEIGHT)
+        self.travel_pause.setMinimumWidth(self.TRAVEL_BUTTON_MIN_W)
+        self.travel_pause.setToolTip(
+            "趕路中站住不動，再按一次從現在的位置接下去。"
+            "⚠ 已經送出去的那一段會走完（移動是伺服器帶的，沒有「立刻站住」的封包）。"
+        )
+        self.travel_pause.toggled.connect(self._on_pause_toggled)
+        return self.travel_pause
+
+    def _on_pause_toggled(self, on: bool) -> None:
+        """按鈕文字要跟著狀態走 —— 壓著卻寫「暫停」會看不出現在是哪一邊。"""
+        self.travel_pause.setText("繼續" if on else "暫停")
+        if not self.quiet:
+            self.travel_paused.emit(on)
+
     def _make_destination_box(self) -> QComboBox:
         """目的地選單：**打中文或地圖代碼都能搜**。
 
@@ -392,6 +423,16 @@ class CharacterCard(QWidget):
     def set_travel_busy(self, busy: bool) -> None:
         """趕路途中不讓人再去勾自動打怪 —— 兩個都在送走路封包會互相打架。"""
         self.auto_hunt.setEnabled(not busy)
+        self.travel_pause.setEnabled(busy)
+        if not busy and self.travel_pause.isChecked():
+            # ⚠ 停下來時要把暫停彈回來，**而且不能反過來通知 bot**
+            # （bot 已經沒了）。按鈕壓著卻沒在趕路是最糟的失效方式：
+            # 下一趟開始時它看起來像「一開始就暫停」。
+            self.quiet = True
+            try:
+                self.travel_pause.setChecked(False)
+            finally:
+                self.quiet = False
         if busy:
             self._travel_notified = False  # 新的一趟，抵達通知重新算
 
@@ -1041,6 +1082,7 @@ class FarmPage(BasePage):
         card.potion_toggled.connect(lambda on, p=pid: self._toggle_potion(p, on))
         card.potion_changed.connect(lambda p=pid: self._apply_potion_config(p))
         card.travel_toggled.connect(lambda on, p=pid: self._toggle_travel(p, on))
+        card.travel_paused.connect(lambda on, p=pid: self._toggle_travel_pause(p, on))
 
         self._readers[pid] = reader
         self._cards[pid] = card
@@ -1386,6 +1428,26 @@ class FarmPage(BasePage):
         )
         self._travelers[pid] = traveler
         traveler.start()
+
+    def _toggle_travel_pause(self, pid: int, on: bool) -> None:
+        """暫停／繼續趕路。**不收攤** —— socket、封包擷取、路線與黑名單都留著。
+
+        找不到 bot 就把按鈕彈回去：壓著卻沒有東西在暫停，等於騙人。
+        """
+        traveler = self._travelers.get(pid)
+        card = self._cards.get(pid)
+        if traveler is None:
+            if card is not None:
+                card.quiet = True
+                try:
+                    card.travel_pause.setChecked(False)
+                finally:
+                    card.quiet = False
+            return
+        if on:
+            traveler.pause()
+        else:
+            traveler.resume()
 
     # ---- 自動補水 ---------------------------------------------------
 
