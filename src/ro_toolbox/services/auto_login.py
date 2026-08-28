@@ -81,6 +81,17 @@ _SELECT_MOVE_LIMIT = 20
 _SELECT_NAME_TIMEOUT = 8.0
 #: 自動點幾次同意還過不去，就改成請使用者按一次（順便學位置）。
 #: 給 3 次是因為實測偶爾會因為 UI 還沒進入可按狀態而漏掉一兩下。
+#: `_click_agree` 回報的位置來源（可信度由高到低）。
+AGREE_FOUND = "畫面上認出來的"
+AGREE_LEARNED = "你教過的位置"
+AGREE_GUESS = "內建預設比例"
+AGREE_FAILED = "點不出去"
+#: 這些來源代表「我們其實在猜」—— 連續猜好幾次還沒過就該求救。
+AGREE_UNSURE = (AGREE_LEARNED, AGREE_GUESS)
+
+#: 滑鼠左鍵的虛擬鍵碼（學按鈕位置時看它的按下緣）。
+_VK_LBUTTON = 0x01
+
 _AGREE_TRIES = 3
 #: 等使用者手動按同意的上限。
 _AGREE_LEARN_SEC = 60.0
@@ -247,6 +258,10 @@ class AutoLogin:
         self._typed_once = False
         #: 連線是什麼時候不見的（0 = 還在）。見 `_connection_lost`。
         self._lost_since = 0.0
+        #: 上一次「同意」按鈕的位置是哪來的（見 `_click_agree`）。
+        #: 主迴圈靠它決定要不要求救 —— **在猜位置**才求救，
+        #: 不是「認不認得出合約書」（那條在別人的解析度上根本不成立）。
+        self._agree_source = AGREE_FOUND
         self.progress = LoginProgress()
 
     # ---- 對外 -------------------------------------------------------
@@ -324,27 +339,51 @@ class AutoLogin:
 
     # ---- 各步驟 -----------------------------------------------------
 
-    def _click_agree(self, hwnd: int) -> None:
-        """按合約書的「同意」。**自己一個子行程**，理由見 `_send_credentials`。
+    def _click_agree(self, hwnd: int) -> str:
+        """按合約書的「同意」，回傳**位置是哪來的**（給呼叫端判斷要不要求救）。
 
         點法本身也有講究：游標移過去要**停一下**再按，遊戲的 UI 要先被
         「滑過」才會進入可按狀態（見 `input.click_foreground`）。
 
-        位置優先用設定裡學到的比例，沒有才用內建的預設值 —— 預設值是在
-        1280x800 的客戶端上量的，別人的解析度不同時會點空，那時候
-        `_learn_agree_button` 會跟他學一次。
+        三個來源，可信度由高到低：
+
+        - `AGREE_FOUND`：**在畫面上認出按鈕**。位置無關，最可信。
+        - `AGREE_LEARNED`：使用者教過的比例。
+        - `AGREE_GUESS`：內建預設比例 —— **在 1280x800 上量的，別人的解析度會點空**。
+
+        ⚠ 使用者實際踩過（朋友的機器）：一路用 `AGREE_GUESS` 點空氣點了 11 次，
+          日誌上完全看不出來 —— 因為這裡以前只有 `log.debug`。所以來源一變就要
+          講一句話，尤其是退到猜的時候。
         """
+        source = AGREE_FAILED
+        spot = None
         try:
             # ⚠ **先從畫面把按鈕找出來**（`agree_button_by_look`）。
             # 合約書是遊戲自己畫的小視窗，而且**可以拖動** —— 用視窗大小算比例
             # 在別的解析度會跑掉，被拖一下也會跑掉。找不到才退回比例法。
             # ⚠ 搜尋要在**子行程**裡做：截圖與送輸入不能在同一個行程（[INP-009]）。
             spot = input_helper.agree_button(hwnd)
+            source = AGREE_FOUND
             if spot is None:
-                spot = game_screen.agree_button_position(hwnd, self._agree_ratio())
+                ratio = self._agree_ratio()
+                spot = game_screen.agree_button_position(hwnd, ratio)
+                source = AGREE_LEARNED if ratio else AGREE_GUESS
             input_helper.send(hwnd, [input_helper.click(*spot)])
         except (input_helper.InputHelperError, game_screen.ScreenError) as exc:
             log.debug("點合約書失敗（可能沒有合約書）：%s", exc)
+            source = AGREE_FAILED
+        if source != self._agree_source:
+            self._agree_source = source
+            where = f"螢幕 {spot}" if spot else "（沒點成）"
+            if source == AGREE_GUESS:
+                log.warning(
+                    "畫面上認不出「同意」按鈕，只能用**內建預設比例**點 %s ——"
+                    "你的客戶端解析度如果不是 1280x800，這一下多半點在空的地方",
+                    where,
+                )
+            else:
+                log.info("同意按鈕的位置來自「%s」→ %s", source, where)
+        return source
 
     @staticmethod
     def _agree_ratio() -> tuple[float, float] | None:
@@ -368,9 +407,18 @@ class AutoLogin:
         [INP-001]），而按鈕位置會隨客戶端的解析度設定跑掉 ——
         內建的比例是在 1280x800 上量的。與其猜別人的版面，不如問一次。
 
-        怎麼知道他按了哪裡：一直看兩件事 —— 游標在哪、畫面還是不是合約書。
-        合約書消失的**那一瞬間**，游標所在的位置就是按鈕（存成視窗內的比例）。
-        中途游標亂晃沒關係，我們只取轉變前最後一個落在視窗內的位置。
+        怎麼知道他按了哪裡：**看他真的按下左鍵**（按下緣 ＋ 當下的游標位置），
+        只要那一點落在遊戲視窗裡就學起來。
+
+        ⚠⚠ 以前唯一的訊號是「合約書消失的那一瞬間游標在哪」，而「合約書在不在」
+        要問 `game_screen.detect()` —— 它用**視窗的固定比例區塊**判斷，
+        可是合約書是**可拖動的小視窗**，解析度不同就整個對不上。
+        使用者朋友的機器實際踩到：認不出合約書 → 這個函式根本沒被呼叫過 →
+        永遠學不到 → 用內建比例點空氣點了 11 次。
+        所以現在主訊號改成「按下左鍵」（跟畫面長什麼樣完全無關），
+        「合約書消失」降級成輔助訊號，而且**必須先真的看到過合約書**才算數 ——
+        不然認不出合約書的機器會在第一拍就以為「已經過了」，
+        把當下的游標位置學成按鈕（很有自信的錯值）。
         """
         import ctypes
         from ctypes import wintypes
@@ -378,55 +426,78 @@ class AutoLogin:
         from ro_toolbox.config.settings import current_settings, save_settings
 
         user32 = ctypes.windll.user32
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        shot = self._save_screen(hwnd)
         self._step(
             "自動按不掉合約書（你的解析度可能跟預設值不同）—— "
             "請你手動按一次「同意」，我會把位置記起來，之後就不用了"
+            + (f"（畫面已存到 {shot}）" if shot else "")
         )
+
+        def learn(point: tuple[int, int], why: str) -> bool:
+            ratio = game_screen.window_ratio_of(hwnd, *point)
+            if ratio is None or not (0.0 < ratio[0] < 1.0 and 0.0 < ratio[1] < 1.0):
+                return False
+            settings = current_settings()
+            settings.agree_button = [round(ratio[0], 4), round(ratio[1], 4)]
+            try:
+                save_settings(settings)
+            except Exception as exc:  # noqa: BLE001 - 存不了不該讓登入失敗
+                log.warning("學到的同意按鈕位置存不起來：%s", exc)
+            self._step(
+                f"記起來了（{why}）：同意按鈕在視窗的 "
+                f"({ratio[0]:.4f}, {ratio[1]:.4f})，下次自動按"
+            )
+            return True
+
         deadline = time.monotonic() + timeout
         last: tuple[int, int] | None = None
+        seen_eula = False
+        was_down = bool(user32.GetAsyncKeyState(_VK_LBUTTON) & 0x8000)
         while time.monotonic() < deadline:
             point = wintypes.POINT()
+            here: tuple[int, int] | None = None
             if user32.GetCursorPos(ctypes.byref(point)):
                 ratio = game_screen.window_ratio_of(hwnd, point.x, point.y)
                 if ratio and 0.0 < ratio[0] < 1.0 and 0.0 < ratio[1] < 1.0:
-                    last = (point.x, point.y)
+                    here = last = (point.x, point.y)
+            # ★ 主訊號：左鍵的**按下緣**，而且要按在遊戲視窗裡。
+            down = bool(user32.GetAsyncKeyState(_VK_LBUTTON) & 0x8000)
+            pressed, was_down = (down and not was_down), down
+            if pressed and here is not None and learn(here, "看到你按下去"):
+                return True
             try:
-                gone = game_screen.detect(
-                    game_screen.capture(hwnd)
-                ) is not game_screen.Stage.EULA
+                stage = game_screen.detect(game_screen.capture(hwnd))
             except game_screen.ScreenError:
-                gone = False
-            if gone:
+                stage = None
+            seen_eula = seen_eula or stage is game_screen.Stage.EULA
+            # 輔助訊號：**真的看過合約書**之後它消失了 —— 那一瞬間游標在哪。
+            if seen_eula and stage is not None and stage is not game_screen.Stage.EULA:
                 if last is None:
                     self._step("合約書過了，但沒看到你按在哪 —— 這次不學")
                     return True
-                ratio = game_screen.window_ratio_of(hwnd, *last)
-                if ratio is None:
-                    return True
-                settings = current_settings()
-                settings.agree_button = [round(ratio[0], 4), round(ratio[1], 4)]
-                try:
-                    save_settings(settings)
-                except Exception as exc:  # noqa: BLE001 - 存不了不該讓登入失敗
-                    log.warning("學到的同意按鈕位置存不起來：%s", exc)
-                self._step(
-                    f"記起來了：同意按鈕在視窗的 "
-                    f"({ratio[0]:.4f}, {ratio[1]:.4f})，下次自動按"
-                )
+                learn(last, "合約書消失時游標在那裡")
                 return True
             time.sleep(_POLL)
+        self._step("等不到你按「同意」—— 位置沒學到，下次還是只能用預設值")
         return False
 
-    def _still_on_eula(self, hwnd: int) -> bool:
-        """畫面是不是還停在合約書。判斷不出來就當作不是 —— 這個判斷只用來
-        決定「要不要改口問使用者」，寧可不問也不要問錯。"""
+    def _save_screen(self, hwnd: int) -> str | None:
+        """把現在的畫面存成 PNG，回傳路徑。存不了回 None（不該讓登入失敗）。
+
+        為什麼要存：畫面認不出來的時候，**那張圖是唯一能拿來修辨識的東西**。
+        只在「已經卡住、要請使用者幫忙」的時候存一張，不是每次登入都存。
+        ⚠ 只在合約書這一關存 —— 登入畫面上有打好的帳號。
+        """
         try:
-            return game_screen.detect(
-                game_screen.capture(hwnd)
-            ) is game_screen.Stage.EULA
-        except Exception as exc:  # noqa: BLE001
-            log.debug("判斷畫面失敗：%s", exc)
-            return False
+            from ro_toolbox.config.paths import log_dir
+
+            path = log_dir() / "eula-screen.png"
+            image = game_screen.capture(hwnd)
+            return str(path) if image.save(str(path)) else None
+        except Exception as exc:  # noqa: BLE001 - 存圖失敗不該影響登入
+            log.debug("存不了畫面：%s", exc)
+            return None
 
     def _clear_actions(self) -> list[dict]:
         """把目前這一格清乾淨，**兩個方向都清**。
@@ -1152,8 +1223,13 @@ class AutoLogin:
                 return False
             attempt += 1
             if (not asked and attempt > _AGREE_TRIES
-                    and self._still_on_eula(hwnd)):
-                # 點了好幾次還在合約書 = 位置對不上，別再盲點下去。
+                    and self._agree_source in AGREE_UNSURE):
+                # ⚠⚠ 這個條件以前是 `self._still_on_eula(hwnd)`，而那條靠
+                #    `game_screen.detect()` —— 它用**視窗的固定比例區塊**判斷，
+                #    而合約書是可拖動的小視窗，解析度不同就整個對不上。
+                #    使用者朋友的機器實際踩到：認不出合約書 → 永遠不求救 →
+                #    用 1280x800 量的內建比例點了 11 次空氣，日誌上看不出原因。
+                #    現在的判準是**「我們自己在猜位置」**，那才是該求救的理由。
                 asked = True
                 self._learn_agree_button(hwnd, min(_AGREE_LEARN_SEC,
                                                    deadline - time.monotonic()))
@@ -1166,7 +1242,7 @@ class AutoLogin:
             # **否決**：那要在主行程截圖，而 tests/test_auto_login.py 明確釘著
             # 「AutoLogin 不准自己截圖（[INP-009]）」。省下來的時間也有限 ——
             # 探針判焦點之後重試本來就少了，多點那一下落在背景圖上是無害的。
-            self._click_agree(hwnd)
+            self._agree_source = self._click_agree(hwnd)
             try:
                 # Enter 單獨留到最後，中間插一次**純觀察**的記錄
                 # （只寫日誌，不做決定 —— 見 `_note_field_placement`）。
@@ -1240,16 +1316,24 @@ class AutoLogin:
                 # 視窗訊息（[INP-001]），只能用滑鼠點，而按鈕位置是用視窗大小的
                 # 比例算的（在 1942x1256 上量的）。別人的客戶端解析度不同時，
                 # 那一下就可能點空 —— 要講出來，不要只說「帳密沒送出去」。
-                stage = "不明"
-                try:
-                    stage = game_screen.detect(game_screen.capture(hwnd)).value
-                except Exception as exc:  # noqa: BLE001 - 只是為了講清楚，失敗就算了
-                    log.debug("收尾判定畫面失敗：%s", exc)
-                extra = (
-                    "（畫面還停在合約書 —— 多半是「同意」按鈕的位置對不上"
-                    "你的解析度，請手動按一次同意）"
-                    if stage == game_screen.Stage.EULA.value else f"（畫面：{stage}）"
-                )
+                # ⚠ 講「我們有沒有把握」，不要只講「畫面認不認得出來」。
+                #   認不出畫面本身就是別人解析度不同時的常態（使用者朋友的機器），
+                #   照舊版的寫法只會印「（畫面：不明）」—— 對使用者毫無幫助。
+                if self._agree_source in AGREE_UNSURE:
+                    shot = self._save_screen(hwnd)
+                    extra = (
+                        f"（「同意」按鈕的位置是**{self._agree_source}**猜的，"
+                        "很可能一直點在空的地方 —— 請手動按一次同意，"
+                        "我就會把位置記起來"
+                        + (f"；畫面已存到 {shot}）" if shot else "）")
+                    )
+                else:
+                    stage = "不明"
+                    try:
+                        stage = game_screen.detect(game_screen.capture(hwnd)).value
+                    except Exception as exc:  # noqa: BLE001 - 只為講清楚，失敗就算了
+                        log.debug("收尾判定畫面失敗：%s", exc)
+                    extra = f"（同意按鈕點得到，畫面：{stage}）"
                 self.progress.fail(
                     "輸入帳號密碼",
                     f"打了 {attempt} 次，客戶端都沒有連上伺服器 —— 帳密沒送出去。{extra}",

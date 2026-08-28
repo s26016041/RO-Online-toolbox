@@ -669,6 +669,127 @@ def test_a_broken_saved_ratio_falls_back_to_the_builtin(monkeypatch):
         assert bot._agree_ratio() is None, bad
 
 
+def _settings_in(monkeypatch, tmp_path):
+    from ro_toolbox.config import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "config_file", lambda: tmp_path / "s.json")
+    monkeypatch.setattr(settings_module, "_current", settings_module.AppSettings())
+    return settings_module
+
+
+def _no_mouse(monkeypatch, down=False):
+    """把左鍵狀態固定住（預設沒按），這樣測試不會被真的滑鼠影響。"""
+    import ctypes
+
+    monkeypatch.setattr(
+        ctypes.windll.user32, "GetAsyncKeyState",
+        lambda _vk: (-32768 if down else 0),
+    )
+
+
+def test_agree_click_reports_where_the_position_came_from(monkeypatch, tmp_path):
+    """⚠ 使用者朋友的機器實際踩過：解析度跟我們不同 → 用內建比例點了 11 次空氣。
+
+    以前這裡只有 `log.debug`，日誌上完全看不出「其實在猜」。
+    現在 `_click_agree` 要把來源講出來，主迴圈才有辦法決定要不要求救。
+    """
+    _settings_in(monkeypatch, tmp_path)
+    bot = AutoLogin(_account(), 1, lambda _: None)
+    monkeypatch.setattr(auto_login.input_helper, "send", lambda *a, **k: None)
+    monkeypatch.setattr(
+        auto_login.game_screen, "agree_button_position", lambda hwnd, ratio: (5, 6)
+    )
+
+    # 1) 畫面上認出來 —— 最可信
+    monkeypatch.setattr(auto_login.input_helper, "agree_button", lambda hwnd: (11, 22))
+    assert bot._click_agree(0x1) == auto_login.AGREE_FOUND
+
+    # 2) 認不出來、也沒學過 —— 只能用內建比例**猜**
+    monkeypatch.setattr(auto_login.input_helper, "agree_button", lambda hwnd: None)
+    assert bot._click_agree(0x1) == auto_login.AGREE_GUESS
+
+    # 3) 認不出來，但使用者教過 —— 用學到的
+    from ro_toolbox.config import settings as settings_module
+
+    settings_module.current_settings().agree_button = [0.5, 0.6]
+    assert bot._click_agree(0x1) == auto_login.AGREE_LEARNED
+
+    # 猜與學到的都算「沒把握」，那才是該求救的理由（不是「認不認得出合約書」）
+    assert auto_login.AGREE_GUESS in auto_login.AGREE_UNSURE
+    assert auto_login.AGREE_LEARNED in auto_login.AGREE_UNSURE
+    assert auto_login.AGREE_FOUND not in auto_login.AGREE_UNSURE
+
+
+def test_learning_works_even_when_the_screen_is_unrecognisable(monkeypatch, tmp_path):
+    """★ 這就是朋友那台的情況：解析度不同 → `detect()` 永遠認不出合約書。
+
+    學習的主訊號因此改成「看到他按下左鍵」—— 跟畫面長什麼樣完全無關。
+    """
+    import ctypes
+
+    settings_module = _settings_in(monkeypatch, tmp_path)
+    bot = AutoLogin(_account(), 1, lambda _: None)
+    monkeypatch.setattr(auto_login.game_screen, "capture", lambda hwnd: object())
+    # 認不出來：從頭到尾都是 UNKNOWN
+    monkeypatch.setattr(auto_login.game_screen, "detect", lambda img: Stage.UNKNOWN)
+    monkeypatch.setattr(
+        game_screen, "window_ratio_of", lambda hwnd, x, y: (x / 1000, y / 500)
+    )
+    monkeypatch.setattr(AutoLogin, "_save_screen", lambda self, hwnd: None)
+
+    class _Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    def _cursor(ref):
+        point = ctypes.cast(ref, ctypes.POINTER(_Point)).contents
+        point.x, point.y = 400, 300
+        return 1
+
+    monkeypatch.setattr(ctypes.windll.user32, "GetCursorPos", _cursor)
+    # 第一拍沒按、第二拍按下去（按下緣）
+    states = [0, -32768, -32768]
+    monkeypatch.setattr(
+        ctypes.windll.user32, "GetAsyncKeyState",
+        lambda _vk: states.pop(0) if states else 0,
+    )
+    assert bot._learn_agree_button(0x1234, timeout=5.0) is True
+    assert settings_module.current_settings().agree_button == [0.4, 0.6]
+
+
+def test_it_will_not_learn_a_random_spot_when_it_cannot_see_the_eula(
+    monkeypatch, tmp_path
+):
+    """⚠ 認不出合約書的機器上，「合約書消失了」這個訊號**第一拍就成立** ——
+    照舊版的寫法會把當下的游標位置學成按鈕，那是很有自信的錯值。
+
+    所以輔助訊號要先**真的看過合約書**才算數；沒看過就只認「按下左鍵」。
+    """
+    import ctypes
+
+    settings_module = _settings_in(monkeypatch, tmp_path)
+    bot = AutoLogin(_account(), 1, lambda _: None)
+    monkeypatch.setattr(auto_login.game_screen, "capture", lambda hwnd: object())
+    monkeypatch.setattr(auto_login.game_screen, "detect", lambda img: Stage.UNKNOWN)
+    monkeypatch.setattr(
+        game_screen, "window_ratio_of", lambda hwnd, x, y: (x / 1000, y / 500)
+    )
+    monkeypatch.setattr(AutoLogin, "_save_screen", lambda self, hwnd: None)
+
+    class _Point(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+    def _cursor(ref):
+        point = ctypes.cast(ref, ctypes.POINTER(_Point)).contents
+        point.x, point.y = 400, 300
+        return 1
+
+    monkeypatch.setattr(ctypes.windll.user32, "GetCursorPos", _cursor)
+    _no_mouse(monkeypatch)                       # 使用者從頭到尾沒按
+    monkeypatch.setattr(auto_login, "_POLL", 0.001)
+    assert bot._learn_agree_button(0x1234, timeout=0.05) is False
+    assert settings_module.current_settings().agree_button is None, "不准亂學"
+
+
 def test_learning_records_where_the_user_clicked(monkeypatch, tmp_path):
     """合約書消失的那一瞬間，游標在哪就把那裡記成按鈕（存比例不存座標）。"""
     import ctypes
@@ -695,6 +816,8 @@ def test_learning_records_where_the_user_clicked(monkeypatch, tmp_path):
         return 1
 
     monkeypatch.setattr(ctypes.windll.user32, "GetCursorPos", _cursor)
+    _no_mouse(monkeypatch)          # 這一條驗的是「合約書消失」那個輔助訊號
+    monkeypatch.setattr(AutoLogin, "_save_screen", lambda self, hwnd: None)
     assert bot._learn_agree_button(0x1234, timeout=5.0) is True
     assert settings_module.current_settings().agree_button == [0.4, 0.6]
 
