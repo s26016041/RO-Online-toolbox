@@ -247,3 +247,61 @@ def test_resending_is_fast_enough_to_out_pace_being_hit():
     from ro_toolbox.services import walker as mod
 
     assert mod.RESEND_SEC <= 0.3
+
+
+# ---- 學到的步幅不准被重新規劃打掉（使用者實測：連送 21 個一樣的封包）--------
+
+
+def test_a_shrunk_step_survives_a_new_path():
+    """⚠⚠ 移動被拒絕時步幅會對半縮，去找伺服器肯收的長度。
+
+    但呼叫端一發現「這段走不成」就會重新規劃、重新 `set_path()` ——
+    舊版在那裡把步幅打回 `MAX_STEP`，等於**永遠學不會**：
+    使用者實機 2026-08-28 在 izlu2dun 連送 21 個一模一樣的封包
+    （解回來都是同一格），角色一步都沒動。
+    """
+    from ro_toolbox.services import walker as mod
+
+    walker = mod.Walker(lambda x, y: None)
+    walker.set_path([(x, 0) for x in range(1, 40)])
+    walker._step = 5                      # 假設已經縮到 5
+
+    walker.set_path([(x, 0) for x in range(1, 40)])
+    assert walker._step == 5, "重新規劃不該把學到的步幅丟掉"
+
+
+def test_a_new_path_never_starts_crawling():
+    """縮太小的話新路徑會一格一格爬 —— 至少要從 CARRY_MIN 起跳。"""
+    from ro_toolbox.services import walker as mod
+
+    walker = mod.Walker(lambda x, y: None)
+    walker.set_path([(x, 0) for x in range(1, 40)])
+    walker._step = 1
+
+    walker.set_path([(x, 0) for x in range(1, 40)])
+    assert walker._step == mod.CARRY_MIN
+
+
+def test_a_successful_move_restores_the_full_step():
+    """成功一次就回到最大步幅，所以縮了不必怕回不去。"""
+    from ro_toolbox.services import walker as mod
+
+    sent = []
+    walker = mod.Walker(lambda x, y: sent.append((x, y)))
+    walker.set_path([(x, 0) for x in range(1, 40)])
+    walker._step = 5
+    walker.update((0, 0))
+    walker.note_move_ack(sent[-1])
+    walker.update((0, 0))
+    assert walker._step == mod.MAX_STEP
+
+
+def test_the_step_is_short_enough_for_diagonal_moves():
+    """⚠ [PKT-030] 的「≤17 接受」是**直線**量的，斜走的上限低很多。
+
+    使用者實機 2026-08-28 在 izlu2dun 同一條開闊斜線上逐格量：
+    14 格被忽略、12 格被忽略、10 / 8 / 6 格會動。
+    """
+    from ro_toolbox.services import walker as mod
+
+    assert mod.MAX_STEP <= 10
