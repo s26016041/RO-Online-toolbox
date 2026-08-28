@@ -58,7 +58,7 @@ from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.travel_bot import TravelBot
 from ro_toolbox.ui.pages.base_page import BasePage
-from ro_toolbox.ui.widgets.toast import show_toast
+from ro_toolbox.ui.widgets.toast import show_notice
 
 log = logging.getLogger(__name__)
 
@@ -179,8 +179,9 @@ class CharacterCard(QWidget):
     potion_stats = Signal(object)
     #: 使用者按下／取消「自動尋路」。參數：是否開啟。
     travel_toggled = Signal(bool)
-    #: 使用者按下／放開「暫停」。參數：是否暫停。
-    travel_paused = Signal(bool)
+    #: 使用者按了「暫停」。**沒有參數** —— 這顆只會暫停，
+    #: 要繼續是再按一次「自動尋路」（使用者指定）。
+    travel_pause_pressed = Signal()
     #: 背景 TravelBot 回報狀態。
     travel_stats = Signal(object)
 
@@ -191,6 +192,12 @@ class CharacterCard(QWidget):
         #: 這一趟的「到了」通知跳過沒有。bot 停下來時還會再回報一次同一份
         #: stats（arrived 仍是 True），沒有這道閘門會跳兩次。
         self._travel_notified = False
+        #: 死亡通知跳過沒有。bot 停下來時還會再回報一次同一份 stats
+        #: （died 仍是 True），沒有這道閘門會連跳兩個框。
+        self._death_notified = False
+        #: 現在是不是在趕路／是不是暫停中（決定暫停鈕能不能按）
+        self._travel_busy = False
+        self._travel_paused = False
         #: 想選但清單裡還沒出現的道具（背包是非同步讀的，選單填好才選得到）
         self._want_item: dict[str, int | None] = {"hp": None, "sp": None, "home": None}
         #: True = 現在是**程式自己**在改 UI，不是使用者的意思 —— 這種變動不存檔。
@@ -336,32 +343,46 @@ class CharacterCard(QWidget):
         return self.auto_travel
 
     def _make_pause_button(self) -> QPushButton:
-        """趕路中站住不動，再按一次接下去。
+        """趕路中站住不動。**只有暫停，沒有繼續** —— 要繼續是再按一次「自動尋路」。
+
+        使用者指定的形狀：「自動尋路按鈕只需要暫停就好不需要變成繼續，
+        他要繼續可以再按一次自動尋路就會繼續了」。所以這顆**不是**開關，
+        按下去就是暫停，然後自己壓成不能按；「自動尋路」那顆會彈起來，
+        看起來就是「可以再按一次」。
 
         ⚠ 為什麼不叫人「取消再按一次」：取消是**收攤** —— 關 socket、關封包
-        擷取、忘掉這一趟學到的傳點黑名單，再開一次要重新 AOB 定位、重新複製
+        擷取、忘掉這一趟學到的傳點黑名單，再開要重新 AOB 定位、重新複製
         socket（剛換頻道那幾秒常常複製不到，[PKT-072]）。暫停只是不送走路封包。
 
         沒在趕路時**壓著不能按**（不是藏起來）：藏起來會讓版面跳動，
         而且看不到就不知道有這個功能。
         """
         self.travel_pause = QPushButton("暫停")
-        self.travel_pause.setCheckable(True)
         self.travel_pause.setEnabled(False)
         self.travel_pause.setFixedHeight(self.ROW_HEIGHT)
         self.travel_pause.setMinimumWidth(self.TRAVEL_BUTTON_MIN_W)
         self.travel_pause.setToolTip(
-            "趕路中站住不動，再按一次從現在的位置接下去。"
+            "趕路中站住不動。要繼續就再按一次「自動尋路」，"
+            "會從現在的位置接下去（連線與路線都留著）。"
             "⚠ 已經送出去的那一段會走完（移動是伺服器帶的，沒有「立刻站住」的封包）。"
         )
-        self.travel_pause.toggled.connect(self._on_pause_toggled)
+        self.travel_pause.clicked.connect(self.travel_pause_pressed)
         return self.travel_pause
 
-    def _on_pause_toggled(self, on: bool) -> None:
-        """按鈕文字要跟著狀態走 —— 壓著卻寫「暫停」會看不出現在是哪一邊。"""
-        self.travel_pause.setText("繼續" if on else "暫停")
-        if not self.quiet:
-            self.travel_paused.emit(on)
+    def set_travel_paused(self, paused: bool) -> None:
+        """暫停中的樣子：暫停鈕壓著不能按，「自動尋路」彈起來等你再按一次。
+
+        ⚠ 改「自動尋路」的狀態時**一定要擋住訊號**：那顆的 `toggled` 直接接到
+        `travel_toggled`，不擋的話彈起來會被當成「使用者要取消」，
+        整個 bot 就被收攤掉了 —— 正好是暫停要避免的事。
+        """
+        self._travel_paused = paused
+        self.travel_pause.setEnabled(self._travel_busy and not paused)
+        blocked = self.auto_travel.blockSignals(True)
+        try:
+            self.auto_travel.setChecked(self._travel_busy and not paused)
+        finally:
+            self.auto_travel.blockSignals(blocked)
 
     def _make_destination_box(self) -> QComboBox:
         """目的地選單：**打中文或地圖代碼都能搜**。
@@ -404,6 +425,7 @@ class CharacterCard(QWidget):
         """⚠ 這裡**不記日誌** —— `TravelBot._note()` 已經記過了。
         兩邊都記的症狀是同一句話印兩次（實測：「前往 依斯魯得島　前往 izlude」）。
         介面上唯一的表現是：bot 停了，按鈕就彈起來。"""
+        self._notify_death(stats)
         if getattr(stats, "arrived", False) and not self._travel_notified:
             # 到了要**跳到螢幕最前面**講一聲：趕路動輒幾十秒，人早就切回遊戲
             # 或去做別的事了，只寫在日誌等於沒講。
@@ -413,7 +435,9 @@ class CharacterCard(QWidget):
             body = f"{who} 已抵達 {where}"
             if stats.note:
                 body = f"{body}\n{stats.note}"
-            show_toast("自動尋路：到了", body)
+            # 使用者指定：要**按確定才消失**的驚嘆號框，不是幾秒後自己收掉的
+            # 那種 —— 趕路要幾十秒，人早就離開電腦，自動收掉等於沒講。
+            show_notice("自動尋路：到了", body)
         if not stats.running:
             # 走完（或失敗）就把按鈕彈起來 —— 按鈕壓著卻沒在走，
             # 看起來會像「還在趕路」，那是最糟的失效方式。
@@ -422,17 +446,13 @@ class CharacterCard(QWidget):
 
     def set_travel_busy(self, busy: bool) -> None:
         """趕路途中不讓人再去勾自動打怪 —— 兩個都在送走路封包會互相打架。"""
+        self._travel_busy = busy
         self.auto_hunt.setEnabled(not busy)
         self.travel_pause.setEnabled(busy)
-        if not busy and self.travel_pause.isChecked():
-            # ⚠ 停下來時要把暫停彈回來，**而且不能反過來通知 bot**
-            # （bot 已經沒了）。按鈕壓著卻沒在趕路是最糟的失效方式：
-            # 下一趟開始時它看起來像「一開始就暫停」。
-            self.quiet = True
-            try:
-                self.travel_pause.setChecked(False)
-            finally:
-                self.quiet = False
+        if not busy:
+            # 停下來就不是「暫停中」了。下一趟要從乾淨的狀態開始，
+            # 不然新的一趟看起來會像「一開始就暫停」。
+            self._travel_paused = False
         if busy:
             self._travel_notified = False  # 新的一趟，抵達通知重新算
 
@@ -658,10 +678,29 @@ class CharacterCard(QWidget):
     def _apply_farm_stats(self, stats: FarmStats) -> None:
         """⚠ 這裡**不寫任何介面文字**（使用者指定：提示字一律進執行日誌）。
         擊殺／撿取／目標與 bot 自己的 note 都由 `FarmBot._note()` 記進日誌。
-        介面上唯一的表現是：bot 停了，勾勾就彈起來。"""
+        介面上唯一的表現是：bot 停了，勾勾就彈起來。
+
+        **死亡是唯一的例外**：使用者指定死了要跳「按確定才消失」的通知窗，
+        而且**只**關掉自動打怪，別的什麼都不做（不回城、不重連、不繼續打）。
+        """
+        self._notify_death(stats)
         if not stats.running and self.auto_hunt.isChecked():
             # 勾著卻沒在跑，看起來會像「還在掛機」，那是最糟的失效方式
             self.auto_hunt.setChecked(False)
+
+    def _notify_death(self, stats) -> None:  # noqa: ANN001 - FarmStats／TravelStats
+        """角色死了就跳一次通知窗。
+
+        ⚠ **只跳一次**：bot 停下來時還會再回報一次同一份 stats（`died` 仍是
+        True），沒有這道閘門會連跳兩個框。跟抵達通知同一個道理。
+        """
+        if getattr(stats, "running", False) and not getattr(stats, "died", False):
+            self._death_notified = False   # 新的一輪，下次死了要再講一次
+        if not getattr(stats, "died", False) or self._death_notified:
+            return
+        self._death_notified = True
+        who = self.character or "角色"
+        show_notice("角色死亡", f"{who} 已經死亡，自動打怪已關閉。")
 
     @staticmethod
     def _make_bar(object_name: str) -> QProgressBar:
@@ -1082,7 +1121,7 @@ class FarmPage(BasePage):
         card.potion_toggled.connect(lambda on, p=pid: self._toggle_potion(p, on))
         card.potion_changed.connect(lambda p=pid: self._apply_potion_config(p))
         card.travel_toggled.connect(lambda on, p=pid: self._toggle_travel(p, on))
-        card.travel_paused.connect(lambda on, p=pid: self._toggle_travel_pause(p, on))
+        card.travel_pause_pressed.connect(lambda p=pid: self._pause_travel(p))
 
         self._readers[pid] = reader
         self._cards[pid] = card
@@ -1409,7 +1448,14 @@ class FarmPage(BasePage):
             if card is not None:
                 card.set_travel_busy(False)
             return
-        if pid in self._travelers:
+        traveler = self._travelers.get(pid)
+        if traveler is not None:
+            # 已經有 bot 在跑。暫停中的話，**再按一次就是繼續**（使用者指定的
+            # 形狀：暫停鈕只暫停，繼續走「自動尋路」這一顆）。
+            if getattr(traveler, "paused", False):
+                traveler.resume()
+                if card is not None:
+                    card.set_travel_paused(False)
             return
 
         if pid in self._bots and card is not None and card.auto_hunt.isChecked():
@@ -1429,25 +1475,20 @@ class FarmPage(BasePage):
         self._travelers[pid] = traveler
         traveler.start()
 
-    def _toggle_travel_pause(self, pid: int, on: bool) -> None:
-        """暫停／繼續趕路。**不收攤** —— socket、封包擷取、路線與黑名單都留著。
+    def _pause_travel(self, pid: int) -> None:
+        """按下「暫停」：站住不動，但**不收攤**（socket、擷取、路線、黑名單都留著）。
 
-        找不到 bot 就把按鈕彈回去：壓著卻沒有東西在暫停，等於騙人。
+        找不到 bot 就把介面收回正常狀態 —— 壓著卻沒有東西在暫停等於騙人。
         """
         traveler = self._travelers.get(pid)
         card = self._cards.get(pid)
         if traveler is None:
             if card is not None:
-                card.quiet = True
-                try:
-                    card.travel_pause.setChecked(False)
-                finally:
-                    card.quiet = False
+                card.set_travel_paused(False)
             return
-        if on:
-            traveler.pause()
-        else:
-            traveler.resume()
+        traveler.pause()
+        if card is not None:
+            card.set_travel_paused(True)
 
     # ---- 自動補水 ---------------------------------------------------
 

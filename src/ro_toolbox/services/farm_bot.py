@@ -180,6 +180,9 @@ class FarmStats:
     walk_rejected: int = 0  # 被伺服器忽略的移動次數（診斷用）
     missed: int = 0  # 打到空氣的次數（座標過時，診斷用）
     resent: int = 0  # 補送攻擊的次數（診斷用：接近 0 就代表補送機制沒在用）
+    #: 角色死了。⚠ 跟一般的「停下來」分開報：使用者要求死亡要**跳通知窗**
+    #: （按確定才消失），而且**只**關掉自動打怪，別的什麼都不要做。
+    died: bool = False
 
 
 @dataclass
@@ -570,6 +573,9 @@ class FarmBot:
         if status is None:
             return True  # 讀不到就不亂判斷（可能正在換地圖）
         if status.hp <= 0:
+            # ⚠ 使用者指定：死了就**跳通知窗＋關掉自動打怪，別的都不要做**
+            # （不要自己回城、不要重連、不要繼續打）。`died` 讓介面分得出來。
+            self._stats.died = True
             self._fail("⚠ 角色已死亡，自動打怪已停止")
             return False
 

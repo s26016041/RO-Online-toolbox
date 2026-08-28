@@ -541,12 +541,23 @@ class Traveler:
         return None, frozenset()
 
     def _plan(self, map_name: str, avoid: set[tuple[str, int, int]]):
-        """算一條路線。**先試純走路**，走不到才把要對話的 NPC 連結算進來 ——
-        BFS 只看換圖次數，不擋的話它會為了少換一張圖就叫你去搭船。"""
-        route = plan_route(map_name, self._goal_map, avoid)
-        if route is None:
-            route = plan_route(map_name, self._goal_map, avoid, allow_npc=True)
-        return route
+        """算一條路線：**換最少張圖的那條，船／飛空艇／傳送師都算進來**。
+
+        使用者指定：「自動尋路盡量選擇可以 NPC 傳送、走最少地圖的路線」。
+        所以一律 `allow_npc=True` —— BFS 本來就在最小化換圖次數，把 NPC 連結
+        放進去之後，只要搭一次船比繞十幾張野外圖近，它就會挑船。
+        實測 `prontera → cmd_fild03`：純走路 26 段，加上飛空艇 18 段。
+
+        ⛔ **舊行為（先試純走路，走得到就不麻煩人）已經拿掉。** 那是為了
+        「不要為了少換一張圖就叫你去搭船」，但使用者要的正是相反的偏好。
+        代價講清楚：NPC 那一段要對話（`travel_bot` 會自己講，看不懂選單就停
+        下來等人），而傳送師要花錢。純走路的路線仍然在候選裡 —— 只是不再
+        無條件優先。
+
+        ⚠ 862 條 NPC 連結**每一條都有外觀編號**（實測），所以不必再分
+        「講得動的」與「講不動的」兩層 —— 認人的資料一定有。
+        """
+        return plan_route(map_name, self._goal_map, avoid, allow_npc=True)
 
     def _dead_end(self, route: list[Hop]) -> Hop | None:
         """路線上哪一段**落地之後走不到下一道門**？沒有就回 None。
@@ -983,7 +994,9 @@ class Traveler:
         self._clear_warp()
         self._walker.clear()
         self._route_map = ""  # 逼下一拍重新規劃
-        if plan_route(map_name, self._goal_map, self._avoid) is None:
+        # ⚠ 這裡也要 `allow_npc=True`，判準才跟 `_plan()` 一致。
+        # 不一致的話會出現「其實有船可以搭，卻回報走不到」的假失敗。
+        if plan_route(map_name, self._goal_map, self._avoid, allow_npc=True) is None:
             fallback = _no_route_note(map_name, self._goal_map, excluded=True)
             self.note = f"{reason}\n{fallback}" if reason else fallback
             return "blocked"

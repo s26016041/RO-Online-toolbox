@@ -149,7 +149,7 @@ def test_arrival_pops_a_notice_on_top_once(qtbot, monkeypatch):
     from ro_toolbox.ui.pages import farm_page as mod
 
     shown = []
-    monkeypatch.setattr(mod, "show_toast", lambda *args: shown.append(args))
+    monkeypatch.setattr(mod, "show_notice", lambda *args: shown.append(args))
     card = make_card(qtbot)
     card.set_travel_busy(True)
     card.auto_travel.setChecked(True)
@@ -164,7 +164,7 @@ def test_travel_that_fails_pops_no_notice(qtbot, monkeypatch):
     from ro_toolbox.ui.pages import farm_page as mod
 
     shown = []
-    monkeypatch.setattr(mod, "show_toast", lambda *args: shown.append(args))
+    monkeypatch.setattr(mod, "show_notice", lambda *args: shown.append(args))
     card = make_card(qtbot)
     card.set_travel_busy(True)
     card._apply_travel_stats(FakeTravelStats(running=False, arrived=False, note="⚠ 到不了"))
@@ -987,7 +987,7 @@ def test_no_terrain_means_we_do_not_second_guess_the_memory(monkeypatch):
     assert sent == []
 
 
-# ---- 趕路中的「暫停」按鈕 -------------------------------------------------
+# ---- 趕路中的「暫停」按鈕（只暫停，繼續走「自動尋路」那一顆）----------------
 
 
 def test_pause_button_is_only_live_while_travelling(qtbot):
@@ -1003,52 +1003,176 @@ def test_pause_button_is_only_live_while_travelling(qtbot):
     assert card.travel_pause.isEnabled() is False
 
 
-def test_stopping_pops_the_pause_button_without_telling_the_bot(qtbot):
-    """⚠ 按鈕壓著卻沒在趕路是最糟的失效方式 —— 下一趟看起來像「一開始就暫停」。
-    彈回來的時候**不能反過來通知 bot**（那時候 bot 已經沒了）。"""
+def test_the_pause_button_never_says_resume(qtbot):
+    """使用者指定：這顆只做暫停，文字不准變成「繼續」。"""
     card = make_card(qtbot)
-    said: list[bool] = []
-    card.travel_paused.connect(said.append)
+    assert card.travel_pause.text() == "暫停"
+    assert card.travel_pause.isCheckable() is False
 
     card.set_travel_busy(True)
-    card.travel_pause.setChecked(True)
-    assert said == [True]
-    assert card.travel_pause.text() == "繼續", "文字要跟著狀態走"
-
-    card.set_travel_busy(False)
-    assert card.travel_pause.isChecked() is False
-    assert said == [True], "程式自己彈回來的，不該再通知一次"
+    card.set_travel_paused(True)
     assert card.travel_pause.text() == "暫停"
+
+
+def test_pausing_pops_the_travel_button_without_stopping_the_bot(qtbot):
+    """⚠⚠ 「自動尋路」彈起來是要讓人**再按一次繼續**，不是取消。
+
+    那顆的 toggled 直接接到 travel_toggled，程式自己改狀態時不擋訊號的話，
+    彈起來會被當成「使用者要取消」—— bot 整個被收攤，正好是暫停要避免的事。
+    """
+    card = make_card(qtbot)
+    said: list[bool] = []
+    card.travel_toggled.connect(said.append)
+
+    card.set_travel_busy(True)
+    card.auto_travel.setChecked(True)
+    assert said == [True]
+
+    card.set_travel_paused(True)
+    assert card.auto_travel.isChecked() is False, "要彈起來，才看得出可以再按一次"
+    assert said == [True], "程式自己改的，不准被當成使用者取消"
+    assert card.travel_pause.isEnabled() is False, "已經暫停了就不用再按暫停"
 
 
 class _FakeTraveler:
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.paused = False
 
     def pause(self) -> None:
         self.calls.append("pause")
+        self.paused = True
 
     def resume(self) -> None:
         self.calls.append("resume")
+        self.paused = False
+
+    def stop(self) -> None:
+        self.calls.append("stop")
 
 
-def test_the_button_actually_pauses_and_resumes_the_bot(qtbot):
+def test_pause_then_travel_again_resumes_instead_of_restarting(qtbot):
+    """使用者指定：要繼續就再按一次「自動尋路」。**不是**重開一個新的 bot。"""
+    page = _page(qtbot)
+    card = make_card(qtbot)
+    bot = _FakeTraveler()
+    page._cards[1234] = card
+    page._travelers[1234] = bot
+    card.set_travel_busy(True)
+
+    page._pause_travel(1234)
+    assert bot.calls == ["pause"]
+    assert card.auto_travel.isChecked() is False
+
+    page._toggle_travel(1234, True)          # 再按一次「自動尋路」
+    assert bot.calls == ["pause", "resume"]
+    assert page._travelers[1234] is bot, "不准換一個新的 bot（那等於收攤重來）"
+    assert card.auto_travel.isChecked() is True
+    assert card.travel_pause.isEnabled() is True
+
+
+def test_travelling_button_pressed_again_while_running_does_nothing(qtbot):
+    """沒暫停的時候再按一次不該重開，也不該偷偷 resume。"""
     page = _page(qtbot)
     bot = _FakeTraveler()
     page._travelers[1234] = bot
-
-    page._toggle_travel_pause(1234, True)
-    page._toggle_travel_pause(1234, False)
-    assert bot.calls == ["pause", "resume"]
+    page._toggle_travel(1234, True)
+    assert bot.calls == []
 
 
-def test_pausing_with_no_bot_pops_the_button_back(qtbot):
-    """壓著卻沒有東西在暫停 = 騙人。找不到 bot 就把按鈕彈回去。"""
+def test_pausing_with_no_bot_puts_the_ui_back(qtbot):
+    """壓著卻沒有東西在暫停 = 騙人。"""
     page = _page(qtbot)
     card = make_card(qtbot)
     page._cards[1234] = card
     card.set_travel_busy(True)
-    card.travel_pause.setChecked(True)
+    card.auto_travel.setChecked(True)
 
-    page._toggle_travel_pause(1234, True)   # _travelers 裡沒有 1234
-    assert card.travel_pause.isChecked() is False
+    page._pause_travel(1234)                 # _travelers 裡沒有 1234
+    assert card.travel_pause.isEnabled() is True
+    assert card.auto_travel.isChecked() is True
+
+
+# ---- 死亡：跳「按確定才消失」的框，而且只關自動打怪 ------------------------
+
+
+class FakeFarmStats:
+    def __init__(self, **kw) -> None:
+        self.running = kw.get("running", True)
+        self.kills = 0
+        self.picked = 0
+        self.monsters_near = 0
+        self.target = ""
+        self.note = kw.get("note", "")
+        self.last_loot = ""
+        self.walk_rejected = 0
+        self.missed = 0
+        self.resent = 0
+        self.died = kw.get("died", False)
+
+
+def test_death_pops_a_notice_and_only_turns_off_auto_hunt(qtbot, monkeypatch):
+    """使用者指定：死了就跳通知窗、關掉自動打怪，**別的什麼都不要做**。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    shown = []
+    monkeypatch.setattr(mod, "show_notice", lambda *args: shown.append(args))
+    card = make_card(qtbot)
+    card.character = "狐狐狸"
+    card.auto_hunt.setChecked(True)
+
+    card._apply_farm_stats(FakeFarmStats(running=False, died=True))
+    assert len(shown) == 1
+    assert "狐狐狸" in shown[0][1]
+    assert card.auto_hunt.isChecked() is False
+
+
+def test_death_only_pops_one_notice(qtbot, monkeypatch):
+    """bot 停下來時還會再回報一次同一份 stats（died 仍是 True）—— 只准跳一次。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    shown = []
+    monkeypatch.setattr(mod, "show_notice", lambda *args: shown.append(args))
+    card = make_card(qtbot)
+    card._apply_farm_stats(FakeFarmStats(running=True, died=True))
+    card._apply_farm_stats(FakeFarmStats(running=False, died=True))
+    assert len(shown) == 1
+
+
+def test_a_new_run_can_report_death_again(qtbot, monkeypatch):
+    """再開一輪又死了，還是要講 —— 閘門只擋同一輪的重複回報。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    shown = []
+    monkeypatch.setattr(mod, "show_notice", lambda *args: shown.append(args))
+    card = make_card(qtbot)
+    card._apply_farm_stats(FakeFarmStats(running=False, died=True))
+    card._apply_farm_stats(FakeFarmStats(running=True, died=False))   # 新的一輪
+    card._apply_farm_stats(FakeFarmStats(running=False, died=True))
+    assert len(shown) == 2
+
+
+def test_the_arrival_notice_needs_an_ok_press(qtbot):
+    """使用者指定：抵達的框要**按確定才消失**，不能自己收掉。"""
+    from ro_toolbox.ui.widgets.toast import TopToast
+
+    notice = TopToast("到了", "測試", seconds=0, icon="⚠", need_ok=True)
+    qtbot.addWidget(notice)
+    assert notice.ok_button.text() == "確定"
+
+    closed: list[int] = []
+    notice.close = lambda: closed.append(1)   # 攔下關閉，看誰會關它
+    notice.mousePressEvent(None)
+    assert closed == [], "點旁邊不算 —— 使用者要求按確定才消失"
+
+
+def test_the_plain_toast_still_closes_on_a_click(qtbot):
+    """一般通知（沒有確定鈕）維持原本的行為：點一下就收。"""
+    from ro_toolbox.ui.widgets.toast import TopToast
+
+    toast = TopToast("進度", "測試", seconds=0)
+    qtbot.addWidget(toast)
+    closed: list[int] = []
+    toast.close = lambda: closed.append(1)
+    toast.mousePressEvent(None)
+    assert closed == [1]

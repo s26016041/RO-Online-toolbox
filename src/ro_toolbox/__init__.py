@@ -1,6 +1,6 @@
 """RO Online Toolbox — 桌面自動化工具箱。"""
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 APP_NAME = "RO Online Toolbox"
 ORG_NAME = "ro-toolbox"

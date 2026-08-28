@@ -92,6 +92,8 @@ class TravelStats:
     arrived: bool = False
     #: 使用者按了暫停。**還在跑**（連線、擷取、路線都留著），只是不送走路封包。
     paused: bool = False
+    #: 角色死了。跟一般的失敗分開報 —— 介面要跳「按確定才消失」的通知窗。
+    died: bool = False
 
 
 class TravelBot:
@@ -387,6 +389,7 @@ class TravelBot:
             status = self._reader.read() if self._reader else None
             pos = self._reader.read_position() if self._reader else None
             if status is not None and status.hp <= 0:
+                self._stats.died = True
                 self._fail("⚠ 角色已死亡，自動尋路已停止")
                 return
             # 座標讀不到（換圖中、或定位失效）就這一拍不動 ——
