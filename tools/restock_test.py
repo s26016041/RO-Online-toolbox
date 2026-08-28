@@ -1,4 +1,4 @@
-r"""實機跑一次「走去商人 → 買藥水到負重 80% → 走去船員」，用數字驗收。
+r"""實機跑一次「走去商人 → 買 HP 藥水到負重 69% → 走去船員」，用數字驗收。
 
     .venv\Scripts\python.exe tools\restock_test.py --item 502
 
@@ -77,7 +77,7 @@ def walk_to(pid: int, where: str, cell: tuple[int, int] | None, log: list) -> bo
 
 def shop(pid: int, look: int, cell: tuple[int, int], order: RestockOrder,
          log: list, known: dict | None = None) -> Restocker:
-    """站在商人旁邊之後的那一段：認人 → 開店 → 量單位重 → 買到 80%。
+    """站在商人旁邊之後的那一段：認人 → 開店 → 量單位重 → 買到 69%。
 
     `known` 是**走路途中**看到的實體 `{gid: (外觀, x, y, ...)}`。
     ⚠ 沒有它多半認不出商人：實體只在**進入視野**時送一次封包（[PKT-061]），

@@ -1,8 +1,9 @@
 """回程之後自動補藥水的決策（不需遊戲，也不會送任何真的封包）。
 
 釘住使用者指定的四條規則：
-  1. 買設定裡的那瓶；**沒設 SP 就完全不碰 SP**
-  2. 買到「現在負重 ＋ 買下去的重量」達到上限 80% 為止，沒有數量上限
+  1. **只補 HP**（回程補給完全不碰 SP，2026-08-29 指定）
+  2. 買到「現在負重 ＋ 買下去的重量」達到上限 69% 為止（硬上限 70%），
+     沒有數量上限；已經到 69% 就連探路那兩瓶都不買
   3. **錢不夠要講出來**（介面要停掉自動打怪並跳通知）
   4. 單位重量是**量出來的**，不是猜的也不是解說明字串
 """
@@ -115,8 +116,8 @@ def test_the_unit_weight_is_measured_not_guessed():
     bot.feed(*par(shop.SP_WEIGHT, 20100))          # 一瓶 = 100
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
     reopen(bot, (HP_ITEM, 50))
-    # 上限 48100 × 80% = 38480，現在 20100 → 還有 18380 → 183 個
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 183)])
+    # 上限 48100 × 69% = 33189，現在 20100 → 還有 13089 → 130 個
+    assert sent[-1] == shop.buy_packet([(HP_ITEM, 130)])
 
 
 def test_every_order_reopens_the_shop_first():
@@ -157,22 +158,32 @@ def test_running_out_of_money_is_reported_for_the_ui_to_act_on():
     assert sent[-1] == shop.buy_packet([(HP_ITEM, 12)])
 
 
-def test_no_sp_potion_configured_means_sp_is_never_touched():
-    """使用者指定：沒設定 SP 藥水就不用買 SP。"""
-    order = RestockOrder(hp_item=HP_ITEM, sp_item=None)
-    assert order.wanted() == [HP_ITEM]
+def test_restock_only_ever_buys_hp():
+    """使用者 2026-08-29 指定：回程補給**只補 HP**，連 SP 的欄位都不該存在。
 
-    both = RestockOrder(hp_item=HP_ITEM, sp_item=SP_ITEM)
-    assert both.wanted() == [HP_ITEM, SP_ITEM]
+    留一個「預設不填」的 SP 欄位，就是留一條「哪天被填到就會買 SP」的路。
+    """
+    assert RestockOrder(hp_item=HP_ITEM).wanted() == [HP_ITEM]
+    assert RestockOrder().wanted() == []
+    assert not hasattr(RestockOrder(hp_item=HP_ITEM), "sp_item")
+
+
+def test_the_sp_potion_on_the_shelf_is_never_touched():
+    """店裡同時賣 SP 藥水也不准去碰它 —— 只補 HP。"""
+    bot, sent, _clock = make()
+    walk_up_to_the_shop_list(bot, sent, (SP_ITEM, 100), (HP_ITEM, 50))
+    assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)]), "第一筆就該是 HP 那瓶"
+    assert all(shop.buy_packet([(SP_ITEM, n)]) not in sent for n in range(1, 300))
 
 
 def test_an_item_the_shop_does_not_sell_is_skipped_not_substituted():
     """⚠ 清單裡沒有就是沒有 —— 不准挑一個「看起來像」的來買。"""
-    bot, sent, _clock = make(RestockOrder(hp_item=HP_ITEM, sp_item=SP_ITEM))
-    walk_up_to_the_shop_list(bot, sent, (SP_ITEM, 100))   # 只賣 SP 那瓶
+    bot, sent, _clock = make()
+    walk_up_to_the_shop_list(bot, sent, (SP_ITEM, 100))   # 只賣別的瓶子
 
-    # HP 那瓶不在清單裡 → 跳過，直接去探 SP 那瓶
-    assert sent[-1] == shop.buy_packet([(SP_ITEM, 1)])
+    # 設定的那瓶不在清單裡 → 什麼都不買，不准拿架上那瓶頂替
+    assert all(shop.buy_packet([(SP_ITEM, n)]) not in sent for n in range(1, 300))
+    assert bot.update() == "blocked"
 
 
 def test_nothing_we_want_is_a_loud_stop():
@@ -215,25 +226,51 @@ def test_a_rejected_purchase_stops_instead_of_retrying():
     assert "被拒絕" in bot.stats.note
 
 
-def test_buying_both_potions_reports_the_total():
-    bot, sent, _clock = make(RestockOrder(hp_item=HP_ITEM, sp_item=SP_ITEM))
+def test_buying_finishes_with_the_total():
+    bot, sent, _clock = make()
     walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50), (SP_ITEM, 100))
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
     bot.feed(*par(shop.SP_ZENY, 10_000_000))
 
     catalog = ((HP_ITEM, 50), (SP_ITEM, 100))
-    for item, unit in ((HP_ITEM, 100), (SP_ITEM, 50)):
-        base = 20000 if item == HP_ITEM else 30000
-        bot.feed(*par(shop.SP_WEIGHT, base))
-        bot.feed(shop.OP_BUY_RESULT, b"\x00")       # 探路第一瓶
-        reopen(bot, *catalog)
-        bot.feed(*par(shop.SP_WEIGHT, base + unit))
-        bot.feed(shop.OP_BUY_RESULT, b"\x00")       # 探路第二瓶
-        reopen(bot, *catalog)
-        assert sent[-1].startswith(b"\xc8\x00")
-        bot.feed(shop.OP_BUY_RESULT, b"\x00")       # 大單成交
-        if item == HP_ITEM:
-            reopen(bot, *catalog)                   # 換下一瓶也要重開店
+    bot.feed(*par(shop.SP_WEIGHT, 20000))
+    bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 探路第一瓶
+    reopen(bot, *catalog)
+    bot.feed(*par(shop.SP_WEIGHT, 20100))           # 一瓶 = 100
+    bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 探路第二瓶
+    reopen(bot, *catalog)
+    assert sent[-1] == shop.buy_packet([(HP_ITEM, 130)])
+    bot.feed(*par(shop.SP_WEIGHT, 33100))           # 買完之後的負重
+    bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 大單成交
 
     assert bot.update() == "done"
-    assert set(bot.stats.bought) == {HP_ITEM, SP_ITEM}
+    assert bot.stats.bought == {HP_ITEM: 132}       # 探路 2 ＋ 大單 130
+    assert "132" in bot.stats.note
+
+
+def test_already_heavy_enough_buys_nothing_at_all():
+    """⚠ 已經到 69% 就**連探路那兩瓶都不買** —— 探路是為了算「還能買幾個」，
+    答案已經是 0 的時候買它就是買過頭，而且會安靜地越過 70%。
+    """
+    bot, sent, _clock = make()
+    bot.start(LOOK, CELL)
+    bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
+    bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
+    bot.feed(*par(shop.SP_WEIGHT, 33200))           # 69% 是 33189，已經超過
+    bot.update()
+    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
+    bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50)))
+
+    assert all(not b.startswith(b"\xc8\x00") for b in sent), "一瓶都不准買"
+    assert bot.update() == "done", "沒買不是失敗，是不用補"
+    assert "不用補" in bot.stats.note
+
+
+def test_weight_unknown_still_probes():
+    """負重只在變動時才送過來（[PKT-074]），沒看過就當**不知道**：照樣探路。
+
+    「讀不到就當滿了」會安靜地什麼都不補，人帶著兩瓶水回去打怪。
+    """
+    bot, sent, _clock = make()
+    walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
+    assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)])

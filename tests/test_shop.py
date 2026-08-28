@@ -64,17 +64,36 @@ def test_par_change_reads_weight_and_zeny():
     assert shop.display_weight(45304) == 4530
 
 
-# ---- 「該買幾個」：買到負重 80%（使用者指定）------------------------------
+# ---- 「該買幾個」：買到負重 69%，硬上限 70%（使用者指定）------------------
 
 
-def test_buys_up_to_eighty_percent_of_max_weight():
-    """使用者指定：現在負重 ＋ 買下去的重量，達到上限的 80% 為止。"""
-    # 上限 48100 → 80% = 38480；現在 4260*10 = 42600 已經超過 → 一個都不買
+def test_buys_up_to_sixty_nine_percent_of_max_weight():
+    """使用者 2026-08-29 指定：現在負重 ＋ 買下去的重量，達到上限的 69% 為止。"""
+    # 上限 48100 → 69% = 33189；現在 4260*10 = 42600 已經超過 → 一個都不買
     assert shop.plan_purchase(42600, 48100, 100, 999999, 50).amount == 0
-    # 現在 20000，80% 是 38480，還有 18480 的空間，一個 100 → 184 個
+    # 現在 20000，69% 是 33189，還有 13189 的空間，一個 100 → 131 個
     plan = shop.plan_purchase(20000, 48100, 100, 999999, 50)
-    assert plan.amount == 184
+    assert plan.amount == 131
     assert plan.limited_by == "weight"
+
+
+def test_seventy_percent_is_a_hard_cap_no_matter_what_ratio_is_passed():
+    """⚠ 使用者指定「不可超過 70%」—— 傳再大的 ratio 也不准越過。
+
+    夾不住的話會買到走不動，而且看起來像成功（買賣結果照樣回 0）。
+    """
+    assert shop.fill_target(48100, 0.9) == shop.fill_target(48100, 0.70) == 33670
+    plan = shop.plan_purchase(20000, 48100, 100, 999999, 50, ratio=0.9)
+    assert plan.amount == 136                      # (33670 - 20000) // 100
+    assert 20000 + plan.amount * 100 <= 48100 * 0.70
+
+
+def test_buying_that_many_never_lands_over_the_target():
+    """買下去之後的負重也要在目標以內（`//` 向下取整，不是四捨五入）。"""
+    for weight in range(0, 33189, 997):
+        for unit in (7, 100, 313):
+            plan = shop.plan_purchase(weight, 48100, unit, 10**9, 1)
+            assert weight + plan.amount * unit <= shop.fill_target(48100)
 
 
 def test_running_out_of_money_is_reported_not_hidden():

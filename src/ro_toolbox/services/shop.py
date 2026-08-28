@@ -28,6 +28,12 @@
 
 實機對照：封包 `45304 / 48100`，畫面顯示 `4530 / 4810`。所有計算一律用
 **原始值**，只有要給人看的時候才除以 10 —— 兩種單位混用會算出十倍的量。
+
+## 買到幾成：目標 69%，硬上限 70%
+
+使用者 2026-08-29 指定。`fill_target()` 是**唯一**算得出這個數字的地方，
+而且會把 `ratio` 夾在 `WEIGHT_CAP_RATIO`（70%）以內 —— 買過頭會走不動。
+`//` 是向下取整，所以「買下去之後」也一定還在目標以內。
 """
 
 from __future__ import annotations
@@ -73,8 +79,11 @@ _BUY_ENTRY = 6
 
 #: 負重原始值 ÷ 這個 = 畫面上看到的數字。
 WEIGHT_SCALE = 10
-#: 買到負重的幾成為止（使用者指定）。
-FILL_RATIO = 0.8
+#: 買到負重的幾成為止（使用者 2026-08-29 指定：69%）。
+FILL_RATIO = 0.69
+#: ⚠ **硬上限**：買下去之後的負重不准越過上限的這個比例（使用者指定 70%）。
+#: 傳進來的 `ratio` 再大也會被夾在這裡 —— 買過頭會走不動，是安靜地做錯事。
+WEIGHT_CAP_RATIO = 0.70
 #: 一次下單的數量欄是 u16。
 _MAX_AMOUNT = 0xFFFF
 
@@ -168,6 +177,18 @@ def find_item(items: list[ShopItem], item_id: int) -> ShopItem | None:
     return None
 
 
+def fill_target(max_weight: int, ratio: float = FILL_RATIO) -> int:
+    """買到哪個負重（**原始值**）為止。
+
+    ⚠ 一律夾在 `WEIGHT_CAP_RATIO` 以內：「不可超過 70%」是使用者訂的硬規則，
+    傳再大的 `ratio` 也不准越過。買到幾成只有這一個地方算得出來 ——
+    同一條算式在第二個地方再寫一次，改比例的時候另一份不會跟上。
+    """
+    if max_weight <= 0:
+        return 0
+    return int(max_weight * min(ratio, WEIGHT_CAP_RATIO))
+
+
 def plan_purchase(
     weight: int,
     max_weight: int,
@@ -176,7 +197,7 @@ def plan_purchase(
     price: int,
     ratio: float = FILL_RATIO,
 ) -> Purchase:
-    """買到「現在負重 ＋ 買下去的重量」達到上限的 `ratio` 為止（使用者指定）。
+    """買到「現在負重 ＋ 買下去的重量」達到 `fill_target()` 為止（使用者指定）。
 
     全部用**原始值**（畫面上的十倍，見檔頭）。
 
@@ -188,7 +209,7 @@ def plan_purchase(
     """
     if unit_weight <= 0 or price <= 0 or max_weight <= 0:
         return Purchase(0, "weight")
-    room = int(max_weight * ratio) - weight
+    room = fill_target(max_weight, ratio) - weight
     if room <= 0:
         return Purchase(0, "weight")
     by_weight = room // unit_weight

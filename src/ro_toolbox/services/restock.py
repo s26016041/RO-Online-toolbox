@@ -1,12 +1,16 @@
-"""回程之後自動補藥水：認人 → 開店 → **量出單位重量** → 買到負重 80%。
+"""回程之後自動補藥水：認人 → 開店 → **量出單位重量** → 買到負重 69%。
 
 **這支不碰 socket、不碰記憶體、不開執行緒**：封包進來用 `feed()`，要送出去的
 封包交給建構子給的 `send`。所以整段測得起來（見 `tests/test_restock.py`）。
 
 ## 使用者指定的規則
 
-- 買**設定裡的那瓶**（補水設定的 `hp_item` / `sp_item`）。**沒設 SP 就不買 SP。**
-- 買到「現在負重 ＋ 買下去的重量」達到**上限的 80%** 為止，**沒有數量上限**。
+- **只補 HP**（補水設定的 `hp_item`）。使用者 2026-08-29 指定：回程補給**完全
+  不碰 SP** —— 所以這裡連 SP 的欄位都沒有，不是「有欄位但預設不填」。
+- 買到「現在負重 ＋ 買下去的重量」達到**上限的 69%** 為止（硬上限 70%，見
+  `shop.fill_target()`），**沒有數量上限**。
+- 出發前就已經到 69% 了就**一瓶都不買**（連探路那兩瓶都不買）——
+  探路是為了算「還能買幾個」，答案已經是 0 的時候買它就是買過頭。
 - **錢不夠**就結束自動打怪並跳畫面最前面的通知（這裡回報 `broke=True`，
   真正的停用與通知由介面做）。
 
@@ -59,14 +63,13 @@ PROBE_ROUNDS = 2
 
 @dataclass
 class RestockOrder:
-    """要補什麼。`sp_item` 是 None 就**完全不碰 SP**（使用者指定）。"""
+    """要補什麼。**只有 HP**（使用者 2026-08-29 指定：回程補給不補 SP）。"""
 
     hp_item: int | None = None
-    sp_item: int | None = None
     ratio: float = shop.FILL_RATIO
 
     def wanted(self) -> list[int]:
-        return [i for i in (self.hp_item, self.sp_item) if i]
+        return [self.hp_item] if self.hp_item else []
 
 
 @dataclass
@@ -222,15 +225,26 @@ class Restocker:
         log.info("%s", why)
         return "done"
 
+    def _full(self) -> bool:
+        """負重已經到目標了嗎（到了就連探路那兩瓶都不買）。
+
+        ⚠ 讀不到負重就當作**不知道**（False）：負重只在變動時才送過來
+        （[PKT-074]），剛接上很可能一次都沒看過。那種情況照樣去探路 ——
+        探路會把負重問出來，`_buy_the_rest()` 算出 0 就自然不會多買。
+        """
+        if self._weight is None or self._max_weight is None:
+            return False
+        return self._weight >= shop.fill_target(self._max_weight, self._order.ratio)
+
     def _next_item(self, fresh: bool = False) -> str:
-        """換下一個要買的道具。都買完了就結束。
+        """換下一個要買的道具。都買完了（或負重滿了）就結束。
 
         `fresh=True` 代表**剛收到商品清單**（店是開著的），可以直接下單；
         否則要先把店重開一次（一次開店只能下一筆單，見檔頭）。
         """
         self._probe = []
         self._probing = True
-        while self._queue:
+        while self._queue and not self._full():
             item_id = self._queue.pop(0)
             found = shop.find_item(self._items, item_id)
             if found is None:
@@ -244,10 +258,15 @@ class Restocker:
                 return "working"
             return self._order_more(PROBE_AMOUNT)
         self._item = None
+        self._queue = []
         total = sum(self.stats.bought.values())
-        if not total:
-            return self._fail("⚠ 這家店沒有你設定的藥水，什麼都沒買")
-        return self._finish(f"補貨完成，共買了 {total} 個")
+        if total:
+            return self._finish(f"補貨完成，共買了 {total} 個")
+        if self._full():
+            return self._finish(
+                f"負重已達上限的 {self._order.ratio:.0%}，不用補"
+            )
+        return self._fail("⚠ 這家店沒有你設定的藥水，什麼都沒買")
 
     def _order_more(self, amount: int) -> str:
         """再買一筆。**一次開店只能下一筆單**，所以先把店重開一次（見檔頭）。"""
