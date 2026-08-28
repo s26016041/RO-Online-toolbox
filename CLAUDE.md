@@ -169,7 +169,7 @@ memory 是新對話一開始就會載入的索引。只寫 GAMEDATA，下一個 
 | 位置 | 定位方式 |
 |---|---|
 | `services/character.py` | 角色狀態結構（資料樣式 ＋ **命中多個時用數值驗證挑出真的**） |
-| `signatures.POSITION_X/Y_SIGS` | 角色座標（座標寫入端的指令骨架，x/y 各兩個立即值互驗，`y-x==4`） |
+| `services/player_position.py` | 角色座標（**進圖座標全域**用程式碼骨架；**移動元件**用 `GID == AID` 當場掃出來）|
 | `signatures.NAVI_DEST_SIGS` | 遊戲尋路的目標地圖（CRT 靜態建構鏈） |
 | `signatures.SELECT_CURSOR_SIGS` / `SELECT_NAME_SIGS` | 選角畫面的游標與名字 |
 | `services/bag.py` | 背包容器（除以 34 的魔術乘數 → 解析函式 → `mov ecx, imm32`） |
@@ -178,6 +178,18 @@ memory 是新對話一開始就會載入的索引。只寫 GAMEDATA，下一個 
 打包資產（使用者的電腦沒有 `RODATA/`，這些是唯一來源）：
 `assets/` 的 `items` / `mobs` / `warps` / `mapnames` / `terrain` / `icons`，
 產生腳本都在 `tools/build_*.py`。
+
+### ⚠ 特徵找得到 ≠ 找到的是對的東西（2026-08-28，[MEM-047]）
+
+舊的 `POSITION_X/Y_SIGS` 每一項技術指標都漂亮：實機 1 處命中、四個立即值
+互相驗證、`y` 剛好 `x+4`、改版模擬也過。**但它指到的是小地圖的標記** ——
+沒有小地圖圖檔的地圖（1082 張裡有 **396 張**，室內圖幾乎全中）上那段程式碼
+根本不會執行，全域就停在上一張圖的座標，而 `position_located` 照樣是 True。
+
+**新增特徵時要多做一件事：把命中處所在的函式看一遍**，確認它在做的事
+就是你以為的那件事。做法很便宜 —— 把那個位址當位元組搜整個模組映像，
+看有幾處引用（那條全域**全檔只有 2 處**，都在同一個畫小地圖的函式裡），
+再反組譯一段看它在幹嘛。
 
 **2026-08-26 已清掉的寫死位址**（留著當範例，同類問題照這個做）：
 `StatusOffsets.position`、`input_helper.SUBMITTED_ACCOUNT_OFFSET`、

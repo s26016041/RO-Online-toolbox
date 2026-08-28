@@ -11,19 +11,16 @@
 from __future__ import annotations
 
 import logging
-import struct
 
 from ro_toolbox.services.aob import locate_global, scan
 from ro_toolbox.services.memory_scan import VALUE_TYPES, MemoryScanner
+from ro_toolbox.services.player_position import PlayerPosition
 from ro_toolbox.services.signatures import (
     CHAR_STATUS,
     MAP_NAME_ENCODING,
     MAP_NAME_MAX_BYTES,
     NAME_ENCODING,
     NAME_MAX_BYTES,
-    POSITION_X_SIGS,
-    POSITION_XY_GAP,
-    POSITION_Y_SIGS,
     SELECT_CURSOR_SIGS,
     SELECT_NAME_SIGS,
     STATUS_OFFSETS,
@@ -275,10 +272,13 @@ class CharacterReader:
     def __init__(self) -> None:
         self._scanner = MemoryScanner()
         self._base: int | None = None
-        #: 座標全域（x）的位址，用程式碼特徵定位（見 POSITION_X_SIGS）。
-        #: 與 `_base` 分開是因為它們是**兩個獨立的全域**，改版時位移幅度不同 ——
-        #: 用「兩者距離」推導正是 [MEM-039] 壞掉的地方。
-        self._position: int | None = None
+        #: 座標從**角色自己的實體結構**讀（用 AID 認人），與這個 HP 結構無關。
+        #: 舊版讀的是小地圖標記留下的全域，在沒有小地圖圖檔的 396 張地圖上
+        #: **從頭到尾不會被寫**，卻照樣回一個看起來合理的殘留值（[MEM-047]）。
+        self._position = PlayerPosition(self._scanner)
+        #: 上一次讀到的地圖。換圖時要把實體位址丟掉重找 —— 舊實體會被回收，
+        #: 但**回收不等於清乾淨**（[MEM-022]／[MEM-047]）。
+        self._map_name = ""
         #: 這個行程裡**曾經**定位成功過嗎？
         #: 沒有 → 多半只是還沒進到遊戲（登入畫面根本沒有角色資料），不是錯誤。
         #: 有過 → 現在找不到才是真的異常（登出了，或改版讓特徵失效）。
@@ -352,58 +352,50 @@ class CharacterReader:
         self._base = hits[0]
         self._pid = pid
         log.info("角色狀態結構定位於 %#x", self._base)
-        self._position = self._locate_position()
+        self._locate_position()
         return True
 
-    def _locate_position(self) -> int | None:
-        """用程式碼特徵定位座標全域（x；y 一定是 x+4）。失敗回 None。
+    def _locate_position(self) -> bool:
+        """定位座標的兩個來源（進圖座標全域 ＋ 角色的移動元件）。
 
-        兩條特徵讀的是**同一個骨架裡的不同立即值**，所以「y 剛好等於 x+4」
-        是一個真正的交叉驗證，不是巧合。對不上就是解錯了，回 None 讓需要座標的
-        功能大聲停用 —— 絕不退回舊的固定距離推導（那正是 [MEM-039] 壞掉的東西）。
+        AID 是從剛剛定位好的狀態結構讀出來的 —— 這就是 CLAUDE.md 的
+        「存身分、當場查位置」：身分（AID）穩定，元件在堆積哪裡每次現查。
         """
-        x = locate_global(self._scanner, POSITION_X_SIGS)
-        y = locate_global(self._scanner, POSITION_Y_SIGS)
-        if x is None or y is None:
-            log.error("角色座標定位失敗（遊戲可能已改版）—— 走路類功能將停用")
-            return None
-        if y - x != POSITION_XY_GAP:
-            log.error(
-                "角色座標定位不一致：x=%#x y=%#x（相差 %d，應為 %d）—— 判定為解錯",
-                x, y, y - x, POSITION_XY_GAP,
-            )
-            return None
-        log.info("角色座標全域定位於 %#x", x)
-        return x
+        status = self._collect()
+        self._map_name = status.map_name if status is not None else ""
+        return self._position.locate(status.aid if status is not None else 0)
 
     @property
     def position_located(self) -> bool:
         """座標定位成功了嗎？沒有的話走路類功能要停用，不要空轉。"""
-        return self._position is not None
+        return self._position.located
 
     def read_position(self) -> tuple[int, int] | None:
-        """讀角色的格座標 (x, y)。
+        """讀角色的格座標 (x, y)。驗不過回 None —— **絕不回殘留值**。
 
         與 read() 分開：座標是每秒都在變的東西，呼叫端可能只要它而不需要
-        整包狀態；而且它的驗證條件不同（要靠地形檢查，不是數值範圍）。
+        整包狀態。實作與踩過的坑見 `services/player_position.py`。
+
+        ⚠ 這裡**自己**再讀一次地圖名（幾十微秒），不依賴呼叫端有沒有先呼叫
+        `read()`。地圖名決定兩件事：換圖要丟掉舊的移動元件、以及拿哪張圖的
+        地形驗「這一格站得住嗎」。少了它，換圖後那個殘留值又會安靜地過關。
         """
-        if self._position is None:
-            return None
-        raw = self._scanner._read_bytes(self._position, 8)
-        if not raw or len(raw) < 8:
-            return None
-        x, y = struct.unpack("<II", raw)
-        # 合理性：RO 沒有超過 512x512 的地圖，而 0 是地圖邊界（一定不可走）。
-        #
-        # ⚠ (0,0) 一定要擋掉。2026-08-26 改版讓 position 偏移失效後，這裡讀到的是
-        # 一片 0；當時的檢查只擋 >=512，(0,0) 就這樣**通過驗證**傳給了自動打怪，
-        # 它拿 (0,0) 當起點算 A*、找不到路就往地圖角落走 —— 完全不報錯。
-        # 這正是 CLAUDE.md 說的「安靜地做錯事」，所以寧可回 None 讓呼叫端停下來。
-        # 出處見 GAMEDATA [MEM-039]。
-        if not (0 < x < 512 and 0 < y < 512):
-            log.debug("座標超出合理範圍：(%s, %s)", x, y)
-            return None
-        return x, y
+        map_name = self._read_text(
+            STATUS_OFFSETS.map_name, MAP_NAME_MAX_BYTES, MAP_NAME_ENCODING
+        )
+        self._note_map(map_name)
+        return self._position.read(map_name)
+
+    def _note_map(self, map_name: str) -> None:
+        """地圖換了就把記著的移動元件丟掉。客戶端會回收舊元件，而**回收不等於
+        清乾淨**：GID 可能還在原地，只是不再更新（[MEM-022]／[MEM-047]）。"""
+        if not map_name or map_name == self._map_name:
+            return
+        if self._map_name:
+            log.info("地圖從 %s 換到 %s，重新定位角色移動元件",
+                     self._map_name, map_name)
+            self._position.invalidate()
+        self._map_name = map_name
 
     def alive(self) -> bool:
         """目標行程還活著嗎？
@@ -441,6 +433,7 @@ class CharacterReader:
         if self._pid is not None:
             _ever_valid.add(self._pid)
         _notes_for(self._pid or 0).ok("角色狀態恢復正常")
+        self._note_map(status.map_name)
         return status
 
     def probe(self, base: int) -> CharacterStatus | None:
@@ -508,7 +501,8 @@ class CharacterReader:
 
     def close(self) -> None:
         self._base = None
-        self._position = None
+        self._map_name = ""
+        self._position.forget()
         try:
             self._scanner.close()
         except Exception as exc:  # noqa: BLE001

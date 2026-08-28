@@ -20,7 +20,9 @@ CLAUDE.md 要求所有位址一律 AOB 定位，而 AOB 有兩種安靜的壞法
 **唯一性檢查**（對執行中的行程）
   - 角色狀態：AOB 命中幾個都可以，但**通過合理性驗證的只能有 1 個**。
     （原始 AOB 唯一是錯的判準：堆積裡會有同樣位元組樣式的垃圾，見 [MEM-041]。）
-  - 角色座標：`POSITION_X/Y_SIGS` 各要定位成功，而且 **y 必須是 x+4**。
+  - 角色座標：進圖座標全域要用**兩條互相獨立的骨架**定位到同一個位址、
+    `y == x+4`；讀出來的格子要落在當下地圖的可走格上（[MEM-047]／[MEM-048]）。
+    移動元件（`GID == AID`）**通過驗證的只能有 1 個** —— 剛換圖時 0 個是正常的。
   - 尋路目的地全域：`NAVI_GOAL_SIGS` 要定位成功（兩條獨立骨架互相驗證）。
   - 送出帳號緩衝：`SUBMITTED_ACCOUNT_SIGS` 要定位成功（自動登入的閉環驗證靠它）。
   - 背包容器骨架：`sub ecx,5` + 除以 34 的魔術乘數，只能解出一個容器。
@@ -52,13 +54,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from ro_toolbox.services import bag, packet_table  # noqa: E402
 from ro_toolbox.services.aob import locate_global, scan  # noqa: E402
 from ro_toolbox.services.character import CharacterReader  # noqa: E402
+from ro_toolbox.services.mapdata import has_terrain, load_terrain  # noqa: E402
 from ro_toolbox.services.memory_scan import MemoryScanner  # noqa: E402
 from ro_toolbox.services.signatures import (  # noqa: E402
     CHAR_STATUS,
     NAVI_GOAL_SIGS,
-    POSITION_X_SIGS,
-    POSITION_XY_GAP,
-    POSITION_Y_SIGS,
     SELECT_CURSOR_SIGS,
     SELECT_NAME_SIGS,
     SUBMITTED_ACCOUNT_SIGS,
@@ -343,22 +343,49 @@ def check_live(pid: int, snap: Snapshot, report: Report, notes: list[str]) -> No
         f"（其餘是堆積垃圾，見 [MEM-041]）"
     )
 
-    # --- 1b. 座標與導航目標：程式碼特徵，一定要**唯一且交叉對得上** ---
+    # --- 1b. 角色座標：實體要**唯一**，而且讀出來的格子要真的可走 ---
+    #
+    # 這一項以前查的是「座標全域 x 與 y 相鄰」。那條特徵每一項技術指標都漂亮，
+    # 但它指到的是**小地圖標記**，在沒有小地圖圖檔的 396 張地圖上根本不更新
+    # （[MEM-047]）。所以現在查的不是「找不找得到」，而是**找到的是不是活的**：
+    # 通過驗證的實體只能有一個，而且它給的格子要落在這張圖的可走格上。
+    reader = CharacterReader()
+    entry = component = pos = map_name = None
+    ok_cell = False
+    if reader.attach(pid):
+        status = reader.read()
+        map_name = status.map_name if status else ""
+        entry = reader._position.entry_address   # noqa: SLF001 - 診斷工具才這樣讀
+        component = reader._position.address     # noqa: SLF001
+        pos = reader.read_position()
+        if pos and map_name and has_terrain(map_name):
+            ok_cell = load_terrain(map_name).is_walkable(*pos)
+    reader.close()
+    report.add(
+        f"PID {pid} 進圖座標全域定位（兩條骨架互驗、y=x+4）",
+        entry is not None,
+        f"位址 {entry and hex(entry)}",
+    )
+    report.add(
+        f"PID {pid} 讀得到角色座標",
+        pos is not None,
+        f"{pos}（{map_name}）移動元件 {component and hex(component)}"
+        + ("（還沒在這張圖上走過，用進圖座標）" if component is None else ""),
+    )
+    report.add(
+        f"PID {pid} 座標落在可走格上",
+        ok_cell,
+        f"{map_name} {pos} 可走={ok_cell}"
+        + ("" if map_name and has_terrain(map_name) else "（沒有這張圖的地形，無法驗）"),
+    )
+
     scanner = MemoryScanner()
     scanner.open(pid)
     try:
-        x = locate_global(scanner, POSITION_X_SIGS)
-        y = locate_global(scanner, POSITION_Y_SIGS)
         navi = locate_global(scanner, NAVI_GOAL_SIGS)
         account = locate_global(scanner, SUBMITTED_ACCOUNT_SIGS)
     finally:
         scanner.close()
-    report.add(
-        f"PID {pid} 角色座標定位（x 與 y 必須相鄰）",
-        x is not None and y is not None and y - x == POSITION_XY_GAP,
-        f"x={x and hex(x)} y={y and hex(y)}（相差 {y - x if x and y else None}，"
-        f"應為 {POSITION_XY_GAP}）",
-    )
     report.add(
         f"PID {pid} 尋路目的地全域定位",
         navi is not None,

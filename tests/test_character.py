@@ -186,53 +186,337 @@ def test_position_is_not_a_hardcoded_offset_any_more():
     assert not hasattr(STATUS_OFFSETS, "position")
 
 
-def test_position_signatures_mask_the_answer_and_cross_check():
-    """特徵不准把答案寫死；x 與 y 取的是同一個骨架裡的不同立即值。"""
-    from ro_toolbox.services.signatures import (
-        POSITION_X_SIGS,
-        POSITION_XY_GAP,
-        POSITION_Y_SIGS,
+def test_position_signatures_are_gone_on_purpose():
+    """座標**不再**用任何程式碼特徵定位 —— 見 GAMEDATA [MEM-047]。
+
+    舊的 `POSITION_X/Y_SIGS` 技術上完全正確（1 處命中、四個立即值互驗、y=x+4），
+    但它錨到的是**小地圖標記**的全域：沒有小地圖圖檔的地圖（1082 張裡有 396 張，
+    室內圖幾乎全中）上那段程式碼根本不會執行，於是全域停在上一張圖的座標，
+    `position_located` 卻還是 True。留著它就等於留著一個「很有自信的錯值」。
+    """
+    from ro_toolbox.services import signatures
+
+    for name in ("POSITION_X_SIGS", "POSITION_Y_SIGS", "POSITION_XY_GAP"):
+        assert not hasattr(signatures, name), f"{name} 應該已經刪掉"
+
+
+# ---- 座標：移動元件（`GID == AID`）＋ 進圖座標全域 -----------------------
+
+
+class FakeMemory:
+    """假的記憶體：位址 → bytes。只實作 PlayerPosition 用得到的兩個方法。"""
+
+    def __init__(self, blocks=None, regions=((0x1000, 0x1000),)):
+        self.blocks = dict(blocks or {})
+        self._regions = list(regions)
+
+    def regions(self, writable_only=True):  # noqa: ARG002
+        return list(self._regions)
+
+    def read_region(self, addr, size):
+        for base, blob in self.blocks.items():
+            if base <= addr and addr + size <= base + len(blob):
+                return blob[addr - base : addr - base + size]
+        return None
+
+
+#: 進圖座標全域放在假記憶體的這個位址（真的位址是程式碼特徵定位出來的）
+ENTRY_ADDR = 0xE000
+#: 重找的冷卻時間過了多久（比 RELOCATE_COOLDOWN 大就好）
+RELOCATE_GAP = 5.0
+
+
+def _component(aid, dest, path=(), index=-1, path_at=0x9000, state=1):
+    """組一塊移動元件：GID、狀態、終點、路徑陣列指標、路徑索引。
+
+    `state=0` 代表被回收的殘留元件（實測四塊殘留的這個欄位全是 0）。
+    """
+    from ro_toolbox.services import player_position as pp
+
+    buf = bytearray(pp.SPAN)
+    buf[0:4] = aid.to_bytes(4, "little")
+    buf[pp.OFF_STATE : pp.OFF_STATE + 4] = state.to_bytes(4, "little")
+    buf[pp.OFF_DEST_X : pp.OFF_DEST_X + 4] = dest[0].to_bytes(4, "little", signed=True)
+    buf[pp.OFF_DEST_Y : pp.OFF_DEST_Y + 4] = dest[1].to_bytes(4, "little", signed=True)
+    begin = path_at if path else 0
+    end = begin + len(path) * pp.PATH_STRIDE
+    buf[pp.OFF_PATH_BEGIN : pp.OFF_PATH_BEGIN + 4] = begin.to_bytes(4, "little")
+    buf[pp.OFF_PATH_END : pp.OFF_PATH_END + 4] = end.to_bytes(4, "little")
+    buf[pp.OFF_PATH_INDEX : pp.OFF_PATH_INDEX + 4] = index.to_bytes(
+        4, "little", signed=True
+    )
+    nodes = bytearray()
+    for x, y in path:
+        node = bytearray(pp.PATH_STRIDE)
+        node[0:4] = x.to_bytes(4, "little", signed=True)
+        node[4:8] = y.to_bytes(4, "little", signed=True)
+        nodes += node
+    return bytes(buf), bytes(nodes)
+
+
+def _entry_blob(cell):
+    return cell[0].to_bytes(4, "little", signed=True) + cell[1].to_bytes(
+        4, "little", signed=True
     )
 
-    x_sig, y_sig = POSITION_X_SIGS[0], POSITION_Y_SIGS[0]
-    assert x_sig.pattern == y_sig.pattern, "兩條要錨在同一段程式碼才算交叉驗證"
-    assert "??" in x_sig.pattern
-    # 每個立即值本身在骨架裡出現兩次 —— 那是這條特徵自帶的一致性檢查
-    assert len(x_sig.operands) == 2
-    assert len(y_sig.operands) == 2
-    assert set(x_sig.operands).isdisjoint(y_sig.operands)
-    assert POSITION_XY_GAP == 4
+
+def _position_at(addr, aid=777, entry=None, **kw):
+    """做一個已經定位好的 PlayerPosition（跳過掃描與程式碼特徵）。"""
+    from ro_toolbox.services.player_position import PlayerPosition
+
+    body, nodes = _component(aid, **kw)
+    blocks = {addr: body, kw.get("path_at", 0x9000): nodes}
+    if entry is not None:
+        blocks[ENTRY_ADDR] = _entry_blob(entry)
+    mem = FakeMemory(blocks)
+    pos = PlayerPosition(mem)
+    pos._aid = aid
+    pos._addr = addr
+    pos._entry = ENTRY_ADDR if entry is not None else None
+    return pos, mem
 
 
-def test_position_rejects_out_of_range(monkeypatch):
-    """超出任何 RO 地圖尺寸的值要當成定位失效。"""
-    reader = CharacterReader()
-    reader._position = 0x1000
-
-    class FakeScanner:
-        def _read_bytes(self, _addr, _size):
-            return (999).to_bytes(4, "little") + (999).to_bytes(4, "little")
-
-    reader._scanner = FakeScanner()
-    assert reader.read_position() is None
+def test_standing_still_reads_the_destination_field():
+    """沒在走的時候（索引 -1）終點欄位就是目前所在格。"""
+    pos, _mem = _position_at(0x5000, dest=(65, 99))
+    assert pos.read() == (65, 99)
 
 
-def test_position_rejects_all_zero(monkeypatch):
+def test_walking_reads_the_path_node_not_the_destination():
+    """走路途中終點欄位是**要去哪**，目前在哪要看路徑索引。
+
+    實機 2026-08-28：送出 (65,92)→(65,104) 之後終點欄位 0.03 秒就變成 (65,104)，
+    而角色還在 (65,92)。拿終點當位置的話，A* 會從一個還沒到的地方起算。
+    """
+    path = [(65, 92), (65, 93), (65, 94), (65, 95)]
+    pos, _mem = _position_at(0x5000, dest=(65, 95), path=path, index=1, state=2)
+    assert pos.read() == (65, 93)
+
+
+def test_recycled_component_is_rejected():
+    """殘留的舊元件：GID 還在、座標也還在，只有狀態欄位被清成 0。
+
+    實測四塊殘留元件（(110,182)／(249,42)／(198,205)／(65,84)，第一個就是
+    換圖前 izlude 的位置）全部 `+0x38 == 0`，活的是 1（站著）或 2（走路）。
+    這正是 [MEM-047] 那個「很有自信的錯值」的來源。
+    """
+    pos, _mem = _position_at(0x5000, dest=(112, 181), state=0)
+    assert pos.read() is None
+
+
+def test_falls_back_to_the_map_entry_position():
+    """剛換圖、還沒走過路：移動元件根本不存在，答案在進圖座標全域。
+
+    實機驗證過：換圖之後 60+ 個 `GID == AID` 的候選沒有一個通得過驗證
+    （狀態是 0、路徑指標是 0、終點欄位是垃圾）。少了這個退化，
+    走路類功能會在每次換圖之後整個停用。
+    """
+    pos, _mem = _position_at(0x5000, dest=(0, 0), state=0, entry=(112, 179))
+    assert pos.read() == (112, 179)
+
+
+def test_component_wins_over_the_map_entry_position():
+    """走過之後就以移動元件為準 —— 進圖座標不會跟著走路更新。"""
+    pos, _mem = _position_at(0x5000, dest=(65, 99), entry=(65, 87))
+    assert pos.read() == (65, 99)
+
+
+def test_zero_cell_is_rejected():
     """(0,0) 是定位失效的樣子，不是合法座標 —— 見 GAMEDATA [MEM-039]。
 
-    改版讓 position 偏移失效時讀到的就是一片 0。當時的檢查只擋 >=512，
-    所以 (0,0) 一路傳給自動打怪，它拿去算 A* 找不到路就往地圖角落走，
-    全程不報錯。0 是地圖邊界，任何地圖上都不可走。
+    0 是地圖邊界，任何地圖上都不可走。當年就是 (0,0) 通過了檢查，
+    自動打怪拿它當 A* 起點走去地圖角落，全程不報錯。
     """
-    reader = CharacterReader()
-    reader._position = 0x1000
+    pos, _mem = _position_at(0x5000, dest=(0, 0))
+    assert pos.read() is None
 
-    class ZeroScanner:
-        def _read_bytes(self, _addr, _size):
-            return b"\x00" * 8
 
-    reader._scanner = ZeroScanner()
-    assert reader.read_position() is None
+def test_out_of_range_cell_is_rejected():
+    """RO 沒有超過 512x512 的地圖。"""
+    pos, _mem = _position_at(0x5000, dest=(999, 999))
+    assert pos.read() is None
+
+
+def test_state_field_out_of_range_is_rejected():
+    """堆積垃圾在這個位置常常是指標或很大的數字。"""
+    pos, _mem = _position_at(0x5000, dest=(65, 99), state=1_000_000)
+    assert pos.read() is None
+
+
+def test_path_index_out_of_range_is_rejected():
+    """索引超出路徑陣列＝解錯了，不准硬讀那塊記憶體。"""
+    pos, _mem = _position_at(0x5000, dest=(65, 99), path=[(65, 92)], index=7)
+    assert pos.read() is None
+
+
+def test_gid_change_means_the_component_was_recycled():
+    """那塊記憶體換人住了 —— 立刻回 None，不准繼續回舊座標。"""
+    pos, _mem = _position_at(0x5000, dest=(65, 99))
+    pos._aid = 888  # 元件上的 GID 還是 777
+    assert pos.read() is None
+
+
+def test_a_cell_that_is_not_on_this_map_is_rejected():
+    """殘留座標最有效的一關：**這一格在這張圖上站得住嗎**。
+
+    實機 izlude → izlude_in：兩張都是 200×200，殘留的 (112,181) 範圍內合法，
+    卻落在牆裡（izlude_in 只有 7.9% 可走）。判準跟 `Traveler._settle()` 一樣，
+    兩層用不同判準的縫就是 [PKT-078] 卡住的地方。
+    """
+    from ro_toolbox.services import player_position as pp
+
+    class Wall:
+        width = height = 200
+
+        @staticmethod
+        def is_walkable(x, y):
+            return (x, y) == (65, 87)
+
+    pos, _mem = _position_at(0x5000, dest=(112, 181), entry=(65, 87))
+    pos._terrain_map = "izlude_in"
+    pos._terrain = Wall()
+    assert pp.START_SNAP < 10, "這個測試假設 START_SNAP 遠小於兩點的距離"
+    assert pos.read("izlude_in") == (65, 87)
+
+
+def test_locate_picks_the_live_component_out_of_the_ghosts():
+    """殘留元件 GID 一樣，靠狀態欄位分辨（[MEM-041]：命中多個 ≠ 方法壞了）。"""
+    from ro_toolbox.services.player_position import PlayerPosition
+
+    aid = 777
+    live, nodes = _component(aid, dest=(65, 99))
+    ghost, _ = _component(aid, dest=(112, 181), state=0)
+    key = aid.to_bytes(4, "little")
+    region = bytearray(0x1000)
+    region[0x100 : 0x100 + len(ghost)] = ghost
+    region[0x600 : 0x600 + len(live)] = live
+    mem = FakeMemory({0x1000: bytes(region), 0x9000: nodes}, regions=[(0x1000, 0x1000)])
+    assert region.count(key) >= 2, "兩塊都要含有 GID，才是真的在考驗驗證"
+
+    pos = PlayerPosition(mem)
+    pos._aid = aid
+    assert pos._locate_component() is True
+    assert pos.address == 0x1600
+    assert pos.read() == (65, 99)
+
+
+def test_two_live_components_fall_back_instead_of_guessing():
+    """驗完還是不只一個＝真的分不出來。不准賭 —— 改用進圖座標。"""
+    from ro_toolbox.services.player_position import PlayerPosition
+
+    aid = 777
+    one, nodes = _component(aid, dest=(65, 99))
+    two, _ = _component(aid, dest=(30, 40))
+    region = bytearray(0x1000)
+    region[0x100 : 0x100 + len(one)] = one
+    region[0x600 : 0x600 + len(two)] = two
+    mem = FakeMemory(
+        {0x1000: bytes(region), 0x9000: nodes, ENTRY_ADDR: _entry_blob((7, 8))},
+        regions=[(0x1000, 0x1000)],
+    )
+    pos = PlayerPosition(mem)
+    pos._aid = aid
+    pos._entry = ENTRY_ADDR
+    assert pos._locate_component() is False
+    assert pos.address is None
+    assert pos.read() == (7, 8)
+
+
+def _one_region_memory(aid=777, dest=(65, 99)):
+    live, nodes = _component(aid, dest=dest)
+    region = bytearray(0x1000)
+    region[0x600 : 0x600 + len(live)] = live
+    return FakeMemory(
+        {0x1000: bytes(region), 0x9000: nodes}, regions=[(0x1000, 0x1000)]
+    )
+
+
+def test_read_relocates_after_the_component_dies_but_not_every_tick():
+    """位址失效要重找，但**不准每一拍都重找**（全掃一趟 0.7~0.8 秒，bot 會定格）。"""
+    from ro_toolbox.services.player_position import PlayerPosition
+
+    mem = _one_region_memory()
+    clock = [100.0]
+    pos = PlayerPosition(mem, now=lambda: clock[0])
+    pos._aid = 777
+    assert pos._locate_component() is True
+
+    tries = []
+    real = PlayerPosition._locate_component
+    pos._locate_component = lambda: (tries.append(1), real(pos))[1]
+
+    pos._addr = 0x4000  # 假裝元件被回收了（那個位址什麼都沒有）
+    assert pos.read() is None          # 冷卻中：連找都不找
+    assert tries == []
+
+    clock[0] += 100
+    assert pos.read() == (65, 99)      # 冷卻過了：重找並找回來
+    assert len(tries) == 1
+
+
+def test_relocating_only_rescans_the_hot_regions():
+    """剛換圖還沒走路的時候元件本來就不存在。那段期間每 2 秒全掃一次
+    （511 MB、0.7~0.8 秒）等於一直卡頓 —— 平常只掃上次有命中的區段。"""
+    from ro_toolbox.services.player_position import FULL_RESCAN_SEC, PlayerPosition
+
+    mem = _one_region_memory()
+    clock = [1000.0]
+    pos = PlayerPosition(mem, now=lambda: clock[0])
+    pos._aid = 777
+    assert pos._locate_component() is True
+    assert pos._hot == [(0x1000, 0x1000)], "命中的區段要記起來"
+
+    full = []
+    real_regions = mem.regions
+    mem.regions = lambda writable_only=True: (full.append(1), real_regions())[1]
+
+    # 元件還在 → 熱區段就找得到，完全不必列舉整份記憶體
+    pos._addr = None
+    clock[0] += RELOCATE_GAP
+    assert pos.read() == (65, 99)
+    assert full == []
+
+    # 熱區段裡真的沒有了 → 全掃時間到才翻整份記憶體
+    mem.blocks[0x1000] = bytes(0x1000)
+    pos._addr = None
+    clock[0] += FULL_RESCAN_SEC + 1
+    assert pos.read() is None
+    assert len(full) == 1
+
+    # 下一次重找只隔了冷卻時間 → 不准再全掃一次
+    pos._addr = None
+    clock[0] += RELOCATE_GAP
+    assert pos.read() is None
+    assert len(full) == 1, f"{FULL_RESCAN_SEC} 秒內不准再全掃一次"
+
+
+def test_invalidate_forces_a_relocate():
+    """換地圖一定要重找：舊元件會被回收，而**回收不等於清乾淨**。"""
+    pos, _mem = _position_at(0x5000, dest=(65, 99))
+    assert pos.read() == (65, 99)
+    pos.invalidate()
+    assert pos.address is None
+
+
+def test_map_entry_signatures_cross_check_each_other():
+    """兩條骨架必須互相獨立，而且都不准把答案寫死。"""
+    from ro_toolbox.services.signatures import (
+        MAP_ENTRY_X_SIGS,
+        MAP_ENTRY_XY_GAP,
+        MAP_ENTRY_Y_SIGS,
+    )
+
+    assert len(MAP_ENTRY_X_SIGS) == 2 and len(MAP_ENTRY_Y_SIGS) == 2
+    patterns = {sig.pattern for sig in MAP_ENTRY_X_SIGS}
+    assert len(patterns) == 2, "兩條要是不同的骨架才算互相驗證"
+    assert patterns == {sig.pattern for sig in MAP_ENTRY_Y_SIGS}
+    for sig in MAP_ENTRY_X_SIGS + MAP_ENTRY_Y_SIGS:
+        assert "??" in sig.pattern, f"{sig.name} 把答案寫死了"
+    # x 與 y 取的是**同一段程式碼裡不同的立即值**
+    for xs, ys in zip(MAP_ENTRY_X_SIGS, MAP_ENTRY_Y_SIGS):
+        assert xs.pattern == ys.pattern
+        assert set(xs.operands).isdisjoint(ys.operands)
+    assert MAP_ENTRY_XY_GAP == 4
 
 
 def test_empty_name_is_not_a_real_character():
@@ -258,14 +542,32 @@ def test_residual_char_select_values_are_rejected():
 # ---- 定位：命中多個時要先驗合理性，不是直接放棄 ---------------------------
 
 
-def _fake_position(monkeypatch, x=0x122A67C, y=0x122A680):
-    """把座標的程式碼特徵定位換掉（單元測試沒有真的行程可以掃）。"""
-    from ro_toolbox.services import character as mod
-    from ro_toolbox.services.signatures import POSITION_X_SIGS
+def _fake_position(monkeypatch, ok=True, addr=0x5078D228, map_name="izlude"):
+    """把「找角色實體」那一趟全掃換掉（單元測試沒有真的行程可以掃）。
 
+    順便把 `_collect()` 與 `attached` 也換掉 —— 定位座標要先知道 AID，
+    而 AID 是從角色結構讀出來的，沒有真的行程就讀不到。
+    """
+    from ro_toolbox.services.memory_scan import MemoryScanner
+    from ro_toolbox.services.player_position import PlayerPosition
+
+    def fake_locate(self, aid):
+        self._aid = aid
+        self._addr = addr if ok else None
+        return ok
+
+    monkeypatch.setattr(PlayerPosition, "locate", fake_locate)
     monkeypatch.setattr(
-        mod, "locate_global", lambda _sc, sigs: x if sigs is POSITION_X_SIGS else y
+        PlayerPosition, "read", lambda self, m="": (65, 99) if ok else None,
     )
+    monkeypatch.setattr(
+        CharacterReader, "_collect",
+        lambda self: make(name="狐狐狸", map_name=map_name),
+    )
+    monkeypatch.setattr(
+        CharacterReader, "_read_text", lambda self, *a, **k: map_name,
+    )
+    monkeypatch.setattr(MemoryScanner, "attached", property(lambda self: True))
 
 
 def _attachable(monkeypatch, hits, plausible_at):
@@ -336,14 +638,44 @@ def test_single_hit_skips_the_probe(monkeypatch):
     assert reader.position_located is True
 
 
-def test_position_is_disabled_when_the_two_globals_disagree(monkeypatch):
-    """x 與 y 不相鄰＝骨架解錯了。不准將就用，走路類功能要停用。"""
+def test_position_is_disabled_when_no_source_works(monkeypatch):
+    """兩個來源都問不出來＝不知道人在哪。走路類功能要停用，不准空轉。
+
+    ⚠ HP／等級照樣讀得到（那是另一個結構）—— attach 不該整個失敗。
+    """
     from ro_toolbox.services import character as mod
 
     reader = CharacterReader()
     monkeypatch.setattr(reader._scanner, "open", lambda _pid: None)
     monkeypatch.setattr(mod, "scan", lambda *a, **k: [0x15D7C98])
-    _fake_position(monkeypatch, x=0x122A67C, y=0x1999999)
+    _fake_position(monkeypatch, ok=False)
     assert reader.attach(4321) is True  # HP／等級還是讀得到
     assert reader.position_located is False
     assert reader.read_position() is None
+
+
+def test_changing_map_throws_the_component_address_away(monkeypatch):
+    """換圖時記著的實體位址不能再信 —— [MEM-047] 那個「很有自信的錯值」
+    就是舊實體被回收之後座標停在上一張圖造成的。"""
+    from ro_toolbox.services import character as mod
+
+    reader = CharacterReader()
+    monkeypatch.setattr(reader._scanner, "open", lambda _pid: None)
+    monkeypatch.setattr(mod, "scan", lambda *a, **k: [0x15D7C98])
+    _fake_position(monkeypatch)
+    maps = ["izlude", "izlude", "izlude_in"]
+    monkeypatch.setattr(
+        CharacterReader,
+        "_collect",
+        lambda self: make(name="狐狐狸", map_name=maps.pop(0) if maps else "izlude_in"),
+    )
+    assert reader.attach(4321) is True
+
+    dropped = []
+    monkeypatch.setattr(
+        type(reader._position), "invalidate", lambda self: dropped.append(1)
+    )
+    reader.read()          # 還在 izlude
+    assert dropped == []
+    reader.read()          # 換到 izlude_in
+    assert dropped == [1]
