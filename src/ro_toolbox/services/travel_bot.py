@@ -30,7 +30,7 @@ from ro_toolbox.services import mapdata, npc_dialog
 from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import map_display_name, npc_links_on_map
 from ro_toolbox.services.navigation import NavigationReader
-from ro_toolbox.services.travel import Traveler
+from ro_toolbox.services.travel import START_SNAP, Traveler, nearest_walkable
 from ro_toolbox.services.walker import MAX_STEP, Walker
 
 log = logging.getLogger(__name__)
@@ -112,11 +112,15 @@ class TravelBot:
         pid: int,
         destination: str | None = None,
         on_update: Callable[[TravelStats], None] | None = None,
+        destination_cell: tuple[int, int] | None = None,
     ) -> None:
         """`destination` 不給就去讀**遊戲導航視窗現在指的地圖**（一般用法）。
         給了就走去那張圖 —— 測試與日後的地圖選單用得到。"""
         self._pid = pid
         self._destination = destination
+        #: 要走到那張圖上的**哪一格**（None = 踏進那張圖就算到）。
+        #: 自動補貨用得到：目標是「商人腳邊」，不是「那張圖」。
+        self._destination_cell = destination_cell
         self._on_update = on_update
         #: socket ／ 角色定位 ／ 封包擷取三條線共用同一份規則（`services/game_link.py`）。
         #: ⚠ 以前這一段是 farm_bot 抄一份、travel_bot 抄一份 —— [PKT-072] 就是
@@ -304,7 +308,7 @@ class TravelBot:
                 problem if problem.startswith("⚠") else problem,
             )
 
-        self._traveler.set_goal(self._destination)
+        self._traveler.set_goal(self._destination, self._destination_cell)
         self._note(f"前往 {self._stats.goal_label or self._destination}"
                    f"（{self._destination}），正在計算路線…")
         return True
@@ -698,9 +702,18 @@ class TravelBot:
         terrain = self._terrain_for(map_name)
         if terrain is None:
             return pos          # 沒有地形就沒得驗，照舊用記憶體的值
-        # ⚠ 只看**在不在這張圖的範圍內**，不看走不走得過 ——
-        # 站在傳點上、站在邊界格上都是合法的位置。
-        if 0 <= pos[0] < terrain.width and 0 <= pos[1] < terrain.height:
+        # 判準要跟 `Traveler._settle()` **完全一樣**：在範圍內，**而且**附近
+        # `START_SNAP` 格內站得住。
+        #
+        # ⚠⚠ 舊版只看範圍。那對「換到比較小的圖」有效（[MEM-022] 就是這樣抓的），
+        # 但**換到差不多大的圖就整個失效**：使用者實測 2026-08-28，從 izlude
+        # 走進 izlude_in（兩張都是 200×200），殘留座標 (112,181) 範圍內合法、
+        # 卻落在牆裡（izlude_in 只有 7.9% 可走）。於是這裡回了一個爛座標、
+        # 不去問伺服器也不推一下，而 `Traveler` 拿到之後判定「不在這張圖上」，
+        # 等 10 秒就大聲停用 —— 兩層用不同判準，中間那個縫就是卡住的地方。
+        #
+        # 站在傳點上／邊界格上照樣過得了：那些地方 3 格內一定有站得住的格子。
+        if nearest_walkable(terrain, pos, radius=START_SNAP) is not None:
             self._nudges = 0
             return pos
         server = self._server_pos
@@ -772,7 +785,7 @@ class TravelBot:
             return []
         centre = np.array([terrain.height / 2, terrain.width / 2])
         order = np.argsort(((cells - centre) ** 2).sum(axis=1))
-        picked: list[tuple[int, int]] = []
+        picked: list[tuple[int, int]] = list(self._landing_probes(terrain))
         for index in order:
             y, x = int(cells[index][0]), int(cells[index][1])
             if all(max(abs(x - px), abs(y - py)) > _NUDGE_SPACING
@@ -781,6 +794,35 @@ class TravelBot:
         self._nudge_map, self._nudge_list = terrain.name, picked
         log.info("%s 上挑了 %d 個問位置的目標", terrain.name, len(picked))
         return picked
+
+    @staticmethod
+    def _landing_probes(terrain) -> list[tuple[int, int]]:
+        """**先問傳點落地處旁邊那幾格。**
+
+        會走到「不知道自己在哪」這一步，幾乎都是**剛換完圖**（[MEM-022]：
+        座標還停在上一張圖）。而剛換完圖時人一定站在某個**傳點的落地處** ——
+        那是我們手上就有的資料（`warp_landings_on`）。
+
+        ⚠ 不能拿落地格本身當目標：人已經站在那裡，送過去伺服器不會動，
+        我們就得不到任何訊號。要送**旁邊幾格**，動了才問得出位置。
+
+        ⚠ 也不能送太遠：移動超過 `MAX_STEP` 會被靜默忽略（[PKT-077]）。
+        所以固定挑落地處附近一小圈。
+        """
+        from ro_toolbox.services.gamedata import warp_landings_on
+        from ro_toolbox.services.travel import nearest_walkable
+
+        out: list[tuple[int, int]] = []
+        for landing in warp_landings_on(terrain.name):
+            spot = nearest_walkable(terrain, landing, radius=3)
+            if spot is None:
+                continue
+            for dx, dy in ((3, 0), (0, 3), (-3, 0), (0, -3)):
+                cell = (spot[0] + dx, spot[1] + dy)
+                if terrain.is_walkable(*cell) and cell not in out:
+                    out.append(cell)
+                    break
+        return out
 
     def _terrain_for(self, map_name: str):
         """這張圖的地形（記著上一張，不要每拍重讀）。讀不到回 None。"""
