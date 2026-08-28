@@ -128,6 +128,10 @@ _PIN_SOCKET_TIMEOUT = 20.0
 #: 一直「缺料」（踩過：15 秒不夠）。
 _PIN_SEED_TIMEOUT = 40.0
 _POLL = 0.4
+#: 送出**之前**確認「帳號有沒有打進帳號欄」的等待上限。
+#: 一次記憶體搜尋約 0.4 秒（[MEM-032]），所以這裡大約是搜 4 次。
+#: ⚠ 逾時**不代表打反了**（也可能是讀不到）—— 見 `_fields_look_right`。
+_FIELD_CHECK_TIMEOUT = 1.8
 #: 探針打進去之後，最多等這麼久去記憶體裡找它。
 #:
 #: 找得到＝焦點在帳號欄（[MEM-032]：帳號欄的字在堆積上找得到，密碼欄的**整個
@@ -222,6 +226,8 @@ class AutoLogin:
         self._tab_first: bool | None = None
         #: 已經打過一輪了嗎。重試時欄位裡有上一輪的字，一定要清空。
         self._typed_once = False
+        #: 送出前的檢查已經翻過一次面了嗎。只准翻一次 —— 見 `_fields_look_right`。
+        self._presubmit_flipped = False
         self.progress = LoginProgress()
 
     # ---- 對外 -------------------------------------------------------
@@ -547,25 +553,80 @@ class AutoLogin:
         self._typed_once = True
         return batches
 
-    def _needs_clear_after_tab(self) -> bool:
-        """Tab 過去那一格要不要先清空。
+    def _fields_look_right(self) -> bool:
+        """兩格都打完、**還沒按 Enter** 時確認沒打反。打反就翻面並回 False。
 
-        使用者實測的規則：**剛進登入畫面時，有焦點的那一格是空的**，
-        而客戶端只會把記住的帳號預填在**帳號欄**。所以：
+        ## 怎麼驗
 
-            Tab 過去是帳號欄 → 有預填，**要清**
-            Tab 過去是密碼欄 → 是空的，**不用清**
+        [MEM-032] 量過一個不對稱：**打進帳號欄的字在堆積上找得到，
+        打進密碼欄的字整個記憶體都搜不到。** 而不論假設對錯，我們都會把
+        帳號打進「我們以為是帳號欄」的那一格 —— 所以：
 
-        ⚠ **重試時一律要清** —— 那時候欄位裡是上一輪我們自己打進去的字。
+            找得到自己的帳號 → 它真的在帳號欄 → 打對了
+            找不到           → 帳號被打進密碼欄 → 打反了
 
-        為什麼值得為了一次清空多寫這段：清空只能走視窗訊息，而打字走按鍵，
-        兩種通道不能同行程（[INP-009]）—— 所以**每一次清空就是一個子行程**，
-        打包後就是 2.7 秒（[INP-013]）。白清一次就是白等 2.7 秒。
+        帳號欄在打之前一定會先清空（`_needs_clear_after_tab`），
+        所以搜到的不會是客戶端預填的舊值。
+
+        ## 為什麼要在送出**之前**驗
+
+        送出之後也有驗（`submitted_account()`），但那時已經跳了「帳密錯誤」，
+        要關掉錯誤框、翻面、整輪重打 —— 大約 25 秒，而且使用者會看到錯誤。
+        這裡驗只要一次記憶體搜尋（約 0.4 秒），而且不會有任何錯誤畫面。
+
+        ## ⚠ 驗不出來時要**放行**，不是擋下來
+
+        「搜不到」也可能是記憶體讀不到。所以只准翻面**一次**：翻過還是搜不到
+        就照樣送出去，讓送出後的閉環驗證兜底 —— 寧可退回舊行為，
+        也不要在這裡卡死（安全退化）。
         """
-        if self._typed_once:
+        deadline = time.monotonic() + _FIELD_CHECK_TIMEOUT
+        while True:
+            if input_helper.field_addresses(self._pid, self._account.username):
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_POLL)
+        if self._presubmit_flipped:
+            self._step("還是找不到自己的帳號，但已經翻過一次 —— 照樣送出去，"
+                       "讓送出後的驗證兜底")
             return True
-        # tab_first＝True 代表第一格是密碼欄，Tab 過去的第二格就是帳號欄。
-        return self._tab_first
+        self._presubmit_flipped = True
+        self._tab_first = not self._tab_first
+        self._step(
+            f"送出前發現帳號不在帳號欄（打反了）—— 不送出，改成先打"
+            f"{'密碼' if self._tab_first else '帳號'}重打一次"
+        )
+        return False
+
+    def _needs_clear_after_tab(self) -> bool:
+        """Tab 過去那一格要不要先清空。**答案永遠是要。**
+
+        ⚠ 這裡試過一次最佳化又收回來，理由值得記住。
+
+        使用者實測的規則是對的：剛進登入畫面時有焦點的那一格是空的，
+        而客戶端只把記住的帳號預填在**帳號欄**。照這個規則，
+        「焦點在帳號欄 → Tab 過去的密碼欄是空的 → 不用清」應該成立，
+        而且可以省掉一個子行程（打包後就是 2.7 秒，[INP-013]）。
+
+        **但那個推論有兩個洞**：
+
+        1. **我們對「Tab 過去是哪一格」的把握，來自探針**（`_probe_focus`），
+           而探針**可能判錯**（找不到時分不出「在密碼欄」與「記憶體讀不到」）。
+           判錯的時候「不用清」就會讓舊值留著，直接送出去。
+        2. 登入畫面上有「**存檔**」選項，客戶端不見得只記帳號 ——
+           「密碼欄一定是空的」本來就不是我們驗過的事實。
+
+        使用者實測回報：「輸入完密碼移動到帳號應該要刪除帳號再打入真帳號，
+        可是他沒刪除舊帳，ENTER 導致錯誤。雖然最後還是成功但不該有那個錯誤。」
+
+        **代價完全不對稱**：省下 2.7 秒 vs 一次打錯送出（伺服器拒絕、跳錯誤框、
+        關掉、翻面、整輪重打 ≈ 25 秒）。所以一律清。
+
+        （探針**之前**那一次仍然不用清 —— 那一格是空的與否都不影響判斷，
+        我們搜的是探針**子字串**，見 `_probe_focus`。）
+        """
+        return True
 
     def _dismiss_error(self, hwnd: int) -> None:
         """關掉「帳密錯誤」對話框。按一次 Enter 就回到登入畫面（使用者實測）。
@@ -1078,8 +1139,16 @@ class AutoLogin:
             # 探針判焦點之後重試本來就少了，多點那一下落在背景圖上是無害的。
             self._click_agree(hwnd)
             try:
-                for batch in self._credential_batches(hwnd):
+                # ⚠ **Enter 單獨留到最後**：送出去之前先確認字打到對的格子。
+                # 打反了就翻面重打，不要送出去讓伺服器拒絕 —— 那會跳錯誤框、
+                # 要關掉、再整輪重來（使用者實測：「雖然最後還是成功，
+                # 但不該有那個錯誤」）。
+                *typing, enter = self._credential_batches(hwnd)
+                for batch in typing:
                     input_helper.send(hwnd, batch)
+                if not self._fields_look_right():
+                    continue
+                input_helper.send(hwnd, enter)
             except input_helper.InputHelperError as exc:
                 log.debug("第 %d 次送不進去：%s", attempt, exc)
                 if time.monotonic() >= deadline:

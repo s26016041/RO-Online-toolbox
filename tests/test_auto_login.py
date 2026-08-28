@@ -58,6 +58,8 @@ def fast(monkeypatch):
         "_CHAR_LIST_TIMEOUT",
         "_CHAR_LIST_QUIET",
         "_BLOB_TIMEOUT",
+        "_PROBE_TIMEOUT",
+        "_FIELD_CHECK_TIMEOUT",
     ):
         if hasattr(auto_login, name):
             monkeypatch.setattr(auto_login, name, 0.4)
@@ -808,23 +810,24 @@ def test_focus_is_measured_once_not_every_attempt(monkeypatch, wired):
 # 而客戶端只會把記住的帳號預填在帳號欄。
 
 
-def test_starting_in_the_account_box_needs_no_clearing_after_tab(monkeypatch, wired):
-    """焦點在帳號欄 → Tab 過去是**空的密碼欄**，不用清。"""
-    bot = _bot(monkeypatch, [0x18254788])          # 探針找得到 = 焦點在帳號欄
-    batches = bot._credential_batches(0x1234)
-    assert bot._tab_first is False
-    # 清空 / 打字 / Tab / 打字 / Enter —— 中間**沒有**第二次清空
-    assert len(batches) == 5, [len(b) for b in batches]
+def test_the_field_after_tab_is_always_cleared(monkeypatch, wired):
+    """⚠ 試過「Tab 過去是空的密碼欄就不用清」，**收回來了**。
 
+    使用者實測：「輸入完密碼移動到帳號應該要刪除帳號再打入真帳號，
+    可是他沒刪除舊帳，ENTER 導致錯誤。」
 
-def test_starting_in_the_password_box_still_clears_the_prefilled_account(
-    monkeypatch, wired
-):
-    """焦點在密碼欄 → Tab 過去是**有預填的帳號欄**，那一格要清。"""
-    bot = _bot(monkeypatch, [])                    # 探針找不到 = 焦點在密碼欄
-    batches = bot._credential_batches(0x1234)
-    assert bot._tab_first is True
-    assert len(batches) == 6, [len(b) for b in batches]
+    那個最佳化有兩個洞：
+      1. 我們對「Tab 過去是哪一格」的把握來自探針，而探針**可能判錯**。
+      2. 登入畫面有「存檔」選項，「密碼欄一定是空的」從來不是驗過的事實。
+
+    省下 2.7 秒 vs 一次打錯送出（錯誤框＋整輪重打 ≈ 25 秒）—— 完全不對稱。
+    """
+    for found in ([0x18254788], []):          # 兩種焦點判定都要清
+        bot = _bot(monkeypatch, found)
+        batches = bot._credential_batches(0x1234)
+        assert len(batches) == 6, [len(b) for b in batches]
+        # 清空／打字／Tab／**清空**／打字／Enter
+        assert all("key" in a for a in batches[3]), batches[3]
 
 
 def test_a_retry_always_clears_because_our_own_text_is_still_there(monkeypatch, wired):
@@ -928,3 +931,46 @@ def test_no_window_message_after_a_key_in_the_same_batch(monkeypatch, wired):
                 seen_key = True
             if "text" in action or "key" in action:
                 assert not seen_key, f"按鍵之後又送視窗訊息：{batch}"
+
+
+# ---- 送出**之前**就抓到打反，不要讓伺服器拒絕 ---------------------------
+#
+# 使用者實測：「雖然最後還是成功的，但不該有那個錯誤。」
+# 送出後才驗的代價是：跳錯誤框 → 關掉 → 翻面 → 整輪重打 ≈ 25 秒。
+
+
+def test_the_account_being_findable_means_we_typed_into_the_right_box(
+    monkeypatch, wired
+):
+    """[MEM-032]：打進**帳號欄**的字在堆積上找得到，打進密碼欄的搜不到。"""
+    bot = _bot(monkeypatch, [0x18254788])
+    assert bot._fields_look_right() is True
+
+
+def test_not_finding_the_account_flips_instead_of_submitting(monkeypatch, wired):
+    """搜不到自己的帳號 = 它被打進密碼欄了 —— 翻面重打，**不要送出**。"""
+    bot = _bot(monkeypatch, [])
+    bot._tab_first = False
+    assert bot._fields_look_right() is False
+    assert bot._tab_first is True, "要翻面"
+    assert any("打反了" in step for step in bot.progress.steps)
+
+
+def test_it_only_flips_once_before_submitting(monkeypatch, wired):
+    """⚠ 「搜不到」也可能是記憶體讀不到 —— 翻過一次就照樣送出去，
+    讓送出後的閉環驗證兜底。不准在這裡卡死（安全退化）。"""
+    bot = _bot(monkeypatch, [])
+    bot._tab_first = False
+    assert bot._fields_look_right() is False      # 第一次：翻面
+    assert bot._fields_look_right() is True       # 第二次：放行
+    assert bot._tab_first is True, "第二次不准再翻"
+
+
+def test_enter_is_held_back_until_the_fields_check_out(monkeypatch, wired):
+    """打反的時候 Enter **一個都不准送出去**。"""
+    bot = _bot(monkeypatch, [])
+    bot._tab_first = False
+    *typing, enter = bot._credential_batches(0x1234)
+    assert enter[0]["key"] == 0x0D
+    assert all(a.get("key") != 0x0D for batch in typing for a in batch), \
+        "Enter 不准混在打字的批次裡"
