@@ -522,3 +522,47 @@ def test_a_known_confirm_word_wins_even_with_other_options():
 def test_a_menu_of_only_exits_picks_nothing():
     index, _why = nd.pick_confirm(["結束", "取消"])
     assert index is None
+
+
+# ---- 最後那個「離開」不按掉，事情就不會發生 --------------------------------
+
+#: ↓ 0x00B7 選單：izlude 的「船長 卡魯」（GID 143），實機 2026-08-28 看到的兩個選項
+CAPTAIN_MENU = bytes.fromhex("23008f000000b56fbcd6b4b5bf4fb6f02d323830307a3aa455a6b8a641b7663a00")
+
+
+def _talk_to(gid: int = 143, want: str = "發樂斯 燈塔島"):
+    talk = nd.NpcTalk(gid, want, npc="船長 卡魯")
+    assert talk.next_packet() == nd.build_contact(gid)   # 接觸
+    return talk
+
+
+def test_the_close_button_is_pressed_so_the_script_can_finish():
+    """⚠⚠ 使用者實機 2026-08-28：選單選對了、封包也送出去了，**船就是不開**，
+    停在原地十分鐘。
+
+    RO 的腳本用 `close2;` —— 伺服器送 `0x00B6` 叫客戶端畫出「離開」鈕，
+    **玩家按了、客戶端回 `0x0146`，腳本才會繼續跑到傳送那一行**。
+    我們收了 0x00B6 卻沒回，腳本就永遠卡在那裡：沒有錯誤、沒有拒絕，就只是不動。
+    """
+    talk = _talk_to()
+    talk.feed(nd.ZC_MENU_LIST, CAPTAIN_MENU)
+    assert talk.next_packet() == nd.build_choose(143, 1)
+    assert talk.done is True
+
+    # 腳本跑到 close2，伺服器叫我們畫「離開」鈕
+    talk.feed(nd.ZC_CLOSE_DIALOG, (143).to_bytes(4, "little"))
+    assert talk.next_packet() == nd.build_close(143), "沒按掉就永遠不會傳送"
+
+
+def test_we_never_close_someone_elses_dialog():
+    """只回應**我們正在講話的那一隻**（GID 對得上）。"""
+    talk = _talk_to()
+    talk.feed(nd.ZC_CLOSE_DIALOG, (999).to_bytes(4, "little"))
+    assert talk.next_packet() is None
+
+
+def test_a_close_before_the_menu_is_still_answered():
+    """有些腳本會先講一段話再收掉 —— 那個「離開」也要按，不然對話卡著。"""
+    talk = _talk_to()
+    talk.feed(nd.ZC_CLOSE_DIALOG, (143).to_bytes(4, "little"))
+    assert talk.next_packet() == nd.build_close(143)

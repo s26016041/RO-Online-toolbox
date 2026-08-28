@@ -157,7 +157,10 @@ def parse_say(payload: bytes) -> tuple[int, str] | None:
 
 
 def parse_wait(payload: bytes) -> int | None:
-    """解 `0x00B5`（等「下一步」）。回 NPC GID。"""
+    """`0x00B5`（等「下一步」）與 `0x00B6`（等「離開」）的 payload 都只有 GID(4)。
+
+    回 NPC GID；讀不出來回 None。
+    """
     if len(payload) < 4:
         return None
     return int.from_bytes(payload[0:4], "little") or None
@@ -333,6 +336,20 @@ class NpcTalk:
             return
         if opcode == ZC_WAIT_DIALOG and parse_wait(payload) == self._gid:
             self._push(build_next(self._gid))
+            return
+        if opcode == ZC_CLOSE_DIALOG and parse_wait(payload) == self._gid:
+            # ⚠⚠ **一定要按掉那個「離開」**，不然事情不會發生。
+            #
+            # 使用者實機 2026-08-28：選單選對了、封包也送出去了，然後**船就是不開**，
+            # 停在原地十分鐘。原因是 RO 的腳本用 `close2;` —— 伺服器送 `0x00B6`
+            # 叫客戶端畫出「離開」鈕，**玩家按了、客戶端回 `0x0146`，腳本才會繼續
+            # 往下跑到傳送那一行**。我們收了 0x00B6 卻沒回，腳本就永遠卡在那裡。
+            #
+            # 這不是「多按一個沒差」：不按 = 傳送永遠不會發生，而且完全沒有徵兆
+            #（沒有錯誤、沒有拒絕，就只是不動）。
+            #
+            # ⚠ 只回應**我們正在講話的那隻**（GID 對得上）—— 別人的對話框不要碰。
+            self._push(build_close(self._gid))
             return
         if opcode == ZC_SAY_DIALOG:
             got = parse_say(payload)

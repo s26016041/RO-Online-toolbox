@@ -135,6 +135,11 @@ class TravelBot:
         self._shake_cell: tuple[int, int] | None = None
         #: 這一段的對話已經談不下去了（看不懂選單），別再重試
         self._dialog_dead: tuple | None = None
+        #: 「該送的都送了，等換圖」那句話講過了沒。
+        #: ⚠ 不擋的話它會**每一拍印一次**：`_note()` 只比對「上一句」，
+        #: 而主迴圈每拍都會用 Traveler 的等待訊息把它蓋掉 —— 兩句一直輪流，
+        #: 就變成一秒十行的洗版（使用者實測日誌）。
+        self._said_waiting = False
         #: 已經提醒過哪一段要人手動（避免每拍洗版）
         self._asked: tuple[str, int, int] | None = None
         self._thread: threading.Thread | None = None
@@ -615,6 +620,7 @@ class TravelBot:
             self._talk = npc_dialog.NpcTalk(
                 self._npc_gid, want, npc=hop.npc, sole=len(here) == 1
             )
+            self._said_waiting = False
             log.info("「%s」在資料裡有 %d 個目的地", hop.npc, len(here))
             log.info("開始跟「%s」(GID %s) 對話，想去 %s",
                      hop.npc, self._npc_gid, want)
@@ -627,7 +633,8 @@ class TravelBot:
             self._note(f"{talk.note} —— 請自己跟「{hop.npc}」講話，我在這裡等")
             self._talk = None
             self._dialog_dead = key
-        elif talk.done:
+        elif talk.done and not self._said_waiting:
+            self._said_waiting = True
             self._note(f"{talk.note}；等換圖…")
 
     def _keep_in_sync(self, now: float) -> bool:
