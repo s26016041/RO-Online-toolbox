@@ -46,11 +46,13 @@ from ro_toolbox.services import bag, icons, potion_store, window_list
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
 from ro_toolbox.services.gamedata import (
+    density_label,
     heals_hp,
     heals_sp,
     item_name,
     map_display_name,
     map_name_table,
+    mob_spawn_rows,
 )
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.process_monitor import local_network_up
@@ -418,6 +420,7 @@ class CharacterCard(QWidget):
         for code, name in sorted(map_name_table().items(), key=lambda kv: kv[1]):
             # 中文名跟地圖代碼都放進同一行，兩種打法都搜得到
             combo.addItem(f"{name}（{code}）", code)
+        self._add_mob_rows(combo)
         completer = QCompleter([combo.itemText(i) for i in range(combo.count())], combo)
         completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         completer.setFilterMode(Qt.MatchFlag.MatchContains)   # 打中間的字也搜得到
@@ -426,6 +429,31 @@ class CharacterCard(QWidget):
         combo.currentIndexChanged.connect(self.potion_changed)  # 設定變了要存
         self.destination = combo
         return combo
+
+    @staticmethod
+    def _add_mob_rows(combo: QComboBox) -> None:
+        """再放一批「怪物 → 哪張圖」的列，讓人**打怪物名字**也找得到目的地。
+
+        資料就在 `assets/mobs.json.gz` 的出沒表裡（來源是客戶端自己的
+        `navi_mob_tw.lub`，遊戲的地圖資訊視窗用的是同一份）——
+        **數量不是我們估的，是遊戲自己的數字**。
+
+        一列長這樣（選下去就是走去那張圖）：
+
+            波利 → 普隆德拉原野08（prt_fild08）超多 100
+
+        ⚠ 「超多／多／普通／很少」的**分界是我們切的**（`gamedata.DENSITY_STEPS`），
+        客戶端資料裡只有數字。所以數字一定要留在同一行 —— 標籤只是方便掃視，
+        真正的依據是那個數字。
+
+        ⚠ 放在地圖列**後面**：`findData(地圖代碼)` 取第一個命中，
+        地圖列在前面才會被挑到（存檔還原、回連接回去都靠它）。
+        """
+        for name, where, count in mob_spawn_rows():
+            label = map_display_name(where) or where
+            combo.addItem(
+                f"{name} → {label}（{where}）{density_label(count)} {count}", where
+            )
 
     def pending_items(self):
         """還原存檔時選了、但**下拉裡還沒有**的道具編號（背包還沒讀到）。

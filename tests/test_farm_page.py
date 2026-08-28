@@ -219,6 +219,43 @@ def test_destination_lists_chinese_and_code(qtbot):
     assert card.destination.findData("geffen") > 0
 
 
+def test_you_can_search_the_destination_by_monster_name(qtbot):
+    """使用者要的：打怪物名字就列出「哪張圖有牠、多不多」，選下去就走過去。
+
+    一列長這樣（數量是**遊戲自己的數字**，來自客戶端的 navi_mob 出沒表）：
+
+        波利 → 普隆德拉原野（prt_fild08）超多 100
+    """
+    card = make_card(qtbot)
+    rows = [
+        card.destination.itemText(i)
+        for i in range(card.destination.count())
+        if card.destination.itemText(i).startswith("波利 →")
+    ]
+    assert rows, "打「波利」要找得到出沒地圖"
+    assert "prt_fild08" in rows[0] and "超多" in rows[0], rows[0]
+    assert "100" in rows[0], "標籤旁邊一定要有真正的數字"
+
+
+def test_a_monster_row_takes_you_to_that_map(qtbot):
+    """選怪物那一列，存的還是**地圖代碼** —— 尋路吃的就是它。"""
+    card = make_card(qtbot)
+    index = next(
+        i for i in range(card.destination.count())
+        if card.destination.itemText(i).startswith("波利 →")
+    )
+    card.destination.setCurrentIndex(index)
+    assert card.chosen_destination() == "prt_fild08"
+
+
+def test_the_plain_map_row_still_wins_when_restoring(qtbot):
+    """⚠ `findData(地圖代碼)` 取**第一個**命中。地圖列一定要排在怪物列前面，
+    不然存檔還原與回連接回去會挑到一列寫著怪物名字的東西。"""
+    card = make_card(qtbot)
+    index = card.destination.findData("prt_fild08")
+    assert card.destination.itemText(index).startswith("普隆德拉原野")
+
+
 def test_choosing_a_destination_wins_over_the_game(qtbot):
     card = make_card(qtbot)
     card.destination.setCurrentIndex(card.destination.findData("geffen"))

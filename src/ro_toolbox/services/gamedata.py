@@ -321,3 +321,70 @@ def maps_with_potion_sellers() -> list[str]:
         if any(any(w in str(r[2]) for w in POTION_SELLER_WORDS) for r in rows if len(r) >= 4):
             out.append(name)
     return sorted(out)
+
+
+# ---- 怪物出沒：哪張圖有這隻怪、大概幾隻 ------------------------------------
+#
+# 資料就在 `assets/mobs.json.gz` 的 `maps` 欄裡（`{地圖: 數量}`），來源是客戶端
+# 自己的 `navi_mob_tw.lub` —— 遊戲的地圖資訊視窗用的是同一份（[DAT-016]）。
+# 也就是說**數量不是我們估的**，是遊戲自己的數字。
+
+
+#: 數量 → 給人看的粗略標籤。
+#:
+#: ⚠ **分界是我們自己切的**，不是客戶端給的字串 —— 客戶端資料裡只有數字。
+#: 切法照實際分布走（2,907 筆出沒資料：最少 1、中位數 15、75% 是 35、
+#: 90% 是 65、最多 230），所以四段大約各佔 30% / 30% / 25% / 15%。
+#: 標籤只是**方便掃視**，真正的依據永遠是旁邊那個數字。
+DENSITY_STEPS = ((5, "很少"), (20, "普通"), (50, "多"))
+DENSITY_TOP = "超多"
+
+
+def density_label(count: int) -> str:
+    """把出沒數量講成一個詞。⚠ 分界見 `DENSITY_STEPS`，是我們切的不是遊戲給的。"""
+    for limit, word in DENSITY_STEPS:
+        if count <= limit:
+            return word
+    return DENSITY_TOP
+
+
+def mob_maps(class_id: int) -> list[tuple[str, int]]:
+    """這隻怪出現在哪些圖、各幾隻。**由多到少**排。查不到回空的。"""
+    entry = _load(_MOB_TABLE).get(str(class_id)) or {}
+    maps = entry.get("maps") or {}
+    return sorted(((m, int(c)) for m, c in maps.items()), key=lambda kv: -kv[1])
+
+
+def find_mobs(text: str) -> list[tuple[int, str]]:
+    """名字含 `text` 的怪：[(class ID, 名字)]。空字串回空的（不要整份倒出來）。"""
+    text = text.strip()
+    if not text:
+        return []
+    out = [
+        (int(k), v["name"])
+        for k, v in _load(_MOB_TABLE).items()
+        if v.get("name") and text in v["name"]
+    ]
+    return sorted(out, key=lambda kv: (len(kv[1]), kv[1]))
+
+
+@lru_cache(maxsize=1)
+def mob_spawn_rows() -> list[tuple[str, str, int]]:
+    """全部「怪 → 圖」的出沒列：[(怪名, 地圖代碼, 數量)]，怪名相同時數量多的在前。
+
+    給目的地選單用：使用者打怪物名字就找得到「哪張圖有牠、多不多」。
+    ⚠ 只收**有中文名的怪**（沒名字沒得搜）與**我們有地形的圖**
+    （走不到的地圖列出來只會讓人選到一個註定失敗的目的地）。
+    """
+    from ro_toolbox.services.mapdata import has_terrain
+
+    rows: list[tuple[str, str, int]] = []
+    for entry in _load(_MOB_TABLE).values():
+        name = entry.get("name")
+        if not name:
+            continue
+        for where, count in (entry.get("maps") or {}).items():
+            if has_terrain(where):
+                rows.append((name, where, int(count)))
+    rows.sort(key=lambda row: (row[0], -row[2]))
+    return rows
