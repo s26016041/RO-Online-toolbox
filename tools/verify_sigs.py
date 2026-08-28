@@ -18,8 +18,9 @@ CLAUDE.md 要求所有位址一律 AOB 定位，而 AOB 有兩種安靜的壞法
 主控台只印結論，完整明細寫到 `reports/verify_sigs-<時間>.md`。
 
 **唯一性檢查**（對執行中的行程）
-  - 角色狀態：AOB 命中幾個都可以，但**通過合理性驗證的只能有 1 個**。
-    （原始 AOB 唯一是錯的判準：堆積裡會有同樣位元組樣式的垃圾，見 [MEM-041]。）
+  - 角色狀態：三條**程式碼骨架**要定位到同一個位址（每條自己還會驗
+    「MaxHP = HP+4」），而且那個位址上的值要通得過合理性驗證。
+    （資料 AOB 已淘汰：樣式裡有一個 byte 其實是會變的遊戲狀態，見 [MEM-052]。）
   - 角色座標：進圖座標全域要用**兩條互相獨立的骨架**定位到同一個位址、
     `y == x+4`；讀出來的格子要落在當下地圖的可走格上（[MEM-047]／[MEM-048]）。
     移動元件（`GID == AID`）**通過驗證的只能有 1 個** —— 剛換圖時 0 個是正常的。
@@ -52,12 +53,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
 from ro_toolbox.services import bag, packet_table  # noqa: E402
-from ro_toolbox.services.aob import locate_global, scan  # noqa: E402
+from ro_toolbox.services.aob import locate_global  # noqa: E402
 from ro_toolbox.services.character import CharacterReader  # noqa: E402
 from ro_toolbox.services.mapdata import has_terrain, load_terrain  # noqa: E402
 from ro_toolbox.services.memory_scan import MemoryScanner  # noqa: E402
 from ro_toolbox.services.signatures import (  # noqa: E402
-    CHAR_STATUS,
+    CHAR_STATUS_SIGS,
     MAP_ENTRY_X_SIGS,
     MAP_ENTRY_XY_GAP,
     MAP_ENTRY_Y_SIGS,
@@ -318,32 +319,34 @@ def check_live(pid: int, snap: Snapshot, report: Report, notes: list[str]) -> No
     print(f"\n[唯一性] PID {pid}")
     base, blob = snap.text_base, snap.text
 
-    # --- 1. 角色狀態：AOB 是**錨**，唯一性靠內容驗證（[MEM-041]）---
+    # --- 1. 角色狀態：程式碼骨架定位 + 內容驗證（[MEM-052]）---
     #
-    # ⚠ 這裡以前要求「原始 AOB 只能命中 1 個」，那個判準是錯的：玩久了堆積裡會
-    # 出現同樣位元組樣式的垃圾（實測 6 個命中裡 5 個是 HP 15／maxHP 42 億／名字空白）。
-    # 真正要守的是「**驗完之後只剩一個**」—— 那才是生產路徑的行為。
+    # ⚠ 這裡以前查的是「資料 AOB 驗完之後只剩一個」。那條資料特徵
+    # 2026-08-29 在實機上死了：樣式裡有一個 byte 其實是會變的遊戲狀態
+    # （HP-0x10，實測從 1 變成 0），於是掃描 0 命中、功能整條停用。
+    # 現在錨在程式碼上，這裡要守的是兩件事：
+    #   a) 三條骨架各自命中、讀出來的位址一致（locate_global 自己會檢查）
+    #   b) 那個位址上的值通得過合理性驗證（= 真的是這隻角色）
+    scanner = MemoryScanner()
+    scanner.open(pid)
+    try:
+        addr = locate_global(scanner, CHAR_STATUS_SIGS)
+    finally:
+        scanner.close()
     reader = CharacterReader()
     located = reader.attach(pid)
     try:
-        scanner = MemoryScanner()
-        scanner.open(pid)
-        try:
-            hits = scan(scanner, CHAR_STATUS, writable_only=True, limit=64)
-        finally:
-            scanner.close()
-        real = [h for h in hits if reader.probe(h) is not None] if located else []
+        status = reader.probe(addr) if (located and addr is not None) else None
     finally:
         reader.close()
     report.add(
-        f"PID {pid} 角色狀態驗證後唯一",
-        len(real) == 1,
-        f"AOB 命中 {len(hits)} 個，通過合理性驗證 {len(real)} 個："
-        f"{[hex(h) for h in real]}",
+        f"PID {pid} 角色狀態定位得到且驗得過",
+        addr is not None and status is not None,
+        f"骨架定位 {addr and hex(addr)}，合理性驗證 {status}",
     )
     notes.append(
-        f"- PID {pid} 角色狀態：AOB 命中 {len(hits)} 個 → 驗證後 {len(real)} 個"
-        f"（其餘是堆積垃圾，見 [MEM-041]）"
+        f"- PID {pid} 角色狀態：程式碼骨架 → {addr and hex(addr)}"
+        f"（資料 AOB 已淘汰，見 [MEM-052]）"
     )
 
     # --- 1b. 角色座標：實體要**唯一**，而且讀出來的格子要真的可走 ---
@@ -608,6 +611,10 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
 
     # --- 選角畫面的兩個全域（游標格號、選定的角色名字）---
     #
+    # 角色狀態（`CHAR_STATUS_SIGS`）是所有功能的地基：HP、等級、地圖、AID
+    # 都從它算出來。它以前是資料 AOB，2026-08-29 被一個「其實會變」的
+    # byte 弄死（[MEM-052]），所以現在也要跟著跑一次改版模擬。
+    #
     # 這兩個是自動選角的眼睛：移游標之前要讀得到「現在在第幾格」，
     # 按下 Enter 之後要讀得到「客戶端選了誰」。定位錯了會選到別人，
     # 所以位移不變、骨架壞掉要退成 None，兩件事都要驗。
@@ -615,6 +622,7 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
     # 進圖座標（`MAP_ENTRY_*`）是換圖之後唯一知道「人在哪」的來源
     # （[MEM-048]）—— 定位錯了會拿別的全域當座標，A* 從錯的起點算路。
     for label, sigs in (
+        ("角色狀態", CHAR_STATUS_SIGS),
         ("選角游標", SELECT_CURSOR_SIGS),
         ("角色名字", SELECT_NAME_SIGS),
         ("進圖座標 x", MAP_ENTRY_X_SIGS),
@@ -645,9 +653,12 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
         text = bytearray(snap.text)
         for sig in sigs:
             for match in sig.compiled().finditer(bytes(text)):
-                for off in sig.operands:
+                # ⚠ 有 `operand_deltas` 的骨架，立即值指的是**鄰居欄位**
+                #   （HP 旁邊的 MaxHP）。整組搬家時 delta 要跟著搬，
+                #   不然這一項會變成在測「delta 檢查會不會擋下來」。
+                for off, delta in zip(sig.operands, sig.deltas(), strict=True):
                     spot = match.start() + off
-                    text[spot:spot + 4] = moved.to_bytes(4, "little")
+                    text[spot:spot + 4] = (moved + delta).to_bytes(4, "little")
         report.add(
             f"{label}：立即值改掉之後答案跟著改",
             locate_global(_mutate(snap, bytes(text)), sigs) == moved,
@@ -674,7 +685,8 @@ def simulate(snap: Snapshot, report: Report, notes: list[str]) -> None:
         if first is not None and enough:
             tampered = bytearray(snap.text)
             spot = first.start() + sigs[0].operands[0]
-            tampered[spot:spot + 4] = (truth + 0x40).to_bytes(4, "little")
+            bad = truth + 0x40 + sigs[0].deltas()[0]
+            tampered[spot:spot + 4] = bad.to_bytes(4, "little")
             report.add(
                 f"{label}：兩處答案不一致 -> 回 None",
                 locate_global(_mutate(snap, bytes(tampered)), sigs) is None,

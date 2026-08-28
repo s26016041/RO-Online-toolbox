@@ -139,7 +139,40 @@ def test_operands_inside_one_skeleton_must_agree():
     assert locate_global(FakeScanner(_code(bad)), [loop]) is None
 
 
+def test_neighbour_fields_are_normalised_before_comparing():
+    """骨架一次碰 HP 與它旁邊的 MaxHP：讀出來先減掉 delta 再比對。
+
+    這是 [MEM-052] 之後加的機制 —— 只驗一個立即值的特徵，指到別的欄位時
+    完全看不出來；要求「相鄰欄位剛好差 4」就把長得像的骨架擋掉了。
+    """
+    mov_ecx = bytes.fromhex("8B0D")   # mov ecx, [imm32]
+    mov_edx = bytes.fromhex("8B15")   # mov edx, [imm32]
+    ret = bytes.fromhex("C3")
+    pair = CodeSignature(
+        name="pair", pattern="8B 0D ?? ?? ?? ?? 8B 15 ?? ?? ?? ?? C3",
+        operands=(2, 8), operand_deltas=(0, 4),
+    )
+
+    def site(gap: int) -> bytes:
+        return (mov_ecx + TARGET.to_bytes(4, "little")
+                + mov_edx + (TARGET + gap).to_bytes(4, "little") + ret)
+
+    assert locate_global(FakeScanner(_code(site(4))), [pair]) == TARGET
+    # 差距不是 4 —— 這一組不是 HP/MaxHP，必須拒答而不是挑一個用。
+    assert locate_global(FakeScanner(_code(site(8))), [pair]) is None
+
+
+def test_delta_count_must_match_operands():
+    """寫錯 delta 個數是程式錯誤，要當場炸，不能安靜地少驗一個。"""
+    with pytest.raises(ValueError):
+        CodeSignature(name="x", pattern="A1 ?? ?? ?? ??",
+                      operands=(1,), operand_deltas=(0, 4))
+
+
 @pytest.mark.parametrize("sig", [
+    *__import__(
+        "ro_toolbox.services.signatures", fromlist=["x"]
+    ).CHAR_STATUS_SIGS,
     *__import__(
         "ro_toolbox.services.signatures", fromlist=["x"]
     ).SELECT_CURSOR_SIGS,

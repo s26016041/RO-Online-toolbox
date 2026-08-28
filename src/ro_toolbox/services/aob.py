@@ -181,13 +181,32 @@ class CodeSignature:
     `operands` 是要從命中的起點算起、哪幾個位移上讀 4-byte 立即值。
     同一個骨架裡讀得到好幾個時（例如一段迴圈重複引用同一個全域），
     它們**必須全部相等** —— 那是這條特徵自帶的一致性檢查。
+
+    `operand_deltas` 把那個檢查延伸到**鄰居**：骨架常常一次碰好幾個相鄰的
+    全域（HP 緊接著 MaxHP、四個 getter 依序讀 HP/MaxHP/SP/MaxSP）。
+    填上每個立即值相對「要定位的那一個」的距離，讀出來先各自減掉它，
+    再要求全部相等。這比「只讀一個立即值」強得多：長得像的骨架很多，
+    但**同時滿足「相鄰欄位剛好差 4」的很少**（實測 `A1 imm 99 C3` 這種
+    getter 骨架在模組裡有 7 處，加上 delta 檢查之後只剩 2 處，答案一致）。
+    留空 = 全部 0 = 舊行為（所有立即值必須相等）。
     """
 
     name: str
     pattern: str
     operands: tuple[int, ...]
+    #: 每個 operand 相對「要定位的那個全域」的距離。留空代表全部 0。
+    operand_deltas: tuple[int, ...] = ()
     #: 這個骨架是什麼指令、為什麼挑它。改版壞掉時要靠這段話重找。
     why: str = ""
+
+    def __post_init__(self) -> None:
+        if self.operand_deltas and len(self.operand_deltas) != len(self.operands):
+            raise ValueError(
+                f"特徵「{self.name}」的 operand_deltas 個數與 operands 對不上"
+            )
+
+    def deltas(self) -> tuple[int, ...]:
+        return self.operand_deltas or (0,) * len(self.operands)
 
     def compiled(self) -> re.Pattern[bytes]:
         out = b""
@@ -244,9 +263,11 @@ def locate_global(
     for sig in signatures:
         found: set[int] = set()
         for match in sig.compiled().finditer(blob):
-            for off in sig.operands:
+            for off, delta in zip(sig.operands, sig.deltas(), strict=True):
                 start = match.start() + off
-                value = int.from_bytes(blob[start:start + 4], "little")
+                # 減掉 delta：骨架碰到的是鄰居欄位時，先換算回「主角」那個位址
+                # 再比對，於是「MaxHP 剛好等於 HP+4」變成特徵自帶的檢查。
+                value = int.from_bytes(blob[start:start + 4], "little") - delta
                 if base <= value < base + span:
                     found.add(value)
                 else:

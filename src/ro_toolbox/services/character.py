@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import logging
 
-from ro_toolbox.services.aob import locate_global, scan
+from ro_toolbox.services.aob import locate_global
 from ro_toolbox.services.memory_scan import VALUE_TYPES, MemoryScanner
 from ro_toolbox.services.player_position import PlayerPosition
 from ro_toolbox.services.status_effects import ActiveStatus, StatusEffects
 from ro_toolbox.services.signatures import (
-    CHAR_STATUS,
+    CHAR_STATUS_SIGS,
     MAP_NAME_ENCODING,
     MAP_NAME_MAX_BYTES,
     NAME_ENCODING,
@@ -35,9 +35,6 @@ _INT32 = VALUE_TYPES["int32"]
 # 合理性驗證用的上限。讀到超出範圍的值代表定位跑掉了，寧可回報失敗。
 _MAX_LEVEL = 999
 _MAX_HP = 10_000_000
-#: 定位時最多收幾個候選。以前是 8 —— 實測堆積裡的垃圾命中就有 5 個，
-#: 上限訂太低會在驗證之前就把真的角色截掉（而且完全看不出來被截了）。
-_SCAN_LIMIT = 64
 # 經驗值是 int64，但單一等級的門檻不會離譜。超過就是讀到垃圾，寧可不顯示。
 _MAX_EXP = 10_000_000_000
 # 滿級時伺服器塞一個哨兵值當「升級所需」（實測商狐 Job 50 讀到 999999999999999999）。
@@ -264,7 +261,7 @@ class SelectScreen:
 
 
 class CharacterReader:
-    """以 AOB 特徵定位角色狀態結構，之後每次讀取都用同一個基址。
+    """以**程式碼骨架**定位角色狀態全域，之後每次讀取都用同一個基址。
 
     基址在 attach() 時定位一次。遊戲重開或改版後必須重新 attach ——
     絕對不要把定位結果存到設定檔或原始碼裡。
@@ -302,38 +299,42 @@ class CharacterReader:
     def attach(self, pid: int, should_stop=None) -> bool:
         """附加到行程並用特徵定位。失敗回傳 False，呼叫端要大聲停用功能。
 
-        should_stop: 可選的 callable，掃描每個記憶體區塊前會問一次；
-        回傳 True 就中止定位。關程式時用得到——全掃一趟要一秒多。
+        should_stop: 可選的 callable，動手之前問一次；回傳 True 就放棄。
+        以前這裡要全堆積掃 1～2.5 秒，所以每個區塊都得問一次；改成程式碼
+        骨架定位之後整趟只讀一次程式碼區段（30 毫秒內），問一次就夠了。
         """
         self.close()
+        if should_stop is not None and should_stop():
+            return False
         try:
             self._scanner.open(pid)
         except Exception as exc:  # noqa: BLE001
             log.error("開啟行程 %s 失敗：%s", pid, exc)
             return False
 
-        hits = scan(
-            self._scanner,
-            CHAR_STATUS,
-            writable_only=True,
-            limit=_SCAN_LIMIT,
-            should_stop=should_stop,
-        )
-        # ⚠ 命中多個**不代表特徵壞了**。實測（2026-08-26）玩久了之後堆積裡會出現
-        # 5 個同樣位元組樣式的垃圾：HP 15、max_hp 42 億、名字與地圖都是空的。
-        # 真正的角色（狐狐狸 HP 1020/1020、Base 33、在 mjolnir_06）也在裡面，
-        # 但舊版看到「不只一個」就直接放棄 —— 遊戲明明開著卻讀不到，
-        # 使用者實際回報過。AOB 只是**錨**，分辨「這是不是角色」要靠數值本身。
-        if len(hits) > 1:
-            real = [h for h in hits if self.probe(h) is not None]
-            log.info("角色特徵命中 %d 個，通過合理性驗證的有 %d 個", len(hits), len(real))
-            hits = real
-        if not hits:
+        # ⚠ **不要退回資料樣式。** 以前這裡掃的是 HP 前面 0x20 bytes 的固定
+        # 欄位，其中一個 byte 其實是會變的遊戲狀態，2026-08-29 實機上它從 1
+        # 變成 0，整條功能就「角色狀態結構不見了」每幾秒噴一次（[MEM-052]）。
+        # 現在錨在程式碼上，資料怎麼變都不影響定位。
+        base = locate_global(self._scanner, CHAR_STATUS_SIGS)
+        if base is None:
+            # 骨架一條都對不上 = 遊戲改版了（或 GameGuard 擋住讀取）。
+            # 這與「還沒進遊戲」是兩回事，不管有沒有成功過都要大聲。
+            _notes_for(pid).problem(
+                "no-signature", logging.ERROR,
+                "角色狀態的程式碼特徵定位不到 —— 遊戲可能已改版，功能停用",
+            )
+            self.close()
+            return False
+
+        # 位址找得到不代表裡面有角色：登入／選角畫面上那個全域是殘渣
+        # （數值全落在合理範圍、只有名字是空的，見 `_plausible`）。
+        if self.probe(base) is None:
             notes = _notes_for(pid)
             if pid in _ever_valid:
                 notes.problem(
                     "gone", logging.ERROR,
-                    "角色狀態結構不見了 —— 角色可能已登出，或改版讓特徵失效",
+                    "角色狀態讀不出來了 —— 角色可能已登出（位址 %#x 還在）", base,
                 )
             else:
                 # 還沒進到遊戲裡就是讀不到，這是**正常狀態不是錯誤**。
@@ -343,17 +344,8 @@ class CharacterReader:
                 )
             self.close()
             return False
-        if len(hits) > 1:
-            # 驗證之後還是不只一個 —— 那才是真的分不出來（多開？特徵不夠精確？）。
-            # 這種時候不准賭，賭錯就是照著別人的血量做決策。
-            _notes_for(pid).problem(
-                "ambiguous", logging.ERROR,
-                "有 %d 個位址都像是真的角色狀態，分不出來，判定為定位失敗", len(hits),
-            )
-            self.close()
-            return False
 
-        self._base = hits[0]
+        self._base = base
         self._pid = pid
         log.info("角色狀態結構定位於 %#x", self._base)
         self._locate_position()
@@ -455,8 +447,9 @@ class CharacterReader:
     def probe(self, base: int) -> CharacterStatus | None:
         """在**指定位址**讀一份狀態並驗合理性，不動降噪狀態也不改 `_base`。
 
-        定位時用來把垃圾命中挑掉：AOB 只是錨，真正分辨「這是不是角色」的是
-        數值本身（見 `_plausible`：名字、HP ≤ maxHP、等級範圍…）。
+        `attach()` 用它回答「這個位址現在有沒有角色」：程式碼骨架給的是
+        **位址**，位址永遠在；分辨「裡面是不是真的角色」要靠數值本身
+        （見 `_plausible`：名字、等級範圍、HP 上限…）。
         """
         saved = self._base
         self._base = base

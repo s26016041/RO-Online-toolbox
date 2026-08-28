@@ -18,7 +18,10 @@ from ro_toolbox.services.character import (  # noqa: E402
     _plausible,
     _until_null,
 )
-from ro_toolbox.services.signatures import CHAR_STATUS, STATUS_OFFSETS  # noqa: E402
+from ro_toolbox.services.signatures import (  # noqa: E402
+    CHAR_STATUS_SIGS,
+    STATUS_OFFSETS,
+)
 
 
 def make(**kwargs) -> CharacterStatus:
@@ -132,11 +135,32 @@ def test_signature_offsets_are_documented():
     assert STATUS_OFFSETS.name == 0x2800
 
 
-def test_signature_has_wildcards():
-    """特徵不准把答案寫死，必須留萬用字元（見 CLAUDE.md）。"""
-    _pattern, mask = CHAR_STATUS.parse()
-    assert 0 in mask, "特徵沒有任何 ?? 位元組，可能把變動值寫死了"
-    assert CHAR_STATUS.value_offset == 0x20
+def test_signature_never_hardcodes_the_answer():
+    """位址一律從立即值讀出來，不准寫進特徵裡（見 CLAUDE.md）。
+
+    每條骨架讀立即值的那四個 byte 都必須是 `??` —— 寫死的那一刻，
+    這條特徵就只對這一版有效了。
+    """
+    assert CHAR_STATUS_SIGS, "角色狀態一條特徵都沒有"
+    for sig in CHAR_STATUS_SIGS:
+        tokens = sig.pattern.split()
+        for off, delta in zip(sig.operands, sig.deltas(), strict=True):
+            assert tokens[off:off + 4] == ["??"] * 4, (
+                f"{sig.name} 的 operand {off:#x} 沒有遮掉"
+            )
+            assert delta % 4 == 0, f"{sig.name} 的 delta 不是 dword 對齊"
+        assert sig.why, f"{sig.name} 沒寫骨架出處"
+
+
+def test_signature_cross_checks_neighbour_fields():
+    """每條骨架都要有自己的一致性檢查：至少兩個立即值互相對照。
+
+    2026-08-29 的教訓（[MEM-052]）：只驗一個立即值的特徵，指到別的欄位時
+    完全看不出來。三條骨架都同時碰 HP 與 MaxHP，差 4 就是內建的檢查。
+    """
+    for sig in CHAR_STATUS_SIGS:
+        assert len(sig.operands) >= 2, f"{sig.name} 只讀一個立即值，沒有互驗"
+        assert 4 in sig.deltas(), f"{sig.name} 沒有拿 MaxHP（HP+4）當交叉驗證"
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="只支援 Windows")
@@ -622,14 +646,14 @@ def _fake_position(monkeypatch, ok=True, addr=0x5078D228, map_name="izlude"):
     monkeypatch.setattr(MemoryScanner, "attached", property(lambda self: True))
 
 
-def _attachable(monkeypatch, hits, plausible_at):
-    """準備一個只差 scan 結果的 reader（不真的開行程）。"""
+def _attachable(monkeypatch, addr, plausible_at):
+    """準備一個只差「骨架定位結果」的 reader（不真的開行程）。"""
     from ro_toolbox.services import character as mod
 
     reader = CharacterReader()
     monkeypatch.setattr(reader._scanner, "open", lambda _pid: None)
     monkeypatch.setattr(reader._scanner, "close", lambda: None)
-    monkeypatch.setattr(mod, "scan", lambda *a, **k: list(hits))
+    monkeypatch.setattr(mod, "locate_global", lambda *a, **k: addr)
     monkeypatch.setattr(
         CharacterReader,
         "probe",
@@ -639,55 +663,34 @@ def _attachable(monkeypatch, hits, plausible_at):
     return reader
 
 
-def test_junk_hits_are_filtered_instead_of_giving_up(monkeypatch):
-    """實測 2026-08-26：玩久了堆積裡會出現 5 個同樣位元組樣式的垃圾
-    （HP 15、max_hp 42 億、名字與地圖都空的），真的角色也在裡面。
+def test_code_signature_gives_the_base_directly(monkeypatch):
+    """骨架定位成功 ＋ 位址上的值驗得過 = 接上。"""
+    reader = _attachable(monkeypatch, addr=0x15D7C98, plausible_at={0x15D7C98})
+    assert reader.attach(4321) is True
+    assert reader._base == 0x15D7C98
 
-    舊版看到「不只一個」就直接放棄，症狀是「遊戲明明開著卻讀不到角色」。
-    AOB 只是錨，分辨「這是不是角色」要靠數值本身。
+
+def test_missing_skeleton_fails_loudly(monkeypatch):
+    """三條骨架一條都對不上 = 遊戲改版了。大聲停用，不准退回舊辦法。"""
+    reader = _attachable(monkeypatch, addr=None, plausible_at={0x15D7C98})
+    assert reader.attach(4321) is False
+    assert reader._base is None
+
+
+def test_address_alone_is_never_trusted(monkeypatch):
+    """位址永遠找得到（它在程式碼裡），所以**一定**要驗內容。
+
+    登入／選角畫面上那個全域是殘渣：數值全落在合理範圍、只有名字是空的。
+    少了這一步，自動掛機頁會拿殘渣建出一個分頁然後照著它算血量。
     """
-    reader = _attachable(
-        monkeypatch,
-        hits=[0x39871000, 0x15D7C98, 0x39872000, 0x39873000],
-        plausible_at={0x15D7C98},
-    )
-    assert reader.attach(4321) is True
-    assert reader._base == 0x15D7C98
-
-
-def test_two_believable_characters_still_fail_loudly(monkeypatch):
-    """驗證之後還是不只一個＝真的分不出來。不准賭，賭錯就是照別人的血量決策。"""
-    reader = _attachable(
-        monkeypatch,
-        hits=[0x15D7C98, 0x16D7C98],
-        plausible_at={0x15D7C98, 0x16D7C98},
+    seen = []
+    reader = _attachable(monkeypatch, addr=0x15D7C98, plausible_at=set())
+    monkeypatch.setattr(
+        CharacterReader, "probe", lambda self, base: seen.append(base),
     )
     assert reader.attach(4321) is False
     assert reader._base is None
-
-
-def test_no_believable_hit_is_treated_as_not_in_game(monkeypatch):
-    reader = _attachable(monkeypatch, hits=[0x39871000, 0x39872000], plausible_at=set())
-    assert reader.attach(4321) is False
-    assert reader._base is None
-
-
-def test_single_hit_skips_the_probe(monkeypatch):
-    """只有一個命中時不必額外驗 —— read() 本來就會驗，不要多掃一次記憶體。"""
-    from ro_toolbox.services import character as mod
-
-    reader = CharacterReader()
-    monkeypatch.setattr(reader._scanner, "open", lambda _pid: None)
-    monkeypatch.setattr(mod, "scan", lambda *a, **k: [0x15D7C98])
-    _fake_position(monkeypatch)
-
-    def boom(self, base):
-        raise AssertionError("只有一個命中時不該呼叫 probe")
-
-    monkeypatch.setattr(CharacterReader, "probe", boom)
-    assert reader.attach(4321) is True
-    assert reader._base == 0x15D7C98
-    assert reader.position_located is True
+    assert seen == [0x15D7C98], "attach 沒有驗過位址上的內容"
 
 
 def test_position_is_disabled_when_no_source_works(monkeypatch):
@@ -699,7 +702,7 @@ def test_position_is_disabled_when_no_source_works(monkeypatch):
 
     reader = CharacterReader()
     monkeypatch.setattr(reader._scanner, "open", lambda _pid: None)
-    monkeypatch.setattr(mod, "scan", lambda *a, **k: [0x15D7C98])
+    monkeypatch.setattr(mod, "locate_global", lambda *a, **k: 0x15D7C98)
     _fake_position(monkeypatch, ok=False)
     assert reader.attach(4321) is True  # HP／等級還是讀得到
     assert reader.position_located is False
@@ -713,9 +716,11 @@ def test_changing_map_throws_the_component_address_away(monkeypatch):
 
     reader = CharacterReader()
     monkeypatch.setattr(reader._scanner, "open", lambda _pid: None)
-    monkeypatch.setattr(mod, "scan", lambda *a, **k: [0x15D7C98])
+    monkeypatch.setattr(mod, "locate_global", lambda *a, **k: 0x15D7C98)
     _fake_position(monkeypatch)
-    maps = ["izlude", "izlude", "izlude_in"]
+    # attach 會讀兩次地圖（probe 驗內容一次、_locate_position 一次），
+    # 之後才輪到 read()。前三個是同一張圖，第四個才換。
+    maps = ["izlude", "izlude", "izlude", "izlude_in"]
     monkeypatch.setattr(
         CharacterReader,
         "_collect",

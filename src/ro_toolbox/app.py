@@ -246,13 +246,13 @@ def probe() -> int:
         status = reader.read()
         say(f"[探針] 讀到角色 = {status and status.name}"
               f" @ {status and status.map_name} {reader.read_position()}")
-    # 直接跑一次特徵掃描，看命中幾個、幾個通過驗證 ——
-    # 「attach 回 True 但 read() 回 None」就是這一步挑錯了候選。
+    # 直接跑一次特徵定位，看骨架對不對得上、位址上的值驗不驗得過 ——
+    # 「attach 回 True 但 read() 回 None」就是後半這一步的問題。
     if ok:
         import numpy
 
-        from ro_toolbox.services.aob import scan as aob_scan
-        from ro_toolbox.services.signatures import CHAR_STATUS
+        from ro_toolbox.services.aob import locate_global
+        from ro_toolbox.services.signatures import CHAR_STATUS_SIGS
 
         sc = reader._scanner  # noqa: SLF001 - 診斷
         regions = sc.regions(writable_only=True)
@@ -268,12 +268,12 @@ def probe() -> int:
             say(f"[探針]   讀 {base_addr:#x} 的 {size / 1024 / 1024:.1f} MB → "
                 f"拿到 {got / 1024 / 1024:.1f} MB"
                 f"　錯誤碼 {ctypes.get_last_error()}")
-        # 連掃三次：分辨「穩定掃不到」與「時好時壞」
+        # 連定位三次：分辨「穩定找不到」與「時好時壞」
         for round_no in (1, 2, 3):
-            hits = aob_scan(sc, CHAR_STATUS, writable_only=True, limit=64)
-            good = [h for h in hits if reader.probe(h) is not None]
-            say(f"[探針] 第 {round_no} 次掃描：命中 {len(hits)} 個、驗過 {len(good)} 個"
-                f"　{[hex(h) for h in hits[:4]]}")
+            addr = locate_global(sc, CHAR_STATUS_SIGS)
+            good = reader.probe(addr) if addr is not None else None
+            say(f"[探針] 第 {round_no} 次定位：{addr and hex(addr)}"
+                f"　合理性驗證 {'過' if good is not None else '不過'}　{good}")
     reader.close()
     return 0
 

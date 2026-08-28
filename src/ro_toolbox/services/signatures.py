@@ -13,33 +13,71 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ro_toolbox.services.aob import AOBSignature, CodeSignature
+from ro_toolbox.services.aob import CodeSignature
 
 # ---------------------------------------------------------------------------
-# 角色狀態（HP / SP / 等級）
+# 角色狀態（HP / SP / 等級）：用**程式碼骨架**定位，不看資料樣式
 # ---------------------------------------------------------------------------
-# 生成方式：同時開三個角色（Base/Job/HP/SP 各不相同），先用數值掃描找出
-# 三者共通的結構位址，再取該位址前 0x20 bytes 的共同位元組樣式當特徵。
 #
-# 樣式內容是 HP 前方的固定欄位：0, 4, 15, 0, 1, 0, <變動>, 0
-# 第 7 個 dword 三個行程都不同（0x53a2591 / 0x53f8c9d / 0x531dbba），已遮成 ??。
+# ⚠ 這裡以前是一條**資料** AOB（`CHAR_STATUS`），錨在 HP 前面 0x20 bytes 的
+#   固定欄位 `0, 4, 15, 0, 1, 0, ??, 0` 上。2026-08-29 實機炸掉（[MEM-052]）：
+#   第 5 個 dword（HP-0x10）那個 `1` **不是結構常數，是會變的資料** ——
+#   白雪狐掛了 20 分鐘之後它變成 0，特徵當場 0 命中，於是
+#   「角色狀態結構不見了」每隔幾秒噴一次，自動掛機與自動補水整條停掉。
+#   （另外兩個角色同一時間都還是 1，所以看起來像「只有那一隻壞掉」。）
+#   GAMEDATA [MEM-003] 當年就把這個列成已知風險：
+#   「還沒驗證這些值在戰鬥／移動／換地圖時會不會變」—— 它真的會變。
 #
-# 驗證（2026-08-23，見 GAMEDATA [MEM-003]）：
-#   三個行程各只命中 1 個位址，都等於預期位址，六個欄位值全部正確。
-CHAR_STATUS = AOBSignature(
-    pattern=(
-        "00 00 00 00  04 00 00 00  0F 00 00 00  00 00 00 00 "
-        "01 00 00 00  00 00 00 00  ?? ?? ?? ??  00 00 00 00"
+#   教訓：**資料樣式裡只要有一個 byte 是「遊戲狀態」，那條特徵就是定時炸彈。**
+#   而且炸的時候長得像「遊戲關了」，不像「特徵過期」。
+#
+# 現在改用 HP 全域的**程式碼引用**。這個全域在 Ragexe.exe 的映像裡
+#（`VirtualQueryEx` 回 MEM_IMAGE、AllocationBase = 模組基底），
+# 不是堆積物件，所以程式碼骨架完全適用，而且掃的是程式碼區段：
+# 以前全堆積掃 1～2.5 秒，現在 30 毫秒以內。
+#
+# 三條骨架落在三個互相獨立的函式裡，**每一條自己就會驗「MaxHP = HP+4」**
+#（`operand_deltas`）。實機（2026-08-29，三個行程）各只命中 1 處，
+# 讀出來的位址三條一致。生成與驗證見 GAMEDATA [MEM-052]。
+CHAR_STATUS_SIGS = (
+    CodeSignature(
+        name="hp-set-from-server",
+        pattern=(
+            "8B 47 04 39 05 ?? ?? ?? ?? 0F 84 ?? ?? ?? ?? B9 ?? ?? ?? ?? "
+            "A3 ?? ?? ?? ?? E8 ?? ?? ?? ?? E9 ?? ?? ?? ?? "
+            "8B 47 04 39 05 ?? ?? ?? ?? 74 ?? B9 ?? ?? ?? ?? "
+            "A3 ?? ?? ?? ?? E8 ?? ?? ?? ??"
+        ),
+        operands=(0x05, 0x15, 0x28, 0x34),
+        operand_deltas=(0, 0, 4, 4),
+        why="伺服器送新數值時的寫入端：`cmp [HP],eax / je / mov ecx,觀察者 / "
+            "mov [HP],eax / call 通知`，緊接著同一段對 MaxHP 再做一次。"
+            "四個立即值 = HP、HP、MaxHP、MaxHP，彼此互驗。實機 1 處命中。",
     ),
-    value_offset=0x20,
-    vt_key="int32",
-    label="角色狀態（HP 起點）",
+    CodeSignature(
+        name="hp-push-with-aid",
+        pattern="FF 35 ?? ?? ?? ?? B9 ?? ?? ?? ?? FF 35 ?? ?? ?? ?? "
+                "FF 35 ?? ?? ?? ?? E8 ?? ?? ?? ?? 5F 5E C3",
+        operands=(0x02, 0x0D),
+        operand_deltas=(4, 0),
+        why="把 MaxHP、HP、AID 三個全域一起推進某個更新函式（函式尾巴是 "
+            "`pop edi; pop esi; ret`）。前兩個立即值差 4，就是 MaxHP 與 HP。"
+            "實機 1 處命中。",
+    ),
+    CodeSignature(
+        name="hp-maxhp-load-pair",
+        pattern="8B 0D ?? ?? ?? ?? 8B 15 ?? ?? ?? ?? 8B B8 CC 00 00 00",
+        operands=(0x02, 0x08),
+        operand_deltas=(0, 4),
+        why="讀取端：`mov ecx,[HP]; mov edx,[MaxHP]; mov edi,[eax+0xCC]`。"
+            "兩個立即值必須剛好差 4。實機 1 處命中。",
+    ),
 )
 
 
 @dataclass(frozen=True)
 class StatusOffsets:
-    """相對於 CHAR_STATUS 命中位址（= HP 所在處）的欄位偏移。
+    """相對於 `CHAR_STATUS_SIGS` 定位到的 HP 全域的欄位偏移。
 
     結構偏移屬於 CLAUDE.md 允許寫死的類別（大更新才會壞），
     但必須留出處：這些偏移是三個角色交叉比對出來的，見 GAMEDATA [MEM-003]。
