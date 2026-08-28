@@ -7,8 +7,11 @@
 - **分不出是打怪還是補助的不列**（`kind == UNKNOWN`）——
   硬塞進其中一區就是安靜地放錯地方（見 `services/skills._classify`）。
 - 勾選與等級存的是**技能編號**，不是第幾格（CLAUDE.md：存身分，不存位置）。
+- 補助技能要查得到「它會上哪個狀態」才給勾，查不到的**格子鎖起來**並在
+  tooltip 說明為什麼 —— 讓人勾了卻沒反應是最糟的。
 
-打怪那一區的勾選目前**沒有動作**（使用者指定先這樣），但一樣會存起來。
+補助區的標題就是「自動補助技能」開關，**跟自動打怪完全獨立**（使用者指定）：
+不掛機也可以只開這個。打怪那一區的勾選目前沒有動作，但一樣會存起來。
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ro_toolbox.services import icons
-from ro_toolbox.services.buffs import BuffPlan
+from ro_toolbox.services.buffs import BuffPlan, buff_efst
 from ro_toolbox.services.skill_store import SkillSaved
 from ro_toolbox.services.skills import ACTIVE, BUFF, Skill
 
@@ -45,6 +48,12 @@ TILE_PX = 92
 #: 深色主題下會變成看不見的字。
 _COLOR = re.compile(r"\^([0-9a-fA-F]{6})")
 _DEFAULT_COLOR = "000000"
+
+#: 查不到「會上哪個狀態」的補助技能，勾了也補不了 —— 說清楚為什麼。
+UNUSABLE_TIP = (
+    "<div><b>查不到它會上哪個狀態，沒辦法自動補。</b><br>"
+    "這類技能多半本來就不上狀態（瞬間移動、物品鑑定、偷竊…）。</div><hr>"
+)
 
 _ICON_CACHE: dict[str, QPixmap] = {}
 
@@ -136,15 +145,28 @@ class SkillTile(QWidget):
         box.addLayout(row)
 
         self.check = QCheckBox()
-        self.check.setChecked(checked)
+        self.check.setChecked(checked and self.usable)
+        self.check.setEnabled(self.usable)
         self.check.stateChanged.connect(lambda _s: self.changed.emit())
         box.addWidget(self.check, 0, Qt.AlignmentFlag.AlignCenter)
 
         tip = description_html(skill.description()) if skill.description() else skill.name
+        if not self.usable:
+            tip = UNUSABLE_TIP + tip
         self.setToolTip(tip)
         for child in (name, icon, self.value, self.check):
             child.setToolTip(tip)
         self._refresh()
+
+    @property
+    def usable(self) -> bool:
+        """勾了有沒有用。
+
+        補助技能要有「它會上哪個狀態」才補得了 —— 沒有那個對應就沒辦法確認
+        補上了沒，只能瞎送（見 `services/buffs.py`）。查不到的多半本來就不上狀態
+        （瞬間移動、物品鑑定、偷竊…），所以**不給勾**比讓人勾了沒反應好。
+        """
+        return self.skill.kind != BUFF or buff_efst(self.skill.id) is not None
 
     # ---- 等級 -------------------------------------------------------
 
@@ -192,12 +214,16 @@ class SkillPanel(QWidget):
 
         self._grids: dict[str, QGridLayout] = {}
         self._sections: dict[str, QWidget] = {}
-        for kind, title in ((ACTIVE, "打怪技能"), (BUFF, "補助技能（勾起來會自動補）")):
+        #: 「自動補助技能」的開關。**跟自動打怪完全獨立**（使用者指定）——
+        #: 不掛機也可以只開這個。
+        self.auto = QCheckBox("自動補助技能（沒有或剩不到 10 秒就補）")
+        self.auto.toggled.connect(lambda _on: self.changed.emit())
+        for kind, title in ((ACTIVE, "打怪技能"), (BUFF, "")):
             section = QWidget()
             column = QVBoxLayout(section)
             column.setContentsMargins(0, 0, 0, 0)
             column.setSpacing(2)
-            head = QLabel(title)
+            head = self.auto if kind == BUFF else QLabel(title)
             head.setObjectName("skillSection")
             column.addWidget(head)
             grid = QGridLayout()
@@ -266,7 +292,16 @@ class SkillPanel(QWidget):
 
     def apply_saved(self, saved: SkillSaved) -> None:
         self._saved = saved
+        # ⚠ 用 blockSignals：套用設定不該被當成「使用者按了開關」，
+        # 否則載入的當下就會去啟動 bot（而且是在還沒讀到技能之前）。
+        self.auto.blockSignals(True)
+        self.auto.setChecked(saved.auto)
+        self.auto.blockSignals(False)
         self._rebuild()
+
+    @property
+    def auto_enabled(self) -> bool:
+        return self.auto.isChecked()
 
     def snapshot(self) -> SkillSaved:
         """現在的勾選狀態。**只存勾起來的** —— 沒勾的存進去只是雜訊。"""
@@ -277,13 +312,7 @@ class SkillPanel(QWidget):
                 continue
             target = buffs if tile.skill.kind == BUFF else levels
             target[skill_id] = tile.level
-        return SkillSaved(buffs=buffs, levels=levels, learned=dict(self._saved.learned))
-
-    def remember_learned(self, learned: dict[int, int]) -> None:
-        """把 `BuffKeeper` 學到的「技能 → 狀態」對應收回來，下次存檔要帶著。"""
-        self._saved = SkillSaved(
-            buffs=self._saved.buffs, levels=self._saved.levels, learned=dict(learned)
-        )
+        return SkillSaved(buffs=buffs, levels=levels, auto=self.auto.isChecked())
 
     def buff_plans(self) -> list[BuffPlan]:
         """勾起來的補助技能，交給 `BuffKeeper`。"""

@@ -43,6 +43,7 @@ from ro_toolbox.config.paths import in_selftest
 from ro_toolbox.config.settings import current_settings
 from ro_toolbox.core.worker import Worker, WorkerThread
 from ro_toolbox.services import bag, icons, potion_store, skill_store, window_list
+from ro_toolbox.services.buffs import BuffBot
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
 from ro_toolbox.services.gamedata import (
@@ -218,8 +219,10 @@ class CharacterCard(QWidget):
     travel_pause_pressed = Signal()
     #: 背景 TravelBot 回報狀態。
     travel_stats = Signal(object)
-    #: 技能面板的勾選或等級有變動（要存設定、要通知 FarmBot）。
+    #: 技能面板的勾選、等級或「自動補助技能」開關有變動。
     skills_changed = Signal()
+    #: 背景 BuffBot 回報狀態（跨執行緒，一定要用 signal 轉回 UI 執行緒）。
+    buff_stats = Signal(object)
 
     def __init__(self) -> None:
         super().__init__()
@@ -367,7 +370,12 @@ class CharacterCard(QWidget):
         self.skills = SkillPanel()
         self.skills.changed.connect(self.skills_changed)
         layout.addWidget(self.skills)
+        self.buff_label = QLabel("")
+        self.buff_label.setObjectName("pageSubtitle")
+        self.buff_label.setVisible(False)
+        layout.addWidget(self.buff_label)
 
+        self.buff_stats.connect(self._apply_buff_stats)
         self.farm_stats.connect(self._apply_farm_stats)
         self.potion_stats.connect(self._apply_potion_stats)
         self.travel_stats.connect(self._apply_travel_stats)
@@ -764,6 +772,21 @@ class CharacterCard(QWidget):
             return
         # ⚠ 這裡不記日誌 —— `PotionBot._note()` 已經記過了，兩邊都記會印兩次。
 
+    def set_buff_note(self, text: str) -> None:
+        self.buff_label.setText(text)
+        self.buff_label.setVisible(bool(text))
+
+    def _apply_buff_stats(self, stats) -> None:  # noqa: ANN001 - BuffStats
+        """自動補助技能的近況。
+
+        ⚠ 只顯示「它在做什麼」，**不顯示 SP 不夠**（使用者指定：SP 不夠就安靜等，
+        那是正常的暫時狀態，跳出來只會洗版）。
+        """
+        note = stats.note or ""
+        if stats.running and stats.cast:
+            note = f"{note}（已補 {stats.cast} 次）"
+        self.set_buff_note(note)
+
     def _apply_farm_stats(self, stats: FarmStats) -> None:
         """⚠ 這裡**不寫任何介面文字**（使用者指定：提示字一律進執行日誌）。
         擊殺／撿取／目標與 bot 自己的 note 都由 `FarmBot._note()` 記進日誌。
@@ -992,6 +1015,9 @@ class FarmPage(BasePage):
         self._workers: dict[int, AttachWorker] = {}
         self._bots: dict[int, FarmBot] = {}
         self._potions: dict[int, PotionBot] = {}
+        #: 自動補助技能。**跟自動打怪各跑各的**（使用者指定）——
+        #: 不掛機也可以只開這個，掛機時兩邊互不干涉。
+        self._buffs: dict[int, BuffBot] = {}
         self._travelers: dict[int, TravelBot] = {}
         #: 自動回連：角色名 → 斷線前在跑什麼／目前的判斷狀態
         self._snaps: dict = {}
@@ -1290,6 +1316,9 @@ class FarmPage(BasePage):
         worker = self._bag_workers.pop(pid, None)
         if worker is not None:
             worker.wait(3000)
+        buff_bot = self._buffs.pop(pid, None)
+        if buff_bot is not None:
+            buff_bot.stop()
         self._skill_loaded.discard(pid)
         # ⚠ 一定要等它結束再往下 —— QThread 還在跑就被解構會**殺掉整支程式**
         # （[ENV-006]，收尾用等待不是丟掉）。
@@ -1535,11 +1564,6 @@ class FarmPage(BasePage):
             # start() 只起執行緒就返回（設定在背景做，UI 不卡）；成敗看回報的 note。
             bot = FarmBot(pid, on_update=lambda s, c=card: c.farm_stats.emit(s))
             self._bots[pid] = bot
-            if card is not None:
-                # 勾起來的補助技能要在 `start()` **之前**交給它 ——
-                # 之後才給的話第一輪不會補，使用者會以為勾了沒用。
-                saved = card.skills.snapshot()
-                bot.set_buffs(card.skills.buff_plans(), saved.learned)
             reader = self._readers.get(pid)
             status = reader.read() if reader is not None else None
             if status is not None and status.has_exp:
@@ -1549,10 +1573,6 @@ class FarmPage(BasePage):
             bot = self._bots.pop(pid, None)
             if bot is not None:
                 self._keep_loot(pid, bot)
-                # 收攤前把它學到的「技能 → 狀態」對應存下來（那是知識不是設定）。
-                if card is not None and card.character:
-                    card.skills.remember_learned(bot.buff_learned)
-                    skill_store.save(card.character, card.skills.snapshot())
                 bot.stop()
             self._exp_start.pop(pid, None)
             if card is not None:
@@ -1663,20 +1683,30 @@ class FarmPage(BasePage):
         self._apply_skill_config(pid, save=False)
 
     def _apply_skill_config(self, pid: int, save: bool = True) -> None:
-        """勾選變了：存回設定，並告訴正在跑的 FarmBot 要補哪些 buff。"""
+        """勾選或開關變了：存回設定，並讓自動補助技能跟上。
+
+        ⚠ 這條路**跟自動打怪無關**（使用者指定）：`BuffBot` 自己一條連線、
+        自己一個開關，開著它不會順便開始打怪，開著打怪也不會順便補 buff。
+        """
         card = self._cards.get(pid)
         if card is None:
             return
-        bot = self._bots.get(pid)
-        if bot is not None:
-            # 把 bot 學到的「技能 → 狀態」對應收回來再存 —— 那是知識，
-            # 丟掉的話下次開程式又要重放一次才知道要檢查什麼。
-            card.skills.remember_learned(bot.buff_learned)
         snapshot = card.skills.snapshot()
         if save and card.character:
             skill_store.save(card.character, snapshot)
-        if bot is not None:
-            bot.set_buffs(card.skills.buff_plans(), snapshot.learned)
+
+        plans = card.skills.buff_plans()
+        bot = self._buffs.get(pid)
+        want = card.skills.auto_enabled and bool(plans)
+        if want and bot is None:
+            bot = BuffBot(pid, plans, on_update=lambda st, c=card: c.buff_stats.emit(st))
+            self._buffs[pid] = bot
+            bot.start()
+        elif want:
+            bot.set_plans(plans)
+        elif bot is not None:
+            self._buffs.pop(pid, None).stop()
+            card.set_buff_note("")
 
     def _load_bag(self, pid: int, again: bool = False) -> None:
         """在背景讀背包（實測 22 ms）。數量會自己一直更新，不需要任何按鈕。

@@ -29,7 +29,6 @@ from ro_toolbox.core.ro_protocol import (
     build_query,
     unpack_move,
 )
-from ro_toolbox.services.buffs import BuffKeeper
 from ro_toolbox.services.entities import EntityScanner
 from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import (
@@ -214,10 +213,6 @@ class FarmBot:
         self._loot: dict[int, int] = {}  # 物品 ID -> 撿取次數
         self._loot_lock = threading.Lock()
         self._walker = Walker(self._send_move)
-        #: 自動補 buff。要等 `start()` 讀到自己的 AID 才建得起來（目標填自己）。
-        self._buffs: BuffKeeper | None = None
-        self._buff_plans: list = []
-        self._buff_learned: dict[int, int] = {}
         self._aim: _Aim | None = None
         self._skip: dict[int, float] = {}  # 打不到的目標 → 黑名單到期時間
         #: gid → 被列入黑名單的時間。用來判斷「之後有沒有再看到它」——
@@ -360,7 +355,6 @@ class FarmBot:
             if status.aid:
                 self._my_gid = status.aid
                 log.info("自己的 GID（AID）=%s", status.aid)
-                self._start_buffs(status.aid, reader)
             self._map = status.map_name
             # 按下按鈕時人在哪，那張就是「家」。被傳走要走回這裡。
             self._home_map = status.map_name
@@ -474,7 +468,6 @@ class FarmBot:
             # 腳邊的掉落物永遠先撿：怪死在腳邊，等打完下一隻就走開撿不到了
             self._grab_nearby(pos)
             self._update_aim(now, pos)
-            self._keep_buffs()
             self._stats.monsters_near = len(self._world.monster_gids())
             self._stats.walk_rejected = self._walker.rejected
 
@@ -488,49 +481,6 @@ class FarmBot:
 
             self._emit()
             self._stop.wait(_TICK)
-
-    # ---- 補助技能 ---------------------------------------------------
-
-    def set_buffs(self, plans, learned: dict[int, int] | None = None) -> None:
-        """換掉「要自動補哪些補助技能」。跑起來之後也可以改。
-
-        `learned` 是上次學到的「技能 → 狀態」對應（見 `services/buffs.py`），
-        帶進來就不用再放一次才知道要檢查什麼。
-        """
-        self._buff_plans = list(plans)
-        if learned:
-            self._buff_learned.update(learned)
-        if self._buffs is not None:
-            self._buffs.set_plans(self._buff_plans)
-
-    @property
-    def buff_learned(self) -> dict[int, int]:
-        """學到的「技能 → 狀態」對應，給呼叫端存回設定。"""
-        if self._buffs is not None:
-            return dict(self._buffs.learned)
-        return dict(self._buff_learned)
-
-    @property
-    def buff_note(self) -> str:
-        return self._buffs.stats.note if self._buffs is not None else ""
-
-    def _start_buffs(self, aid: int, reader) -> None:
-        self._buffs = BuffKeeper(
-            self._send, aid, reader.status_effects, time.monotonic,
-            learned=self._buff_learned,
-        )
-        self._buffs.set_plans(self._buff_plans)
-
-    def _keep_buffs(self) -> None:
-        """補一個快沒了的 buff。
-
-        ⚠ **只在沒有交戰目標時做。** 放技能會中斷「連續普攻」（0x0437 action=7，
-        [PKT-024]），打到一半插一個 buff 進去等於自己把攻擊停掉，而伺服器
-        不會吭聲（[PKT-034] 同一類問題）。剩餘 10 秒的餘裕足夠等打完這一隻。
-        """
-        if self._buffs is None or self._aim is not None:
-            return
-        self._buffs.tick()
 
     def _keep_in_sync(self, now: float) -> bool:
         """換地圖／換伺服器頻道之後，重新綁定 socket 與地形。
@@ -1204,8 +1154,8 @@ class FarmBot:
     def _send(self, data: bytes) -> bool:
         """送封包。失敗代表 socket 已經失效（多半是換頻道），下一拍會重綁。
 
-        回傳「送出去了沒」——`BuffKeeper` 要靠它分辨「沒送成功」與「送了沒效果」，
-        兩者的處置不一樣（前者等重綁，後者要算進失敗次數）。
+        回傳「送出去了沒」，讓呼叫端分得出「沒送成功」與「送了沒效果」——
+        兩者的處置不一樣（前者等重綁，後者要重試）。
         """
         if not self._link.send(data):
             self._resync_at = 0.0     # 逼下一拍立刻重綁，不要等節流時間

@@ -1,45 +1,68 @@
-"""看著身上的狀態，勾選的補助技能**沒有或快過期就補上**。
+"""自動補補助技能：勾起來的，**身上沒有或剩不到 10 秒就放**。
+
+跟自動打怪**完全獨立**：自己一條連線、自己一個開關（使用者指定）。
+交戰中照放 —— 觸發條件到了就放，不看在不在打架。
 
 ## 怎麼知道「這個技能對應身上的哪個狀態」
 
-技能編號（`KN_TWOHANDQUICKEN` = 60）跟狀態編號（`EFST_TWOHANDQUICKEN` = 2）是
-**兩套不同的編號**，客戶端沒有現成的對照表。名字長得像不算證據
-（CLAUDE.md：不准用「看起來像」）。
+查表。技能編號與狀態編號（EFST）是兩套編號，對照表在
+`tools/build_skill_table.py` 生成時就算好了（`assets/skills.json.gz` 的 `efst` 欄），
+用兩條獨立線索交叉驗證：**技能代號去掉職業前綴**（`SM_ENDURE` → `EFST_ENDURE`）
+與**中文名完全相同**（「霸體」→「霸體」）。兩條都有就要一致才採用，
+不一致的 4 個留空。實機驗證過 `SM_ENDURE` → 1、`KN_TWOHANDQUICKEN` → 2。
 
-所以這裡**當場學**：施放前記下身上的狀態集合，施放後看多出來哪一個 ——
-多出來的那個就是它。只有「恰好多一個」才採信；多好幾個（同時被怪上了 debuff）
-或一個都沒多，這一次就不學，下次再說。
+**對不到的技能不能自動補**（多半本來就不上狀態：瞬間移動、物品鑑定、偷竊…）。
+介面上那些格子不給勾，這裡再擋一次。
 
-學到之後存進設定，下次直接用（`learned` 進出都由呼叫端負責，這裡不碰檔案）。
+## SP 不夠就跳過，不是失敗
 
-## 施放後怎麼確認
+SP 不夠是**很正常的暫時狀態**，等回滿了自然就補得上。所以那時候什麼都不做、
+不記失敗、不跳訊息（使用者指定）—— 把它當錯誤只會洗版，而且會讓退避越拖越久。
 
-**不睡覺等**。送出去之後每一拍去讀身上的狀態，看到它出現才算成功
-（CLAUDE.md：做 → 讀 → 確認）。逾時只當**放棄的上限**，不是成功的依據。
+## 送出去之後
 
-連續失敗三次就停用那個技能並大聲說 —— 常見原因是 SP 不夠、還在冷卻、
-或者那根本不是會上狀態的技能（「物品鑑定」也被分類成補助型）。
-安靜地每 0.5 秒重送一次是最糟的結果。
+每一拍去讀身上的狀態，看到它出現才算成功（CLAUDE.md：做 → 讀 → 確認）。
+沒出現就**退避重試**（1 → 2 → 4 → … 最多 30 秒），不是連發也不是永久停用：
+交戰中詠唱被打斷很常見，停用它反而是錯的。
 """
 
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass, field
 
 from ro_toolbox.core.ro_protocol import build_use_skill
-from ro_toolbox.services.gamedata import skill_name
+from ro_toolbox.services.game_link import GameLink
+from ro_toolbox.services.gamedata import skill_name, skill_table
 
 log = logging.getLogger(__name__)
 
 #: 剩下不到這麼久就先補起來（使用者指定 10 秒）。
 REFRESH_BELOW_MS = 10_000
-#: 送出之後等這麼久還沒看到狀態上身，就當這一次失敗。**只是放棄的上限**。
+#: 送出之後等這麼久還沒看到狀態上身，就當這一次沒成功。**只是放棄的上限**。
 CONFIRM_TIMEOUT = 5.0
-#: 同一個技能連續失敗幾次就停用它。
-MAX_FAILURES = 3
+#: 沒成功時的退避：第一次等 1 秒，之後翻倍，最多 30 秒。
+BACKOFF_START = 1.0
+BACKOFF_MAX = 30.0
 #: 兩次施放之間至少隔多久 —— 一拍只做一件事，免得整排 buff 一起噴出去。
 MIN_GAP = 0.6
+#: 主迴圈多久跑一拍。
+TICK = 0.4
+
+
+def buff_efst(skill_id: int) -> int | None:
+    """這個技能會上哪個狀態。查不到回 None（那就不能自動補）。"""
+    return (skill_table().get(skill_id) or {}).get("efst")
+
+
+def sp_cost(skill_id: int, level: int) -> int | None:
+    """這一級要花多少 SP。查不到回 None（那就不做 SP 檢查，送出去讓伺服器決定）。"""
+    costs = (skill_table().get(skill_id) or {}).get("sp")
+    if not costs or not 1 <= level <= len(costs):
+        return None
+    return costs[level - 1]
 
 
 @dataclass(frozen=True)
@@ -59,36 +82,29 @@ class BuffPlan:
 class _Pending:
     skill_id: int
     sent_at: float
-    before: frozenset[int]
 
 
 @dataclass
 class BuffStats:
     """給介面看的狀態。"""
 
+    running: bool = False
     cast: int = 0
-    failed: int = 0
+    #: 因為 SP 不夠而跳過幾次。**只是計數，不是錯誤** —— 給人看「它在等」。
+    waiting_sp: int = 0
     note: str = ""
-    #: 已停用的技能編號 → 為什麼。
-    disabled: dict[int, str] = field(default_factory=dict)
+    #: 勾了但查不到對應狀態、補不了的技能編號。
+    unusable: set[int] = field(default_factory=set)
 
 
 class BuffKeeper:
     """`tick()` 每拍做**一件事**：確認上一次的結果，或補一個 buff。
 
-    不自己開連線、不自己讀記憶體 —— 送封包與讀狀態都由呼叫端注入，
-    這樣 farm_bot 可以沿用它已經建好的那一份（[PKT-072]：同一條規則抄很多份
-    就會有人漏掉）。
+    不自己開連線、不自己讀記憶體 —— 送封包與讀狀態都由呼叫端注入
+    （[PKT-072]：同一條規則抄很多份就會有人漏掉）。
     """
 
-    def __init__(
-        self,
-        send,
-        aid: int,
-        read_statuses,
-        now,
-        learned: dict[int, int] | None = None,
-    ) -> None:
+    def __init__(self, send, aid: int, read_statuses, now) -> None:
         #: `send(data) -> bool`：把封包送出去。
         self._send = send
         #: 自己的 AID。對自己放補助技能就是把目標填自己（[PKT-041]）。
@@ -96,23 +112,28 @@ class BuffKeeper:
         #: `read_statuses() -> list[ActiveStatus] | None`
         self._read = read_statuses
         self._now = now
-        #: 技能編號 → 它會上的狀態編號（EFST）。學到就留著。
-        self.learned: dict[int, int] = dict(learned or {})
         self._plans: list[BuffPlan] = []
         self._pending: _Pending | None = None
-        self._failures: dict[int, int] = {}
+        #: 技能編號 → (下次可以再試的時間, 目前的退避秒數)
+        self._retry: dict[int, tuple[float, float]] = {}
         self._last_cast = 0.0
         self.stats = BuffStats()
 
     def set_plans(self, plans) -> None:
-        """換掉勾選清單。**已經學到的對應不清掉** —— 那是知識不是設定。"""
+        """換掉勾選清單。取消再勾回來等於「再試一次」：退避歸零。"""
         self._plans = [p for p in plans if p.level > 0]
         alive = {p.skill_id for p in self._plans}
-        # 取消勾選再勾回來，等於使用者說「再試一次」：把失敗計數與停用清掉。
-        for skill_id in list(self._failures):
+        for skill_id in list(self._retry):
             if skill_id not in alive:
-                self._failures.pop(skill_id, None)
-                self.stats.disabled.pop(skill_id, None)
+                self._retry.pop(skill_id, None)
+        self.stats.unusable = {
+            p.skill_id for p in self._plans if buff_efst(p.skill_id) is None
+        }
+        for skill_id in self.stats.unusable:
+            log.warning(
+                "「%s」查不到它會上哪個狀態，沒辦法確認補上了沒 —— 不自動補",
+                skill_name(skill_id),
+            )
 
     @property
     def active(self) -> bool:
@@ -130,57 +151,38 @@ class BuffKeeper:
         present = {row.efst: row for row in statuses}
 
         if self._pending is not None:
-            done = self._settle(present)
-            if done is not None:
-                return done
-
+            settled = self._settle(present)
+            if settled is not None:
+                return settled     # 這一拍的工作就是「確認上一個的結果」
+            return None            # 還在等，先不做別的事
         return self._cast_next(present, sp)
 
     # ---- 確認上一次 -------------------------------------------------
 
-    def _settle(self, present: dict[int, object]) -> str | None:
-        """看上一次送出去的技能成功了沒。還在等就回 None（這一拍不做別的）。"""
+    def _settle(self, present: dict) -> str | None:
+        """看上一次送出去的技能成功了沒。還在等就回 None。"""
         pending = self._pending
         assert pending is not None
-        now = self._now()
-        appeared = frozenset(present) - pending.before
-        known = self.learned.get(pending.skill_id)
-
-        if known is not None and known in present:
-            self._succeed(pending.skill_id)
-            return self._note(f"{skill_name(pending.skill_id)} 補上了")
-
-        if known is None and len(appeared) == 1:
-            efst = next(iter(appeared))
-            self.learned[pending.skill_id] = efst
-            self._succeed(pending.skill_id)
-            return self._note(
-                f"{skill_name(pending.skill_id)} 補上了（學到它對應狀態 {efst}）"
-            )
-
-        if now - pending.sent_at < CONFIRM_TIMEOUT:
-            return None       # 還在等，這一拍不做別的事
-
-        self._pending = None
-        self.stats.failed += 1
-        count = self._failures.get(pending.skill_id, 0) + 1
-        self._failures[pending.skill_id] = count
+        efst = buff_efst(pending.skill_id)
         name = skill_name(pending.skill_id)
-        if count >= MAX_FAILURES:
-            why = (
-                "施放後身上沒出現對應的狀態 —— 可能 SP 不夠、還在冷卻，"
-                "或者它根本不是會上狀態的技能"
-            )
-            self.stats.disabled[pending.skill_id] = why
-            log.warning("補助技能「%s」連續失敗 %d 次，停用它：%s", name, count, why)
-            return self._note(f"{name} 連續失敗 {count} 次，停用")
-        log.info("補助技能「%s」這次沒成功（第 %d 次），等下再試", name, count)
-        return self._note(f"{name} 沒成功，等下再試")
 
-    def _succeed(self, skill_id: int) -> None:
+        if efst is not None and efst in present:
+            self._pending = None
+            self._retry.pop(pending.skill_id, None)
+            self.stats.cast += 1
+            return self._note(f"{name} 補上了")
+
+        now = self._now()
+        if now - pending.sent_at < CONFIRM_TIMEOUT:
+            return None
+
         self._pending = None
-        self._failures.pop(skill_id, None)
-        self.stats.cast += 1
+        _, backoff = self._retry.get(pending.skill_id, (0.0, 0.0))
+        backoff = min(BACKOFF_MAX, backoff * 2 if backoff else BACKOFF_START)
+        self._retry[pending.skill_id] = (now + backoff, backoff)
+        # 交戰中詠唱被打斷很常見 —— 退避重試就好，不必大聲，也不要停用。
+        log.info("「%s」放了沒上身，%.0f 秒後再試", name, backoff)
+        return self._note(f"{name} 沒上身，{backoff:.0f} 秒後再試")
 
     # ---- 挑一個來補 -------------------------------------------------
 
@@ -189,33 +191,154 @@ class BuffKeeper:
         if now - self._last_cast < MIN_GAP:
             return None
         for plan in self._plans:
-            if plan.skill_id in self.stats.disabled:
+            efst = buff_efst(plan.skill_id)
+            if efst is None:
+                continue                      # 補不了（已經在 set_plans 說過一次）
+            until, _ = self._retry.get(plan.skill_id, (0.0, 0.0))
+            if now < until:
+                continue                      # 還在退避
+            if not self._needs(efst, present):
                 continue
-            if not self._needs(plan, present):
+            cost = sp_cost(plan.skill_id, plan.level)
+            if sp is not None and cost is not None and sp < cost:
+                # SP 不夠是暫時狀態，等回滿了自然補得上 —— 安靜跳過（使用者指定）。
+                self.stats.waiting_sp += 1
+                log.debug("SP %d 不夠放「%s」（要 %d），先跳過",
+                          sp, skill_name(plan.skill_id), cost)
                 continue
-            if sp is not None and sp <= 0:
-                return self._note("SP 用完了，先不補 buff")
-            data = build_use_skill(plan.level, plan.skill_id, self._aid)
-            if not self._send(data):
+            if not self._send(build_use_skill(plan.level, plan.skill_id, self._aid)):
                 return self._note(f"{skill_name(plan.skill_id)} 送不出去")
             self._last_cast = now
-            self._pending = _Pending(plan.skill_id, now, frozenset(present))
+            self._pending = _Pending(plan.skill_id, now)
             return self._note(f"補 {skill_name(plan.skill_id)} Lv{plan.level}")
         return None
 
-    def _needs(self, plan: BuffPlan, present: dict) -> bool:
-        """這個 buff 該不該補。"""
-        efst = self.learned.get(plan.skill_id)
-        if efst is None:
-            return True             # 還不知道它上什麼狀態 —— 放一次才學得到
+    @staticmethod
+    def _needs(efst: int, present: dict) -> bool:
+        """這個 buff 該不該補：身上沒有，或剩不到 10 秒。"""
         row = present.get(efst)
         if row is None:
-            return True             # 身上沒有
+            return True
         remaining = getattr(row, "remaining_ms", None)
         if remaining is None:
-            return False            # 無時限（或算不出可信值）→ 別重放
+            return False              # 無時限（或算不出可信值）→ 別重放
         return remaining < REFRESH_BELOW_MS
 
     def _note(self, text: str) -> str:
         self.stats.note = text
         return text
+
+
+class BuffBot:
+    """自己一條連線、自己一個執行緒，跟自動打怪互不相干（使用者指定）。
+
+    ⚠ 跟 `PotionBot` 一樣是**獨立的送封包來源**。兩個 bot 同時對同一隻角色
+    送東西是可以的（喝水與放 buff 不互斥），但走路類的動作不要混進來。
+    """
+
+    def __init__(self, pid: int, plans=None, on_update=None) -> None:
+        self._pid = pid
+        self._on_update = on_update
+        self._plans = list(plans or [])
+        self._link = GameLink(pid, should_stop=lambda: self._stop.is_set(),
+                              need_position=False)
+        self._keeper: BuffKeeper | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._stats = BuffStats()
+
+    # ---- 對外 -------------------------------------------------------
+
+    @property
+    def stats(self) -> BuffStats:
+        return self._stats
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def set_plans(self, plans) -> None:
+        self._plans = list(plans)
+        if self._keeper is not None:
+            self._keeper.set_plans(self._plans)
+
+    def start(self) -> bool:
+        if self.running:
+            return True
+        self._stop.clear()
+        self._stats = BuffStats(running=True, note="連線中…")
+        self._emit()
+        self._thread = threading.Thread(
+            target=self._run, name=f"buffs-{self._pid}", daemon=True
+        )
+        self._thread.start()
+        return True
+
+    def stop(self, timeout: float = 3.0) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+        self._thread = None
+        self._stats.running = False
+        self._emit()
+
+    # ---- 執行緒 -----------------------------------------------------
+
+    def _run(self) -> None:
+        try:
+            if self._setup():
+                self._loop()
+        except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
+            log.exception("自動補 buff 停了：%s", exc)
+            self._fail(f"停了：{exc}")
+        finally:
+            self._link.close()
+            self._stats.running = False
+            self._emit()
+
+    def _setup(self) -> bool:
+        problem = self._link.open()
+        if problem:
+            self._fail(problem)
+            return False
+        reader = self._link.reader
+        status = reader.read() if reader is not None else None
+        if status is None or not status.aid:
+            self._fail("讀不到角色（還沒進到遊戲裡？）")
+            return False
+        self._keeper = BuffKeeper(
+            self._link.send, status.aid, reader.status_effects, time.monotonic
+        )
+        self._keeper.set_plans(self._plans)
+        self._stats = self._keeper.stats
+        self._stats.running = True
+        self._stats.note = "看著身上的狀態…"
+        self._emit()
+        return True
+
+    def _loop(self) -> None:
+        keeper = self._keeper
+        assert keeper is not None
+        reader = self._link.reader
+        while not self._stop.is_set():
+            status = reader.read() if reader is not None else None
+            if status is None:
+                # 角色不見了（登出／回到選角）—— 停下來，不要空轉送封包。
+                self._fail("讀不到角色狀態，先停下來")
+                return
+            before = keeper.stats.note
+            keeper.tick(sp=status.sp)
+            if keeper.stats.note != before:
+                self._emit()
+            self._stop.wait(TICK)
+
+    def _fail(self, message: str) -> None:
+        self._stats.running = False
+        self._stats.note = message
+        log.warning("自動補 buff：%s", message)
+        self._emit()
+
+    def _emit(self) -> None:
+        if self._on_update is not None:
+            self._on_update(self._stats)

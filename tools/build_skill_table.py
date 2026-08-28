@@ -40,6 +40,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from lub_parse import Index, load, simulate, tw  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
 OUT = ROOT / "assets" / "skills.json.gz"
 
 
@@ -119,6 +120,50 @@ def _fields(lines: list[str]) -> dict[str, str]:
     return found
 
 
+def _efst_map() -> tuple[dict[str, int], dict[str, int]]:
+    """狀態表的兩份索引：代號 → 編號、**唯一**的中文名 → 編號。
+
+    中文名撞名的（9 個技能會撞到）不放進來 —— 對到兩個等於分不出來。
+    """
+    from ro_toolbox.services.gamedata import efst_table
+
+    table = efst_table()
+    by_key = {v["key"]: k for k, v in table.items() if v.get("key")}
+    names: dict[str, list[int]] = defaultdict(list)
+    for efst_id, entry in table.items():
+        if entry.get("name"):
+            names[entry["name"]].append(efst_id)
+    by_name = {name: ids[0] for name, ids in names.items() if len(ids) == 1}
+    return by_key, by_name
+
+
+def _efst_for(key: str, name: str, by_key: dict[str, int],
+              by_name: dict[str, int]) -> int | None:
+    """這個技能會上哪個狀態（EFST）。判不出來回 None —— 那就不能自動補。
+
+    兩條獨立的線索：
+
+    1. **代號**：技能代號去掉職業前綴，前面接 `EFST_`
+       （`SM_ENDURE` → `EFST_ENDURE`）。
+    2. **中文名**：技能名與狀態名完全相同（「霸體」→「霸體」）。
+
+    兩條都有就要**一致才採用**：全表 237 個兩者都有的裡面 233 個一致，
+    剩下 4 個（`LK_CONCENTRATION`、`HP_BASILICA`、`GN_SPORE_EXPLOSION`、
+    `AG_CRYSTAL_IMPACT`）對到不同的編號 —— 那時候留空，不猜
+    （CLAUDE.md：不確定一律留空；填錯＝很有自信的錯，而且會安靜地
+    對著一個其實沒上身的狀態一直重放）。
+
+    對不到的多半是**本來就不上狀態**的技能（瞬間移動、物品鑑定、偷竊、
+    製作箭…），那正是我們要的答案：不上狀態的東西不該進自動補的清單。
+    """
+    suffix = key.split("_", 1)[1] if "_" in key else key
+    from_key = by_key.get("EFST_" + suffix)
+    from_name = by_name.get(name)
+    if from_key and from_name and from_key != from_name:
+        return None
+    return from_key or from_name
+
+
 def _kind_hint(fields: dict[str, str]) -> str | None:
     """從描述判斷是打怪型還是補助型。判斷不出來回 None —— 留給 `inf` 決定。
 
@@ -152,6 +197,7 @@ def build() -> dict:
             inner[id(table)][key] = value
 
     descriptions = _descriptions(folder)
+    efst_by_key, efst_by_name = _efst_map()
 
     skills: dict[int, dict] = {}
     unresolved: list[str] = []
@@ -170,11 +216,15 @@ def build() -> dict:
             unresolved.append(code)
             continue
         maxlv = fields.get("MaxLv")
+        display = tw(name)
         entry = {
             "key": code,
-            "name": tw(name),
+            "name": display,
             "maxlv": int(maxlv) if isinstance(maxlv, (int, float)) else None,
         }
+        efst = _efst_for(code, display, efst_by_key, efst_by_name)
+        if efst:
+            entry["efst"] = efst
         for field, out_key in (("SpAmount", "sp"), ("AttackRange", "range")):
             numbers = _numbers(fields.get(field))
             if numbers:
@@ -205,6 +255,10 @@ def build() -> dict:
             "nameless": len(nameless),
             "described": sum(1 for e in skills.values() if e.get("desc")),
             "kind": kinds,
+            "efst": sum(1 for e in skills.values() if e.get("efst")),
+            "buff_with_efst": sum(
+                1 for e in skills.values() if e.get("kind") == "buff" and e.get("efst")
+            ),
         },
     }
     table = {"_meta": meta, **{str(k): v for k, v in sorted(skills.items())}}
@@ -229,12 +283,15 @@ def main() -> None:
     print(f"有描述的 {counts['described']} 個；"
           f"從「類型」分得出來的：打怪型 {counts['kind']['active']}、"
           f"補助型 {counts['kind']['buff']}、判不出來 {counts['kind']['none']}（交給 inf）")
-    for skill_id in (5, 7, 8, 60, 142):
+    print(f"對得到狀態編號（EFST）的 {counts['efst']} 個，"
+          f"其中補助型 {counts['buff_with_efst']}/{counts['kind']['buff']} "
+          f"—— 對不到的多半本來就不上狀態（瞬間移動、物品鑑定、偷竊…）")
+    for skill_id in (5, 7, 8, 29, 60, 142):
         entry = table.get(str(skill_id))
         if entry:
             print(f"  {skill_id:>5}  {entry['key']:<20} {entry['name']:<12} "
-                  f"類型={entry.get('type')!r} 對象={entry.get('target')!r} "
-                  f"→ {entry.get('kind')}")
+                  f"類型={entry.get('type')!r} → {entry.get('kind')} "
+                  f"EFST={entry.get('efst')}")
     size = OUT.stat().st_size
     print(f"\n-> {OUT}（{size / 1024:.0f} KB）")
 

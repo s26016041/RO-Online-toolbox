@@ -21,6 +21,8 @@ ENDURE = Skill(8, "SM_ENDURE", "霸體", 8, 10, 10, BUFF)
 SWORD = Skill(2, "SM_SWORD", "單手劍使用熟練度", 1, 10, 0, PASSIVE)
 UNLEARNED = Skill(56, "KN_PIERCE", "連刺攻擊", 0, 10, 7, ACTIVE)
 MYSTERY = Skill(144, "SM_MOVINGRECOVERY", "移動時恢復HP", 3, 1, 0, UNKNOWN)
+#: 「露天商店」是補助類但**不上狀態** —— 查不到 EFST，所以不給勾。
+VENDING = Skill(41, "MC_VENDING", "露天商店", 8, 10, 30, BUFF)
 
 
 @pytest.fixture
@@ -88,11 +90,37 @@ def test_snapshot_only_keeps_what_is_checked(panel):
     assert saved.levels == {}
 
 
-def test_learned_map_survives_a_snapshot(panel):
-    """學到的「技能 → 狀態」對應是知識，存檔要帶著。"""
+def test_auto_switch_is_remembered(panel):
+    """「自動補助技能」的開關要存 —— 它只對自己放 buff，不會意外跑去打怪。"""
     panel.set_skills([QUICKEN])
-    panel.remember_learned({QUICKEN.id: 2})
-    assert panel.snapshot().learned == {QUICKEN.id: 2}
+    assert not panel.auto_enabled
+    panel.auto.setChecked(True)
+    assert panel.snapshot().auto
+
+    panel.apply_saved(SkillSaved(buffs={QUICKEN.id: 7}, auto=True))
+    assert panel.auto_enabled
+
+
+def test_applying_settings_does_not_look_like_a_click(panel, qtbot=None):
+    """套用設定不該被當成「使用者按了開關」，否則載入當下就會去啟動 bot。"""
+    seen = []
+    panel.changed.connect(lambda: seen.append(1))
+    panel.apply_saved(SkillSaved(auto=True))
+    assert seen == []
+
+
+def test_buffs_without_a_status_cannot_be_checked(panel):
+    """「露天商店」不上狀態，勾了也補不了 —— 格子鎖起來並說明原因。"""
+    panel.set_skills([VENDING])
+    tile = panel._tiles[VENDING.id]
+    assert not tile.usable
+    assert not tile.check.isEnabled()
+    assert "沒辦法自動補" in tile.toolTip()
+
+    panel.apply_saved(SkillSaved(buffs={VENDING.id: 8}))   # 檔案裡硬塞也不算數
+    panel.set_skills([VENDING])
+    assert not panel._tiles[VENDING.id].checked
+    assert panel.buff_plans() == []
 
 
 def test_level_cap_follows_a_level_up(panel):
