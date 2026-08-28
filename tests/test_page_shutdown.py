@@ -10,6 +10,10 @@
 
 from __future__ import annotations
 
+import gc
+
+from PySide6.QtCore import QThread
+
 from ro_toolbox.core.worker import Worker, WorkerThread
 from ro_toolbox.ui.pages.base_page import BasePage
 
@@ -137,3 +141,71 @@ def test_without_the_flag_it_scans_as_usual(qtbot, monkeypatch):
     assert scanned == [1]
     assert page._scan_timer.isActive() is True
     page.shutdown()
+
+
+# ---- 背景執行緒不准被「覆蓋掉」------------------------------------------
+#
+# 使用者實機：`py main.py` 登入完之後噴
+#   QThread: Destroyed while thread '' is still running
+# 呼叫端普遍寫成 `self._xxx_thread = WorkerThread(worker)`，下一次再起一條就把
+# 上一條覆蓋掉；上一條還沒跑完的話 Python 這邊就沒人引用它了 → QThread 被解構
+# → Qt 中止整個行程。這種事不該要求每個呼叫端自己記得。
+
+
+def test_a_running_thread_is_not_dropped_when_it_is_replaced(qtbot):
+    """⚠ 這是那句「Destroyed while thread is still running」的真正成因。"""
+    from ro_toolbox.core import worker as worker_mod
+    from ro_toolbox.core.worker import Worker, WorkerThread
+
+    class _Slow(Worker):
+        def run(self) -> None:
+            while not self.should_stop:
+                QThread.msleep(5)
+
+    started = WorkerThread(_Slow())
+    started.start()
+    qtbot.waitUntil(lambda: started.is_running, timeout=2000)
+    first_thread = started.thread
+
+    # 呼叫端把引用蓋掉 —— 實際程式碼就是 `self._x = WorkerThread(...)`
+    started = None
+    gc.collect()
+
+    assert any(t.thread is first_thread for t in worker_mod._RUNNING), \
+        "還在跑的執行緒不准被丟掉"
+    # 收尾：讓它正常停下來
+    for t in list(worker_mod._RUNNING):
+        if t.thread is first_thread:
+            t.stop()
+
+
+def test_a_finished_thread_is_let_go(qtbot):
+    """跑完的就要放掉，不然一直累積等於漏記憶體。"""
+    from ro_toolbox.core import worker as worker_mod
+    from ro_toolbox.core.worker import Worker, WorkerThread
+
+    class _Quick(Worker):
+        def run(self) -> None:
+            return
+
+    done = WorkerThread(_Quick())
+    done.start()
+    qtbot.waitUntil(lambda: done.thread.isFinished(), timeout=2000)
+    done.stop()
+    assert done not in worker_mod._RUNNING
+
+
+def test_no_page_hand_lists_its_threads_to_stop(qtbot):
+    """⚠ 收尾一律靠 `BasePage.shutdown()` 的**全面掃描**，不准自己列清單。
+
+    清單會漏，而漏掉一條的後果是整個行程被中止 ——
+    `AccountPage` 就漏過 `_link_thread`（2026-08-27）。
+    """
+    import inspect
+
+    from ro_toolbox.ui.pages.account_page import AccountPage
+
+    body = inspect.getsource(AccountPage.shutdown)
+    listed = [n for n in ("_link_thread", "_offset_thread", "_login_thread")
+              if n in body]
+    assert not listed, f"又在自己列清單了（{listed}）—— 交給 super().shutdown() 掃"

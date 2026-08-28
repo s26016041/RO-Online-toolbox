@@ -834,6 +834,7 @@ class AccountPage(BasePage):
     def shutdown(self) -> None:
         super().shutdown()
         self._timer.stop()
-        for thread in (self._offset_thread, self._login_thread):
-            if thread is not None:
-                thread.stop()
+        # 收尾靠 `super().shutdown()` 的**全面掃描**（`BasePage`）——
+        # 這裡不再另外列清單：清單會漏，掃描不會。
+        # ⚠ 掃描救不了的是「**還在跑就被新的蓋掉**」那種，那個擋在
+        # `WorkerThread` 自己身上（`core/worker._RUNNING`）。

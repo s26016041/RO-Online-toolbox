@@ -3482,6 +3482,43 @@ A1  <全域>        mov  eax, [某全域]
   `_ReconnectWorker.run`）。測試 `tests/test_farm_page.py`
   （6 條，含「一拍不算」「行程還在不算」「沒勾不做」「我的網路斷了不做」）。
 
+### [ENV-010] ★★★ `QThread: Destroyed while thread is still running` 的**第二種**成因：被新的蓋掉
+
+- **狀態**：已驗證（使用者實機）＋ 已修
+- **日期**：2026-08-28
+- **症狀**：`py main.py` 跑自動登入，帳密階段完成之後噴
+
+      QThread: Destroyed while thread '' is still running
+
+  然後行程被中止（0xC0000409）。
+
+- **第一種成因已經修過**（2026-08-27）：`shutdown()` 漏收某條執行緒。
+  當時的修法是把收尾改成**全面掃描** `vars(self)`（`BasePage.shutdown`），
+  理由是「清單會漏，掃描不會」。那條是對的。
+- **★ 但掃描救不了第二種**：呼叫端普遍寫成
+
+      self._link_thread = WorkerThread(worker)   # 每幾秒起一條
+
+  下一次再起一條就把上一條**覆蓋掉**。上一條要是還沒跑完，
+  `vars(self)` 裡已經沒有它了 —— 掃描掃不到，Python 也沒人引用它，
+  於是 `QThread` 被解構，Qt 中止整個行程。
+  帳號頁的連線狀態（`_link_thread`）就是這個形狀：每 N 秒一條，一直覆蓋。
+
+- **修法：擋在 `WorkerThread` 自己身上**（`core/worker._RUNNING`）。
+  `start()` 時把自己放進一份模組層級的清單，**只在 `isFinished()` 之後才移除**：
+
+      def start(self):
+          _RUNNING[:] = [t for t in _RUNNING if not t.thread.isFinished()]
+          _RUNNING.append(self)
+          self.thread.start()
+
+  `stop()` 等到執行緒真的結束才把自己拿掉；等不到的走原本的 `_STUCK`。
+- **為什麼要修在這一層**：這種事**不該要求每個呼叫端自己記得**。
+  漏掉一個地方就是整個程式掛掉，而且症狀（一句 Qt 警告 ＋ 靜默中止）
+  跟那個地方一點關係都沒有，很難查。擋在共用類別上一次擋掉全部。
+- **⚠ 順帶**：`AccountPage.shutdown()` 一度又被加回「明列清單」的寫法 ——
+  那正是 2026-08-27 否決掉的做法，已收回。測試釘住「不准再自己列清單」。
+
 ### [ENV-008] ★★★ 功能的進度全是 INFO，而預設記錄層級是 WARNING —— 面板與 app.log **一行都沒有**
 
 - **狀態**：已驗證（讀程式碼＋使用者實際回報）＋ 已修

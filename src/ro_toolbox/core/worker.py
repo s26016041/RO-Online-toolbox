@@ -49,6 +49,18 @@ class Worker(QObject):
 #: 只會在收尾時長大，行程結束就跟著消失。
 _STUCK: list = []
 
+#: **正在跑的**背景執行緒。這裡也故意留著引用。
+#:
+#: ⚠⚠ 為什麼需要：呼叫端通常是 `self._xxx_thread = WorkerThread(worker)`，
+#: 下一次再起一條就把上一條**覆蓋掉**。上一條要是還沒跑完，Python 這邊就沒人
+#: 引用它了 → `QThread` 被解構 → Qt 喊
+#: 「**QThread: Destroyed while thread '' is still running**」→ 中止整個行程。
+#: 使用者實機踩到（帳號頁的連線狀態每幾秒起一條，`shutdown()` 又沒收它）。
+#:
+#: 這種事**不該要求每一個呼叫端自己記得**：漏掉一個地方就是整個程式掛掉，
+#: 而且症狀跟那個地方一點關係都沒有。所以擋在這一層，一次擋掉全部。
+_RUNNING: list = []
+
 
 class WorkerThread:
     """把 Worker 搬到 QThread 上跑，並負責收尾。"""
@@ -61,6 +73,9 @@ class WorkerThread:
         worker.finished.connect(self.thread.quit)
 
     def start(self) -> None:
+        # 已經跑完的可以安全丟掉；還在跑的一律留著（見 `_RUNNING`）。
+        _RUNNING[:] = [t for t in _RUNNING if not t.thread.isFinished()]
+        _RUNNING.append(self)
         self.thread.start()
 
     def stop(self, timeout_ms: int = 3000) -> None:
@@ -79,7 +94,9 @@ class WorkerThread:
         """
         self.worker.request_stop()
         self.thread.quit()
-        if not self.thread.wait(timeout_ms):
+        if self.thread.wait(timeout_ms):
+            _RUNNING[:] = [t for t in _RUNNING if t is not self]
+        else:
             log.warning("背景執行緒未在 %sms 內結束，留著它直到行程結束", timeout_ms)
             # ⚠ worker 也要一起留：它被 moveToThread 到那條執行緒上。
             _STUCK.append((self.thread, self.worker))
