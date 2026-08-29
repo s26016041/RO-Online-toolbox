@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from ro_toolbox.services import game_screen, game_socket, input_helper, login_packets
 from ro_toolbox.services import input as game_input
 from ro_toolbox.services.accounts import Account
+from ro_toolbox.services.game_screen import Stage
 from ro_toolbox.services.login_lock import LoginLock
 from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
@@ -92,7 +93,14 @@ AGREE_UNSURE = (AGREE_LEARNED, AGREE_GUESS)
 #: 滑鼠左鍵的虛擬鍵碼（學按鈕位置時看它的按下緣）。
 _VK_LBUTTON = 0x01
 
-_AGREE_TRIES = 3
+#: 開始按同意之後過了這麼久還沒進到登入畫面，才請使用者按一次。
+#:
+#: ⚠ 舊版的條件是「打了 3 次」（十幾秒），太早了 —— 實測**合約書要等客戶端
+#: 載完才真的按得動，遊戲開了 30~80 秒之間才會生效**（[INP-008]）。
+#: 太早求救的代價很實際：使用者實機踩過，工具在合約書早就過掉的畫面上叫他
+#: 「請按一次同意」，他只好去按當下唯一那顆按鈕（公告框的「確定」），
+#: 於是把「確定」學成了「同意」。
+_AGREE_ASK_AFTER = 60.0
 #: 等使用者手動按同意的上限。
 _AGREE_LEARN_SEC = 60.0
 
@@ -262,6 +270,10 @@ class AutoLogin:
         #: 主迴圈靠它決定要不要求救 —— **在猜位置**才求救，
         #: 不是「認不認得出合約書」（那條在別人的解析度上根本不成立）。
         self._agree_source = AGREE_FOUND
+        #: 遊戲視窗。**這是快取，不是身分** —— 一律走 `_window()` 現查。
+        self._hwnd: int | None = None
+        #: 上一次講出來的畫面判定（只在變化時講，不要每一輪洗版）。
+        self._said_stage: Stage | None = None
         self.progress = LoginProgress()
 
     # ---- 對外 -------------------------------------------------------
@@ -313,7 +325,8 @@ class AutoLogin:
 
         if not self._send_credentials(hwnd):
             return self.progress
-        if not self._send_otp(hwnd):
+        # 視窗現查：合約書之後客戶端可能已經把視窗換掉了（見 `_window`）。
+        if not self._send_otp(self._window() or hwnd):
             return self.progress
 
         # 到這裡前景輸入的部分結束了，後面走封包 —— 把鍵鼠還給使用者。
@@ -324,10 +337,11 @@ class AutoLogin:
         # ⚠ **二次密碼過了才准選角。** 沒確認就送 `0x0066` 的後果是：
         # 伺服器把角色標成「進入遊戲中」，客戶端卻還停在二次密碼畫面 ——
         # 角色就這樣**卡登**（實際發生過，使用者的角色卡住進不去）。
+        hwnd = self._window() or hwnd
         pin_ok = self._send_pin(hwnd)
         self._remember_characters()
         if pin_ok:
-            self._select_character(hwnd)
+            self._select_character(self._window() or hwnd)
         else:
             reason = "二次密碼沒有得到伺服器確認，不敢送選角（會把角色卡在登入中）"
             self.progress.stopped_at_character = reason
@@ -339,7 +353,7 @@ class AutoLogin:
 
     # ---- 各步驟 -----------------------------------------------------
 
-    def _click_agree(self, hwnd: int) -> str:
+    def _click_agree(self, hwnd: int, report=None) -> str:
         """按合約書的「同意」，回傳**位置是哪來的**（給呼叫端判斷要不要求救）。
 
         點法本身也有講究：游標移過去要**停一下**再按，遊戲的 UI 要先被
@@ -358,11 +372,15 @@ class AutoLogin:
         source = AGREE_FAILED
         spot = None
         try:
-            # ⚠ **先從畫面把按鈕找出來**（`agree_button_by_look`）。
+            # ⚠ **先從畫面把按鈕找出來**（`input_helper.look_at_screen`）。
             # 合約書是遊戲自己畫的小視窗，而且**可以拖動** —— 用視窗大小算比例
             # 在別的解析度會跑掉，被拖一下也會跑掉。找不到才退回比例法。
             # ⚠ 搜尋要在**子行程**裡做：截圖與送輸入不能在同一個行程（[INP-009]）。
-            spot = input_helper.agree_button(hwnd)
+            # 呼叫端通常已經看過畫面了，把那一份傳進來 —— 不要為了同一件事
+            # 再開一個子行程，也不要用「上一張圖」以外的畫面做決定。
+            if report is None:
+                report = input_helper.look_at_screen(hwnd)
+            spot = report.agree
             source = AGREE_FOUND
             if spot is None:
                 ratio = self._agree_ratio()
@@ -370,7 +388,13 @@ class AutoLogin:
                 source = AGREE_LEARNED if ratio else AGREE_GUESS
             self._type(hwnd, [input_helper.click(*spot)])
         except (input_helper.InputHelperError, game_screen.ScreenError) as exc:
-            log.debug("點合約書失敗（可能沒有合約書）：%s", exc)
+            log.info("點合約書失敗：%s", exc)
+            source = AGREE_FAILED
+        except Exception as exc:  # noqa: BLE001 - 點不到不該把整條登入炸掉
+            # ⚠ 實機踩過：`GetWindowRect` 丟 `pywintypes.error`（視窗被換掉），
+            # 那個例外不是 `ScreenError`，直接炸穿工作執行緒 —— 使用者看到的是
+            # 登入無聲無息地不見了。點不到就點不到，讓主迴圈自己決定要不要重試。
+            log.warning("點合約書時出了意料外的錯（不中斷登入）：%s", exc)
             source = AGREE_FAILED
         if source != self._agree_source:
             self._agree_source = source
@@ -384,6 +408,45 @@ class AutoLogin:
             else:
                 log.info("同意按鈕的位置來自「%s」→ %s", source, where)
         return source
+
+    def _say_stage(self, stage: Stage, note: str) -> None:
+        """畫面判定變了就講一聲。**每一輪都判、只在變化時講。**
+
+        使用者的要求原話：「我希望他可以知道自己到底執行到哪、在哪個畫面」。
+        每一輪都印會把日誌洗掉，所以只在**換關**的時候印，而且連判定的依據
+        （亮度、差異數字、按鈕分數）一起印 —— 認錯畫面時那些數字才是線索。
+        """
+        if stage is self._said_stage:
+            return
+        self._said_stage = stage
+        self._step(f"畫面現在是「{stage.value}」（{note}）")
+
+    def _give_up_on_credentials(self, hwnd: int, attempt: int,
+                                stage: Stage) -> None:
+        """帳密這一關逾時了：**說清楚卡在哪一關、憑什麼這樣說**。
+
+        ⚠ 這一關卡住最常見的原因是**合約書沒被按掉**：那個畫面不吃視窗訊息
+        （[INP-001]），只能用滑鼠點，而點不到就一路空轉到逾時。
+        所以失敗訊息一定要帶上「最後看到的是哪一個畫面」——
+        使用者才分得出「合約書按不掉」跟「按掉了但字沒送出去」，
+        那是兩個完全不同的問題（舊版兩種都只寫「帳密沒送出去」）。
+        """
+        if stage is Stage.EULA:
+            shot = self._save_screen(hwnd)
+            extra = ("（畫面一直停在合約書 —— 同意按鈕點了沒有用"
+                     + (f"；畫面已存到 {shot}）" if shot else "）"))
+        elif self._agree_source in AGREE_UNSURE and stage is not Stage.LOGIN:
+            shot = self._save_screen(hwnd)
+            extra = (
+                f"（畫面認不出來，而且「同意」按鈕的位置是**{self._agree_source}**猜的，"
+                "很可能一直點在空的地方 —— 請手動按一次同意，我就會把位置記起來"
+                + (f"；畫面已存到 {shot}）" if shot else "）")
+            )
+        else:
+            extra = f"（畫面：{stage.value}；同意按鈕點得到）"
+        tried = (f"打了 {attempt} 次，客戶端都沒有連上伺服器 —— 帳密沒送出去。"
+                 if attempt else "連帳號密碼都還沒打到（一直過不了前面那一關）。")
+        self.progress.fail("輸入帳號密碼", f"{tried}{extra}")
 
     @staticmethod
     def _agree_ratio() -> tuple[float, float] | None:
@@ -468,6 +531,16 @@ class AutoLogin:
             except game_screen.ScreenError as exc:
                 log.debug("學按鈕時抓不到畫面：%s", exc)
                 stage = None
+            # ★ **從頭到尾沒看過合約書，卻認得出這是登入畫面 → 當場收工。**
+            #   合約書早就過了還在這裡等，使用者會照著我們的話去按畫面上唯一
+            #   那顆按鈕（公告框的「確定」）—— 那一按就把「確定」學成「同意」，
+            #   之後每次登入都拿它去點（實機踩過：學到的樣板真的是「確定」，
+            #   設定裡也存了一個錯的比例）。
+            #   ⚠ 看過合約書就**不能**從這裡走：那是「他按掉了」的正常轉場，
+            #     要留給下面「合約書消失時游標在那裡」那個訊號去學。
+            if stage is game_screen.Stage.LOGIN and not seen_eula:
+                self._step("合約書已經不在了（畫面：登入畫面）—— 不用你按，這次不學")
+                return False
             point = wintypes.POINT()
             here: tuple[int, int] | None = None
             if user32.GetCursorPos(ctypes.byref(point)):
@@ -723,6 +796,35 @@ class AutoLogin:
             return False
         return now - self._lost_since >= _LOGIN_LOST_SEC
 
+    def _window(self) -> int | None:
+        """現在的遊戲視窗。**存 PID（身分），不存 hwnd（位置）。**
+
+        ⚠⚠ 實機踩過（2026-08-30）：**客戶端會把自己的視窗換掉。**
+        合約書按掉之後舊的 hwnd 就失效了 ——
+
+            pywintypes.error: (1400, 'GetWindowRect', '無效的視窗控制代碼。')
+
+        那個例外從 `_click_agree` 一路炸穿工作執行緒，整條自動登入當場死掉；
+        就算沒炸，`_game_gone()` 也會把「視窗換掉」判成「遊戲關掉了」，
+        於是使用者看到的是「遊戲明明停在登入畫面，工具說遊戲已經關掉」。
+
+        hwnd 是**位置**，CLAUDE.md 明令不准存；穩定的身分是 PID，
+        視窗每次要用的時候現查。
+        """
+        if self._hwnd is not None and _window_alive(self._hwnd):
+            return self._hwnd
+        found = game_screen.find_window(self._pid)
+        if found is None:
+            return None
+        if self._hwnd is not None and found != self._hwnd:
+            # 大聲講：這件事會讓「為什麼剛剛送不進去」一秒看懂。
+            log.warning("遊戲把視窗換掉了（%#x → %#x）—— 改用新的那個",
+                        self._hwnd, found)
+            if self._lock is not None:
+                self._lock.retarget(found)
+        self._hwnd = found
+        return found
+
     def _game_gone(self, hwnd: int | None = None) -> bool:
         """遊戲已經不在了嗎（行程結束、或視窗關掉）？
 
@@ -739,10 +841,15 @@ class AutoLogin:
 
         ⚠ 不靠比對錯誤訊息的字串 —— 那會在下一次改訊息時安靜地失效。
         直接問行程死活與視窗還在不在，那是**確定的事實**。
+
+        ⚠ 但「這個 hwnd 死了」**不等於**遊戲關掉了 —— 客戶端會換視窗
+        （見 `_window`）。所以視窗死掉時要先回頭問 PID：找得到新的就不算不在了。
         """
         if not _process_alive(self._pid):
             return True
-        return hwnd is not None and not _window_alive(hwnd)
+        if hwnd is not None and not _window_alive(hwnd):
+            return self._window() is None
+        return False
 
     def _stop_if_gone(self, hwnd: int, where: str) -> bool:
         """遊戲不在了就把整條登入停掉並回 True。"""
@@ -1232,36 +1339,69 @@ class AutoLogin:
     def _send_credentials(self, hwnd: int) -> bool:
         """過合約書、打帳號密碼、送出。
 
-        ## 兩關，各有各的訊號（都不看畫面、不讀記憶體）
+        ## 每一輪都先問「我現在在哪一關」
 
-        1. **合約書**：點「同意」是前景滑鼠事件，必須自己一個子行程 ——
-           同一個行程送過滑鼠事件之後，它後續的 `PostMessage` 會被封鎖（實測）。
-           過了沒？合約書在的時候整個視窗不吃 `PostMessage`（[INP-001]），
-           所以**送一個無害的 Home 進去試試**：送得進＝過了。
-        2. **帳密**：打完送出，客戶端真的收下才會送出 `0x0064`。看到那一包才算數。
+        以前這支**完全不看畫面**：每一輪都先點一次同意，再把帳密打一遍，
+        成敗只看「客戶端有沒有連上伺服器」。理由是「點空了無害」。
+        使用者實機證明那是錯的（2026-08-30）：
 
-        逾時只是放棄的上限，不是成功的依據。
+        - 合約書早就按掉了，它照樣拿**猜的位置**往登入畫面上點；
+        - 合約書還在的時候它照樣打字，而那個畫面**整個不吃 `PostMessage`**
+          （[INP-001]）—— 六個子行程一個一個失敗，日誌只有 debug 級的
+          「送不進去」，使用者看到的是「已經在打帳號密碼、合約卻還沒按下」；
+        - 最後還請使用者「手動按一次同意」，而畫面上根本沒有合約書 ——
+          他只能去按當下唯一那顆按鈕（公告框的「確定」），
+          於是把「確定」學成了「同意」。
+
+        所以現在每一輪都先在**子行程**裡看一眼畫面（[INP-009]，主行程不准截圖），
+        再照它決定要做什麼：
+
+            合約書   → 按同意，**不打字**（打了也不會進去），回頭再看一眼
+            登入畫面 → **不點任何東西**，直接打帳密送出
+            認不出來 → 照舊：按一下同意再打字（別人的解析度上這是常態）
+
+        判定只用**確定的東西**：跟真的合約書／真的輸入框比對過的縮圖差異
+        （`game_screen.detect`），認不出來就老實說認不出來，不准猜。
+
+        ## 成敗的訊號沒有變
+
+        **帳密**：打完送出，客戶端真的收下才會去連伺服器。連上了才算數
+        （逾時只是放棄的上限，不是成功的依據）。
         """
         started = time.monotonic()
         deadline = started + _INPUT_TIMEOUT
 
-        attempt = 0
+        attempt = 0          # **真的打字**的次數（按同意的那幾輪不算）
         asked = False
+        stage = Stage.UNKNOWN
         while True:
+            # 視窗**每一輪現查**：客戶端會把視窗換掉（見 `_window`）。
+            hwnd = self._window()
             # 遊戲不在了就不要再打了（使用者：有問題就馬上停）。
-            if self._stop_if_gone(hwnd, "輸入帳號密碼"):
+            if hwnd is None or self._stop_if_gone(hwnd, "輸入帳號密碼"):
+                if hwnd is None:
+                    self.progress.fail("輸入帳號密碼", "遊戲已經關掉了 —— 不再重試。")
                 return False
-            attempt += 1
-            if (not asked and attempt > _AGREE_TRIES
-                    and self._agree_source in AGREE_UNSURE):
-                # ⚠⚠ 這個條件以前是 `self._still_on_eula(hwnd)`，而那條靠
-                #    `game_screen.detect()` —— 它用**視窗的固定比例區塊**判斷，
-                #    而合約書是可拖動的小視窗，解析度不同就整個對不上。
-                #    使用者朋友的機器實際踩到：認不出合約書 → 永遠不求救 →
-                #    用 1280x800 量的內建比例點了 11 次空氣，日誌上看不出原因。
-                #    現在的判準是**「我們自己在猜位置」**，那才是該求救的理由。
+
+            # ★ 每一輪都先看一眼：**現在到底在哪一關**。
+            #   這一步在子行程裡做（[INP-009]），主行程不准自己截圖。
+            screen = input_helper.look_at_screen(hwnd)
+            stage = screen.stage
+            self._say_stage(stage, screen.note)
+
+            if (not asked and stage is not Stage.LOGIN
+                    and (stage is Stage.EULA or self._agree_source in AGREE_UNSURE)
+                    and time.monotonic() - started >= _AGREE_ASK_AFTER):
+                # ⚠⚠ 這個條件以前是「打了三次還沒過」，而且**沒有看畫面** ——
+                #    使用者實機踩過最糟的版本：合約書早就按掉了，工具照樣叫他
+                #    「請手動按一次同意」，他看著沒有合約書的畫面，只好去按當下
+                #    唯一那顆按鈕（公告框的「確定」）—— 於是**學到的按鈕樣子
+                #    變成「確定」**，設定裡也存了一個錯的比例，之後每次登入
+                #    都拿它去點。所以：**認得出是登入畫面就絕對不求救**，
+                #    而且要等夠久（客戶端載完才按得動，實測 30~80 秒）。
                 asked = True
-                wait = min(_AGREE_LEARN_SEC, deadline - time.monotonic())
+                wait = _AGREE_LEARN_SEC
+                waited = time.monotonic()
                 # ⚠ 等人動手的這幾十秒**不算程式卡住** —— 不告訴看門狗的話，
                 #   等完回來沒多久 120 秒就到了，前景被放掉，接下來每一次
                 #   輸入都 `PostMessage` 失敗（使用者實測：等 61 秒 → 重試
@@ -1269,16 +1409,31 @@ class AutoLogin:
                 if self._lock is not None:
                     self._lock.wait_for_user(wait)
                 self._learn_agree_button(hwnd, wait)
-            self._step(f"按同意、輸入帳號密碼並送出（第 {attempt} 次）")
-            # ⚠ 不能用「字打不打得進去」判斷合約書過了沒 —— 實測合約書還在時
-            # 打進去的字**照樣會進到欄位裡**（只是看不見、Enter 也送不出去），
-            # 那個判定會回報「已經好了」然後從此不再按同意（踩過）。
-            #
-            # ⚠ 想過用畫面判斷「合約書已經不在了就別點」來省兩個子行程，
-            # **否決**：那要在主行程截圖，而 tests/test_auto_login.py 明確釘著
-            # 「AutoLogin 不准自己截圖（[INP-009]）」。省下來的時間也有限 ——
-            # 探針判焦點之後重試本來就少了，多點那一下落在背景圖上是無害的。
-            self._agree_source = self._click_agree(hwnd)
+                # ⚠ **等人動手的那幾十秒不算進預算。** 不補回去的話，教完位置
+                #   剛好逾時 —— 使用者才剛按完，工具就說「打了 N 次都沒連上」，
+                #   學到的位置一次都沒用到（前景鎖那邊也是這樣處理的）。
+                deadline += time.monotonic() - waited
+                continue
+
+            if stage is not Stage.LOGIN:
+                # 合約書、或還認不出來的畫面 —— 先把同意按掉。
+                # ⚠ **認出是登入畫面就不要點。** 那一下不是無害的：使用者實機
+                #   踩過，合約書早就過了，工具照樣拿「猜的位置」往畫面上點，
+                #   點在登入框旁邊的背景圖上，而日誌只寫「按同意（第 N 次）」。
+                self._agree_source = self._click_agree(hwnd, screen)
+            if stage is Stage.EULA:
+                # ⚠ 合約書還在的時候**打字一定不會成功**：那個畫面整個不吃
+                #   `PostMessage`（[INP-001]）。舊版照打不誤，於是六個子行程
+                #   一個一個失敗，日誌上只留下 debug 級的「送不進去」——
+                #   使用者看到的是「已經在打帳號密碼，可是合約還沒按下」。
+                #   按了就回頭再看一眼，不要在這裡假裝有進度。
+                if time.monotonic() >= deadline:
+                    self._give_up_on_credentials(hwnd, attempt, stage)
+                    return False
+                continue
+
+            attempt += 1
+            self._step(f"畫面：{stage.value} —— 輸入帳號密碼並送出（第 {attempt} 次）")
             try:
                 # Enter 單獨留到最後，中間插一次**純觀察**的記錄
                 # （只寫日誌，不做決定 —— 見 `_note_field_placement`）。
@@ -1288,11 +1443,17 @@ class AutoLogin:
                 self._note_field_placement()
                 self._type(hwnd, enter)
             except input_helper.InputHelperError as exc:
-                log.debug("第 %d 次送不進去：%s", attempt, exc)
+                # ⚠ 這一句以前是 `log.debug` —— 等於沒有。使用者的日誌只有
+                #   「按同意、輸入帳號密碼並送出（第 N 次）」一行一行往下，
+                #   **完全看不出每一次是死在哪**（送不進去？視窗換掉了？搶不到
+                #   前景？）。這是查這個問題唯一的線索，一定要看得到。
+                self._step(f"第 {attempt} 次沒送進去（畫面：{stage.value}）：{exc}")
                 if self._stop_if_gone(hwnd, "輸入帳號密碼"):
                     return False
                 if time.monotonic() >= deadline:
-                    self.progress.fail("輸入帳號密碼", f"送不進視窗訊息：{exc}")
+                    self.progress.fail(
+                        "輸入帳號密碼",
+                        f"送不進視窗訊息（畫面：{stage.value}）：{exc}")
                     return False
                 continue
             server = self._wait_connection(_CREDENTIAL_TIMEOUT)
@@ -1364,32 +1525,7 @@ class AutoLogin:
                 )
                 break
             if time.monotonic() >= deadline:
-                # ⚠ 這一關卡住最常見的原因是**合約書沒被按掉**：那個畫面不吃
-                # 視窗訊息（[INP-001]），只能用滑鼠點，而按鈕位置是用視窗大小的
-                # 比例算的（在 1942x1256 上量的）。別人的客戶端解析度不同時，
-                # 那一下就可能點空 —— 要講出來，不要只說「帳密沒送出去」。
-                # ⚠ 講「我們有沒有把握」，不要只講「畫面認不認得出來」。
-                #   認不出畫面本身就是別人解析度不同時的常態（使用者朋友的機器），
-                #   照舊版的寫法只會印「（畫面：不明）」—— 對使用者毫無幫助。
-                if self._agree_source in AGREE_UNSURE:
-                    shot = self._save_screen(hwnd)
-                    extra = (
-                        f"（「同意」按鈕的位置是**{self._agree_source}**猜的，"
-                        "很可能一直點在空的地方 —— 請手動按一次同意，"
-                        "我就會把位置記起來"
-                        + (f"；畫面已存到 {shot}）" if shot else "）")
-                    )
-                else:
-                    stage = "不明"
-                    try:
-                        stage = game_screen.detect(game_screen.capture(hwnd)).value
-                    except Exception as exc:  # noqa: BLE001 - 只為講清楚，失敗就算了
-                        log.debug("收尾判定畫面失敗：%s", exc)
-                    extra = f"（同意按鈕點得到，畫面：{stage}）"
-                self.progress.fail(
-                    "輸入帳號密碼",
-                    f"打了 {attempt} 次，客戶端都沒有連上伺服器 —— 帳密沒送出去。{extra}",
-                )
+                self._give_up_on_credentials(hwnd, attempt, stage)
                 return False
             self._step("客戶端還沒連上伺服器，再打一次")
 
@@ -1510,6 +1646,8 @@ class AutoLogin:
             return False
         attempt = 0
         while time.monotonic() < deadline:
+            # 視窗**每一輪現查**（客戶端會換視窗，見 `_window`）。
+            hwnd = self._window() or hwnd
             if self._stop_if_gone(hwnd, "送出 OTP"):
                 return False
             if self._connection_lost():
@@ -1615,6 +1753,7 @@ class AutoLogin:
         while time.monotonic() < deadline:
             hwnd = game_screen.find_window(self._pid)
             if hwnd is not None:
+                self._hwnd = hwnd        # 快取；之後一律走 `_window()` 現查
                 self._step(f"視窗出現了（等了 {time.monotonic() - started:.0f} 秒）")
                 return hwnd
             if time.monotonic() >= next_note:

@@ -87,6 +87,17 @@ class LoginLock:
 
         return game_input.focus_window(self._hwnd, 2.0)
 
+    def retarget(self, hwnd: int) -> None:
+        """改盯另一個視窗。**客戶端會把自己的視窗換掉**（2026-08-30 實機）——
+
+        合約書按掉之後舊的 hwnd 就失效了。不換的話這個鎖會一直去搶一個
+        不存在的視窗：`reassert()` 永遠回 False，每一批輸入前都以為「焦點跑掉」，
+        而真正的遊戲視窗其實好端端地在那裡。
+        """
+        if hwnd and hwnd != self._hwnd:
+            self._hwnd = hwnd
+            self.reassert()
+
     def release(self) -> None:
         """解除鎖定並把焦點還給使用者原本的視窗。呼叫幾次都安全。"""
         self._stop.set()

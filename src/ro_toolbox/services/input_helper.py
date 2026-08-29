@@ -69,14 +69,14 @@ def text(value: str) -> dict:
     return {"text": value}
 
 
-def find_agree() -> dict:
-    """在畫面上找合約書的「同意」按鈕，把座標印出來給主行程。
+def look() -> dict:
+    """看一眼畫面：**現在在哪一關** ＋ 合約書的「同意」按鈕在哪。
 
     ⚠ **為什麼要在子行程裡做**：截圖與送輸入不能在同一個行程
-    （[INP-009]，主行程送過輸入之後會被封鎖）。主行程只負責決定要不要找，
+    （[INP-009]，主行程送過輸入之後會被封鎖）。主行程只負責決定要不要看，
     真正碰視窗的事情一律在這裡做完。
     """
-    return {"find_agree": True}
+    return {"look": True}
 
 
 #: 有對應字元碼的功能鍵。**這張表很重要**：
@@ -165,6 +165,8 @@ def _environment() -> dict[str, str]:
 
 #: 子行程回報找到的按鈕座標時用的開頭。
 _AGREE_PREFIX = "AGREE "
+#: 子行程回報「畫面現在停在哪一關」時用的開頭（值是 `Stage` 的名字）。
+_STAGE_PREFIX = "STAGE "
 #: 子行程回報「為什麼找到／為什麼沒找到」時用的開頭。
 #:
 #: ⚠ 這一行不是裝飾。找按鈕跑在子行程裡（[INP-009]），它的 `log` **不會**
@@ -226,37 +228,68 @@ def _run(actions: list[dict], hwnd: int) -> str:
     return done.stdout or ""
 
 
-def agree_button(hwnd: int) -> tuple[int, int] | None:
-    """問子行程「同意按鈕在螢幕上的哪裡」。找不到（或子行程失敗）回 None。
+def look_at_screen(hwnd: int):
+    """問子行程「畫面現在停在哪一關、同意按鈕在螢幕的哪裡」。
 
-    回 None 不是錯誤：畫面可能還沒到合約書。呼叫端要有退路
-    （`game_screen.agree_button_position` 的比例法）。
+    回傳 `game_screen.ScreenReport`（**永遠不回 None** —— 看不到畫面就是
+    `Stage.UNKNOWN` 加一句說明，呼叫端才不用到處判斷 None）。
+
+    ⚠ 認不出來不是錯誤：畫面可能還在載入。呼叫端要有退路，但**不准假裝
+    知道自己在哪一關** —— 那正是使用者踩到的坑（合約書早就過了還在點同意）。
     """
+    from ro_toolbox.services.game_screen import ScreenReport, Stage
+
     try:
-        output = _run([find_agree()], hwnd)
+        output = _run([look()], hwnd)
     except InputHelperError as exc:
-        log.debug("找同意按鈕的子行程失敗：%s", exc)
-        return None
-    spot = None
+        log.info("看畫面的子行程失敗：%s", exc)
+        return ScreenReport(Stage.UNKNOWN, None, f"子行程失敗：{exc}")
+    spot: tuple[int, ...] | None = None
+    stage = Stage.UNKNOWN
     note = ""
     for line in (output or "").splitlines():
         if line.startswith(_AGREE_NOTE):
             note = line[len(_AGREE_NOTE):]
+        elif line.startswith(_STAGE_PREFIX):
+            name = line[len(_STAGE_PREFIX):].strip()
+            stage = getattr(Stage, name, Stage.UNKNOWN)
         elif line.startswith(_AGREE_PREFIX):
             try:
                 spot = tuple(int(v) for v in line[len(_AGREE_PREFIX):].split())
             except ValueError:
                 spot = None
-    if spot is not None and len(spot) == 2:
-        log.info("子行程從畫面找到同意按鈕：%s（%s）", spot, note or "沒有說明")
-        return spot[0], spot[1]
-    # 找不到不是錯誤（畫面可能還沒到合約書），但**一定要留下原因** ——
+    found = (spot[0], spot[1]) if spot is not None and len(spot) == 2 else None
+    # 每一輪都留下一行：認得出／認不出、憑什麼、畫面判定是什麼。
     # 別人的機器上這一句是唯一查得到的東西。
-    log.info("子行程在畫面上找不到同意按鈕（%s）", note or "沒有說明")
-    return None
+    log.info("子行程看畫面：%s、同意按鈕 %s（%s）",
+             stage.value, found or "找不到", note or "沒有說明")
+    return ScreenReport(stage, found, note or "沒有說明")
 
 
 # ---- 子行程這一側 -----------------------------------------------------------
+
+
+def _speak_utf8() -> None:
+    """子行程的輸出一律講 UTF-8。**打包之後這一步是必要的。**
+
+    ⚠ 實機（2026-08-30，打包版）：主行程日誌裡的說明整段是亂碼 ——
+
+        子行程在畫面上找不到同意按鈕（�e�� 1942x1256�...）
+
+    「畫面」的 Big5 是 `B5 65`，UTF-8 解不出 `B5` 就換成 `�`，`65` 剛好是 `e`
+    —— 也就是子行程用 **cp950** 印出來、主行程用 utf-8 讀。
+    主行程明明有設 `PYTHONIOENCODING=utf-8`，但 **PyInstaller 的啟動器用
+    isolated config，`PYTHON*` 環境變數整批不生效**，所以凍結之後那一行等於沒設。
+    唯一保險的做法是在子行程自己這一側把輸出串流轉成 UTF-8。
+
+    這不是「只是難看」：那一句是別人的機器上唯一查得到的線索
+    （[INP-009]，子行程的 `log` 不會進主程式日誌），看不懂就等於沒有。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001 - 轉不了就照舊，不該讓輸入失敗
+            print(f"輸出轉不成 UTF-8（略過）：{exc}", file=sys.stderr)
 
 
 def _switch_ime_off(hwnd: int) -> None:
@@ -282,21 +315,23 @@ def _switch_ime_off(hwnd: int) -> None:
         print(f"切換輸入法失敗（略過）：{exc}", file=sys.stderr)
 
 
-def _report_agree(hwnd: int) -> None:
-    """在畫面上找合約書的「同意」按鈕，找到就把螢幕座標印出來。
+def _report_screen(hwnd: int) -> None:
+    """看一眼畫面，把「在哪一關」與「同意按鈕在哪」印出來給主行程。
 
-    找不到**不算失敗**（畫面可能還沒到合約書）—— 什麼都不印，主行程會有退路。
+    認不出來**不算失敗**（畫面可能還在載入）—— 照樣把說明印出來，
+    主行程要靠它決定下一步（而且那是別人的機器上唯一的線索）。
     """
     try:
         from ro_toolbox.services import game_screen
 
-        spot, note = game_screen.agree_button_report(hwnd)
-    except Exception as exc:  # noqa: BLE001 - 找不到不該讓整串動作失敗
-        print(f"{_AGREE_NOTE}找同意按鈕失敗（略過）：{exc}")
+        report = game_screen.screen_report(hwnd)
+    except Exception as exc:  # noqa: BLE001 - 看不到畫面不該讓整串動作失敗
+        print(f"{_AGREE_NOTE}看畫面失敗（略過）：{exc}")
         return
-    print(f"{_AGREE_NOTE}{note}")
-    if spot is not None:
-        print(f"{_AGREE_PREFIX}{spot[0]} {spot[1]}")
+    print(f"{_STAGE_PREFIX}{report.stage.name}")
+    print(f"{_AGREE_NOTE}{report.note}")
+    if report.agree is not None:
+        print(f"{_AGREE_PREFIX}{report.agree[0]} {report.agree[1]}")
 
 
 def run_helper(argv: list[str]) -> int:
@@ -307,6 +342,7 @@ def run_helper(argv: list[str]) -> int:
     """
     from ro_toolbox.services import input as game_input
 
+    _speak_utf8()
     try:
         index = argv.index(HELPER_FLAG)
         hwnd = int(argv[index + 1])
@@ -332,8 +368,8 @@ def run_helper(argv: list[str]) -> int:
                     return 1
             elif "ime_off" in action:
                 _switch_ime_off(hwnd)
-            elif "find_agree" in action:
-                _report_agree(hwnd)
+            elif "look" in action:
+                _report_screen(hwnd)
             elif "click" in action:
                 x, y = action["click"]
                 game_input.click_foreground(hwnd, int(x), int(y))

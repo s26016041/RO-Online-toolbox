@@ -136,18 +136,51 @@ def find_window(pid: int) -> int | None:
     return found[0] if found else None
 
 
+def window_alive(hwnd: int) -> bool:
+    """這個視窗控制代碼還指得到東西嗎。
+
+    ⚠ 一定要在碰任何視窗 API 之前問一次。**客戶端會把視窗換掉** ——
+    2026-08-30 實機：按掉合約書之後舊的 hwnd 就失效了，`GetWindowRect`
+    丟 `pywintypes.error: (1400, '無效的視窗控制代碼')`，那個例外**不是**
+    `ScreenError`，一路炸穿工作執行緒，整條自動登入當場死掉。
+    """
+    if not available():
+        return False
+    try:
+        return bool(win32gui.IsWindow(hwnd))
+    except Exception as exc:  # noqa: BLE001 - 問不到就當它不在
+        log.debug("問不到視窗死活：%s", exc)
+        return False
+
+
+def _window_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """視窗的螢幕矩形。**失敗一律翻成 `ScreenError`**，不准漏 win32 的例外出去。"""
+    if not available():
+        raise ScreenError("缺少 pywin32。")
+    if not window_alive(hwnd):
+        raise ScreenError("遊戲視窗已經不在了（客戶端把視窗換掉或關掉了）。")
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    except Exception as exc:  # noqa: BLE001 - win32 的例外一律翻成 ScreenError
+        raise ScreenError(f"問不到遊戲視窗的位置：{exc}") from exc
+    if right - left <= 0 or bottom - top <= 0:
+        raise ScreenError("遊戲視窗尺寸不合理（可能已經關掉）。")
+    return left, top, right, bottom
+
+
 def window_ratio_of(hwnd: int, x: int, y: int) -> tuple[float, float] | None:
     """把一個螢幕座標換算成**視窗內的比例**。算不出來（視窗沒了）回 None。
 
     存比例不存座標：視窗會移動、會改大小、DPI 也會變。
     """
-    if not available() or is_minimised(hwnd):
+    if is_minimised(hwnd):
         return None
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    width, height = right - left, bottom - top
-    if width <= 0 or height <= 0:
+    try:
+        left, top, right, bottom = _window_rect(hwnd)
+    except ScreenError as exc:
+        log.debug("算不出視窗比例：%s", exc)
         return None
-    return (x - left) / width, (y - top) / height
+    return (x - left) / (right - left), (y - top) / (bottom - top)
 
 
 def window_point_of(hwnd: int, x: int, y: int) -> tuple[int, int] | None:
@@ -155,10 +188,12 @@ def window_point_of(hwnd: int, x: int, y: int) -> tuple[int, int] | None:
 
     `capture()` 抓的是整個視窗（含外框），所以樣板比對出來的座標也是這一套。
     """
-    if not available() or is_minimised(hwnd):
+    if is_minimised(hwnd):
         return None
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    if right - left <= 0 or bottom - top <= 0:
+    try:
+        left, top, _right, _bottom = _window_rect(hwnd)
+    except ScreenError as exc:
+        log.debug("算不出視窗座標：%s", exc)
         return None
     return x - left, y - top
 
@@ -221,10 +256,8 @@ def capture(hwnd: int) -> QImage:
         raise ScreenError("缺少 pywin32，無法抓取遊戲畫面。")
     if is_minimised(hwnd):
         raise ScreenError("遊戲視窗被最小化了 —— 這種狀態抓不到畫面也送不進輸入。")
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    left, top, right, bottom = _window_rect(hwnd)
     width, height = right - left, bottom - top
-    if width <= 0 or height <= 0:
-        raise ScreenError("遊戲視窗尺寸不合理（可能已經關掉）。")
 
     window_dc = target = bitmap = None
     try:
@@ -657,16 +690,43 @@ def image_note(image: QImage) -> str:
         return f"{image.width()}x{image.height()}（亮度算不出來：{exc}）"
 
 
-def agree_button_report(hwnd: int) -> tuple[tuple[int, int] | None, str]:
-    """從畫面把「同意」按鈕找出來。回 (螢幕座標或 None, 給人看的說明)。
+@dataclass(frozen=True, slots=True)
+class ScreenReport:
+    """看一眼遊戲畫面得到的全部東西：**現在在哪一關** ＋ 同意按鈕在哪。
 
-    說明一定要有東西：這支跑在**子行程**裡，它的 `log` 不會進到主程式的日誌
-    （[INP-009]）。別人的機器上出問題時，主行程印出來的這一句是唯一的線索。
+    `note` 是要給人看的說明，一定要有東西：這支跑在**子行程**裡，
+    它的 `log` 不會進到主程式的日誌（[INP-009]）。別人的機器上出問題時，
+    主行程印出來的這一句是唯一的線索。
+    """
+
+    stage: Stage
+    #: 「同意」按鈕的**螢幕**座標；認不出來是 None。
+    agree: tuple[int, int] | None
+    note: str
+
+
+def screen_report(hwnd: int) -> ScreenReport:
+    """看一眼遊戲畫面：現在停在哪一關，還有「同意」按鈕在螢幕的哪裡。
+
+    ## 為什麼兩件事要一起問
+
+    **一次截圖回答兩個問題。** 分兩次問就是兩張圖，兩張之間畫面可能已經換了 ——
+    而且每問一次就要開一個子行程（[INP-009]），打包後那是好幾秒。
+
+    ## 為什麼要回報「在哪一關」（2026-08-30 實機）
+
+    舊版只回報按鈕位置，狀態機因此**永遠不知道自己在哪一關**：合約書早就按掉了、
+    客戶端已經停在登入畫面，它照樣每一輪「點同意」（點在背景圖上），
+    最後還請使用者「手動按一次同意」—— 使用者看著沒有合約書的畫面，
+    只能去按當下唯一那顆按鈕（一個公告框的「確定」），於是**學到的按鈕樣子
+    變成「確定」**，設定裡也存了一個錯的比例。日誌從頭到尾看不出來它認為自己在哪。
     """
     if not available():
-        return None, "沒有 pywin32，看不到畫面"
+        return ScreenReport(Stage.UNKNOWN, None, "沒有 pywin32，看不到畫面")
+    if not window_alive(hwnd):
+        return ScreenReport(Stage.UNKNOWN, None, "遊戲視窗已經不在了（換掉或關掉了）")
     if is_minimised(hwnd):
-        return None, "遊戲視窗被最小化了，抓不到畫面"
+        return ScreenReport(Stage.UNKNOWN, None, "遊戲視窗被最小化了，抓不到畫面")
     import ctypes
 
     dpi = 0
@@ -675,24 +735,33 @@ def agree_button_report(hwnd: int) -> tuple[tuple[int, int] | None, str]:
     except Exception as exc:  # noqa: BLE001 - 舊版 Windows 沒這支
         log.debug("問不到視窗 DPI（%s），當作跟樣板一樣", exc)
     image = capture(hwnd)
-    match = find_agree_match(image, dpi)
     note = f"畫面 {image_note(image)}、DPI {dpi or '不明'}"
     if _spread(image) < _LEARN_MIN_SPREAD:
         # 這不是「認不出按鈕」，是**根本沒看到畫面** —— 兩者的解法完全不同，
         # 別人的機器上要一眼分得出來（全螢幕模式最常這樣）。
-        return None, (f"{note}；`PrintWindow` 抓回來的畫面幾乎是空的 —— "
-                      "遊戲多半在全螢幕模式，請改成視窗模式再試")
+        return ScreenReport(Stage.UNKNOWN, None, (
+            f"{note}；`PrintWindow` 抓回來的畫面幾乎是空的 —— "
+            "遊戲多半在全螢幕模式，請改成視窗模式再試"))
+
+    stage = detect(image)
+    # 判定的**依據**也要印出來：認錯畫面時，這兩個數字是唯一看得出
+    # 「差多少才算數」的東西（門檻見 `_EULA_TOLERANCE` / `_MATCH_TOLERANCE`）。
+    note += (f"；判定 {stage.value}"
+             f"（合約書差 {eula_difference(image):.1f}、"
+             f"登入框差 {login_box_difference(image):.1f}）")
+
+    match = find_agree_match(image, dpi)
     if match is None:
-        return None, f"{note}；比都比不了（樣板載不到或畫面比樣板還小）"
+        return ScreenReport(stage, None, f"{note}；同意按鈕比都比不了"
+                                         "（樣板載不到或畫面比樣板還小）")
     if not match.accepted:
-        return None, f"{note}；{match.describe()}"
-    left, top, _right, _bottom = win32gui.GetWindowRect(hwnd)
-    return (left + match.x, top + match.y), f"{note}；{match.describe()}"
-
-
-def agree_button_by_look(hwnd: int) -> tuple[int, int] | None:
-    """從畫面把「同意」按鈕找出來，回傳**螢幕**座標。找不到回 None。"""
-    return agree_button_report(hwnd)[0]
+        return ScreenReport(stage, None, f"{note}；{match.describe()}")
+    try:
+        left, top, _right, _bottom = _window_rect(hwnd)
+    except ScreenError as exc:
+        return ScreenReport(stage, None, f"{note}；{exc}")
+    return ScreenReport(stage, (left + match.x, top + match.y),
+                        f"{note}；{match.describe()}")
 
 
 def agree_button_position(
@@ -707,12 +776,10 @@ def agree_button_position(
     ⚠ 呼叫端必須是 DPI-aware 的行程，而且要在碰任何視窗 API **之前**就宣告 ——
     中途才改會前後座標不一致（踩過：要求 (1495,864) 實際落在 (667,1088)）。
     """
-    if not available():
-        raise ScreenError("缺少 pywin32。")
     if is_minimised(hwnd):
         # 最小化時 GetWindowRect 回的是縮圖矩形，算出來會是螢幕外的負座標。
         raise ScreenError("遊戲視窗被最小化了，算不出按鈕位置。")
-    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    left, top, right, bottom = _window_rect(hwnd)
     width, height = right - left, bottom - top
     rx, ry = ratio if ratio else AGREE_BUTTON
     return left + int(width * rx), top + int(height * ry)

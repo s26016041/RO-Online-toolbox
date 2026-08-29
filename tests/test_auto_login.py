@@ -65,6 +65,9 @@ def fast(monkeypatch):
             monkeypatch.setattr(auto_login, name, 0.4)
     monkeypatch.setattr(auto_login, "_POLL", 0.02)
     monkeypatch.setattr(auto_login, "_OTP_MIN_SECONDS", 0)
+    # 帳密這一關的預算要**容得下好幾輪**：合約書那幾輪現在很便宜（看一眼、
+    # 按一下就回頭再看），0.4 秒會讓第一輪按完就逾時，測不到後面的流程。
+    monkeypatch.setattr(auto_login, "_INPUT_TIMEOUT", 3.0)
 
 
 @pytest.fixture
@@ -162,9 +165,27 @@ def _run(monkeypatch, stages, packets, sent_ref=None):
         raise AssertionError("AutoLogin 不准自己截圖（[INP-009]）")
 
     monkeypatch.setattr(game_screen, "capture", _forbidden)
+    _looks_like(monkeypatch, stages)
     cap = _Capture(packets)
     monkeypatch.setattr(auto_login, "PacketCapture", cap.factory)
     return AutoLogin(_account(), 4242).run()
+
+
+def _looks_like(monkeypatch, stages, agree=(10, 20)):
+    """安排子行程「看畫面」會回報什麼。
+
+    ⚠ 畫面判定一律來自**子行程**（截圖與送輸入不能同一個行程，[INP-009]），
+    所以測試要換掉的是 `input_helper.look_at_screen`，不是 `game_screen.detect`。
+    腳本用完之後就停在最後一個 —— 真實世界也是這樣，畫面不會自己變回去。
+    """
+    script = list(stages) or [Stage.LOGIN]
+
+    def _look(hwnd):
+        stage = script.pop(0) if len(script) > 1 else script[0]
+        return game_screen.ScreenReport(stage, agree, "測試畫面")
+
+    monkeypatch.setattr(auto_login.input_helper, "look_at_screen", _look)
+    return script
 
 
 def test_happy_path(monkeypatch, wired):
@@ -196,21 +217,44 @@ def test_retries_the_whole_batch_until_the_client_connects(monkeypatch, wired):
         calls["n"] += 1
         return None if calls["n"] <= 2 else real(pid)
 
-    result = _run(monkeypatch, [], [])
+    result = _run(monkeypatch, [Stage.EULA, Stage.LOGIN], [])
     monkeypatch.setattr(auto_login, "find_server", flaky)
     assert result.ok, result.summary
     assert wired.count("click") >= 1, "沒有點過同意"
 
 
-def test_always_clicks_agree_and_it_is_harmless(monkeypatch, wired):
-    """每一輪都先點「同意」，不先判斷有沒有合約書。
+def test_it_does_not_click_when_it_can_see_the_login_screen(monkeypatch, wired):
+    """★ 認得出已經在登入畫面就**不要再點同意**。
 
-    判斷畫面要截圖，而截圖跟送輸入不能在同一個行程做；沒有合約書的時候
-    那一下落在背景圖上，無害。成敗一律由「客戶端有沒有連上伺服器」決定。
+    ⚠ 這一條跟舊版相反（舊版：「每一輪都先點，點空了也無害」）。
+    使用者實機踩過，那一下**不是無害的**：合約書早就過了，工具照樣拿
+    「猜的位置」往畫面上點，最後還請他「手動按一次同意」——
+    他看著沒有合約書的畫面，只能去按當下唯一那顆按鈕（公告框的「確定」），
+    於是把「確定」學成了「同意」，設定裡也存了一個錯的比例。
     """
-    result = _run(monkeypatch, [], [])
+    result = _run(monkeypatch, [Stage.LOGIN], [])
     assert result.ok, result.summary
-    assert "click" in wired
+    assert "click" not in wired, "在登入畫面上不該點同意"
+    assert "type:demo01" in wired
+
+
+def test_it_does_not_type_while_the_eula_is_still_up(monkeypatch, wired):
+    """★ 合約書還在就**不要打字**：那個畫面整個不吃 `PostMessage`（[INP-001]）。
+
+    使用者原話：「不該有已經在打帳號密碼、他還在合約沒按下」。
+    舊版照打不誤，六個子行程一個一個失敗，日誌上只有 debug 級的「送不進去」。
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(
+        AutoLogin, "_credential_batches",
+        lambda self, hwnd: calls.append("typed") or [[], []],
+    )
+    monkeypatch.setattr(auto_login, "_INPUT_TIMEOUT", 0.8)
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
+    result = _run(monkeypatch, [Stage.EULA], [])
+    assert not result.ok
+    assert not calls, "合約書還在的時候不該打字"
+    assert "合約書" in result.detail, result.detail
 
 
 def test_minimised_window_is_refused(monkeypatch, wired):
@@ -701,11 +745,11 @@ def test_agree_click_reports_where_the_position_came_from(monkeypatch, tmp_path)
     )
 
     # 1) 畫面上認出來 —— 最可信
-    monkeypatch.setattr(auto_login.input_helper, "agree_button", lambda hwnd: (11, 22))
+    _looks_like(monkeypatch, [Stage.EULA], agree=(11, 22))
     assert bot._click_agree(0x1) == auto_login.AGREE_FOUND
 
     # 2) 認不出來、也沒學過 —— 只能用內建比例**猜**
-    monkeypatch.setattr(auto_login.input_helper, "agree_button", lambda hwnd: None)
+    _looks_like(monkeypatch, [Stage.UNKNOWN], agree=None)
     assert bot._click_agree(0x1) == auto_login.AGREE_GUESS
 
     # 3) 認不出來，但使用者教過 —— 用學到的
@@ -1071,9 +1115,26 @@ def test_a_dead_process_stops_everything_at_once(monkeypatch, wired):
 
 
 def test_a_closed_window_counts_too(monkeypatch, wired):
+    """視窗沒了、而且 PID 底下也**再也找不到視窗** —— 那才是真的關掉了。"""
     monkeypatch.setattr(auto_login, "_window_alive", lambda hwnd: False)
+    monkeypatch.setattr(game_screen, "find_window", lambda pid: None)
     bot = AutoLogin(_account(), 4242)
     assert bot._game_gone(0x1234) is True
+
+
+def test_the_client_swapping_its_window_is_not_a_dead_game(monkeypatch, wired):
+    """★ 2026-08-30 實機：**客戶端會把自己的視窗換掉**（合約書按掉之後）。
+
+    舊 hwnd 失效 → `GetWindowRect` 丟 1400（無效的視窗控制代碼）→
+    舊版把它判成「遊戲已經關掉了 —— 不再重試」，於是遊戲明明停在登入畫面，
+    自動登入卻整條放棄。身分是 **PID**，視窗要現查。
+    """
+    monkeypatch.setattr(auto_login, "_window_alive", lambda hwnd: hwnd == 0x5678)
+    monkeypatch.setattr(game_screen, "find_window", lambda pid: 0x5678)
+    bot = AutoLogin(_account(), 4242)
+    bot._hwnd = 0x1234
+    assert bot._game_gone(0x1234) is False, "換視窗不等於遊戲關掉"
+    assert bot._window() == 0x5678, "要改用新的視窗"
 
 
 def test_a_live_game_is_never_mistaken_for_a_dead_one(monkeypatch, wired):
