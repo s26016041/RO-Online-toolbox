@@ -48,6 +48,17 @@ REFRESH_BELOW_MS = 10_000
 #: 隊友的只能從封包裡的 total 自己倒數 —— 誤差比較大，用比例比較穩，
 #: 而且幫別人放本來就該早一點（他不會等你）。
 MATE_REFRESH_RATIO = 0.5
+#: 幫隊友放的距離上限（格）。使用者 2026-08-29 指定：
+#: 「感覺幫隊友放要控制在隊友在我 5 格距離才會放，不然會無腦一直放」。
+#:
+#: ⚠ 這是**上限**，不是唯一判準：技能自己的射程（`assets/skills.json.gz`
+#: 的 `range`）比較短的話以射程為準（例：塗毒射程 1，要貼著才放；
+#: 天使之賜福射程 9，會被這個上限夾到 5）。
+#:
+#: 為什麼要夾：隊友位置只有在他**移動**的時候才會更新（`0x0107`，[PKT-084]），
+#: 而且他可能已經換圖了。放不到的時候伺服器只是安靜地丟掉，我們永遠等不到
+#: 狀態變化，於是那個技能一直重試 → 退避 → 再重試。距離擋住就不會空放。
+MATE_MAX_CELLS = 5
 #: 送出之後等這麼久還沒看到狀態上身，就當這一次沒成功。**只是放棄的上限**。
 CONFIRM_TIMEOUT = 5.0
 #: 沒成功時的退避：第一次等 1 秒，之後翻倍，最多 30 秒。
@@ -77,28 +88,65 @@ def buff_efst(skill_id: int) -> int | None:
     return (skill_table().get(skill_id) or {}).get("efst")
 
 
+#: 「對象」欄位裡代表**指名一個人**的寫法。看完整份技能表（1605 個）之後，
+#: 補助技能只出現這幾種：`目標1個`(32)、`1個目標`(4)、`自己和隊友1名`(1)、
+#: `自己以外的一名隊員`(1)。⚠ `地面1格` 是「格」不是「個」，不會誤中。
+_ONE_PERSON = ("1個", "1名", "一名")
+
+
 def can_target_others(skill_id: int) -> bool:
-    """這個技能放得到**別人**身上嗎。判不出來一律回 False（安全退化）。
+    """這個技能**送得出「指定某個隊友」的封包**嗎。判不出來一律 False（安全退化）。
 
-    判準是遊戲自己的技能說明裡的「對象」欄位（`assets/skills.json.gz`）：
+    判準是遊戲自己的技能說明裡的「對象」欄位（`assets/skills.json.gz`），
+    而且**要它指名「一個」對象**：
 
-        對象 : 自己          → 放不到別人（雙手劍攻擊速度增加、霸體…）
-        對象 : 目標1個       → 可以（加速術、天使之賜福…）
-        對象 : 自己和隊員    → 可以
-        對象 : 立即施展      → 放不到指定目標（以自己為中心）
-        對象 : 地面1格       → 地面技能，不是對人
+        對象 : 目標1個            → 可以（加速術、天使之賜福，射程 9）
+        對象 : 自己和隊友1名      → 可以（塗毒，說明寫「在指定目標的武器上…」）
+        對象 : 自己以外的一名隊員 → 可以
+        對象 : 自己               → 不行（霸體、雙手劍攻擊速度增加）
+        對象 : 立即施展           → 不行（以自己為中心）
+        對象 : 地面1格            → 地面技能，不是對人
 
-    ⚠ 「自己」要**先判**：「自己和隊員」也含「自己」兩個字，所以先看有沒有
-    「隊員」再看「自己」，順序反了會把隊伍 buff 判成只能對自己。
+    ## ⚠⚠ 「自己和隊員」是**範圍技**，不是「可以指定隊友」
+
+    舊版看到「隊員」兩個字就回 True，於是速度激發(111)、無視體型攻擊(112)、
+    凶砍(113) 被判成可以指定隊友放。**它們其實是以自己為中心的範圍技** ——
+    遊戲自己的說明講得很清楚（凶砍：「增加自己及**周圍**隊員的物理傷害」，
+    天使之障壁：「提升自己和**畫面內**隊員的…」）。送「目標＝隊友 GID」的
+    `0x0438` 出去伺服器不會理，於是那顆技能永遠在重試然後退避，
+    **安靜地什麼都沒發生**。
+
+    這類技能正確的用法是**當成自己的 buff 勾起來**：放在自己身上，
+    範圍效果本來就會罩到旁邊的隊友。
+
+    分辨的方法就是「對象有沒有指名一個」：`自己和隊員`／`自己與我軍`
+    是一群人（範圍），`自己和隊友1名`／`目標1個` 是一個人（可指定）。
+    射程也對得上（可指定的是 9 格，範圍技都是 1）—— 但射程 1 的塗毒
+    也是可指定的，所以**射程不能當判準**，只能當旁證。
     """
     target = (skill_table().get(skill_id) or {}).get("target") or ""
     if not target:
         return False
-    if "隊員" in target:
-        return True
-    if "自己" in target:
-        return False
-    return "目標" in target or "玩家" in target
+    if "格" in target:
+        return False                      # 地面1格：對地不對人
+    return any(word in target for word in _ONE_PERSON)
+
+
+def skill_range(skill_id: int, level: int) -> int | None:
+    """這一級的射程（格）。查不到回 None —— 呼叫端要自己決定安全預設。
+
+    來源是遊戲自己的技能說明（`assets/skills.json.gz` 的 `range`）：
+    天使之賜福／加速術是 9，塗毒是 1，以自己為中心的範圍技也是 1。
+    """
+    ranges = (skill_table().get(skill_id) or {}).get("range")
+    if not ranges or not 1 <= level <= len(ranges):
+        return None
+    return ranges[level - 1]
+
+
+def cells_between(a: tuple[int, int], b: tuple[int, int]) -> int:
+    """RO 的距離是**正方形**的（八方向各算一格），所以取兩軸差的最大值。"""
+    return max(abs(a[0] - b[0]), abs(a[1] - b[1]))
 
 
 def sp_cost(skill_id: int, level: int) -> int | None:
@@ -150,7 +198,8 @@ class BuffKeeper:
     （[PKT-072]：同一條規則抄很多份就會有人漏掉）。
     """
 
-    def __init__(self, send, aid: int, read_statuses, now, party=None) -> None:
+    def __init__(self, send, aid: int, read_statuses, now, party=None,
+                 read_position=None) -> None:
         #: `send(data) -> bool`：把封包送出去。
         self._send = send
         #: 自己的 AID。對自己放補助技能就是把目標填自己（[PKT-041]）。
@@ -160,6 +209,12 @@ class BuffKeeper:
         self._now = now
         #: `services/party.PartyWatch`（None = 不幫隊友放）。
         self._party = party
+        #: `read_position() -> (x, y) | None`：我現在在哪一格。
+        #: 只有「幫隊友放」用得到（要量距離）。讀不到就不幫隊友放 ——
+        #: 不知道距離而硬放就是使用者說的「無腦一直放」。
+        self._read_position = read_position
+        #: 「不知道自己在哪」講過了沒（不擋就是每拍一行）。
+        self._said_no_pos = False
         #: 要不要幫隊友放（使用者在介面上勾）。
         self.help_mates = False
         self._plans: list[BuffPlan] = []
@@ -320,7 +375,9 @@ class BuffKeeper:
         規則（使用者指定）：
         - 身上沒有那個 buff，**或**剩不到總時長的 50% 就補。
         - **放不到別人身上的技能直接跳過**（`can_target_others()`）——
-          「自己」類的技能送出去只會被伺服器丟掉。
+          「自己」類與「以自己為中心的範圍技」送出去只會被伺服器丟掉。
+        - **隊友太遠就不放**：門檻是技能自己的射程，再夾一個 `MATE_MAX_CELLS`
+          的上限（使用者指定 5 格）。量不出距離（讀不到自己的座標）也不放。
         - SP 不夠**安靜跳過**，跟自己那條一樣。
         """
         if not self.help_mates or self._party is None:
@@ -331,6 +388,15 @@ class BuffKeeper:
         mates = self._party.mates()
         if not mates:
             return None
+        me = self._read_position() if self._read_position is not None else None
+        if me is None:
+            # 不知道自己在哪就量不出距離 —— **不放**（安全退化）。
+            # 硬放的話放不到的那幾個會一直重試，正是使用者說的「無腦一直放」。
+            if not self._said_no_pos:
+                self._said_no_pos = True
+                log.info("讀不到自己的座標，這段時間不幫隊友放（量不出距離）")
+            return None
+        self._said_no_pos = False
         for plan in self._plans:
             efst = buff_efst(plan.skill_id)
             if efst is None or not can_target_others(plan.skill_id):
@@ -342,9 +408,14 @@ class BuffKeeper:
             if sp is not None and cost is not None and sp < cost:
                 self.stats.waiting_sp += 1
                 continue
+            reach = skill_range(plan.skill_id, plan.level)
+            reach = MATE_MAX_CELLS if reach is None else min(reach, MATE_MAX_CELLS)
             for mate in mates:
                 if (plan.skill_id, mate.aid) in self._mate_pending:
                     continue        # 這一發還在等結果，別重送
+                if cells_between(me, mate.cell) > reach:
+                    # 太遠 —— 伺服器只會安靜地丟掉，放了等於白放（見 MATE_MAX_CELLS）。
+                    continue
                 if not self._party.needs(mate, efst, MATE_REFRESH_RATIO):
                     continue
                 data = build_use_skill(plan.level, plan.skill_id, mate.aid)
@@ -469,7 +540,7 @@ class BuffBot:
         self._party = PartyWatch(status.aid, time.monotonic)
         self._keeper = BuffKeeper(
             self._link.send, status.aid, reader.status_effects, time.monotonic,
-            party=self._party,
+            party=self._party, read_position=reader.read_position,
         )
         self._keeper.set_plans(self._plans)
         self._keeper.help_mates = self._help_mates

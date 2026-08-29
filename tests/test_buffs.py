@@ -286,9 +286,13 @@ def test_use_skill_packet_matches_the_real_capture(level, skill_id, target, expe
 
 
 class FakeMate:
-    def __init__(self, aid: int, name: str = "") -> None:
+    def __init__(self, aid: int, name: str = "",
+                 cell: tuple[int, int] = (100, 100)) -> None:
         self.aid = aid
         self.name = name
+        #: 隊友在哪一格（`0x0107`）。預設就站在我旁邊 —— 距離不是這些
+        #: 測試要釘的東西，要釘距離的另外寫（見檔尾）。
+        self.cell = cell
         self._has: dict[int, bool] = {}
 
     def label(self) -> str:
@@ -315,9 +319,14 @@ INCAGI = 29          # AL_INCAGI「目標1個」→ 放得到別人
 INCAGI_EFST = 12
 
 
-def _party_keeper(fake, mates):
+#: 我站在哪（`FakeMate` 預設就站在同一格，也就是「在身邊」）。
+MY_CELL = (100, 100)
+
+
+def _party_keeper(fake, mates, me=MY_CELL):
     party = FakeParty(mates)
-    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party)
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party,
+                        read_position=lambda: me)
     keeper.help_mates = True
     return keeper, party
 
@@ -445,3 +454,106 @@ def test_the_same_mate_is_not_spammed():
         fake.clock += MIN_GAP
         keeper.tick()
     assert len(fake.sent) == 1
+
+
+# ---- 太遠不放（使用者：「不然會無腦一直放」）--------------------------------
+
+
+def test_a_mate_too_far_away_is_left_alone():
+    """使用者 2026-08-29：「幫隊友放要控制在隊友在我 5 格距離才會放」。
+
+    放不到的時候伺服器只是**安靜地丟掉** —— 我們永遠等不到狀態變化，
+    於是那個技能一直重試 → 退避 → 再重試，什麼事都沒發生。
+    """
+    from ro_toolbox.services.buffs import MATE_MAX_CELLS
+
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])     # 自己已經有了
+    far = FakeMate(MATE_AID, "白狐",
+                   cell=(MY_CELL[0] + MATE_MAX_CELLS + 1, MY_CELL[1]))
+    keeper, _party = _party_keeper(fake, [far])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    assert keeper.tick() is None
+    assert fake.sent == []
+
+
+def test_a_mate_right_on_the_line_still_gets_it():
+    from ro_toolbox.services.buffs import MATE_MAX_CELLS
+
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    edge = FakeMate(MATE_AID, "白狐",
+                    cell=(MY_CELL[0] + MATE_MAX_CELLS, MY_CELL[1]))
+    keeper, _party = _party_keeper(fake, [edge])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    assert fake.sent == [build_use_skill(10, INCAGI, MATE_AID)]
+
+
+def test_distance_is_square_not_straight_line():
+    """RO 的距離是正方形的（斜的一步也算一格），所以取兩軸差的最大值。"""
+    from ro_toolbox.services.buffs import cells_between
+
+    assert cells_between((10, 10), (13, 14)) == 4      # 直線距離是 5
+    assert cells_between((10, 10), (10, 10)) == 0
+
+
+def test_no_position_means_no_mate_buffs():
+    """量不出距離就不放（安全退化）—— 不知道遠近而硬放就是無腦一直放。"""
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    party = FakeParty([FakeMate(MATE_AID, "白狐")])
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party,
+                        read_position=lambda: None)
+    keeper.help_mates = True
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    assert keeper.tick() is None
+    assert fake.sent == []
+
+
+def test_a_short_range_skill_uses_its_own_range():
+    """門檻是**技能自己的射程**，`MATE_MAX_CELLS` 只是上限。
+
+    塗毒（138）射程 1 —— 要貼著才放得到，5 格是放不到的。
+    """
+    from ro_toolbox.services.buffs import skill_range
+
+    assert skill_range(138, 1) == 1, "塗毒射程 1"
+    assert skill_range(INCAGI, 10) == 9, "加速術射程 9（會被 5 格上限夾住）"
+
+    from ro_toolbox.services.buffs import buff_efst
+
+    fake = Fake([FakeStatus(buff_efst(138), 200_000)])   # 自己已經有了
+    mate = FakeMate(MATE_AID, "白狐", cell=(MY_CELL[0] + 3, MY_CELL[1]))
+    keeper, _party = _party_keeper(fake, [mate])
+    keeper.set_plans([BuffPlan(138, 1)])
+    keeper.tick()
+    assert fake.sent == [], "射程 1 的技能，隔 3 格不准送"
+
+
+# ---- 「自己和隊員」是範圍技，不是可以指定隊友 ------------------------------
+
+
+def test_self_centred_party_skills_are_not_targeted_at_a_mate():
+    """⚠ 遊戲說明的「對象」寫「自己和隊員」的是**以自己為中心的範圍技**。
+
+    內容講得很清楚 —— 凶砍：「增加自己及**周圍**隊員的物理傷害」；
+    天使之障壁：「提升自己和**畫面內**隊員的…」。送「目標＝隊友 GID」的
+    `0x0438` 出去伺服器不會理，那個技能會一直重試然後安靜地什麼都沒發生。
+    這類技能正確的用法是當成**自己的 buff** 勾起來，範圍效果自然罩到隊友。
+    """
+    from ro_toolbox.services.buffs import can_target_others
+
+    assert not can_target_others(33), "天使之障壁（立即施展）"
+    assert not can_target_others(111), "速度激發（自己和隊員）"
+    assert not can_target_others(112), "無視體型攻擊（自己和隊員）"
+    assert not can_target_others(113), "凶砍（自己和隊員）"
+    assert not can_target_others(74), "聖母之頌歌（立即施展）"
+
+
+def test_skills_that_name_one_person_are_still_targetable():
+    from ro_toolbox.services.buffs import can_target_others
+
+    assert can_target_others(29), "加速術（目標1個）"
+    assert can_target_others(34), "天使之賜福（目標1個）"
+    assert can_target_others(138), "塗毒（自己和隊友1名 —— 說明寫「指定目標」）"
