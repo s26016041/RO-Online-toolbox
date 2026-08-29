@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import struct
 
-from ro_toolbox.services import shop
+from ro_toolbox.services import restock, shop
 from ro_toolbox.services.restock import Restocker, RestockOrder
 
 HP_ITEM = 502
@@ -275,3 +275,80 @@ def test_weight_unknown_still_probes():
     bot, sent, _clock = make()
     walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
     assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)])
+
+
+# ---- 回程道具：固定補到 20 個（使用者指定）--------------------------------
+
+HOME_ITEM = 602      # 蝴蝶翼
+
+
+def test_the_return_item_is_bought_to_a_fixed_count():
+    """回程道具跟藥水是**兩套規則**：藥水買到負重滿，它固定補到 20 個。"""
+    order = restock.RestockOrder(hp_item=HP_ITEM, home_item=HOME_ITEM, home_have=6)
+    assert order.home_needed() == restock.HOME_TARGET - 6
+    # 回程道具**排在藥水前面** —— 它只要幾個，排後面會被負重額度吃光。
+    assert order.wanted() == [HOME_ITEM, HP_ITEM]
+
+
+def test_enough_return_items_means_it_is_not_even_queued():
+    order = restock.RestockOrder(hp_item=HP_ITEM, home_item=HOME_ITEM,
+                                 home_have=restock.HOME_TARGET)
+    assert order.home_needed() == 0
+    assert order.wanted() == [HP_ITEM]
+
+
+def test_no_return_item_selected_changes_nothing():
+    order = restock.RestockOrder(hp_item=HP_ITEM)
+    assert order.home_needed() == 0
+    assert order.wanted() == [HP_ITEM]
+
+
+def test_the_return_item_skips_the_weight_probe():
+    """固定數量不必探路：要幾個是算出來的，不是量出來的。"""
+    bot, sent, _clock = make()
+    order = restock.RestockOrder(home_item=HOME_ITEM, home_have=5)
+    bot = restock.Restocker(lambda data: sent.append(data), _clock, order)
+    bot.start(LOOK, CELL)
+    bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
+    bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
+    bot.feed(*par(shop.SP_WEIGHT, 20000))
+    bot.feed(*par(shop.SP_ZENY, 10_000_000))
+    bot.update()
+    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
+    bot.feed(shop.OP_SHOP_LIST, shop_list((HOME_ITEM, 60)))
+
+    assert sent[-1] == shop.buy_packet([(HOME_ITEM, 15)]), "一次就買足 20-5=15 個"
+
+
+def test_a_full_bag_still_buys_the_return_item():
+    """負重滿了只擋藥水 —— 沒有回程道具就回不了城，而 20 個蝴蝶翼很輕。"""
+    bot, sent, _clock = make()
+    order = restock.RestockOrder(hp_item=HP_ITEM, home_item=HOME_ITEM, home_have=0)
+    bot = restock.Restocker(lambda data: sent.append(data), _clock, order)
+    bot.start(LOOK, CELL)
+    bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
+    bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
+    bot.feed(*par(shop.SP_WEIGHT, 47000))          # 早就超過 65%
+    bot.feed(*par(shop.SP_ZENY, 10_000_000))
+    bot.update()
+    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
+    bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50), (HOME_ITEM, 60)))
+
+    assert sent[-1] == shop.buy_packet([(HOME_ITEM, restock.HOME_TARGET)])
+
+
+def test_a_shop_without_the_return_item_just_skips_it():
+    """商店沒賣就跳過，不是失敗（使用者指定）。"""
+    bot, sent, _clock = make()
+    order = restock.RestockOrder(hp_item=HP_ITEM, home_item=HOME_ITEM, home_have=0)
+    bot = restock.Restocker(lambda data: sent.append(data), _clock, order)
+    bot.start(LOOK, CELL)
+    bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
+    bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
+    bot.feed(*par(shop.SP_WEIGHT, 20000))
+    bot.feed(*par(shop.SP_ZENY, 10_000_000))
+    bot.update()
+    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
+    bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50)))    # 只賣藥水
+
+    assert sent[-1] == shop.buy_packet([(HP_ITEM, restock.PROBE_AMOUNT)]), "跳過它，照樣買藥水"

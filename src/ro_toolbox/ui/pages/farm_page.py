@@ -58,6 +58,7 @@ from ro_toolbox.services.gamedata import (
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.process_monitor import local_network_up
 from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
+from ro_toolbox.services.restock_bot import RestockBot
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.skills import SkillReader
 from ro_toolbox.services.travel_bot import TravelBot
@@ -228,6 +229,10 @@ class CharacterCard(QWidget):
     travel_pause_pressed = Signal()
     #: 背景 TravelBot 回報狀態。
     travel_stats = Signal(object)
+    #: 使用者按了「補水」（一次性動作，不是開關）。
+    restock_pressed = Signal()
+    #: 背景 RestockBot 回報狀態。
+    restock_stats = Signal(object)
     #: 技能面板的勾選、等級或「自動補助技能」開關有變動。
     skills_changed = Signal()
     #: 背景 BuffBot 回報狀態（跨執行緒，一定要用 signal 轉回 UI 執行緒）。
@@ -385,6 +390,7 @@ class CharacterCard(QWidget):
         layout.addWidget(self.buff_label)
 
         self.buff_stats.connect(self._apply_buff_stats)
+        self.restock_stats.connect(self._apply_restock_stats)
         self.farm_stats.connect(self._apply_farm_stats)
         self.potion_stats.connect(self._apply_potion_stats)
         self.travel_stats.connect(self._apply_travel_stats)
@@ -580,6 +586,11 @@ class CharacterCard(QWidget):
         self.auto_potion.setFixedHeight(self.ROW_HEIGHT)
         self.auto_potion.toggled.connect(self.potion_toggled)
         head.addWidget(self.auto_potion)
+        #: 按一下就去最近的藥水商人補一趟（不是開關，是一次性動作）。
+        self.restock_button = QPushButton("補水")
+        self.restock_button.setFixedHeight(self.ROW_HEIGHT)
+        self.restock_button.clicked.connect(self.restock_pressed)
+        head.addWidget(self.restock_button)
         head.addStretch(1)
         box.addLayout(head)
 
@@ -780,6 +791,16 @@ class CharacterCard(QWidget):
                     self.quiet = False
             return
         # ⚠ 這裡不記日誌 —— `PotionBot._note()` 已經記過了，兩邊都記會印兩次。
+
+    def set_restock_busy(self, busy: bool) -> None:
+        """補水途中把按鈕鎖起來 —— 按第二次只會讓兩條路線互相搶走路封包。"""
+        self.restock_button.setEnabled(not busy)
+        self.restock_button.setText("補水中…" if busy else "補水")
+
+    def _apply_restock_stats(self, stats) -> None:  # noqa: ANN001 - RestockRun
+        self.set_restock_busy(stats.running)
+        if stats.note:
+            self.set_note(stats.note)
 
     def set_buff_note(self, text: str) -> None:
         self.buff_label.setText(text)
@@ -1027,6 +1048,9 @@ class FarmPage(BasePage):
         #: 自動補助技能。**跟自動打怪各跑各的**（使用者指定）——
         #: 不掛機也可以只開這個，掛機時兩邊互不干涉。
         self._buffs: dict[int, BuffBot] = {}
+        #: 按「補水」跑起來的一次性動作。**一個角色同時只准一個** ——
+        #: 兩條路線一起送走路封包，角色會在原地抽搐。
+        self._restocks: dict[int, RestockBot] = {}
         self._travelers: dict[int, TravelBot] = {}
         #: 自動回連：角色名 → 斷線前在跑什麼／目前的判斷狀態
         self._snaps: dict = {}
@@ -1078,6 +1102,7 @@ class FarmPage(BasePage):
         self._read_timer.timeout.connect(self._refresh_loot)
         self._read_timer.timeout.connect(self._refresh_current_bag)
         self._read_timer.timeout.connect(self._watch_connections)
+        self._read_timer.timeout.connect(self._watch_restocks)
         #: 定期重掃技能。**不能放在每秒的計時器裡** —— 掃一趟 2 秒，
         #: 每秒掃一次會把整頁拖垮（[MEM-043] 就是這樣被 bag.as_dict 拖慢的）。
         self._skill_timer = QTimer(self)
@@ -1274,6 +1299,7 @@ class FarmPage(BasePage):
         card.travel_toggled.connect(lambda on, p=pid: self._toggle_travel(p, on))
         card.travel_pause_pressed.connect(lambda p=pid: self._pause_travel(p))
         card.skills_changed.connect(lambda p=pid: self._apply_skill_config(p))
+        card.restock_pressed.connect(lambda p=pid: self._start_restock(p))
 
         self._readers[pid] = reader
         self._cards[pid] = card
@@ -1341,6 +1367,9 @@ class FarmPage(BasePage):
         buff_bot = self._buffs.pop(pid, None)
         if buff_bot is not None:
             buff_bot.stop()
+        restock_bot = self._restocks.pop(pid, None)
+        if restock_bot is not None:
+            restock_bot.stop()
         self._skill_loaded.discard(pid)
         skill_reader = self._skill_readers.pop(pid, None)
         # ⚠ 一定要等它結束再往下 —— QThread 還在跑就被解構會**殺掉整支程式**
@@ -1725,6 +1754,54 @@ class FarmPage(BasePage):
             return
         card.skills.set_skills(rows)
         self._apply_skill_config(pid, save=False)
+
+    def _start_restock(self, pid: int) -> None:
+        """按下「補水」：走去最近的藥水商人，補完跳通知。
+
+        ⚠ **先把自動打怪與自動尋路關掉**：三個都在送走路封包會互相搶目標，
+        角色會在原地抽搐（跟 `_toggle_travel` 同一個理由）。
+        """
+        card = self._cards.get(pid)
+        if card is None or pid in self._restocks:
+            return
+        config = card.potion_config()
+        if not config.hp_item and not config.home_item:
+            show_notice(self, "補水", "請先在下面選要補的補血藥水（或回程道具）。")
+            return
+
+        if pid in self._bots:
+            card.auto_hunt.setChecked(False)
+        traveler = self._travelers.get(pid)
+        if traveler is not None:
+            card.set_travel_paused(False)
+            self._toggle_travel(pid, False)
+
+        bot = RestockBot(
+            pid, config.hp_item, config.home_item,
+            on_update=lambda st, c=card: c.restock_stats.emit(st),
+        )
+        self._restocks[pid] = bot
+        card.set_restock_busy(True)
+        if not bot.start():
+            self._restocks.pop(pid, None)
+            card.set_restock_busy(False)
+
+    def _watch_restocks(self) -> None:
+        """跑完的補水收攤並跳通知（使用者指定「補完會跳通知」）。"""
+        for pid, bot in list(self._restocks.items()):
+            if bot.running:
+                continue
+            self._restocks.pop(pid, None)
+            card = self._cards.get(pid)
+            if card is not None:
+                card.set_restock_busy(False)
+            who = self._names.get(pid) or f"PID {pid}"
+            if bot.stats.broke:
+                show_notice(self, "補水", f"{who}：錢不夠，沒買完。")
+            elif bot.stats.done:
+                show_notice(self, "補水完成", f"{who}：{bot.stats.summary()}")
+            else:
+                show_notice(self, "補水沒完成", f"{who}：{bot.stats.note}")
 
     def _apply_skill_config(self, pid: int, save: bool = True) -> None:
         """勾選或開關變了：存回設定，並讓自動補助技能跟上。

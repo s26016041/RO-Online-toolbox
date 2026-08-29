@@ -137,6 +137,8 @@ class TravelBot:
         #: 要找的 NPC：(外觀編號, x, y)。認人要兩個欄位同時對上。
         self._npc_want: tuple[int, int, int] | None = None
         self._npc_gid: int | None = None
+        #: 沿路看到的所有 NPC：`{GID: (外觀, x, y)}`。見 `npc_seen`。
+        self._npc_seen: dict[int, tuple[int, int, int]] = {}
         #: 「走遠再走回來」的進度：None／"away"／"back"
         self._shake = None
         self._shake_round = 0
@@ -385,20 +387,33 @@ class TravelBot:
         if packet.opcode in _OP_ENTITY and self._npc_want is not None:
             self._note_entity(packet.payload)
 
+    @property
+    def npc_seen(self) -> dict[int, tuple[int, int, int]]:
+        """沿路看到的 NPC：`{GID: (外觀, x, y)}`。
+
+        ⚠ **走到了才開擷取是接不到的**：實體只在「進入視野」時送一次封包
+        （[PKT-061]），那一包是走過去的路上來的。所以趕路這一段要順手記下來，
+        交給下一段（例如 `restock_bot` 要認出藥水商人才開得了店）。
+        """
+        return dict(self._npc_seen)
+
     def _note_entity(self, payload: bytes) -> None:
-        want = self._npc_want
-        if want is None or len(payload) < _ENT_POS + 3:
+        if len(payload) < _ENT_POS + 3:
             return
         # objtype 6 = NPC（實測登入擷取：0=其他玩家、6=NPC、GID 只有兩三位數）
         if payload[_ENT_OBJTYPE] != _OBJTYPE_NPC:
             return
         class_id = int.from_bytes(payload[_ENT_CLASS:_ENT_CLASS + 2], "little")
-        if class_id != want[0]:
-            return
         x, y, _dir = unpack_position(payload[_ENT_POS:_ENT_POS + 3])
+        gid = int.from_bytes(payload[_ENT_GID:_ENT_GID + 4], "little")
+        if gid:
+            # 全部都記，不只「這一段要找的那一個」——下一段可能要認別人。
+            self._npc_seen[gid] = (class_id, x, y)
+        want = self._npc_want
+        if want is None or class_id != want[0]:
+            return
         if max(abs(x - want[1]), abs(y - want[2])) > _NPC_SNAP:
             return
-        gid = int.from_bytes(payload[_ENT_GID:_ENT_GID + 4], "little")
         if gid and self._npc_gid != gid:
             self._npc_gid = gid
             log.info("認出 NPC：外觀 %s 在 (%s,%s)，GID=%s", class_id, x, y, gid)

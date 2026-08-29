@@ -61,15 +61,44 @@ PROBE_AMOUNT = 1
 PROBE_ROUNDS = 2
 
 
+#: 回程道具要補到背包有幾個（使用者 2026-08-29 指定）。
+HOME_TARGET = 20
+
+
 @dataclass
 class RestockOrder:
-    """要補什麼。**只有 HP**（使用者 2026-08-29 指定：回程補給不補 SP）。"""
+    """要補什麼。**藥水只補 HP**（使用者 2026-08-29 指定：回程補給不補 SP）。
+
+    回程道具（蝴蝶翼之類）是**固定數量**：補到背包有 `HOME_TARGET` 個為止。
+    跟藥水的「買到負重幾成」是兩套規則 —— 回程道具買太多只是佔重量，
+    而少了一個就回不了城。
+    """
 
     hp_item: int | None = None
     ratio: float = shop.FILL_RATIO
+    #: 回程道具的編號（None = 不補）。
+    home_item: int | None = None
+    #: 背包現在有幾個回程道具（呼叫端查好傳進來 —— 這裡不碰背包）。
+    home_have: int = 0
+
+    def home_needed(self) -> int:
+        """回程道具還差幾個。已經夠了就是 0。"""
+        if not self.home_item:
+            return 0
+        return max(0, HOME_TARGET - self.home_have)
 
     def wanted(self) -> list[int]:
-        return [self.hp_item] if self.hp_item else []
+        """買的順序：**回程道具先買**。
+
+        它只要幾個、又是「沒有就回不了城」的東西；藥水是買到負重滿為止，
+        排在後面才不會把額度吃光。
+        """
+        out: list[int] = []
+        if self.home_item and self.home_needed() > 0:
+            out.append(self.home_item)
+        if self.hp_item:
+            out.append(self.hp_item)
+        return out
 
 
 @dataclass
@@ -244,8 +273,12 @@ class Restocker:
         """
         self._probe = []
         self._probing = True
-        while self._queue and not self._full():
+        while self._queue:
             item_id = self._queue.pop(0)
+            # ⚠ 負重滿了只擋**藥水**：回程道具沒有就回不了城，
+            #   而 20 個蝴蝶翼的重量微不足道。
+            if item_id != self._order.home_item and self._full():
+                continue
             found = shop.find_item(self._items, item_id)
             if found is None:
                 # ⚠ 清單裡沒有就是沒有 —— 不准挑一個「看起來像」的來買。
@@ -253,6 +286,17 @@ class Restocker:
                 continue
             self._item = item_id
             self._price = found.price
+            if item_id == self._order.home_item:
+                # 回程道具是**固定數量**，不探路也不看負重比例：
+                # 要幾個是算出來的（補到 HOME_TARGET），不是量出來的。
+                amount = self._order.home_needed()
+                if amount <= 0:
+                    continue
+                self._probing = False
+                if fresh:
+                    self._buy(amount)
+                    return "working"
+                return self._order_more(amount)
             if fresh:
                 self._buy(PROBE_AMOUNT)
                 return "working"
