@@ -14,7 +14,7 @@ import pytest
 
 from ro_toolbox.services import skills as skills_mod
 from ro_toolbox.services.gamedata import skill_table
-from ro_toolbox.services.skills import SkillReader
+from ro_toolbox.services.skills import FULL_RESCAN_SEC, SkillReader
 
 REGION = 0x10000000
 REGION_SIZE = 0x1000
@@ -264,15 +264,50 @@ def test_duplicate_copies_are_merged(reader):
     assert [s.id for s in found] == [5]
 
 
-def test_conflicting_copies_fail_loudly(reader, caplog):
-    """兩份都通過交叉驗證卻不一樣 —— 不准挑一個用，賭錯就是看著別人的等級。"""
+def test_the_sp_table_settles_a_disagreement(reader):
+    """兩份不一樣時用**第三份獨立資料**仲裁：SP 要對得上 lub 的 SpAmount。
+
+    實機白狐的 `AL_WARP` 就是這樣：`lv=0 sp=38` 的殘留與 `lv=1 sp=35` 的真貨，
+    而表是 `[35, 32, 29, 26]` —— 38 根本不在裡面。
+    """
+    r, scanner = reader
+    scanner.add_skill(27, 0, 38)         # 殘留：SP 對不上表
+    scanner.add_skill(27, 1, 35)         # 真的：sp[0] == 35
+
+    found = r.read()
+    assert found is not None
+    assert [(s.id, s.level, s.sp) for s in found] == [(27, 1, 35)]
+
+
+def test_an_unsettled_skill_is_dropped_not_the_whole_table(reader, caplog):
+    """仲裁不出來就**只丟那一個**，其他技能照常。
+
+    回歸測試：舊版因為一個技能矛盾就把整張表判定為失敗 —— 技能面板全空、
+    而且每 5 秒噴一行 ERROR 把日誌洗掉，別的問題全被沖走（使用者實測回報）。
+    """
+    r, scanner = reader
+    scanner.add_skill(5, 10, 15)         # SM_BASH，正常
+    scanner.add_skill(27, 2, 99)         # 兩份 SP 都對不上表 → 分不出來
+    scanner.add_skill(27, 3, 98)
+
+    with caplog.at_level(logging.WARNING):
+        found = r.read()
+    assert [s.id for s in found or []] == [5], "分不出來的丟掉，其餘照常"
+    assert "矛盾" in caplog.text
+
+
+def test_the_conflict_warning_is_not_repeated_every_tick(reader, clock, caplog):
+    """5 秒一輪，同一組矛盾不該每輪都喊一次。"""
     r, scanner = reader
     scanner.add_skill(5, 10, 15)
-    scanner.add_skill(5, 3, 8)
+    scanner.add_skill(27, 2, 99)
+    scanner.add_skill(27, 3, 98)
 
-    with caplog.at_level(logging.ERROR):
-        assert r.read() is None
-    assert "矛盾" in caplog.text
+    with caplog.at_level(logging.WARNING):
+        for _ in range(3):
+            clock.t += FULL_RESCAN_SEC + 1        # 每次都全掃
+            r.read()
+    assert caplog.text.count("矛盾") == 1
 
 
 def test_no_skills_is_not_a_crash(reader):

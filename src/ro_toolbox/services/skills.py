@@ -172,6 +172,34 @@ def _classify(skill_id: int, inf: int) -> str:
     return UNKNOWN
 
 
+def _sp_matches(skill: Skill) -> bool:
+    """這一份的消耗 SP 對得上 `skillinfolist.lub` 的 `SpAmount` 嗎？
+
+    未學的技能（`level == 0`）比對 Lv1 那一格 —— 實測未學的節點 SP 欄位放的
+    就是 Lv1 的值（`KN_PIERCE` 7、`KN_SPEARBOOMERANG` 10，都與表一致）。
+    """
+    costs = (skill_table().get(skill.id) or {}).get("sp")
+    if not costs:
+        return False
+    index = max(0, skill.level - 1)
+    return index < len(costs) and costs[index] == skill.sp
+
+
+def _arbitrate(a: Skill, b: Skill) -> Skill | None:
+    """同一個技能讀到兩份不一樣的內容時，用 SP 表仲裁。回 None = 分不出來。
+
+    這**不是賭**，是拿第三份互相獨立的資料來判：實機白狐的 `AL_WARP` 有兩份，
+    `lv=0 sp=38` 與 `lv=1 sp=35`，而 lub 的 `SpAmount` 是 `[35, 32, 29, 26]`
+    —— 38 根本不在裡面，那份是殘留。
+    """
+    a_ok, b_ok = _sp_matches(a), _sp_matches(b)
+    if a_ok and not b_ok:
+        return a
+    if b_ok and not a_ok:
+        return b
+    return None
+
+
 def _table_arrays() -> tuple[np.ndarray, int]:
     """把「ID → MaxLv」攤成陣列，讓 numpy 一次比對整塊記憶體。
 
@@ -250,6 +278,8 @@ class SkillReader:
         self._character: CharacterReader | None = None
         #: 連續幾次讀不到角色狀態（見 `_online()`）。
         self._offline_reads = 0
+        #: 上次抱怨過哪些技能矛盾。5 秒一輪，不擋就是每 5 秒一行。
+        self._said_conflict: set[int] = set()
 
     @property
     def pid(self) -> int | None:
@@ -271,6 +301,7 @@ class SkillReader:
         self._known = {}
         self._full_at = 0.0
         self._offline_reads = 0
+        self._said_conflict = set()
 
     def _online(self) -> bool:
         """這個分身現在真的有角色在遊戲裡嗎？
@@ -361,24 +392,40 @@ class SkillReader:
                 skill = self._verify(u32, int(index), codes)
                 if skill is None:
                     continue
+                # ⚠ `int()` 不能省：`index` 是 numpy int64，
+                #   直接餵給 ReadProcessMemory 會丟 ctypes.ArgumentError。
+                addr = int(base + index * 4)
                 previous = found.get(skill.id)
                 if previous is None:
                     found[skill.id] = skill
-                    # ⚠ `int()` 不能省：`index` 是 numpy int64，
-                    #   直接餵給 ReadProcessMemory 會丟 ctypes.ArgumentError。
-                    where[skill.id] = int(base + index * 4)
+                    where[skill.id] = addr
                 elif previous != skill:
-                    # 兩份都通過了交叉驗證卻不一樣 —— 多開？上一隻角色的殘留？
-                    # 這種時候不准挑一個用，賭錯就是照著別人的技能等級做決策。
-                    conflicts.add(skill.id)
+                    # 兩份都通過了交叉驗證卻不一樣（殘留？多開？）——
+                    # 用**第三份獨立資料**仲裁：消耗 SP 要對得上 lub 的 SpAmount。
+                    winner = _arbitrate(previous, skill)
+                    if winner is skill:
+                        found[skill.id] = skill
+                        where[skill.id] = addr
+                    elif winner is None:
+                        conflicts.add(skill.id)
 
         if conflicts:
-            log.error(
-                "有 %d 個技能讀到互相矛盾的內容（例如 %s），分不出哪份是現在的角色，"
-                "判定為定位失敗",
-                len(conflicts), sorted(conflicts)[:5],
-            )
-            return None
+            # ⚠ **只丟掉分不出來的那幾個，不是否決整份。**
+            # 實機踩過：白狐的 AL_WARP 有兩份（lv=0 sp=38 的殘留、lv=1 sp=35 的真貨），
+            # 舊版因為這一個技能就把整張表判定為失敗 —— 技能面板全空、
+            # 而且每 5 秒噴一行 ERROR 把日誌洗掉，別的問題全被沖走。
+            for skill_id in conflicts:
+                found.pop(skill_id, None)
+                where.pop(skill_id, None)
+            if conflicts != self._said_conflict:
+                self._said_conflict = set(conflicts)
+                log.warning(
+                    "有 %d 個技能讀到互相矛盾的內容而且 SP 也仲裁不出來（%s），"
+                    "先不顯示它們；其餘 %d 個照常",
+                    len(conflicts), sorted(conflicts)[:5], len(found),
+                )
+        else:
+            self._said_conflict = set()
         if not found:
             # 還沒進到遊戲裡就是讀不到，這不算錯誤（跟角色狀態一樣）。
             log.info("讀不到技能表 —— 通常是還沒進到遊戲裡，進去之後會自己接上")
