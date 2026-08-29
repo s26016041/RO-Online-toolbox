@@ -402,10 +402,12 @@ def test_a_diagonal_that_has_to_squeeze_through_a_corner_is_rejected(monkeypatch
 
 
 def test_no_attack_is_sent_through_a_wall(monkeypatch):
-    """走不過去就**不送攻擊**。
+    """牆後面的怪：**不送攻擊，而且當場換一隻**。
 
-    舊版在這裡「算不出路就直接打」，等於隔著牆對空氣送封包，然後站著等
-    10 秒的放棄計時器（使用者回報「走過去站著發呆」）。
+    舊版在這裡「算不出路就直接打」，等於隔著牆對空氣送封包。
+    後來改成不打、交給 10 秒的放棄計時器 —— 但那 10 秒裡每一拍都在重算
+    同一條算不出來的路，看起來就是站在原地發呆（使用者實測回報
+    「中間有障礙物比如樹，他會卡住不繞過去」）。現在走不成就當場換目標。
     """
     sent: list[bytes] = []
     bot = _bot_with_terrain(monkeypatch, blocked=[(11, y) for y in range(60)])
@@ -414,9 +416,24 @@ def test_no_attack_is_sent_through_a_wall(monkeypatch):
     see(bot, 5, 13, 10)
     bot._update_aim(T0, (10, 10))
     bot._fight(T0, (10, 10))
-    assert bot._aim is not None, "目標還在，交給放棄計時器收尾"
     assert sent == [], "隔著牆一個封包都不該送"
-    assert bot._aim.attacked is False
+    assert bot._aim is None, "繞不過去就換一隻，不要站著重算同一條路"
+    assert 5 in bot._skip, "換掉的要進黑名單，免得下一拍又挑到牠"
+
+
+def test_an_obstacle_it_can_walk_around_is_walked_around(monkeypatch):
+    """牆上有缺口就**繞過去**，不是放棄 —— 這才是使用者要的行為。"""
+    sent: list[bytes] = []
+    wall = [(11, y) for y in range(60) if y != 20]      # y=20 是缺口
+    bot = _bot_with_terrain(monkeypatch, blocked=wall)
+    bot._world.set_map_size((60, 60))
+    bot._send = sent.append
+    see(bot, 5, 13, 10)
+    bot._update_aim(T0, (10, 10))
+    bot._fight(T0, (10, 10))
+    assert bot._aim is not None, "繞得過去就不該放棄"
+    assert sent, "應該開始走過去"
+    assert all(int.from_bytes(p[:2], "little") == 0x035F for p in sent), "只走路，不打"
 
 
 def test_attack_is_sent_once_the_line_is_clear(monkeypatch):
@@ -655,3 +672,42 @@ def test_endless_ping_pong_stops_loudly():
     assert bot._go_home_start("moc_fild01", T0) is False
     assert bot._traveler is None
     assert "輪迴" in bot._stats.note
+
+
+# ---- 負重 90% 就收工（使用者 2026-08-29 指定：回程並關掉，掛機不補給）------
+
+
+def _weigh(bot, weight: int, max_weight: int) -> None:
+    """餵一包 0x00B0（負重只在變動時送，見 [PKT-074]）。"""
+    import struct
+
+    from ro_toolbox.services.farm_bot import _OP_PAR_CHANGE, _SP_MAX_WEIGHT, _SP_WEIGHT
+
+    for kind, value in ((_SP_MAX_WEIGHT, max_weight), (_SP_WEIGHT, weight)):
+        bot._on_packet(_pkt(_OP_PAR_CHANGE, struct.pack("<HI", kind, value)))
+
+
+def _pkt(opcode: int, payload: bytes):
+    from ro_toolbox.core.ro_packet import RoPacket
+
+    return RoPacket(seq=1, timestamp=0.0, outbound=False, opcode=opcode, payload=payload)
+
+
+def test_no_weight_packet_means_no_judgement(monkeypatch):
+    """負重只在變動時送，剛啟動可能一次都沒看過 —— 那時候不做判斷，不是當成 0。"""
+    bot = _bot_with_terrain(monkeypatch)
+    assert bot._too_heavy() is False
+
+
+def test_ninety_percent_is_the_line(monkeypatch):
+    bot = _bot_with_terrain(monkeypatch)
+    _weigh(bot, 43289, 48100)                 # 89.99%
+    assert bot._too_heavy() is False
+    _weigh(bot, 43290, 48100)                 # 90.0% —— 含
+    assert bot._too_heavy() is True
+
+
+def test_a_zero_max_weight_is_not_a_division_by_zero(monkeypatch):
+    bot = _bot_with_terrain(monkeypatch)
+    _weigh(bot, 100, 0)
+    assert bot._too_heavy() is False

@@ -352,3 +352,9 @@ def test_a_shop_without_the_return_item_just_skips_it():
     bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50)))    # 只賣藥水
 
     assert sent[-1] == shop.buy_packet([(HP_ITEM, restock.PROBE_AMOUNT)]), "跳過它，照樣買藥水"
+
+
+def test_return_item_purchase_ignores_the_weight_target():
+    """回程道具不看負重比例 —— 它是「有沒有」的問題，不是「幾成」的問題。"""
+    order = restock.RestockOrder(home_item=HOME_ITEM, home_have=0)
+    assert order.home_needed() == restock.HOME_TARGET

@@ -364,6 +364,7 @@ class CharacterCard(QWidget):
         self.buff_label.setWordWrap(True)
         layout.addWidget(self.buff_label)
 
+        self._overweight_notified = False
         self._note_text = "定位中…"
         self._last_alert = ""
         self.status_label = QLabel(self._note_text)
@@ -826,6 +827,7 @@ class CharacterCard(QWidget):
         而且**只**關掉自動打怪，別的什麼都不做（不回城、不重連、不繼續打）。
         """
         self._notify_death(stats)
+        self._notify_overweight(stats)
         if not stats.running and self.auto_hunt.isChecked():
             # 勾著卻沒在跑，看起來會像「還在掛機」，那是最糟的失效方式
             self.auto_hunt.setChecked(False)
@@ -843,6 +845,16 @@ class CharacterCard(QWidget):
         self._death_notified = True
         who = self.character or "角色"
         show_notice("角色死亡", f"{who} 已經死亡，自動打怪已關閉。")
+
+    def _notify_overweight(self, stats) -> None:  # noqa: ANN001 - FarmStats
+        """負重滿了就跳一次通知（使用者指定：回程並關掉自動打怪，掛機不補給）。"""
+        if getattr(stats, "running", False) and not getattr(stats, "overweight", False):
+            self._overweight_notified = False
+        if not getattr(stats, "overweight", False) or self._overweight_notified:
+            return
+        self._overweight_notified = True
+        who = self.character or "角色"
+        show_notice("負重滿了", f"{who} 負重已達 90%，自動打怪已關閉，正在回城。")
 
     @staticmethod
     def _make_bar(object_name: str) -> QProgressBar:
@@ -1103,6 +1115,7 @@ class FarmPage(BasePage):
         self._read_timer.timeout.connect(self._refresh_current_bag)
         self._read_timer.timeout.connect(self._watch_connections)
         self._read_timer.timeout.connect(self._watch_restocks)
+        self._read_timer.timeout.connect(self._watch_overweight)
         #: 定期重掃技能。**不能放在每秒的計時器裡** —— 掃一趟 2 秒，
         #: 每秒掃一次會把整頁拖垮（[MEM-043] 就是這樣被 bag.as_dict 拖慢的）。
         self._skill_timer = QTimer(self)
@@ -1616,6 +1629,25 @@ class FarmPage(BasePage):
             # 「沒有要趕路」時才把自動打怪接回去；到站之後使用者自己開。
             card.auto_hunt.setChecked(True)
         log.warning("已接回 PID %s：%s", pid, "、".join(snap.labels) or "（無）")
+
+    def _watch_overweight(self) -> None:
+        """自動打怪回報負重滿了：關掉它，並叫補水那條線用回程道具回城。
+
+        ⚠ 使用者指定「**掛機不補給**」—— 這裡只負責把人帶回城，
+        不會自己跑去買東西。要補貨請按「補水」。
+        """
+        for pid, bot in list(self._bots.items()):
+            if not bot.stats.overweight:
+                continue
+            card = self._cards.get(pid)
+            if card is not None:
+                card.auto_hunt.setChecked(False)      # 這會走 _toggle_farm 收攤
+            potion = self._potions.get(pid)
+            if potion is not None and potion.running:
+                potion.request_home("負重滿了")
+            else:
+                who = self._names.get(pid) or f"PID {pid}"
+                log.warning("%s 負重滿了，但自動補水沒在跑，回不了城", who)
 
     def _toggle_farm(self, pid: int, on: bool) -> None:
         card = self._cards.get(pid)

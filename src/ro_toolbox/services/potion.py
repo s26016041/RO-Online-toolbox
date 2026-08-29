@@ -52,6 +52,11 @@ _BURST_POLL = 0.01
 _BURST_MAX = 25
 _MAX_MISS = 3         # 連續幾次沒喝到就停用
 _RESYNC_SEC = 2.0     # 多久檢查一次換地圖／換頻道
+#: 藥水剩幾瓶就該回去補（使用者 2026-08-29 指定：5 瓶，**不要等到 0**）。
+#:
+#: 為什麼不是 0：喝到最後一瓶才想回城，那一路上就已經沒水可喝了 ——
+#: 回程道具要現找、路上還會被打。留幾瓶當回家的本錢。
+LOW_STOCK = 5
 #: 背包串列走不通時，最快多久才重新定位一次。
 #: 重新定位要跑一次 AOB 掃描（實測 22 ms），而確認「有沒有喝到」是 10 ms 輪詢 ——
 #: 沒有這條限流，綁定壞掉的當下會變成一串重掃把輪詢整個塞住。
@@ -76,7 +81,8 @@ class PotionConfig:
     hp_percent: int = 0
     sp_item: int | None = None
     sp_percent: int = 0
-    #: 水用完回程：HP 或 SP 的藥水**任何一種**用完，就用 `home_item` 回程。
+    #: 水快沒了就回程：HP 或 SP 的藥水**任何一種**剩不到 `LOW_STOCK` 瓶，
+    #: 就用 `home_item` 回程。
     #: 道具由使用者自己從整個背包挑 —— 道具表裡認不出「哪個是回程道具」
     #: （蝴蝶翅膀寫「移動至儲存的位置」、蒼蠅翅膀寫「移動至任意的位置」，
     #: 差別只在描述文字），靠關鍵字猜就是 CLAUDE.md 禁止的「很有自信的錯」。
@@ -140,6 +146,8 @@ class PotionBot:
         self._miss = 0
         self._capture: PacketCapture | None = None
         self._character = ""
+        #: 外面要求回程的理由（空字串 = 沒有）。見 `request_home()`。
+        self._home_why = ""
         self._ack_lock = threading.Lock()
         # {格號: (序號, 道具編號, 剩餘數量, 結果)}
         # ⚠ 用遞增序號而不是時間戳：Windows 的 time.monotonic() 解析度約 15 ms，
@@ -327,10 +335,25 @@ class PotionBot:
         slot = self._slot_of(item_id)
         return self._bag[slot][1] if slot is not None else None
 
+    def request_home(self, why: str) -> None:
+        """外面叫它回程（例如自動打怪回報負重滿了）。**下一拍才動手**。
+
+        ⚠ 不在呼叫端的執行緒直接回程：回程要送封包＋確認那一格真的少一個，
+        那是這個 bot 自己的迴圈在做的事，兩邊同時碰背包會互相打架。
+        """
+        self._home_why = why
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             now = time.monotonic()
             if not self._keep_in_sync(now):
+                return
+            if self._home_why:
+                why, self._home_why = self._home_why, ""
+                if self._cfg.wants_home():
+                    self._go_home(why)
+                else:
+                    self._fail(f"{why}，但沒有設定回程道具")
                 return
             status = self._reader.read() if self._reader else None
             if status is None:
@@ -402,7 +425,8 @@ class PotionBot:
                 # 下一拍 _drink 會強制重讀，這裡只是讓數量顯示立刻跟上
                 if left > 0:
                     self._bag[slot] = (item_id, left)
-                    return True
+                    low = self._low_stock(item_id, left)
+                    return True if low is None else low
                 self._bag.pop(slot, None)
                 return self._exhausted(kind, item_id)
             self._stop.wait(_ACK_POLL)
@@ -482,6 +506,9 @@ class PotionBot:
             self._used(kind, slot, percent, left)
             if left <= 0:
                 return self._exhausted(kind, item_id)
+            low = self._low_stock(item_id, left)
+            if low is not None:
+                return low
         return True
 
     def _wait_used(self, slot: int, before: int) -> bool:
@@ -520,11 +547,27 @@ class PotionBot:
             self._stats.sp_left = left
         self._note(f"{kind} {percent:.0f}% → 喝了第 {index} 格，剩 {left} 個")
 
+    def _low_stock(self, item_id: int, left: int) -> bool | None:
+        """水**快**沒了就先回去補（使用者 2026-08-29 指定：剩 5 瓶就回程）。
+
+        為什麼不等到 0：喝到最後一瓶才想回城，那一路上就已經沒水可喝了 ——
+        回程道具要現找、路上還會被打。留 5 瓶當回家的本錢。
+
+        回 None = 還夠，照常跑。回 False = 已經回程（或回程失敗），迴圈要結束。
+        沒勾「回程」的話這裡什麼都不做 —— 那時候的行為照舊（喝到 0 才關掉那一項）。
+        """
+        if left > LOW_STOCK or not self._cfg.wants_home():
+            return None
+        return self._go_home(f"{item_name(item_id)} 只剩 {left} 個")
+
     def _exhausted(self, kind: str, item_id: int) -> bool:
         """那個道具用完了（背包裡找不到了）。
 
-        勾了「水用完回程」就先回程 —— **HP 或 SP 任一種用完就算**，不必等到
-        兩種都用完。沒水了還留在原地，下一波怪就是送死。
+        ⚠ 正常情況下**走不到這裡** —— 勾了回程的話剩 `LOW_STOCK` 瓶就先回去了。
+        會走到這裡的是「沒勾回程」或「一次連喝跨過門檻」。
+
+        勾了回程就先回程 —— **HP 或 SP 任一種用完就算**，不必等到兩種都用完。
+        沒水了還留在原地，下一波怪就是送死。
         沒勾的話照舊：關掉這一項，另一項還有設定就繼續跑。
         """
         text = f"{item_name(item_id)} 用完了"

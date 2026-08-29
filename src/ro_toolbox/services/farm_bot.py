@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import random
+import struct
 import threading
 import time
 from collections import deque
@@ -145,9 +146,19 @@ _LOOT_TIMEOUT = 8.0  # 撿不到就放棄這一個，別卡住
 _AGGRO_SEC = 12.0
 _FROZEN_SEC = 45.0  # 完全沒進展（沒移動、沒擊殺、沒撿到）這麼久就停下來喊人
 _RESYNC_SEC = 2.0  # 多久檢查一次「地圖／連線有沒有換掉」
+#: 負重到幾成就收工（使用者 2026-08-29 指定：**90% 含**就回程並關掉自動打怪）。
+#:
+#: ⚠ 掛機**不補給**：撿到走不動就該回城，繼續打只是把撿到的東西丟在地上。
+#: 負重只能從封包 `0x00B0` 拿（記憶體裡沒有這個欄位），而它**只在值變動時送**
+#: （[PKT-074]）—— 打怪一直在撿東西，所以值會一直更新。
+OVERWEIGHT_RATIO = 0.90
 
 # 傷害／動作封包：payload[0:4]=攻擊者 GID、[4:8]=目標 GID
 _DAMAGE_OPS = (0x08C8, 0x02E1)
+#: 負重／負重上限（`0x00B0` 的兩個 kind，見 services/shop.py）。
+_SP_WEIGHT = 24
+_SP_MAX_WEIGHT = 25
+_OP_PAR_CHANGE = 0x00B0
 _OP_MOVE_ACK = 0x0087  # 伺服器確認「我」要移動：payload[4:10] = 起點+終點
 
 
@@ -166,6 +177,9 @@ class FarmStats:
     #: 角色死了。⚠ 跟一般的「停下來」分開報：使用者要求死亡要**跳通知窗**
     #: （按確定才消失），而且**只**關掉自動打怪，別的什麼都不要做。
     died: bool = False
+    #: 負重滿了（>= `OVERWEIGHT_RATIO`）。⚠ 介面要**回程並關掉自動打怪**
+    #: （使用者指定：掛機不補給）。
+    overweight: bool = False
 
 
 @dataclass
@@ -224,6 +238,10 @@ class FarmBot:
         self._roam_goal: tuple[int, int] | None = None  # 漫遊的遠點，中途打怪不換
         self._progress: tuple | None = None  # (位置, 擊殺, 撿取) —— 用來偵測完全卡住
         self._progress_at = 0.0
+        #: 負重與上限（原始值，畫面顯示是它的 1/10，見 [PKT-074]）。
+        #: None = 還沒收到過那一包 —— 那時候**不做判斷**，不是當成 0。
+        self._weight: int | None = None
+        self._max_weight: int | None = None
         self._map = ""  # 目前綁定的地圖，換圖要重新載地形
         #: 按下自動打怪時人在哪張圖。**被傳走就走回這裡**（使用者指定的行為）。
         self._home_map = ""
@@ -403,6 +421,15 @@ class FarmBot:
         if packet.outbound:
             return
         payload = packet.payload
+        if packet.opcode == _OP_PAR_CHANGE and len(payload) >= 6:
+            # 負重／上限。⚠ **只在值變動時送**（[PKT-074]）——
+            # 打怪一直在撿東西，所以值會一直更新，不必自己去問。
+            kind, value = struct.unpack_from("<HI", payload, 0)
+            if kind == _SP_WEIGHT:
+                self._weight = value
+            elif kind == _SP_MAX_WEIGHT:
+                self._max_weight = value
+            return
         if packet.opcode == _OP_MOVE_ACK and len(payload) >= 10:
             _start, dest = unpack_move(payload[4:10])
             self._walker.note_move_ack(dest)
@@ -434,6 +461,11 @@ class FarmBot:
             if not self._alive(now):
                 return
             if not self._link_alive():
+                return
+            if self._too_heavy():
+                percent = self._weight / self._max_weight * 100
+                self._stats.overweight = True
+                self._fail(f"⚠ 負重 {percent:.0f}%，自動打怪已停止（要回城卸貨）")
                 return
             if not self._keep_in_sync(now):
                 return
@@ -492,6 +524,16 @@ class FarmBot:
 
             self._emit()
             self._stop.wait(_TICK)
+
+    def _too_heavy(self) -> bool:
+        """負重到頂了嗎。**收不到那一包就當作不知道**，不是當成 0。
+
+        負重只在變動時才送過來（[PKT-074]），剛啟動可能一次都沒看過 ——
+        那時候拿 0 去算會得到「0%」，永遠不會收工。
+        """
+        if self._weight is None or self._max_weight is None or self._max_weight <= 0:
+            return False
+        return self._weight / self._max_weight >= OVERWEIGHT_RATIO
 
     def _link_alive(self) -> bool:
         """連線還活著嗎。死了就大聲停用 —— 不准繼續空轉送封包。
@@ -753,11 +795,17 @@ class FarmBot:
         distance = mob.distance_from(pos) if (mob is not None and pos is not None) else None
         if (distance is not None and pos is not None
                 and not self._close_enough(pos, mob.pos, distance)):
-            # 還太遠、或中間有障礙 —— 先走近。**走不成也不准打**：
-            # 舊版在這裡「算不出路就直接打」，等於隔著牆對空氣送封包，
-            # 然後站著等 10 秒的放棄計時器（使用者回報「走過去站著發呆」）。
-            # 走不成就讓放棄計時器換目標，不要送一發注定打不到的攻擊。
-            self._approach(pos, mob.pos)
+            # 還太遠、或中間有障礙 —— **繞過去**。**走不成也不准打**：
+            # 舊版在這裡「算不出路就直接打」，等於隔著牆對空氣送封包。
+            #
+            # ⚠ 走不成要**當場換一隻**，不能只是 return。舊版忽略 `_approach()`
+            # 的回傳值，於是「怪在樹後面、繞不過去」的時候每一拍都重算一次
+            # 同一條算不出來的路，站在原地耗到 10 秒的放棄計時器 ——
+            # 使用者實測回報「中間有障礙物比如樹，他會卡住不繞過去」。
+            # 繞得過去的照樣繞（`_approach` 走的是 A*，本來就會繞開障礙）；
+            # 這裡處理的是**真的繞不過去**那一種。
+            if not self._approach(pos, mob.pos):
+                self._give_up_target(aim, now, "繞不過去")
             return
         # 貼到了：直線 _ATTACK_RANGE 格內，而且中間乾淨
         self._walker.clear()
@@ -768,6 +816,19 @@ class FarmBot:
         aim.attacked_at = now
         aim.sent_at = now
         aim.attacked_dist = distance or 0
+
+    def _give_up_target(self, aim: _Aim, now: float, why: str) -> None:
+        """放棄這一隻，換下一個。黑名單一下子，免得下一拍又挑到牠。"""
+        log.info("%s：%s，換下一隻", mob_name(self._class_of(aim.gid)), why)
+        self._skip[aim.gid] = now + _SKIP_SEC
+        self._skip_at[aim.gid] = now
+        self._drop_aggro(aim.gid)
+        self._walker.clear()
+        self._aim = None
+
+    def _class_of(self, gid: int) -> int | None:
+        mob = self._world.get(gid)
+        return mob.class_id if mob is not None else None
 
     def _keep_attacking(self, aim: _Aim, now: float) -> None:
         """鎖定之後每 `_ATTACK_RETRY_SEC` 秒再送一次攻擊。**無條件，一直送到牠死。**

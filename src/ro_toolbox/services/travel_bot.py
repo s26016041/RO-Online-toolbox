@@ -381,10 +381,16 @@ class TravelBot:
         if talk is not None:
             talk.feed(packet.opcode, packet.payload)
             return
-        # 還沒開始對話：實體進入視野時把「那隻 NPC」的 GID 記下來。
+        # 還沒開始對話：實體進入視野時把 NPC 的 GID 記下來。
         # 認人靠**兩個欄位同時對上**（外觀編號 ＋ 座標，都來自 RODATA 的
         # Navi_Npc，見 [DAT-027]），不是靠猜一個編號。
-        if packet.opcode in _OP_ENTITY and self._npc_want is not None:
+        #
+        # ⚠ **不准加「只在這一段要找 NPC 時才記」的守衛。** 實體只在進入視野時
+        # 送一次封包（[PKT-061]），走到了才想記就永遠記不到 —— 實機踩過：
+        # 補水走到 izlude_in 的商人腳邊，卻回報「走到了卻認不出商人
+        # （外觀 558 @ (59,113)）」，因為那一段 `_npc_want` 是 None，
+        # 整路的 NPC 封包全被這個守衛擋掉了。記下來很便宜，記不到很貴。
+        if packet.opcode in _OP_ENTITY:
             self._note_entity(packet.payload)
 
     @property

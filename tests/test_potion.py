@@ -609,3 +609,22 @@ def test_unconfirmed_return_is_not_reported_as_home(wired):
     assert bot.stats.went_home is False
     assert bot.stats.failed is True
 
+
+
+# ---- 水剩 5 瓶就回去補（使用者 2026-08-29 指定，不要等到 0）----------------
+
+
+def test_low_stock_goes_home_before_running_dry():
+    """喝到最後一瓶才想回城，那一路上就已經沒水可喝了。"""
+    from ro_toolbox.services.potion import LOW_STOCK
+
+    assert LOW_STOCK == 5
+
+
+def test_low_stock_does_nothing_without_a_return_item():
+    """沒勾回程就照舊 —— 剩幾瓶都繼續喝，喝到 0 才關掉那一項。"""
+    from ro_toolbox.services.potion import PotionBot, PotionConfig
+
+    bot = PotionBot(1234, PotionConfig(hp_item=501, hp_percent=50))
+    assert bot._low_stock(501, 1) is None
+    assert bot._low_stock(501, 0) is None
