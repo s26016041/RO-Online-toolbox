@@ -298,22 +298,44 @@ def test_stops_when_the_bag_cannot_be_read(wired):
     assert sock.sent == []
 
 
-def test_stops_loudly_when_there_is_no_reply(wired):
-    """送了封包但伺服器完全沒回 → 不能悶著一直灌，要大聲停用。"""
+def test_a_potion_still_in_the_bag_is_never_a_reason_to_stop_healing(wired):
+    """⚠⚠ **停掉補水 = 讓角色死掉。**
+
+    實機 2026-08-30（白狐掛機中，背包還有 150 瓶）：
+
+        01:06:53  ⚠ 連續 3 次喝不到（第 13 格），自動補水停用
+        …十分鐘後…
+        01:17:42  HP 15% → 喝了第 13 格   ← 使用者自己發現、手動開回來
+
+    使用者原話：「我的白狐自動喝水怎麼被關閉導致我死了」。
+
+    喝不到最常見的原因是**格號挪了**（[MEM-028]：存編號、格號現查）。
+    藥水還在背包裡就把格號重找一次繼續喝，不准停。
+    """
     _bag, _reader, sock = wired({6: (RED_POTION, 9)}, start=10.0, reply=False)
     bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=50))
     _run(bot, 5.0)
-    assert bot.stats.failed is True
-    assert "連續" in bot.stats.note
-    assert len(sock.sent) == potion._MAX_MISS
+    assert bot.stats.failed is False, "藥水還在背包裡就不准停掉補水"
+    assert len(sock.sent) > potion._MAX_MISS, "重找到格號之後要繼續喝"
 
 
-def test_stops_loudly_when_server_refuses(wired):
+def test_a_refused_drink_also_keeps_going_while_the_potion_is_there(wired):
+    """伺服器拒絕也一樣 —— 拒絕的原因多半是暫時的（狀態異常、冷卻）。"""
     _bag, _reader, sock = wired({6: (RED_POTION, 9)}, start=10.0, result=0)
     bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=50))
     _run(bot, 5.0)
+    assert bot.stats.failed is False
+    assert len(sock.sent) > potion._MAX_MISS
+
+
+def test_a_potion_that_is_really_gone_goes_down_the_exhausted_path(wired):
+    """真的不在背包裡了才算「用完」—— 那條路是設計過的（有勾回程就回城）。"""
+    # 背包讀得到，只是紅藥水不在裡面（放了別的東西）。
+    _bag, _reader, _sock = wired({6: (BLUE_POTION, 5)}, start=10.0, reply=False)
+    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=50))
+    _run(bot, 5.0)
     assert bot.stats.failed is True
-    assert len(sock.sent) == potion._MAX_MISS
+    assert "用完" in bot.stats.note or "沒有" in bot.stats.note, bot.stats.note
 
 
 def test_stops_when_the_reply_names_a_different_item(wired):
@@ -473,8 +495,10 @@ def test_burst_stops_and_counts_a_miss_when_nothing_is_consumed(wired):
     _bag, _reader, sock = wired({6: (RED_POTION, 50)}, start=10.0, dies_after=1)
     bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=99))
     _run(bot, 8.0)
-    assert bot.stats.failed is True
-    assert len(sock.sent) <= potion._MAX_MISS + 1, f"送了 {len(sock.sent)} 次"
+    # ⚠ 藥水還在背包裡就不會停（那會害死角色，見上面那條）——
+    # 這裡釘的是「連喝不准變成悶著狂送的暗路」：計數有在算，
+    # 所以送出的次數受得住檢查，不會一秒幾十發。
+    assert len(sock.sent) <= potion._MAX_MISS * 3, f"送了 {len(sock.sent)} 次"
 
 
 def test_burst_is_skipped_when_the_first_drink_did_not_land(wired):
@@ -482,7 +506,9 @@ def test_burst_is_skipped_when_the_first_drink_did_not_land(wired):
     _bag, _reader, sock = wired({6: (RED_POTION, 9)}, start=10.0, result=0)
     bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=99))
     _run(bot, 5.0)
-    assert len(sock.sent) == potion._MAX_MISS
+    # 第一瓶沒喝到 → 不准連喝。次數還是受失敗計數控制（重找格號後才繼續），
+    # 所以不會變成一條悶著狂送的暗路。
+    assert len(sock.sent) <= potion._MAX_MISS * 3, f"送了 {len(sock.sent)} 次"
 
 
 # ---- 背包快路徑 --------------------------------------------------------

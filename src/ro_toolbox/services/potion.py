@@ -50,7 +50,15 @@ _BURST_ACK_SEC = 0.5
 _BURST_POLL = 0.01
 #: 一輪連喝最多幾瓶。純粹是保險 —— 正常情況幾瓶就過線了。
 _BURST_MAX = 25
-_MAX_MISS = 3         # 連續幾次沒喝到就停用
+_MAX_MISS = 3         # 連續幾次沒喝到就重找格號
+#: 重找格號之後先等一下再試。
+#:
+#: ⚠ 為什麼要等：喝不到的時候**不准停掉補水**（那會害死角色，見
+#: `_maybe_give_up`），但也不能變成一條悶著狂送的暗路 —— 實測不節流的話
+#: 一秒送四發。等一下下就好：真正的問題（格號挪了）重找就解決了，
+#: 解決不了的話送再多也沒用。上限抓 5 秒 —— HP 掉得再快也還救得回來。
+_MISS_COOLDOWN = 1.0
+_MISS_COOLDOWN_MAX = 5.0
 _RESYNC_SEC = 2.0     # 多久檢查一次換地圖／換頻道
 #: 藥水剩幾瓶就該回去補（使用者 2026-08-29 指定：5 瓶，**不要等到 0**）。
 #:
@@ -154,6 +162,8 @@ class PotionBot:
         self._character = ""
         #: 外面要求回程的理由（空字串 = 沒有）。見 `request_home()`。
         self._home_why = ""
+        #: 重找格號之前要等多久（見 `_MISS_COOLDOWN`）。
+        self._miss_wait = _MISS_COOLDOWN
         self._ack_lock = threading.Lock()
         # {格號: (序號, 道具編號, 剩餘數量, 結果)}
         # ⚠ 用遞增序號而不是時間戳：Windows 的 time.monotonic() 解析度約 15 ms，
@@ -536,16 +546,67 @@ class PotionBot:
         return False
 
     def _maybe_give_up(self, index: int) -> bool:
-        if self._miss >= _MAX_MISS:
-            self._fail(
-                f"⚠ 連續 {_MAX_MISS} 次喝不到（第 {index} 格），自動補水停用。"
-                "可能是格號變了或伺服器擋下，請重新選擇道具。"
-            )
+        """喝不到的時候該怎麼辦。**幾乎永遠是「重找一次格號，繼續」。**
+
+        ## ⚠⚠ 停掉補水 = 讓角色死掉
+
+        實機 2026-08-30（白狐掛機中）：
+
+            01:06:18  ⚠ 送了使用道具但伺服器沒回應（第 1 次）
+            01:06:37  ⚠ 送了使用道具但伺服器沒回應（第 2 次）
+            01:06:53  ⚠ 連續 3 次喝不到（第 13 格），自動補水停用
+            …十分鐘後…
+            01:17:42  HP 15% → 喝了第 13 格   ← 使用者自己發現、手動開回來
+
+        使用者原話：「我的白狐自動喝水怎麼被關閉導致我死了」。
+        **背包還有 150 瓶藥水**，格號那一格只是暫時對不上。
+
+        CLAUDE.md 的「失效模式只允許大聲停用或安全退化」在這裡有個例外：
+        補水停掉不是「安全」退化，是**致命**退化。人不在電腦前的時候，
+        停掉補水跟關掉遊戲沒兩樣。
+
+        ## 正確的做法：把格號重找一次
+
+        這個 repo 早就有這條規矩（[MEM-028]：**存編號，格號現查**）——
+        `_slot_of()` 就是幹這個的。喝不到最常見的原因就是格號挪了
+        （丟東西、賣東西、用完一整疊，後面的都會往前遞補）。
+
+        所以：重讀背包、用**道具編號**重找格號。
+        - 找得到 → 計數歸零，下一拍照常喝。
+        - 找不到 → 那是「道具真的沒了」，走既有的 `_exhausted()`
+          （有勾回程就回城補給，沒勾就關掉那一項）—— 那條路是設計過的。
+        """
+        if self._miss < _MAX_MISS:
+            return True
+        # 先冷卻一下再重找 —— 不然會變成一條每秒好幾發的暗路。
+        self._stop.wait(min(self._miss_wait, _MISS_COOLDOWN_MAX))
+        self._miss_wait = min(self._miss_wait * 2, _MISS_COOLDOWN_MAX)
+        if self._stop.is_set():
             return False
-        return True
+        # 格號現查（[MEM-028]）。找得到就繼續 —— 停掉補水會害死角色。
+        self._refresh_bag(force=True)
+        for item_id in (self._cfg.hp_item, self._cfg.sp_item):
+            if not item_id:
+                continue
+            slot = self._slot_of(item_id)
+            if slot is not None:
+                self._miss = 0
+                self._note(
+                    f"⚠ 連續 {_MAX_MISS} 次喝不到（第 {index} 格）—— "
+                    f"重找到 {item_name(item_id)} 在第 {slot} 格，繼續補水"
+                )
+                return True
+        # 兩種道具都不在背包裡了 —— 那是「用完了」，走既有那條路
+        # （勾了回程就回城補給）。**不是**「停用自動補水」。
+        for kind, item_id in (("HP", self._cfg.hp_item), ("SP", self._cfg.sp_item)):
+            if item_id:
+                return self._exhausted(kind, item_id)
+        self._fail("⚠ 沒有設定任何補充道具，自動補水停止")
+        return False
 
     def _used(self, kind: str, index: int, percent: float, left: int) -> None:
         self._miss = 0
+        self._miss_wait = _MISS_COOLDOWN
         if kind == "HP":
             self._stats.hp_used += 1
             self._stats.hp_left = left
