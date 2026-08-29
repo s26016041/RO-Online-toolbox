@@ -42,7 +42,14 @@ from PySide6.QtWidgets import (
 from ro_toolbox.config.paths import in_selftest
 from ro_toolbox.config.settings import current_settings
 from ro_toolbox.core.worker import Worker, WorkerThread
-from ro_toolbox.services import bag, icons, potion_store, skill_store, window_list
+from ro_toolbox.services import (
+    bag,
+    icons,
+    mail_store,
+    potion_store,
+    skill_store,
+    window_list,
+)
 from ro_toolbox.services.buffs import BuffBot
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
@@ -55,6 +62,7 @@ from ro_toolbox.services.gamedata import (
     map_name_table,
     mob_spawn_rows,
 )
+from ro_toolbox.services.mail_bot import MailBot
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.process_monitor import local_network_up
 from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
@@ -63,6 +71,7 @@ from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.skills import SkillReader
 from ro_toolbox.services.travel_bot import TravelBot
 from ro_toolbox.ui.pages.base_page import BasePage
+from ro_toolbox.ui.widgets.mail_dialog import MailDialog
 from ro_toolbox.ui.widgets.skill_panel import SkillPanel
 from ro_toolbox.ui.widgets.toast import show_notice
 
@@ -231,6 +240,7 @@ class CharacterCard(QWidget):
     travel_stats = Signal(object)
     #: 使用者按了「補水」（一次性動作，不是開關）。
     restock_pressed = Signal()
+    mail_pressed = Signal()
     #: 背景 RestockBot 回報狀態。
     restock_stats = Signal(object)
     #: 技能面板的勾選、等級或「自動補助技能」開關有變動。
@@ -596,6 +606,12 @@ class CharacterCard(QWidget):
         self.restock_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
         self.restock_button.clicked.connect(self.restock_pressed)
         head.addWidget(self.restock_button)
+        #: 自動寄信的設定（背包挑東西、數量、寄給誰、啟用）。
+        #: ⚠ 高度跟「補水」同一個理由：qss 的內距會把字夾扁（兩次回報過）。
+        self.mail_button = QPushButton("寄信設定")
+        self.mail_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
+        self.mail_button.clicked.connect(self.mail_pressed)
+        head.addWidget(self.mail_button)
         head.addStretch(1)
         box.addLayout(head)
 
@@ -1123,6 +1139,8 @@ class FarmPage(BasePage):
         #: 正在回連的那個舊 PID。失敗時放回 `_watching` 讓退避重試接得下去。
         self._reconnect_pid = 0
         self._bag_workers: dict[int, BagWorker] = {}
+        #: 自動寄信：一個遊戲視窗一個（背景一直跑，見 `services/mail_bot`）。
+        self._mails: dict[int, MailBot] = {}
         self._bag_loaded: set[int] = set()
         #: 技能：接上時掃一次，之後每 5 秒重掃（使用者指定）。撐得住是因為
         #: `SkillReader` 有快路徑，只重讀記住的結構位址、60 秒才全掃一次。
@@ -1355,6 +1373,7 @@ class FarmPage(BasePage):
         card.travel_pause_pressed.connect(lambda p=pid: self._pause_travel(p))
         card.skills_changed.connect(lambda p=pid: self._apply_skill_config(p))
         card.restock_pressed.connect(lambda p=pid: self._start_restock(p))
+        card.mail_pressed.connect(lambda p=pid: self._edit_mail(p))
 
         self._readers[pid] = reader
         self._cards[pid] = card
@@ -1367,6 +1386,9 @@ class FarmPage(BasePage):
                 self._toggle_potion(pid, True)
         # 技能面板的勾選也一樣：套用**在接上 signal 之後**，格子等背景掃完才長出來。
         card.skills.apply_saved(skill_store.get(status.name))
+        # 自動寄信的設定也帶回來（使用者指定「這些一切都要記錄」）。
+        # ⚠ 只有**啟用中**的才會真的把 bot 帶起來 —— 沒啟用就只是記著設定。
+        self._apply_mail(pid, mail_store.get(status.name), save=False)
         self._failures[pid] = 0
         self._names[pid] = status.name
         self.tabs.addTab(card, status.name or f"PID {pid}")
@@ -1960,6 +1982,56 @@ class FarmPage(BasePage):
             return
         card.skills.set_skills(rows)
         self._apply_skill_config(pid, save=False)
+
+    def _edit_mail(self, pid: int) -> None:
+        """按下「寄信設定」：開視窗挑東西、填數量、選收件人。
+
+        表格列的是**背包現在有的東西**，所以要先讀得到背包；還沒讀到就說一聲，
+        不要開一個空的視窗讓人以為壞了。
+        """
+        card = self._cards.get(pid)
+        who = self._names.get(pid, "")
+        if card is None or not who:
+            return
+        counts: dict[int, int] = {}
+        rows = self._bags.get(pid)
+        if rows:
+            for _slot, (item_id, amount) in rows.items():
+                counts[item_id] = counts.get(item_id, 0) + amount
+        elif pid not in self._bag_loaded:
+            show_notice("寄信設定", "背包還在讀，等一下再按一次就看得到東西了。")
+            return
+
+        dialog = MailDialog(self, saved=mail_store.get(who), bag_counts=counts)
+        if dialog.exec() and dialog.config is not None:
+            self._apply_mail(pid, dialog.config)
+
+    def _apply_mail(self, pid: int, config, save: bool = True) -> None:
+        """套用寄信設定：存檔、然後照「啟用」決定要不要把 bot 帶起來。"""
+        who = self._names.get(pid, "")
+        if save and who:
+            mail_store.save(who, config)
+        bot = self._mails.get(pid)
+        if not config.usable:
+            if bot is not None:
+                self._mails.pop(pid, None)
+                bot.stop()
+                log.info("自動寄信關閉（PID %s）", pid)
+            return
+        if bot is None:
+            bot = MailBot(pid, config, on_update=lambda st, p=pid: self._mail_note(p, st))
+            self._mails[pid] = bot
+            bot.start()
+            log.info("自動寄信啟用（PID %s）：%d 樣，寄給「%s」",
+                     pid, len(config.rules), config.receiver)
+        else:
+            bot.set_config(config)
+
+    def _mail_note(self, pid: int, stats) -> None:  # noqa: ANN001 - MailStats
+        """⚠ 這裡**不記日誌** —— `MailBot._note()` 已經記過了，兩邊都記會印兩次。"""
+        card = self._cards.get(pid)
+        if card is not None and stats.note:
+            card.set_note(stats.note)
 
     def _start_restock(self, pid: int, back_to: str = "") -> None:
         """按下「補水」：走去最近的藥水商人，補完跳通知。
