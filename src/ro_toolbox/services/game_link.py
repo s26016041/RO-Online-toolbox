@@ -32,7 +32,7 @@ from collections.abc import Callable
 from ro_toolbox.services import game_socket
 from ro_toolbox.services.character import CharacterReader
 from ro_toolbox.services.packet_capture import PacketCapture
-from ro_toolbox.services.ro_capture import find_server
+from ro_toolbox.services.ro_capture import find_server, find_servers
 
 log = logging.getLogger(__name__)
 
@@ -83,14 +83,19 @@ class GameLink:
         不講的話使用者按下按鈕之後看到的是完全的沉默。
         """
         self._note("正在找遊戲連線…")
-        server = find_server(self.pid)
-        if server is None:
+        # ⚠⚠ **候選要全部拿，不能只拿最新的那條。** 實機 2026-08-29：
+        # Ragexe 除了地圖伺服器還掛著一條 `.55:3000`，而且它比較新 ——
+        # 舊版就鎖上它，複製不到、等 10 秒、整個功能停掉，而真正在跑的
+        # `.101:10010` 就在旁邊。可以驗證的判準只有「複製得到」，
+        # 所以一條一條試（見 `ro_capture.find_servers`）。
+        servers = find_servers(self.pid)
+        if not servers:
             return "找不到伺服器連線（還沒登入？）"
 
         # ⚠ 剛連上／剛換頻道的那幾秒複製不到，**一定要重試**（[PKT-072]）。
         self._note("正在複製遊戲連線（剛上線的幾秒可能要等一下）…")
-        sock = game_socket.open_game_socket(
-            self.pid, server[0], server[1], should_stop=self._should_stop,
+        sock, server = game_socket.open_any_game_socket(
+            self.pid, servers, should_stop=self._should_stop,
         )
         if not sock:
             return "找不到遊戲 socket，無法送封包（等了也沒出現）"
@@ -171,13 +176,16 @@ class GameLink:
             return "⚠ 遊戲連線已中斷（重綁還是同一條斷掉的連線）"
         log.info("連線 %s → %s，重新綁定", self.server, server)
         self._close_socket()
-        sock = game_socket.open_game_socket(
-            self.pid, server[0], server[1],
+        # 一樣一條一條試：挑中的那條複製不到的話，旁邊那條才是真的（見 `open()`）。
+        # 指定的那條排第一，其餘照新到舊接在後面。
+        picks = [server] + [s for s in find_servers(self.pid) if s != server]
+        sock, bound = game_socket.open_any_game_socket(
+            self.pid, picks,
             timeout=game_socket.SOCKET_REBIND_SEC, should_stop=self._should_stop,
         )
         if not sock:
             return "⚠ 換頻道後找不到新的遊戲 socket"
-        self.sock, self.server = sock, server
+        self.sock, self.server = sock, bound
         self.rebound = True
         self._revive()
         return None

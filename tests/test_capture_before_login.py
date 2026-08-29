@@ -379,3 +379,39 @@ def test_multi_connection_notice_is_logged_once_not_every_tick(monkeypatch, capl
             ro_capture.find_server(1234)
     said = [r for r in caplog.records if "多條非網頁連線" in r.message]
     assert len(said) == 1
+
+
+# ---- 候選要全部給出來，不能只給最新的那條 ----------------------------------
+
+
+def test_all_candidates_are_offered_not_just_the_newest(monkeypatch):
+    """⚠⚠ 實機 2026-08-30（狐狐狸剛開程式按自動尋路）：
+
+        這個行程有多條非網頁連線 [('219.84.200.55', 3000),
+                                  ('219.84.200.101', 10010)]
+        取最新建立的 ('219.84.200.55', 3000)
+        ⚠ 10 秒內複製不到 … 的 socket
+        ⚠ 換頻道後找不到新的遊戲 socket，自動尋路已停止
+
+    `.55:3000` 不是地圖伺服器（真正在跑的是 `.101:10010`），但它比較新。
+    ⛔ **不准寫死「哪個埠不是遊戲」** —— 那是猜的，改版就壞。
+    可以驗證的判準只有「複製得到」，所以候選要全部給出來讓呼叫端一條一條試。
+    """
+    ro_capture = _connections(monkeypatch, [
+        ("219.84.200.101", 10010, 100, True),
+        ("219.84.200.55", 3000, 200, True),          # 比較新，但不是遊戲
+    ])
+    assert ro_capture.find_server(1234) == ("219.84.200.55", 3000)
+    assert ro_capture.find_servers(1234) == [
+        ("219.84.200.55", 3000),
+        ("219.84.200.101", 10010),
+    ], "第一個要跟 find_server() 一樣，後面照新到舊接上"
+
+
+def test_candidates_still_exclude_web_ports(monkeypatch):
+    """GameGuard 的 HTTPS 一樣不准進候選（[PKT-038]）。"""
+    ro_capture = _connections(monkeypatch, [
+        ("219.84.200.101", 10010, 100, True),
+        ("43.201.119.82", 443, 200, True),
+    ])
+    assert ro_capture.find_servers(1234) == [("219.84.200.101", 10010)]

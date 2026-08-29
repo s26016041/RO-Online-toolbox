@@ -46,6 +46,9 @@ def wired(monkeypatch):
     """把外部世界全部換成假的：不碰行程、不碰網路、不碰記憶體。"""
     reader = FakeReader()
     monkeypatch.setattr(game_link, "find_server", lambda _pid: SERVER)
+    # ⚠ `open()`／`resync()` 現在拿的是**候選清單**：實機上 Ragexe 除了地圖
+    # 伺服器還會掛別的連線（`.55:3000`），只挑最新的那條會挑錯（[PKT-086]）。
+    monkeypatch.setattr(game_link, "find_servers", lambda _pid: [SERVER])
     monkeypatch.setattr(game_link, "CharacterReader", lambda: reader)
     monkeypatch.setattr(game_link, "PacketCapture", FakeCapture)
     monkeypatch.setattr(game_link.game_socket, "find_game_socket",
@@ -72,10 +75,10 @@ def test_not_logged_in_says_so_instead_of_crashing(monkeypatch):
 
 
 def test_a_socket_we_cannot_duplicate_is_a_named_failure(wired, monkeypatch):
-    # ⚠ 直接換掉 `open_game_socket`：它內建 20 秒重試（實機需要，剛連上複製不到），
-    # 從 `find_game_socket` 那一層擋的話這條測試自己會跑二十秒。
-    monkeypatch.setattr(game_link.game_socket, "open_game_socket",
-                        lambda *a, **k: 0)
+    # ⚠ 直接換掉 `open_any_game_socket`：它內建 20 秒重試（實機需要，剛連上
+    # 複製不到），從 `find_game_socket` 那一層擋的話這條測試自己會跑二十秒。
+    monkeypatch.setattr(game_link.game_socket, "open_any_game_socket",
+                        lambda *a, **k: (0, None))
     link = GameLink(1234)
     assert "socket" in (link.open() or "")
 

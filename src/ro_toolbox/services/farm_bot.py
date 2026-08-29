@@ -129,6 +129,17 @@ _ESCAPE_MARGIN = 4
 #: 所以這裡自己抓時間：不管走路怎麼說，這麼久還在同一個目標就換一個。
 #: 要比 `_FROZEN_SEC`(45) 小很多，才來得及在被判定卡死之前試過好幾個方向。
 _ESCAPE_GIVE_UP_SEC = 12.0
+#: 座標「還不是即時的」超過這麼久就推一步，把移動元件逼出來。
+#:
+#: ⚠⚠ 剛換圖時 `read_position()` 回的是**進圖座標**：角色跑再遠它都不會變。
+#: 移動元件要等角色**真的走一步**才找得到 —— 而走路又要先知道自己在哪，
+#: 這是個死結。實機 2026-08-30（白狐走到 mjolnir_07 按自動打怪）：
+#: 落在 (19,377) 剛好在傳點禁區裡，脫離邏輯每一拍都用那個假座標算，
+#: 而且 `_escape_warp()` 回 True 會**把這一拍其他事情全部跳過** ——
+#: 於是角色一步都沒走、元件永遠找不到，30 秒後才印出那句警告。
+_STALE_POS_SEC = 3.0
+#: 推一步的節流。伺服器要幾百毫秒才回，推太密只是洗封包。
+_WAKE_EVERY_SEC = 1.0
 #: 被傳走之後，走回原本那張圖最多花多久。逾時就大聲停用。
 _RETURN_GIVEUP_SEC = 300.0
 #: 一輪裡最多被傳走幾次。超過就停下來喊人 ——
@@ -274,6 +285,10 @@ class FarmBot:
         self._escape_goal: tuple[int, int] | None = None
         #: 這個脫離目標是什麼時候挑的（見 `_ESCAPE_GIVE_UP_SEC`）。
         self._escape_since = 0.0
+        #: 座標從什麼時候開始「不是即時的」（0 = 現在是即時的）。
+        self._stale_since = 0.0
+        #: 上次為了「把移動元件逼出來」推的那一步是什麼時候。
+        self._woke_at = 0.0
         self._resync_at = 0.0
         # 傷害封包分析：學到自己的 GID 後，就能認出「正在打我的怪」優先反擊
         self._my_gid: int | None = None
@@ -526,6 +541,19 @@ class FarmBot:
                     )
                 # 漏收 0x0080 會留下永遠打不到的幽靈怪，會害 bot 一直鎖它
                 self._world.forget_far(pos, _VIEW_RANGE)
+
+            # ⚠⚠ **座標還不是即時的時候不准做「靠座標決定」的事。**
+            # 剛換圖時讀到的是進圖座標，角色跑再遠都不會變；移動元件要等
+            # 角色真的走一步才找得到。用假座標去算脫離傳點，會得到一個假的
+            # 目標、送一步假的路，然後每一拍重來 —— 角色一步都沒走，
+            # 元件永遠找不到（實機：30 秒後才印出「回報的是進圖座標」）。
+            #
+            # 出口跟自動尋路那邊一樣：**推一步**。角色一動客戶端就把座標寫回去，
+            # 元件也跟著找得到，下一拍所有判斷就都是真的了。
+            if not self._wake_position(now, pos):
+                self._emit()
+                self._stop.wait(_TICK)
+                continue
 
             # ⚠ 站在傳點禁區裡的話，這一拍只做一件事：走出去。
             # 不是停下來 —— 叫你別靠近傳點，不是叫你關掉自動戰鬥。
@@ -1217,6 +1245,39 @@ class FarmBot:
             return
         if traveler.note:
             self._note(traveler.note)
+
+    def _wake_position(self, now: float, pos: tuple[int, int] | None) -> bool:
+        """座標是即時的嗎。不是的話推一步把移動元件逼出來，並回 False。
+
+        回 False = **這一拍什麼都別做**（除了推的那一步）。
+        剛換圖的頭幾拍讀不到是正常的，所以要等 `_STALE_POS_SEC` 才動手。
+        """
+        reader = self._reader
+        if reader is None or reader.position_live:
+            self._stale_since = 0.0
+            return True
+        if not self._stale_since:
+            self._stale_since = now
+            return False
+        if now - self._stale_since < _STALE_POS_SEC:
+            return False
+        if now - self._woke_at < _WAKE_EVERY_SEC:
+            return False
+        self._woke_at = now
+        terrain = self._terrain
+        if terrain is None or pos is None:
+            return False
+        # 往旁邊一格可以站的地方走一步就夠了 —— 走去哪不重要，
+        # 重要的是「角色動了」。禁區照樣避開。
+        # ⚠ 用 `_nearest_outside()`（它本來就避開傳點禁區）—— 推一步的時候
+        # 更不能踩到傳點：那時候我們連自己在哪都還不確定。
+        target = self._nearest_outside(pos)
+        if target is None or target == pos:
+            return False
+        log.info("座標還不是即時的（讀到的是進圖座標），往 %s 推一步把它逼出來",
+                 target)
+        self._send_move(*target)
+        return False
 
     def _escape_warp(self, pos: tuple[int, int] | None) -> bool:
         """人在傳點禁區裡就先走出去。回 True 代表這一拍在脫離，別做其他事。

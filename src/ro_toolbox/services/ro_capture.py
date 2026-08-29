@@ -39,6 +39,43 @@ _PRIVATE_PREFIXES = ("127.", "192.168.", "10.", "0.", "169.254.")
 WEB_PORTS = frozenset({80, 443})
 
 
+def find_servers(pid: int) -> list[tuple[str, int]]:
+    """所有**可能**是遊戲連線的位址，**由新到舊**。第一個就是 `find_server()`。
+
+    ## 為什麼「最新的那條」不夠
+
+    實機 2026-08-29（狐狐狸剛開程式按自動尋路）：
+
+        這個行程有多條非網頁連線 [('219.84.200.55', 3000),
+                                  ('219.84.200.101', 10010)]，
+        取最新建立的 ('219.84.200.55', 3000)
+        ⚠ 10 秒內複製不到 PID 32164 連到 219.84.200.55:3000 的 socket
+        ⚠ 換頻道後找不到新的遊戲 socket，自動尋路已停止
+
+    `.55:3000` 不是地圖伺服器（真正在跑的是 `.101:10010`），但它**比較新**，
+    所以被挑走了 —— 然後複製不到，等 10 秒，整個自動尋路停掉。
+
+    ⛔ **不要用「連接埠 3000 不是遊戲」這種寫死的判斷**：那是猜的，
+    改版換一個埠就又壞了（CLAUDE.md：不確定一律留空，不准猜）。
+    **可以驗證的判準只有一個 —— 複製得到 socket 而且送得出去。**
+    所以這裡把候選全部給出來，由呼叫端一條一條試（見
+    `game_socket.open_any_game_socket()`）。
+    """
+    fresh = [
+        conn
+        for conn in connections_of(pid)  # 已經由新到舊排好
+        if not conn.ip.startswith(_PRIVATE_PREFIXES) and conn.port not in WEB_PORTS
+    ]
+    usable = [c for c in fresh if c.established] or fresh
+    if usable:
+        return [c.endpoint for c in usable]
+    return [
+        (ip, port)
+        for ip, port in sorted(remote_endpoints_of(pid))
+        if not ip.startswith(_PRIVATE_PREFIXES) and port not in WEB_PORTS
+    ]
+
+
 def find_server(pid: int) -> tuple[str, int] | None:
     """找出行程連到的遊戲伺服器（排除本機／私有位址與網頁埠）。
 

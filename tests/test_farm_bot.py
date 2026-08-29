@@ -822,3 +822,47 @@ def test_an_unreachable_escape_goal_is_not_picked_again(monkeypatch):
 
     assert bot._escape_warp(pos) is False
     assert bot._is_bad_goal(goal)
+
+
+def test_a_stale_position_is_woken_up_before_anything_else(monkeypatch):
+    """⚠⚠ 實機 2026-08-30（白狐走到 mjolnir_07 按自動打怪）：
+
+        00:01:08  太靠近傳點，先走開（往 20,376）
+        00:01:32  ⚠ 已經 30 秒找不到角色的移動元件，現在回報的是**進圖座標**
+
+    剛換圖時讀到的是進圖座標，角色跑再遠它都不會變；而移動元件要等角色
+    **真的走一步**才找得到 —— 走路又要先知道自己在哪，死結。
+    脫離傳點那一段用假座標算，而且它回 True 會把這一拍其他事情全部跳過，
+    於是角色一步都沒走、元件永遠找不到。出口是**推一步**。
+    """
+    from ro_toolbox.services import farm_bot as mod
+
+    bot = _warp_bot()
+    clock = {"now": 9000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+    bot._reader = type("R", (), {"position_live": False})()
+    moves = []
+    monkeypatch.setattr(bot, "_send_move", lambda x, y: moves.append((x, y)))
+
+    pos = (200, 200)
+    assert bot._wake_position(clock["now"], pos) is False, "座標不可信就不要往下做"
+    assert moves == [], "剛換圖的頭幾拍讀不到是正常的，先別急"
+
+    clock["now"] += mod._STALE_POS_SEC + 0.1
+    assert bot._wake_position(clock["now"], pos) is False
+    assert len(moves) == 1, "撐過去就要推一步把元件逼出來"
+    assert moves[0] not in bot._warp_zone, "推的那一步也不准踩進傳點禁區"
+
+    # 節流：不要每拍都推
+    clock["now"] += 0.1
+    bot._wake_position(clock["now"], pos)
+    assert len(moves) == 1
+
+
+def test_a_live_position_is_left_alone(monkeypatch):
+    bot = _warp_bot()
+    bot._reader = type("R", (), {"position_live": True})()
+    moves = []
+    monkeypatch.setattr(bot, "_send_move", lambda x, y: moves.append((x, y)))
+    assert bot._wake_position(9000.0, (200, 200)) is True
+    assert moves == []

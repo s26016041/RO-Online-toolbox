@@ -205,6 +205,47 @@ def open_game_socket(
         time.sleep(_SOCKET_POLL)
 
 
+def open_any_game_socket(
+    pid: int,
+    servers,
+    timeout: float = SOCKET_WAIT_SEC,
+    should_stop=None,
+):
+    """一條一條試，回 `(sock, (ip, port))`；全部失敗回 `(None, None)`。
+
+    ## 為什麼要試不只一條
+
+    實機 2026-08-29：Ragexe 除了地圖伺服器之外還掛著一條 `.55:3000`，
+    而且它**比較新**，於是 `find_server()` 挑了它 —— 複製不到、等 10 秒、
+    自動尋路整個停掉（真正在跑的 `.101:10010` 就在旁邊）。
+
+    ⛔ 不要用「哪個埠不是遊戲」這種寫死的判斷（猜的，改版就壞）。
+    **可以驗證的判準只有一個：複製得到。** 所以一條一條試。
+
+    ⚠ 每一輪對每個候選都只快速試一次，然後整輪重來直到逾時 ——
+    不能第一個候選就把 10 秒用完（剛換頻道時每一條都要幾秒才出現，
+    見 `SOCKET_WAIT_SEC`），也不能只試一輪就放棄。
+    """
+    picks = [s for s in servers if s]
+    if not picks:
+        return None, None
+    deadline = time.monotonic() + timeout
+    while True:
+        for ip, port in picks:
+            sock = find_game_socket(pid, ip, port)
+            if sock:
+                return sock, (ip, port)
+            if should_stop is not None and should_stop():
+                return None, None
+        if time.monotonic() >= deadline:
+            log.warning(
+                "%.0f 秒內複製不到 PID %s 的遊戲 socket（試過 %s）",
+                timeout, pid, "、".join(f"{ip}:{port}" for ip, port in picks),
+            )
+            return None, None
+        time.sleep(_SOCKET_POLL)
+
+
 #: 同一個 WSA 錯誤碼只吼一次，之後每這麼多次補一行摘要。
 #:
 #: ⚠ 不節流的後果是實測出來的：連線被伺服器 reset（10054）之後，bot 每一拍

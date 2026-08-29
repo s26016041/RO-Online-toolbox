@@ -90,8 +90,9 @@ def test_rebinding_to_the_same_dead_connection_does_not_count(link, monkeypatch)
     assert made.dead
 
     monkeypatch.setattr(game_link, "find_server", lambda _pid: SERVER)
-    monkeypatch.setattr(game_link.game_socket, "open_game_socket",
-                        lambda *a, **k: 99)
+    monkeypatch.setattr(game_link, "find_servers", lambda _pid: [SERVER])
+    monkeypatch.setattr(game_link.game_socket, "open_any_game_socket",
+                        lambda *a, **k: (99, SERVER))
     problem = made.resync()
     assert problem and "已中斷" in problem
 
@@ -106,8 +107,9 @@ def test_a_genuinely_new_connection_still_rebinds(link, monkeypatch):
     assert made.dead
 
     monkeypatch.setattr(game_link, "find_server", lambda _pid: OTHER)
-    monkeypatch.setattr(game_link.game_socket, "open_game_socket",
-                        lambda *a, **k: 99)
+    monkeypatch.setattr(game_link, "find_servers", lambda _pid: [OTHER])
+    monkeypatch.setattr(game_link.game_socket, "open_any_game_socket",
+                        lambda *a, **k: (99, OTHER))
     monkeypatch.setattr(game_link.game_socket, "close_socket", lambda _s: None)
     assert made.resync() is None
     assert not made.dead
