@@ -1177,3 +1177,91 @@ def test_a_live_connection_never_looks_dead(monkeypatch, wired):
     bot = AutoLogin(_account(), 4242)
     for _ in range(20):
         assert bot._connection_lost() is False
+
+
+# ---- 等人動手的時間不算「程式卡住」（使用者實測：登入死在這裡）------------
+
+
+def test_waiting_for_the_user_does_not_burn_the_watchdog_budget():
+    """求救等人按合約的那 60 秒，不該吃掉登入鎖的 120 秒預算。
+
+    實機踩過：等 61 秒 → 回來重試 17 次 → 看門狗 120 秒到了把前景放掉 →
+    接下來每一次輸入都 `PostMessage` 失敗，整個自動登入死在
+    「送不進視窗訊息」（使用者實測回報）。
+    """
+    from ro_toolbox.services.login_lock import LoginLock
+
+    lock = LoginLock(hwnd=0)
+    lock._deadline = 1000.0
+    lock.wait_for_user(60.0)
+    assert lock._deadline == 1060.0
+
+    lock.wait_for_user(-5.0)          # 負數不該把期限往回拉
+    assert lock._deadline == 1060.0
+
+
+# ---- 「送出去的帳號」該信誰（實機炸過：信錯來源 → 無限重打）----------------
+
+
+def _login_packet(username: str):
+    """一包 0x0064（明文帳號，見 [PKT-046]）。"""
+    from ro_toolbox.core.ro_packet import RoPacket
+
+    payload = b"\x00" * 4 + username.encode("ascii").ljust(24, b"\x00")
+    return RoPacket(seq=1, timestamp=0.0, outbound=True, opcode=0x0064, payload=payload)
+
+
+def test_the_packet_beats_the_memory_guess(monkeypatch, caplog):
+    """封包是**真的送出去的那串位元組**；記憶體那份會有上一次登入的殘留。
+
+    實機炸過（2026-08-29）：畫面已經登入成功、跳到 Google OTP 了，
+    記憶體卻回一個不相干的舊帳號 `s9318888` —— 於是被判成「打到別的欄位」，
+    翻面重打，把帳號打進 OTP 的認證號碼欄，一路重試到逾時。
+    """
+    import logging
+
+    from ro_toolbox.services import auto_login as mod
+
+    login = mod.AutoLogin.__new__(mod.AutoLogin)
+    login._packets = [_login_packet("87103030")]
+    monkeypatch.setattr(mod.input_helper, "submitted_account",
+                        lambda _pid: "s9318888")
+    login._pid = 1234
+
+    assert login._sent_account() == "87103030"
+    with caplog.at_level(logging.WARNING):
+        chosen = login._sent_account() or mod.input_helper.submitted_account(1234)
+    assert chosen == "87103030", "要以封包為準"
+
+
+def test_memory_is_still_the_fallback(monkeypatch):
+    """沒擷取到 0x0064 的時候，記憶體那份還是聊勝於無。"""
+    from ro_toolbox.services import auto_login as mod
+
+    login = mod.AutoLogin.__new__(mod.AutoLogin)
+    login._packets = []
+    login._pid = 1234
+    monkeypatch.setattr(mod.input_helper, "submitted_account",
+                        lambda _pid: "87103030")
+
+    chosen = login._sent_account() or mod.input_helper.submitted_account(1234)
+    assert chosen == "87103030"
+
+
+def test_an_account_without_an_otp_secret_fails_immediately():
+    """帳號要 OTP、設定裡卻沒密鑰 —— 當場講清楚，不要重試到逾時。
+
+    實機踩過（2026-08-29）：伺服器跳出 Google OTP 視窗，程式一路重試，
+    還把帳號打進了認證號碼欄。
+    """
+    from ro_toolbox.services import auto_login as mod
+
+    login = mod.AutoLogin.__new__(mod.AutoLogin)
+    login._account = type("A", (), {"secret": ""})()
+    login.progress = mod.LoginProgress()
+    login._on_step = None
+    login._pid = 1234
+
+    assert login._send_otp(hwnd=0) is False
+    assert "沒有密鑰" in login.progress.detail
+    assert login.progress.failed_at == "送出 OTP"

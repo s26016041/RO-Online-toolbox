@@ -54,6 +54,10 @@ class LoginLock:
         self._previous = 0
         self._stop = threading.Event()
         self._guard: threading.Thread | None = None
+        #: 看門狗的到期時間。`wait_for_user()` 會把它往後推 ——
+        #: 「在等人動手」不該被算成「程式卡住」。
+        self._deadline = 0.0
+        self._deadline_lock = threading.Lock()
 
     # ---- 對外 -------------------------------------------------------
 
@@ -95,14 +99,29 @@ class LoginLock:
 
     # ---- 內部 -------------------------------------------------------
 
+    def wait_for_user(self, seconds: float) -> None:
+        """接下來這幾秒是**在等人動手**，不要算進看門狗的預算。
+
+        ⚠ 這不是「延長鎖」的萬用後門，只給「請你手動按一次同意」那一段用：
+        那段時間程式什麼都沒做、就是在等人，把它算成「卡住」是錯的。
+        實機踩過：等人按合約等了 61 秒 → 回來重試 17 次 → 120 秒到了，
+        看門狗把前景放掉 → 接著每一次輸入都 `PostMessage` 失敗，
+        整個自動登入就死在「送不進視窗訊息」（使用者實測回報）。
+        """
+        with self._deadline_lock:
+            self._deadline += max(0.0, seconds)
+
     def _watch(self) -> None:
         """看門狗：盯著前景，並在逾時後強制解除。
 
         ⚠ 這條執行緒的存在理由只有一個：**不准把使用者的鍵鼠鎖著不放。**
         主流程當掉、例外沒接到、忘了 release —— 都由它兜底。
         """
-        deadline = time.monotonic() + _MAX_LOCK_SECONDS
+        with self._deadline_lock:
+            self._deadline = time.monotonic() + _MAX_LOCK_SECONDS
         while not self._stop.wait(_REASSERT_INTERVAL):
+            with self._deadline_lock:
+                deadline = self._deadline
             if time.monotonic() >= deadline:
                 log.warning(
                     "登入鎖超過 %.0f 秒還沒解除，強制放開輸入", _MAX_LOCK_SECONDS

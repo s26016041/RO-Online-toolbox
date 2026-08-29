@@ -1261,8 +1261,14 @@ class AutoLogin:
                 #    用 1280x800 量的內建比例點了 11 次空氣，日誌上看不出原因。
                 #    現在的判準是**「我們自己在猜位置」**，那才是該求救的理由。
                 asked = True
-                self._learn_agree_button(hwnd, min(_AGREE_LEARN_SEC,
-                                                   deadline - time.monotonic()))
+                wait = min(_AGREE_LEARN_SEC, deadline - time.monotonic())
+                # ⚠ 等人動手的這幾十秒**不算程式卡住** —— 不告訴看門狗的話，
+                #   等完回來沒多久 120 秒就到了，前景被放掉，接下來每一次
+                #   輸入都 `PostMessage` 失敗（使用者實測：等 61 秒 → 重試
+                #   17 次 → 鎖逾時 → 「送不進視窗訊息」整個登入死掉）。
+                if self._lock is not None:
+                    self._lock.wait_for_user(wait)
+                self._learn_agree_button(hwnd, wait)
             self._step(f"按同意、輸入帳號密碼並送出（第 {attempt} 次）")
             # ⚠ 不能用「字打不打得進去」判斷合約書過了沒 —— 實測合約書還在時
             # 打進去的字**照樣會進到欄位裡**（只是看不見、Enter 也送不出去），
@@ -1292,14 +1298,30 @@ class AutoLogin:
             server = self._wait_connection(_CREDENTIAL_TIMEOUT)
             if server is not None:
                 # ⚠ 「連上了」**不等於帳密正確** —— 錯的帳密照樣會先連上，
-                # 伺服器判定失敗才把連線關掉。所以回頭讀客戶端記下的
-                # 「送出去的帳號」，確認我們打對格了。
-                # 兩個來源都問：客戶端記下的「送出去的帳號」（靜態位址，
-                # 見 input_helper.submitted_account），以及擷取到的 0x0064
-                # （明文帳號，[PKT-046]）。任何一個對不上就算打錯格。
-                sent_now = input_helper.submitted_account(self._pid)
+                # 伺服器判定失敗才把連線關掉。所以回頭確認我們打對格了。
+                #
+                # ⚠⚠ **封包優先，記憶體是備胎。** 兩個來源不對等：
+                #   `0x0064` 是**真的送出去的那串位元組**（[PKT-046]）；
+                #   `submitted_account()` 是記憶體裡一個「疑似記著送出帳號」的
+                #   靜態位址，它會有**上一次登入的殘留**。
+                #
+                # 舊版順序相反，實機就炸在這裡（2026-08-29）：畫面明明已經
+                # 登入成功、跳到 Google OTP 了，記憶體那份卻回一個完全不相干的
+                # 舊帳號 `s9318888`，於是被判成「打到別的欄位」→ 翻面重打 →
+                # 把帳號打進 OTP 的認證號碼欄 → 無限重試到逾時。
+                sent_now = self._sent_account()
                 if sent_now is None:
-                    sent_now = self._sent_account()
+                    sent_now = input_helper.submitted_account(self._pid)
+                elif (guess := input_helper.submitted_account(self._pid)) not in (
+                    None, sent_now
+                ):
+                    # 兩個來源都有卻不一樣 —— 封包是真的送出去的，信它。
+                    # 記憶體那份對不上代表**它的定位壞了**，那是要修的事。
+                    log.warning(
+                        "記憶體說送出的帳號是 %r，封包說是 %r —— 以封包為準"
+                        "（submitted_account 的定位可能已經失效）",
+                        guess, sent_now,
+                    )
                 if sent_now is not None and sent_now != self._account.username:
                     self._step(
                         f"送出去的帳號是 {sent_now!r}，不是我們的 —— 打到別的欄位了，重來"
@@ -1463,6 +1485,17 @@ class AutoLogin:
         # OTP 這一段的預算要**含得下等一組新碼**（最多 30 秒）加上幾輪重試。
         deadline = time.monotonic() + _OTP_TIMEOUT
         secret = self._account.secret
+        if not secret:
+            # ⚠ **這個帳號要 OTP，但設定裡沒有密鑰** —— 再怎麼重試也生不出碼。
+            #   實機踩過（2026-08-29）：伺服器跳出 Google OTP 視窗，而帳號頁
+            #   沒填密鑰，結果程式一路重試到逾時，畫面上還把帳號打進了
+            #   OTP 的認證號碼欄。這種失敗要**當場講清楚**，不要拖到逾時。
+            self.progress.fail(
+                "送出 OTP",
+                "這個帳號需要 Google OTP，但帳號設定裡沒有密鑰 —— "
+                "請到帳號頁掃一次 QR code（或貼上密鑰）再試。",
+            )
+            return False
         attempt = 0
         while time.monotonic() < deadline:
             if self._stop_if_gone(hwnd, "送出 OTP"):
