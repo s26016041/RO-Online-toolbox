@@ -1889,12 +1889,14 @@ class FarmPage(BasePage):
         bot = self._buffs.get(pid)
         # **勾了就是要它動**：沒有第二個總開關（使用者原話「打勾後…就會施放」）。
         want = bool(plans)
+        helping = card.skills.helping_mates
         if want and bot is None:
-            bot = BuffBot(pid, plans, on_update=lambda st, c=card: c.buff_stats.emit(st))
+            bot = BuffBot(pid, plans, help_mates=helping,
+                          on_update=lambda st, c=card: c.buff_stats.emit(st))
             self._buffs[pid] = bot
             bot.start()
         elif want:
-            bot.set_plans(plans)
+            bot.set_plans(plans, help_mates=helping)
         elif bot is not None:
             self._buffs.pop(pid, None).stop()
             card.set_buff_note("")

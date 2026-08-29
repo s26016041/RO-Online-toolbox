@@ -280,3 +280,122 @@ def test_nothing_checked_means_nothing_happens():
 )
 def test_use_skill_packet_matches_the_real_capture(level, skill_id, target, expected):
     assert build_use_skill(level, skill_id, target).hex() == expected.replace(" ", "")
+
+
+# ---- 幫隊友放（使用者指定：沒有或剩不到 50% 就補）--------------------------
+
+
+class FakeMate:
+    def __init__(self, aid: int, name: str = "") -> None:
+        self.aid = aid
+        self.name = name
+        self._has: dict[int, bool] = {}
+
+    def label(self) -> str:
+        return self.name or f"#{self.aid}"
+
+    def has(self, efst: int, _now: float) -> bool:
+        return self._has.get(efst, False)
+
+
+class FakeParty:
+    def __init__(self, mates) -> None:
+        self._mates = list(mates)
+        self.needed: dict[int, bool] = {}
+
+    def mates(self):
+        return list(self._mates)
+
+    def needs(self, _mate, efst: int, _ratio: float) -> bool:
+        return self.needed.get(efst, True)
+
+
+MATE_AID = 24940572
+INCAGI = 29          # AL_INCAGI「目標1個」→ 放得到別人
+INCAGI_EFST = 12
+
+
+def _party_keeper(fake, mates):
+    party = FakeParty(mates)
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party)
+    keeper.help_mates = True
+    return keeper, party
+
+
+def test_a_mate_who_needs_it_gets_it():
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])     # 自己已經有了
+    mate = FakeMate(MATE_AID, "白狐")
+    keeper, _party = _party_keeper(fake, [mate])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    note = keeper.tick()
+    assert fake.sent == [build_use_skill(10, INCAGI, MATE_AID)]
+    assert "白狐" in note
+
+
+def test_my_own_buffs_come_first():
+    """自己倒了就沒人補得成 —— 自己的補完才輪到隊友。"""
+    fake = Fake()                                       # 自己沒有
+    keeper, _party = _party_keeper(fake, [FakeMate(MATE_AID)])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    assert fake.sent == [build_use_skill(10, INCAGI, AID)], "先補自己"
+
+
+def test_skills_that_cannot_target_others_are_skipped():
+    """「對象 : 自己」的技能放不到別人身上 —— 直接跳過，不要送。"""
+    fake = Fake([FakeStatus(QUICKEN_EFST, 200_000)])    # 自己的快速劍還很久
+    keeper, _party = _party_keeper(fake, [FakeMate(MATE_AID)])
+    keeper.set_plans([BuffPlan(QUICKEN, 7)])            # KN_TWOHANDQUICKEN「自己」
+
+    assert keeper.tick() is None
+    assert fake.sent == []
+
+
+def test_a_mate_who_already_has_it_is_left_alone():
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    mate = FakeMate(MATE_AID)
+    keeper, party = _party_keeper(fake, [mate])
+    party.needed[INCAGI_EFST] = False
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    assert keeper.tick() is None
+    assert fake.sent == []
+
+
+def test_helping_is_off_by_default():
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    party = FakeParty([FakeMate(MATE_AID)])
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party)
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    assert keeper.tick() is None, "沒勾就不該幫別人放"
+    assert fake.sent == []
+
+
+def test_no_sp_skips_mates_quietly_too(caplog):
+    import logging
+
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    keeper, _party = _party_keeper(fake, [FakeMate(MATE_AID)])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    with caplog.at_level(logging.INFO):
+        assert keeper.tick(sp=1) is None
+    assert fake.sent == []
+    assert caplog.text == ""
+
+
+def test_the_mate_cast_is_confirmed_on_the_mate():
+    """確認要看**他**身上有沒有，不是看自己的。"""
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    mate = FakeMate(MATE_AID, "白狐")
+    keeper, _party = _party_keeper(fake, [mate])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    mate._has[INCAGI_EFST] = True
+    fake.clock += 0.3
+    assert "補上" in (keeper.tick() or "")
+    assert keeper.stats.mate_cast == 1

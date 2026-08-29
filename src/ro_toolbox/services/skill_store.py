@@ -4,6 +4,7 @@ r"""技能面板的設定：**依角色名**存在使用者本機，下次開程
 
 - `buffs` —— 勾起來要自動補的補助技能：**技能編號 → 要用第幾級**。
 - `levels` —— 打怪型技能欄選的等級（目前只記著，還沒有動作）。
+- `help_mates` —— 有沒有勾「也幫隊友放」。
 
 「這個技能會上哪個狀態」不存在這裡：那是**查表**查得到的靜態知識
 （`assets/skills.json.gz` 的 `efst` 欄，見 `services/buffs.py`），不是使用者的設定。
@@ -38,6 +39,8 @@ class SkillSaved:
 
     buffs: dict[int, int] = field(default_factory=dict)
     levels: dict[int, int] = field(default_factory=dict)
+    #: 有沒有勾「也幫隊友放」。
+    help_mates: bool = False
 
 
 def _path():
@@ -79,6 +82,7 @@ def _clean(data: dict) -> SkillSaved:
     return SkillSaved(
         buffs=_int_map(data.get("buffs"), _MAX_LEVEL),
         levels=_int_map(data.get("levels"), _MAX_LEVEL),
+        help_mates=bool(data.get("help_mates")),
     )
 
 
@@ -98,6 +102,7 @@ def save(character: str, saved: SkillSaved) -> None:
     everything[character] = {
         "buffs": {str(k): v for k, v in sorted(saved.buffs.items())},
         "levels": {str(k): v for k, v in sorted(saved.levels.items())},
+        "help_mates": saved.help_mates,
     }
     try:
         path = _path()

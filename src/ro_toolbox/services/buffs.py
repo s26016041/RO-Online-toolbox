@@ -33,14 +33,21 @@ import threading
 import time
 from dataclasses import dataclass, field
 
-from ro_toolbox.core.ro_protocol import build_use_skill
+from ro_toolbox.core.ro_protocol import build_query, build_use_skill
 from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import skill_name, skill_table
+from ro_toolbox.services.party import PartyWatch
 
 log = logging.getLogger(__name__)
 
-#: 剩下不到這麼久就先補起來（使用者指定 10 秒）。
+#: 剩下不到這麼久就先補起來（使用者指定 10 秒）。**這是給自己的**。
 REFRESH_BELOW_MS = 10_000
+#: 幫隊友補的門檻：剩不到總時長的這個比例就補（使用者指定 50%）。
+#:
+#: 為什麼跟自己不一樣：自己的狀態讀得到**精確的剩餘毫秒**（記憶體），
+#: 隊友的只能從封包裡的 total 自己倒數 —— 誤差比較大，用比例比較穩，
+#: 而且幫別人放本來就該早一點（他不會等你）。
+MATE_REFRESH_RATIO = 0.5
 #: 送出之後等這麼久還沒看到狀態上身，就當這一次沒成功。**只是放棄的上限**。
 CONFIRM_TIMEOUT = 5.0
 #: 沒成功時的退避：第一次等 1 秒，之後翻倍，最多 30 秒。
@@ -62,6 +69,30 @@ RESYNC_SEC = 2.0
 def buff_efst(skill_id: int) -> int | None:
     """這個技能會上哪個狀態。查不到回 None（那就不能自動補）。"""
     return (skill_table().get(skill_id) or {}).get("efst")
+
+
+def can_target_others(skill_id: int) -> bool:
+    """這個技能放得到**別人**身上嗎。判不出來一律回 False（安全退化）。
+
+    判準是遊戲自己的技能說明裡的「對象」欄位（`assets/skills.json.gz`）：
+
+        對象 : 自己          → 放不到別人（雙手劍攻擊速度增加、霸體…）
+        對象 : 目標1個       → 可以（加速術、天使之賜福…）
+        對象 : 自己和隊員    → 可以
+        對象 : 立即施展      → 放不到指定目標（以自己為中心）
+        對象 : 地面1格       → 地面技能，不是對人
+
+    ⚠ 「自己」要**先判**：「自己和隊員」也含「自己」兩個字，所以先看有沒有
+    「隊員」再看「自己」，順序反了會把隊伍 buff 判成只能對自己。
+    """
+    target = (skill_table().get(skill_id) or {}).get("target") or ""
+    if not target:
+        return False
+    if "隊員" in target:
+        return True
+    if "自己" in target:
+        return False
+    return "目標" in target or "玩家" in target
 
 
 def sp_cost(skill_id: int, level: int) -> int | None:
@@ -89,6 +120,8 @@ class BuffPlan:
 class _Pending:
     skill_id: int
     sent_at: float
+    #: 放給誰的 AID（`None` = 自己）。確認的時候要看對的人。
+    target: int | None = None
 
 
 @dataclass
@@ -102,6 +135,8 @@ class BuffStats:
     note: str = ""
     #: 勾了但查不到對應狀態、補不了的技能編號。
     unusable: set[int] = field(default_factory=set)
+    #: 幫隊友補了幾次。
+    mate_cast: int = 0
 
 
 class BuffKeeper:
@@ -111,7 +146,7 @@ class BuffKeeper:
     （[PKT-072]：同一條規則抄很多份就會有人漏掉）。
     """
 
-    def __init__(self, send, aid: int, read_statuses, now) -> None:
+    def __init__(self, send, aid: int, read_statuses, now, party=None) -> None:
         #: `send(data) -> bool`：把封包送出去。
         self._send = send
         #: 自己的 AID。對自己放補助技能就是把目標填自己（[PKT-041]）。
@@ -119,6 +154,10 @@ class BuffKeeper:
         #: `read_statuses() -> list[ActiveStatus] | None`
         self._read = read_statuses
         self._now = now
+        #: `services/party.PartyWatch`（None = 不幫隊友放）。
+        self._party = party
+        #: 要不要幫隊友放（使用者在介面上勾）。
+        self.help_mates = False
         self._plans: list[BuffPlan] = []
         self._pending: _Pending | None = None
         #: 技能編號 → (下次可以再試的時間, 目前的退避秒數)
@@ -162,7 +201,12 @@ class BuffKeeper:
             if settled is not None:
                 return settled     # 這一拍的工作就是「確認上一個的結果」
             return None            # 還在等，先不做別的事
-        return self._cast_next(present, sp)
+        mine = self._cast_next(present, sp)
+        if mine is not None:
+            return mine
+        # 自己的都補好了才輪到隊友 —— 自己倒了就沒人補得成（使用者指定的
+        # 是「多一個按鈕幫隊友放」，不是「改成幫隊友放」）。
+        return self._cast_for_mates(sp)
 
     # ---- 確認上一次 -------------------------------------------------
 
@@ -173,6 +217,8 @@ class BuffKeeper:
         efst = buff_efst(pending.skill_id)
         name = skill_name(pending.skill_id)
 
+        if pending.target is not None:
+            return self._settle_mate(pending, efst, name)
         if efst is not None and efst in present:
             self._pending = None
             self._retry.pop(pending.skill_id, None)
@@ -190,6 +236,34 @@ class BuffKeeper:
         # 交戰中詠唱被打斷很常見 —— 退避重試就好，不必大聲，也不要停用。
         log.info("「%s」放了沒上身，%.0f 秒後再試", name, backoff)
         return self._note(f"{name} 沒上身，{backoff:.0f} 秒後再試")
+
+    def _settle_mate(self, pending: _Pending, efst: int | None,
+                     name: str) -> str | None:
+        """幫隊友放的那一發成功了沒。看的是**他**身上有沒有那個狀態。"""
+        mate = self._mate(pending.target)
+        if efst is not None and mate is not None and mate.has(efst, self._now()):
+            self._pending = None
+            self._retry.pop(pending.skill_id, None)
+            self.stats.mate_cast += 1
+            return self._note(f"幫 {mate.label()} 補上 {name}")
+        now = self._now()
+        if now - pending.sent_at < CONFIRM_TIMEOUT:
+            return None
+        self._pending = None
+        _, backoff = self._retry.get(pending.skill_id, (0.0, 0.0))
+        backoff = min(BACKOFF_MAX, backoff * 2 if backoff else BACKOFF_START)
+        self._retry[pending.skill_id] = (now + backoff, backoff)
+        who = mate.label() if mate is not None else f"#{pending.target}"
+        log.info("幫「%s」放的「%s」沒上身，%.0f 秒後再試", who, name, backoff)
+        return self._note(f"{who} 的 {name} 沒上身，{backoff:.0f} 秒後再試")
+
+    def _mate(self, aid: int | None):
+        if self._party is None or aid is None:
+            return None
+        for mate in self._party.mates():
+            if mate.aid == aid:
+                return mate
+        return None
 
     # ---- 挑一個來補 -------------------------------------------------
 
@@ -220,6 +294,47 @@ class BuffKeeper:
             return self._note(f"補 {skill_name(plan.skill_id)} Lv{plan.level}")
         return None
 
+    def _cast_for_mates(self, sp: int | None) -> str | None:
+        """幫隊友補一個。**一拍只補一個人的一個技能**。
+
+        規則（使用者指定）：
+        - 身上沒有那個 buff，**或**剩不到總時長的 50% 就補。
+        - **放不到別人身上的技能直接跳過**（`can_target_others()`）——
+          「自己」類的技能送出去只會被伺服器丟掉。
+        - SP 不夠**安靜跳過**，跟自己那條一樣。
+        """
+        if not self.help_mates or self._party is None:
+            return None
+        now = self._now()
+        if now - self._last_cast < MIN_GAP:
+            return None
+        mates = self._party.mates()
+        if not mates:
+            return None
+        for plan in self._plans:
+            efst = buff_efst(plan.skill_id)
+            if efst is None or not can_target_others(plan.skill_id):
+                continue
+            until, _ = self._retry.get(plan.skill_id, (0.0, 0.0))
+            if now < until:
+                continue
+            cost = sp_cost(plan.skill_id, plan.level)
+            if sp is not None and cost is not None and sp < cost:
+                self.stats.waiting_sp += 1
+                continue
+            for mate in mates:
+                if not self._party.needs(mate, efst, MATE_REFRESH_RATIO):
+                    continue
+                data = build_use_skill(plan.level, plan.skill_id, mate.aid)
+                if not self._send(data):
+                    return self._note(f"{skill_name(plan.skill_id)} 送不出去")
+                self._last_cast = now
+                self._pending = _Pending(plan.skill_id, now, target=mate.aid)
+                return self._note(
+                    f"幫 {mate.label()} 補 {skill_name(plan.skill_id)} Lv{plan.level}"
+                )
+        return None
+
     @staticmethod
     def _needs(efst: int, present: dict) -> bool:
         """這個 buff 該不該補：身上沒有，或剩不到 10 秒。"""
@@ -243,11 +358,17 @@ class BuffBot:
     送東西是可以的（喝水與放 buff 不互斥），但走路類的動作不要混進來。
     """
 
-    def __init__(self, pid: int, plans=None, on_update=None) -> None:
+    def __init__(self, pid: int, plans=None, on_update=None,
+                 help_mates: bool = False) -> None:
         self._pid = pid
         self._on_update = on_update
         self._plans = list(plans or [])
-        self._link = GameLink(pid, should_stop=lambda: self._stop.is_set(),
+        self._help_mates = help_mates
+        #: 隊友追蹤（要收封包才有東西，見 `services/party.py`）。
+        self._party: PartyWatch | None = None
+        self._asked_names: set[int] = set()
+        self._link = GameLink(pid, on_packet=self._on_packet,
+                              should_stop=lambda: self._stop.is_set(),
                               need_position=False)
         self._keeper: BuffKeeper | None = None
         self._stop = threading.Event()
@@ -264,10 +385,19 @@ class BuffBot:
     def running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
-    def set_plans(self, plans) -> None:
+    def set_plans(self, plans, help_mates: bool | None = None) -> None:
         self._plans = list(plans)
+        if help_mates is not None:
+            self._help_mates = help_mates
         if self._keeper is not None:
             self._keeper.set_plans(self._plans)
+            self._keeper.help_mates = self._help_mates
+
+    def _on_packet(self, packet) -> None:  # noqa: ANN001 - RoPacket
+        """把封包餵給隊友追蹤。**只收進來的**（自己送出去的不算資訊）。"""
+        if packet.outbound or self._party is None:
+            return
+        self._party.feed(packet.opcode, packet.payload)
 
     def start(self) -> bool:
         if self.running:
@@ -314,10 +444,13 @@ class BuffBot:
         if status is None or not status.aid:
             self._fail("讀不到角色（還沒進到遊戲裡？）")
             return False
+        self._party = PartyWatch(status.aid, time.monotonic)
         self._keeper = BuffKeeper(
-            self._link.send, status.aid, reader.status_effects, time.monotonic
+            self._link.send, status.aid, reader.status_effects, time.monotonic,
+            party=self._party,
         )
         self._keeper.set_plans(self._plans)
+        self._keeper.help_mates = self._help_mates
         self._stats = self._keeper.stats
         self._stats.running = True
         self._stats.note = "看著身上的狀態…"
@@ -347,11 +480,25 @@ class BuffBot:
                 # 角色不見了（登出／回到選角）—— 停下來，不要空轉送封包。
                 self._fail("讀不到角色狀態，先停下來")
                 return
+            self._ask_names()
             before = keeper.stats.note
             keeper.tick(sp=status.sp)
             if keeper.stats.note != before:
                 self._emit()
             self._stop.wait(TICK)
+
+    def _ask_names(self) -> None:
+        """幫還沒有名字的隊友送一次 `0x0368` 查名字（回應是 `0x0095`）。
+
+        ⚠ 一個 AID 只問一次 —— 問不到就顯示 AID，不要每拍再問一次。
+        """
+        if self._party is None:
+            return
+        for aid in self._party.unnamed():
+            if aid in self._asked_names:
+                continue
+            self._asked_names.add(aid)
+            self._link.send(build_query(aid))
 
     def _fail(self, message: str) -> None:
         self._stats.running = False

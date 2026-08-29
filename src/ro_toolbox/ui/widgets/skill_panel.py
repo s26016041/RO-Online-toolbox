@@ -219,6 +219,10 @@ class SkillPanel(QWidget):
 
         self._grids: dict[str, QGridLayout] = {}
         self._sections: dict[str, QWidget] = {}
+        #: 「也幫隊友放」。⚠ 是**加購**不是取代：自己的照補，補完才輪到隊友。
+        #: 放不到別人身上的技能（對象 : 自己）會自動跳過。
+        self.help_mates = QCheckBox("也幫隊友放（他沒有、或剩不到一半就補）")
+        self.help_mates.toggled.connect(lambda _on: self.changed.emit())
         for kind, title in (
             (ACTIVE, "打怪技能"),
             (BUFF, "補助技能（勾起來就會補：身上沒有、或剩不到 10 秒）"),
@@ -236,6 +240,8 @@ class SkillPanel(QWidget):
             # 最後多一欄吃掉剩下的寬度，格子才會靠左排而不是被平均拉開。
             grid.setColumnStretch(COLUMNS, 1)
             column.addLayout(grid)
+            if kind == BUFF:
+                column.addWidget(self.help_mates)
             box.addWidget(section)
             self._grids[kind] = grid
             self._sections[kind] = section
@@ -296,7 +302,15 @@ class SkillPanel(QWidget):
 
     def apply_saved(self, saved: SkillSaved) -> None:
         self._saved = saved
+        # ⚠ blockSignals：套用設定不該被當成「使用者按了開關」。
+        self.help_mates.blockSignals(True)
+        self.help_mates.setChecked(saved.help_mates)
+        self.help_mates.blockSignals(False)
         self._rebuild()
+
+    @property
+    def helping_mates(self) -> bool:
+        return self.help_mates.isChecked()
 
     def snapshot(self) -> SkillSaved:
         """現在的勾選狀態。**只存勾起來的** —— 沒勾的存進去只是雜訊。"""
@@ -307,7 +321,8 @@ class SkillPanel(QWidget):
                 continue
             target = buffs if tile.skill.kind == BUFF else levels
             target[skill_id] = tile.level
-        return SkillSaved(buffs=buffs, levels=levels)
+        return SkillSaved(buffs=buffs, levels=levels,
+                          help_mates=self.help_mates.isChecked())
 
     def buff_plans(self) -> list[BuffPlan]:
         """勾起來的補助技能，交給 `BuffKeeper`。"""
