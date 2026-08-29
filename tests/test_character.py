@@ -467,8 +467,35 @@ def test_locate_picks_the_live_component_out_of_the_ghosts():
     assert pos.read() == (65, 99)
 
 
-def test_two_live_components_fall_back_instead_of_guessing():
-    """驗完還是不只一個＝真的分不出來。不准賭 —— 改用進圖座標。"""
+def test_two_live_components_are_told_apart_by_the_entry_position():
+    """⚠⚠ 實機 2026-08-30：兩個候選同時驗過，舊版直接放棄回退到進圖座標 ——
+    那個值角色一移動就是錯的，走位／打怪／脫離傳點全部瞎掉，
+    使用者回報「死了，完全不能用」。
+
+    分得出來的判準是**位置在時間上是連續的**：離參考點最近的那個才是本人。
+    剛換圖沒有上一次的話，參考點就是伺服器剛講過的進圖落點。
+    """
+    from ro_toolbox.services.player_position import PlayerPosition
+
+    aid = 777
+    far, nodes = _component(aid, dest=(65, 99))
+    near, _ = _component(aid, dest=(9, 10))      # 離進圖座標 (7,8) 比較近
+    region = bytearray(0x1000)
+    region[0x100 : 0x100 + len(far)] = far
+    region[0x600 : 0x600 + len(near)] = near
+    mem = FakeMemory(
+        {0x1000: bytes(region), 0x9000: nodes, ENTRY_ADDR: _entry_blob((7, 8))},
+        regions=[(0x1000, 0x1000)],
+    )
+    pos = PlayerPosition(mem)
+    pos._aid = aid
+    pos._entry = ENTRY_ADDR
+    assert pos._locate_component() is True, "有參考點就分得出來，不准放棄"
+    assert pos.read() == (9, 10), "挑離進圖座標最近的那個"
+
+
+def test_without_any_reference_it_still_refuses_to_guess():
+    """連參考點都沒有（進圖座標也讀不到）才是真的分不出來 —— 那時候才准回退。"""
     from ro_toolbox.services.player_position import PlayerPosition
 
     aid = 777
@@ -478,15 +505,13 @@ def test_two_live_components_fall_back_instead_of_guessing():
     region[0x100 : 0x100 + len(one)] = one
     region[0x600 : 0x600 + len(two)] = two
     mem = FakeMemory(
-        {0x1000: bytes(region), 0x9000: nodes, ENTRY_ADDR: _entry_blob((7, 8))},
-        regions=[(0x1000, 0x1000)],
+        {0x1000: bytes(region), 0x9000: nodes}, regions=[(0x1000, 0x1000)]
     )
     pos = PlayerPosition(mem)
     pos._aid = aid
-    pos._entry = ENTRY_ADDR
+    pos._entry = None
     assert pos._locate_component() is False
     assert pos.address is None
-    assert pos.read() == (7, 8)
 
 
 def _one_region_memory(aid=777, dest=(65, 99)):

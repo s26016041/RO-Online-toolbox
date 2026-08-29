@@ -168,6 +168,11 @@ RELOCATE_COOLDOWN = 0.3
 FULL_RESCAN_SEC = 3.0
 
 
+#: 上一次讀到的位置多久之內還算得上參考點（見 `_closest`）。
+#: 太舊的話角色早就走遠了，那時候寧可用伺服器給的進圖座標。
+_REF_FRESH = 5.0
+
+
 def _cell_ok(x: int, y: int) -> bool:
     return 0 < x < MAX_CELL and 0 < y < MAX_CELL
 
@@ -195,6 +200,12 @@ class PlayerPosition:
         self._complained = False
         #: 「還沒找到元件」這句話講過了沒。這條路每 0.3 秒走一次，不擋會洗版。
         self._said_missing = False
+        #: 上一次讀成功的位置與時刻。**位置在時間上是連續的** ——
+        #: 兩拍之間角色跑不了多遠，所以它是分辨「哪個候選才是本人」最好的參考。
+        self._last_pos: tuple[int, int] | None = None
+        self._last_pos_at = 0.0
+        #: 「有好幾個候選」講過了沒（不擋就是每拍一行 ERROR）。
+        self._said_many = False
         #: 最後一次 `read()` 回的是不是**即時**座標（移動元件）。
         #: False = 回的是進圖座標，那個值**角色走了也不會變**——
         #: 呼叫端的「卡住偵測」不可以拿它當「有沒有在動」的依據（見 farm_bot）。
@@ -295,14 +306,41 @@ class PlayerPosition:
         if not self._candidates or self._now() - self._last_full >= FULL_RESCAN_SEC:
             self._last_full = self._now()
             self._candidates = self._scan(self._aid)
-        good = [a for a in self._candidates if self._component_at(a) is not None]
+        seen = {a: self._component_at(a) for a in self._candidates}
+        good = [a for a, cell in seen.items() if cell is not None]
         if len(good) > 1:
-            # 驗完還是不只一個＝真的分不出來。不准賭 —— 賭錯就是照著別人的位置走。
-            log.error(
-                "有 %d 個移動元件都像是角色本人（%s），分不出來，只好改用進圖座標",
-                len(good), [hex(a) for a in good],
-            )
-            return False
+            # ⚠⚠ **不要因為「有兩個」就整個放棄。** 實機 2026-08-30：兩個候選
+            # 同時驗過（`['0x2ed44750', '0x3f27c5d8']`），舊版直接回退到進圖座標
+            # —— 那個值角色一移動就是錯的，於是走位、打怪、脫離傳點全部瞎掉，
+            # 使用者回報「死了，完全不能用」。而且那句 ERROR 沒節流，
+            # **一秒印六行**，把真正該看的訊息全沖掉。
+            #
+            # 分得出來的判準是**位置在時間上是連續的**：兩拍之間（0.2~0.3 秒）
+            # 角色跑不了多遠，所以「離上一次讀到的位置最近」的那個才是本人；
+            # 被回收的舊元件會停在別的地方（多半是上一張圖的座標）。
+            # 剛換圖還沒有上一次的話，用伺服器給的**進圖座標**當參考 ——
+            # 那是伺服器剛剛才講過的落點，權威度最高。
+            picked = self._closest(good, seen)
+            if picked is not None:
+                if not self._said_many:
+                    self._said_many = True
+                    log.info(
+                        "有 %d 個移動元件都像是角色本人（%s）—— "
+                        "用「離上一次的位置最近」挑了 %s",
+                        len(good), [hex(a) for a in good], hex(picked),
+                    )
+                good = [picked]
+            else:
+                # 連參考點都沒有（剛接上、進圖座標也讀不到）—— 那才真的分不出來。
+                # ⚠ 節流：這條每 0.3 秒就會走一次。
+                if not self._said_many:
+                    self._said_many = True
+                    log.error(
+                        "有 %d 個移動元件都像是角色本人（%s），而且沒有參考點"
+                        "可以分辨，只好改用進圖座標",
+                        len(good), [hex(a) for a in good],
+                    )
+                return False
         if not good:
             # ⚠ 這條路每 0.3 秒就會走一次（`RELOCATE_COOLDOWN`）——
             #   每次都印的話是**一秒三行**的洗版，三個分身同時開著更慘，
@@ -341,6 +379,11 @@ class PlayerPosition:
         self._moved_here = False
         self._missing_since = None
         self._warned_missing = False
+        # ⚠ 換圖了，上一張圖的位置**不能**再拿來當參考點（見 `_closest`）——
+        # 那正是「被回收的舊元件」會停在的地方，拿它比對等於挑到舊的那個。
+        self._last_pos = None
+        self._last_pos_at = 0.0
+        self._said_many = False
 
     def forget(self) -> None:
         """完全重置（換行程／收攤時用）。"""
@@ -367,7 +410,11 @@ class PlayerPosition:
             self._moved_here = True
             self._missing_since = None
             self._warned_missing = False
+            self._said_many = False      # 分得出來了，下次再平手要重講一次
             self._live = True
+            # 記下來當「位置是連續的」那個參考點（見 `_closest`）。
+            self._last_pos = pos
+            self._last_pos_at = self._now()
             return pos
         self._live = False
         if self._moved_here:
@@ -415,6 +462,36 @@ class PlayerPosition:
 
     def _can_relocate(self) -> bool:
         return bool(self._aid) and self._now() - self._last_locate >= RELOCATE_COOLDOWN
+
+    def _closest(self, good: list[int], seen: dict) -> int | None:
+        """好幾個候選都像本人時，挑**離參考點最近**的那個。沒有參考點回 None。
+
+        參考點的優先序：
+
+        1. **上一次讀成功的位置** —— 位置在時間上是連續的，兩拍之間
+           （`RELOCATE_COOLDOWN` 0.3 秒）角色跑不了多遠。
+        2. **進圖座標** —— 剛換圖還沒有第 1 項時用它；那是伺服器剛講過的落點。
+
+        ⚠ 這不是猜：被回收的舊元件會停在它最後的位置（多半是上一張圖），
+        跟現在的參考點差很遠。真的兩個都很近的話，挑哪個都不會錯得離譜。
+        """
+        reference = None
+        if self._last_pos is not None and self._now() - self._last_pos_at < _REF_FRESH:
+            reference = self._last_pos
+        if reference is None:
+            reference = self._entry_pos()
+        if reference is None:
+            return None
+        best = None
+        best_gap = None
+        for addr in good:
+            cell = seen.get(addr)
+            if cell is None:
+                continue
+            gap = max(abs(cell[0] - reference[0]), abs(cell[1] - reference[1]))
+            if best_gap is None or gap < best_gap:
+                best, best_gap = addr, gap
+        return best
 
     def _component_at(self, addr: int) -> tuple[int, int] | None:
         """從一個候選位址讀座標；任何一項驗不過就回 None。
