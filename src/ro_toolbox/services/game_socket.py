@@ -211,7 +211,13 @@ def open_game_socket(
 #: 都會再送一次，一小時噴了 **5,185 行** —— 日誌整個被沖掉，真正的原因反而
 #: 找不到（使用者實測回報「兩隻都停了，很怪」）。
 _SEND_ERROR_EVERY = 500
-_send_errors: dict[int, int] = {}
+#: **(socket, 錯誤碼) → 連續失敗次數。**
+#:
+#: ⚠⚠ 一定要含 socket。舊版只用錯誤碼當鍵，而且「任何一次成功就整個清空」——
+#: 多開的時候另外兩隻一直在成功送封包，於是計數每一拍都被歸零，
+#: 壞掉的那一隻**每次都印「第 1 次」那句**。節流寫了等於沒寫：
+#: 實機 15 秒噴了 40 行一模一樣的 10054（使用者實測回報「看起來好怪」）。
+_send_errors: dict[tuple[int, int], int] = {}
 
 
 def send_on_socket(sock: int, data: bytes) -> int:
@@ -220,14 +226,17 @@ def send_on_socket(sock: int, data: bytes) -> int:
     sent = _ws2.send(sock, buf, len(data), 0)
     if sent < 0:
         err = _ws2.WSAGetLastError()
-        count = _send_errors.get(err, 0) + 1
-        _send_errors[err] = count
+        key = (sock, err)
+        count = _send_errors.get(key, 0) + 1
+        _send_errors[key] = count
         if count == 1:
             log.error("send 失敗，WSA 錯誤 %s（同一個錯誤之後只會定期摘要）", err)
         elif count % _SEND_ERROR_EVERY == 0:
             log.error("send 失敗，WSA 錯誤 %s —— 已經連續 %d 次", err, count)
-    elif _send_errors:
-        _send_errors.clear()
+    else:
+        # 只清**這一條** socket 的計數 —— 別人送得出去不代表我這條好了。
+        for key in [k for k in _send_errors if k[0] == sock]:
+            del _send_errors[key]
     return sent
 
 

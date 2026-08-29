@@ -135,3 +135,27 @@ def test_no_terrain_still_says_something(monkeypatch):
     bot._no_position("mjolnir_06")
 
     assert notes and "讀不到角色座標" in notes[-1]
+
+
+def test_the_lost_position_warning_is_said_once_not_every_tick(monkeypatch, caplog):
+    """⚠ 實機每秒噴兩行（使用者：「看起來好怪」）。
+
+    `_note()` 只擋「跟上一句一樣」，而 `_nudge()` 自己也會講話 ——
+    兩句輪流出現就等於兩句都沒被擋到。一次斷線只准講一句。
+    """
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = TravelBot(1234)
+    terrain = _terrain(200, 200)
+    monkeypatch.setattr(bot, "_terrain_for", lambda _m: terrain)
+    monkeypatch.setattr(bot, "_nudge", lambda t, m: None)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+
+    with caplog.at_level("WARNING"):
+        for _ in range(30):
+            bot._no_position("mjolnir_06")
+            clock["now"] += 1.0
+            bot._stats.note = "別的訊息"     # 模擬 `_nudge` 插話
+    said = [r for r in caplog.records if "讀不到角色座標" in r.getMessage()]
+    assert len(said) == 1, f"只准講一次，實際 {len(said)} 次"

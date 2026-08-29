@@ -174,6 +174,8 @@ class TravelBot:
         self._entry_fresh = False
         #: 座標從什麼時候開始讀不到（0 = 現在讀得到）。見 `_no_position`。
         self._pos_lost_at = 0.0
+        #: 這一次「讀不到座標」講過了沒。一次斷線只講一句。
+        self._said_no_pos = False
         #: 上次為了「問出自己在哪」而推一下的時間，以及推了幾次。
         self._nudged_at = 0.0
         self._nudges = 0
@@ -461,6 +463,7 @@ class TravelBot:
                 self._stop.wait(_TICK)
                 continue
             self._pos_lost_at = 0.0
+            self._said_no_pos = False
 
             pos = self._trusted_position(status.map_name, pos)
             if pos is None:
@@ -734,12 +737,19 @@ class TravelBot:
         if now - self._pos_lost_at < _POS_LOST_SEC:
             return
         terrain = self._terrain_for(map_name) if map_name else None
+        # ⚠ **一次斷線只講一句。** `_note()` 只擋「跟上一句一樣」，而 `_nudge()`
+        # 自己也會講話 —— 兩句輪流出現就等於兩句都沒被擋到，實測每秒兩行。
+        # 講不講由這個旗標決定，座標回來時（`_loop`）才放行下一次。
+        if not self._said_no_pos:
+            self._said_no_pos = True
+            if terrain is None:
+                self._note("⚠ 讀不到角色座標，也沒有這張圖的地形可以推一步 —— 原地等",
+                           logging.WARNING)
+            else:
+                self._note("讀不到角色座標，送一步移動把位置逼出來", logging.WARNING)
         if terrain is None:
-            self._note("⚠ 讀不到角色座標，也沒有這張圖的地形可以推一步 —— 原地等",
-                       logging.WARNING)
             return
-        self._note("讀不到角色座標，送一步移動把位置逼出來", logging.WARNING)
-        self._nudge(terrain, map_name)
+        self._nudge(terrain, map_name)      # 這一支自己會節流（`_NUDGE_EVERY_SEC`）
 
     def _trusted_position(self, map_name: str, pos: tuple[int, int]):
         """回一個**確定在這張圖上**的座標；問不出來回 None（這一拍不動）。

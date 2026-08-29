@@ -780,3 +780,45 @@ def test_the_frozen_message_says_what_it_was_doing():
     bot._escape_goal = None
     bot._roam_goal = (250, 250)
     assert "漫遊" in bot._doing()
+
+
+def test_an_escape_that_takes_too_long_changes_direction(monkeypatch):
+    """⚠⚠ 實機 2026-08-29：白狐在傳點禁區裡卡了 45 秒，日誌從頭到尾**沒有**
+    出現「換一個方向」—— `Walker` 一路回報 "walking"（送得出去、也收得到
+    確認），只是人沒有真的前進。於是脫離這件事沒有任何出口，一直到
+    「45 秒毫無進展」把自動打怪關掉（使用者：「他在船點前面自己關掉」）。
+
+    所以時間也要看，不能只信走路那一支說的「走不成」。
+    """
+    from ro_toolbox.services import farm_bot as mod
+
+    bot = _warp_bot()
+    pos = (200, 200)
+    clock = {"now": 5000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(bot._walker, "update", lambda _p: "walking")
+
+    assert bot._escape_warp(pos) is True
+    first = bot._escape_goal
+    assert first is not None
+
+    # 走路一路說「還在走」，但人沒動
+    clock["now"] += mod._ESCAPE_GIVE_UP_SEC / 2
+    assert bot._escape_warp(pos) is True
+    assert bot._escape_goal == first, "還沒超時就別急著換"
+
+    clock["now"] += mod._ESCAPE_GIVE_UP_SEC
+    bot._escape_warp(pos)
+    assert bot._is_bad_goal(first), "超時了就要記起來換一個方向"
+
+
+def test_an_unreachable_escape_goal_is_not_picked_again(monkeypatch):
+    """算不出路也是「這一格不行」—— 不記的話每一拍重算同一條算不出來的路。"""
+    bot = _warp_bot()
+    pos = (200, 200)
+    goal = bot._nearest_outside(pos)
+    # MapTerrain 是 frozen dataclass，改實例會被擋 —— 改類別。
+    monkeypatch.setattr(MapTerrain, "find_path", lambda *a, **k: [])
+
+    assert bot._escape_warp(pos) is False
+    assert bot._is_bad_goal(goal)

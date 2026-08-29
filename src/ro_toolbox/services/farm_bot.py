@@ -117,6 +117,17 @@ _NEAR_BUDGET = 3000
 #: 出門就在門邊、下一步又踩回去，來回刷到被伺服器斷線（使用者實測）。
 #: 脫離禁區時，最遠往外找幾格。禁區半徑之外再留一點，免得剛好停在邊界上。
 _ESCAPE_MARGIN = 4
+#: 脫離傳點禁區最多花這麼久。超過就換一個方向。
+#:
+#: ⚠⚠ **不能只看 `Walker` 說不說「走不成」。** 實機 2026-08-29：白狐卡在
+#: mjolnir_07 的傳點禁區 45 秒，日誌從頭到尾沒有出現「走不到…換一個方向」——
+#: 走路那一支一路回報「walking」，只是人沒有真的前進。於是脫離這件事
+#: **沒有任何出口**，一直到「45 秒毫無進展」的保護把自動打怪關掉
+#: （使用者回報「他在船點前面自己關掉」）。
+#:
+#: 所以這裡自己抓時間：不管走路怎麼說，這麼久還在同一個目標就換一個。
+#: 要比 `_FROZEN_SEC`(45) 小很多，才來得及在被判定卡死之前試過好幾個方向。
+_ESCAPE_GIVE_UP_SEC = 12.0
 #: 被傳走之後，走回原本那張圖最多花多久。逾時就大聲停用。
 _RETURN_GIVEUP_SEC = 300.0
 #: 一輪裡最多被傳走幾次。超過就停下來喊人 ——
@@ -260,6 +271,8 @@ class FarmBot:
         self._warp_cells: frozenset[tuple[int, int]] = frozenset()
         #: 正在往哪裡脫離禁區（None = 沒在脫離）
         self._escape_goal: tuple[int, int] | None = None
+        #: 這個脫離目標是什麼時候挑的（見 `_ESCAPE_GIVE_UP_SEC`）。
+        self._escape_since = 0.0
         self._resync_at = 0.0
         # 傷害封包分析：學到自己的 GID 後，就能認出「正在打我的怪」優先反擊
         self._my_gid: int | None = None
@@ -1206,21 +1219,25 @@ class FarmBot:
         terrain = self._terrain
         if terrain is None or pos is None:
             return False
+        now = time.monotonic()
         if self._escape_goal is not None:
             # 已經在往外走了就讓它走完，別每一拍重算一條新路狂送走路封包。
             state = self._walker.update(pos)
-            if state == "walking":
+            # ⚠⚠ **時間也要看，不能只信走路那一支說的「走不成」。**
+            # 實機 2026-08-29：白狐在傳點禁區裡卡了 45 秒，`Walker` 一路回報
+            # 「walking」（送得出去、也收得到確認），只是人沒有真的前進 ——
+            # 於是這裡永遠等不到 "blocked"，脫離這件事沒有任何出口，
+            # 一直到「45 秒毫無進展」把自動打怪關掉。
+            too_long = now - self._escape_since > _ESCAPE_GIVE_UP_SEC
+            if state == "walking" and not too_long:
                 return True
-            if state == "blocked":
+            if state == "blocked" or too_long:
                 # ⚠⚠ **走不出去的那一格要記下來。**
-                # `_nearest_outside()` 每次都回「最近的那一格」，所以走不成的話
-                # 下一拍算出來的還是同一格、同一條路 —— 一直撞同一面牆，
-                # 直到 45 秒沒進展的保護把自動打怪關掉。使用者實測回報
-                # 「掛機自己停了」，日誌上最後一句正是「太靠近傳點，先走開」。
-                self._bad_goals.append(
-                    (self._escape_goal, time.monotonic() + _BAD_GOAL_SEC)
-                )
-                log.info("走不到 %s，換一個方向脫離傳點禁區", self._escape_goal)
+                # `_nearest_outside()` 每次都回「最近的那一格」，不記的話
+                # 下一拍算出來的還是同一格、同一條路 —— 一直撞同一面牆。
+                self._bad_goals.append((self._escape_goal, now + _BAD_GOAL_SEC))
+                log.info("%s脫離傳點禁區走不到 %s，換一個方向",
+                         "太久：" if too_long else "", self._escape_goal)
             self._escape_goal = None
         if not self._near_warp(pos):
             return False
@@ -1232,8 +1249,12 @@ class FarmBot:
             pos, goal, node_budget=_NEAR_BUDGET, blocked=self._warp_cells
         )
         if not path:
+            # 算不出路也是「這一格不行」—— 不記的話下一拍還是挑它，
+            # 每一拍重算一次同一條算不出來的路（跟走不成是同一個坑）。
+            self._bad_goals.append((goal, now + _BAD_GOAL_SEC))
             return False
         self._escape_goal = goal
+        self._escape_since = now
         self._walker.set_path(path, avoid=self._warp_cells)
         self._walker.update(pos)
         self._note(f"太靠近傳點，先走開（往 {goal[0]},{goal[1]}）")

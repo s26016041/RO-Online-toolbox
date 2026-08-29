@@ -1867,7 +1867,7 @@ class FarmPage(BasePage):
             return
         config = card.potion_config()
         if not config.hp_item and not config.home_item:
-            show_notice(self, "補水", "請先在下面選要補的補血藥水（或回程道具）。")
+            show_notice("補水", "請先在下面選要補的補血藥水（或回程道具）。")
             return
 
         if pid in self._bots:
@@ -1925,11 +1925,11 @@ class FarmPage(BasePage):
                 self._auto_restock.discard(pid)
                 self._resume_after_supplies(pid, card, bot)
             if bot.stats.broke:
-                show_notice(self, "補水", f"{who}：錢不夠，沒買完。")
+                show_notice("補水", f"{who}：錢不夠，沒買完。")
             elif bot.stats.done:
-                show_notice(self, "補水完成", f"{who}：{bot.stats.summary()}")
+                show_notice("補水完成", f"{who}：{bot.stats.summary()}")
             else:
-                show_notice(self, "補水沒完成", f"{who}：{bot.stats.note}")
+                show_notice("補水沒完成", f"{who}：{bot.stats.note}")
 
     def _resume_after_supplies(self, pid: int, card, bot) -> None:  # noqa: ANN001
         """自動補給跑完了：把自動補水與自動打怪接回去。
