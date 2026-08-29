@@ -577,7 +577,17 @@ class FarmBot:
 
         # 血量沒事卻長時間毫無進展（沒移動、沒擊殺、沒撿到）：多半卡住或狀態異常。
         # 交戰時站著不動是正常的，所以擊殺數也算「有進展」。
-        progress = (self._reader.read_position(), self._stats.kills, self._stats.picked)
+        #
+        # ⚠⚠ **座標不是即時的時候不准拿它當「有沒有在動」**（[MEM-054]）。
+        # 剛換圖還沒走過路時讀到的是**進圖座標**：角色跑再遠它也不會變，
+        # 於是「位置沒變」永遠成立 —— 只要 45 秒內剛好沒擊殺沒撿到就被判定卡住，
+        # 而角色其實好好地在走。使用者實測回報過「無法自動打怪」就是這個。
+        # 那時候改看「送出去幾個移動封包」：bot 還在動就不算卡住，
+        # 真的卡死（連移動都不送）照樣抓得到。
+        where = self._reader.read_position()
+        if not self._reader.position_live:
+            where = ("moves", self._walker.sent)
+        progress = (where, self._stats.kills, self._stats.picked)
         if progress != self._progress:
             self._progress = progress
             self._progress_at = now

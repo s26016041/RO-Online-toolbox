@@ -193,6 +193,12 @@ class PlayerPosition:
         self._last_locate = 0.0
         #: 上一次是不是已經抱怨過元件失效了（別每一拍噴一行）
         self._complained = False
+        #: 「還沒找到元件」這句話講過了沒。這條路每 0.3 秒走一次，不擋會洗版。
+        self._said_missing = False
+        #: 最後一次 `read()` 回的是不是**即時**座標（移動元件）。
+        #: False = 回的是進圖座標，那個值**角色走了也不會變**——
+        #: 呼叫端的「卡住偵測」不可以拿它當「有沒有在動」的依據（見 farm_bot）。
+        self._live = False
         #: 上次全掃找到的**所有** `GID == aid` 位址。之後只重驗這一份（0.3 ms）。
         #: ⚠ 這是整個設計的關鍵，見 `_locate_component()` 的說明。
         self._candidates: list[int] = []
@@ -209,6 +215,16 @@ class PlayerPosition:
         self._terrain = None
 
     # ---- 定位 -------------------------------------------------------
+
+    @property
+    def live(self) -> bool:
+        """最後一次讀到的是**即時**座標嗎？
+
+        `False` 代表回的是進圖座標 —— 範圍內、站得住、看起來完全合理，
+        但**角色走了它也不會變**。誰拿它當「有沒有在動」的依據，
+        誰就會在角色明明在跑的時候判定「卡住了」（[MEM-054]）。
+        """
+        return self._live
 
     @property
     def located(self) -> bool:
@@ -288,14 +304,22 @@ class PlayerPosition:
             )
             return False
         if not good:
-            log.info(
-                "還沒找到角色的移動元件（AID %d，%d 個候選）"
-                "—— 剛換圖還沒走過路的話這是正常的，先用進圖座標",
-                self._aid, len(self._candidates),
-            )
+            # ⚠ 這條路每 0.3 秒就會走一次（`RELOCATE_COOLDOWN`）——
+            #   每次都印的話是**一秒三行**的洗版，三個分身同時開著更慘，
+            #   而且會把真正該看的訊息沖掉（使用者實測回報）。
+            #   狀態沒變就閉嘴：找到元件時 `_said_missing` 會被清掉，
+            #   下次再掉出來才會再說一次。
+            if not self._said_missing:
+                self._said_missing = True
+                log.info(
+                    "還沒找到角色的移動元件（AID %d，%d 個候選）"
+                    "—— 剛換圖還沒走過路的話這是正常的，走一步就會接上，先用進圖座標",
+                    self._aid, len(self._candidates),
+                )
             return False
         self._addr = good[0]
         self._complained = False
+        self._said_missing = False
         log.info("角色移動元件定位於 %#x（AID %d，%d 個候選）",
                  self._addr, self._aid, len(self._candidates))
         return True
@@ -343,7 +367,9 @@ class PlayerPosition:
             self._moved_here = True
             self._missing_since = None
             self._warned_missing = False
+            self._live = True
             return pos
+        self._live = False
         if self._moved_here:
             # ⚠⚠ 這張圖上已經讀到過元件 = 角色已經動過 = **進圖座標早就過期了**。
             #    這時候退回去用它，就是換一個地方重演 [MEM-047]：

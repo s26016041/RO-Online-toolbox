@@ -374,6 +374,11 @@ class CharacterReader:
         return self._effects.read()
 
     @property
+    def position_live(self) -> bool:
+        """最後一次讀到的座標是**即時**的嗎（見 `PlayerPosition.live`）。"""
+        return self._position.live
+
+    @property
     def position_located(self) -> bool:
         """座標定位成功了嗎？沒有的話走路類功能要停用，不要空轉。"""
         return self._position.located
