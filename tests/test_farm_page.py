@@ -385,8 +385,12 @@ def test_a_saved_potion_setting_is_not_cancelled_by_a_slow_bag(qtbot, monkeypatc
     assert started == [(1234, True)], "背包回來就要接著啟動"
 
 
-def test_a_genuinely_empty_setting_still_says_so(qtbot):
-    """真的什麼都沒選（也沒有在等的道具）才准取消勾選並講原因。"""
+def test_a_genuinely_empty_setting_says_so_but_keeps_the_box_ticked(qtbot, caplog):
+    """真的什麼都沒選就講原因 —— 但**還是不准把勾勾拿掉**。
+
+    使用者指定（2026-08-30）：「自動補水不管何時都不需要關閉」。
+    選好道具之後 `_watch_potion_alive()` 會自己把它開起來。
+    """
     from ro_toolbox.ui.pages.farm_page import CharacterCard
 
     page = _page(qtbot)
@@ -395,9 +399,11 @@ def test_a_genuinely_empty_setting_still_says_so(qtbot):
     card.character = "狐狐狸"
     page._cards[1234] = card
     card.auto_potion.setChecked(True)
-    page._toggle_potion(1234, True)
-    assert card.auto_potion.isChecked() is False
+    with caplog.at_level("WARNING"):
+        page._toggle_potion(1234, True)
+    assert card.auto_potion.isChecked() is True
     assert 1234 not in page._pending_potion
+    assert "沒有東西可以補" in caplog.text, "還是要講原因"
 
 
 # ---- 閃退（遊戲行程整個不見）也要重開 -----------------------------------
@@ -1635,3 +1641,242 @@ def test_a_supply_run_waits_for_the_bag_instead_of_giving_up(monkeypatch, qtbot)
     assert page._restocks == {}, "還不能開始"
     assert notices == [], "不准跳「請先選道具」—— 使用者明明選了"
     assert pid in page._supply_pending, "要留著，背包讀到再試"
+
+
+# ---- 補給完要真的接回掛機（2026-08-30 實機） -------------------------------
+#
+# 使用者：「白狐回去補給後走回練等區直接壞掉，沒自己開自動戰鬥」。
+# 日誌卻印著「掛機接回去了」—— 最像線索的那一行是**假的**。
+
+
+class _ResumeFarmBot:
+    def __init__(self, pid, on_update=None):
+        self.pid = pid
+        self.stats = type("S", (), {
+            "running": False, "overweight": False, "died": False,
+        })()
+
+    def start(self):
+        self.stats.running = True
+        return True
+
+    def stop(self):
+        self.stats.running = False
+
+    def loot(self):
+        return {}
+
+
+class _AliveWatchPotionBot:
+    def __init__(self, pid, config, on_update=None):
+        self.pid = pid
+        self.running = False
+        self.stats = type("S", (), {
+            "running": True, "went_home": False, "needs_supplies": False,
+        })()
+
+    def start(self):
+        self.running = True
+        return True
+
+    def stop(self):
+        self.running = False
+
+
+def _wired_card(page, qtbot, pid=1234, who="白狐"):
+    """一張接好訊號的卡片（`_on_attached` 裡那幾條，測試用不到遊戲）。"""
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = who
+    card.farm_toggled.connect(lambda on, p=pid: page._toggle_farm(p, on))
+    card.potion_toggled.connect(lambda on, p=pid: page._toggle_potion(p, on))
+    card.went_home.connect(
+        lambda p=pid: page._set_auto_hunt(p, False, keep_intent=True))
+    page._cards[pid] = card
+    page._names[pid] = who
+    return card
+
+
+def test_going_home_for_supplies_keeps_the_farm_intent(qtbot, monkeypatch):
+    """⚠⚠ 沒水回城**不是使用者不想掛了**。
+
+    以前卡片自己把「自動打怪」的勾勾拿掉，頁面把那讀成使用者關的，
+    `_want_farm` 就被清掉了 —— 補完貨走回練功點之後再也接不回去。
+    """
+    from ro_toolbox.services.potion import PotionStats
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.setattr(mod, "FarmBot", _ResumeFarmBot)
+    page = _page(qtbot, monkeypatch)
+    card = _wired_card(page, qtbot)
+    card.auto_hunt.setChecked(True)                 # 使用者要掛機
+    assert page._wants_farm(1234) is True
+    card._apply_potion_stats(PotionStats(running=False, went_home=True, note="回城"))
+    assert card.auto_hunt.isChecked() is False, "回城了就別勾著空轉"
+    assert page._wants_farm(1234) is True, "但『要掛機』這件事要留著"
+
+
+def test_resume_after_supplies_does_not_claim_what_it_did_not_do(
+    qtbot, monkeypatch, caplog
+):
+    """報喜不報憂會讓下一個人查半天 —— 沒接回去就要說沒接回去。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.setattr(mod, "FarmBot", _ResumeFarmBot)
+    page = _page(qtbot, monkeypatch)
+    card = _wired_card(page, qtbot)
+
+    class _Bot:
+        stats = type("S", (), {"came_back": True})()
+
+    with caplog.at_level("WARNING"):
+        page._resume_after_supplies(1234, card, _Bot())
+    assert "沒有" in caplog.text
+    assert card.auto_hunt.isChecked() is False
+
+
+def test_a_ticked_box_with_nothing_running_gets_restarted(qtbot, monkeypatch):
+    """勾著卻沒東西在跑 = 介面說「掛機中」、實際什麼都沒做。那是 bug。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.setattr(mod, "FarmBot", _ResumeFarmBot)
+    page = _page(qtbot, monkeypatch)
+    card = _wired_card(page, qtbot)
+    card.auto_hunt.blockSignals(True)
+    card.auto_hunt.setChecked(True)          # 勾著，但頁面完全不知道
+    card.auto_hunt.blockSignals(False)
+    assert 1234 not in page._bots
+    page._set_auto_hunt(1234, True, keep_intent=True)
+    assert 1234 in page._bots, "要自己補一個起來"
+
+
+# ---- 自動補水不准被關掉（使用者 2026-08-30 指定） --------------------------
+
+
+def _potion_card(page, qtbot, monkeypatch):
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.setattr(mod, "PotionBot", _AliveWatchPotionBot)
+    # 有沒有登入一律問連線（[MEM-029]）—— 測試裡就當它登入著。
+    monkeypatch.setattr(mod, "find_server", lambda _pid: ("1.2.3.4", 10000))
+    card = _wired_card(page, qtbot)
+    card.set_slots({6: (501, 30)})
+    card.hp_item.setCurrentIndex(card.hp_item.findData(501))
+    card.hp_threshold.setValue(50)
+    card.auto_potion.setChecked(True)
+    return card
+
+
+def test_a_dead_potion_bot_is_restarted_instead_of_unticked(qtbot, monkeypatch):
+    """「自動補水不管何時都不需要關閉」—— 掉了就重開，不是把勾勾拿掉。"""
+    page = _page(qtbot, monkeypatch)
+    card = _potion_card(page, qtbot, monkeypatch)
+    assert 1234 in page._potions
+    page._potions[1234].running = False      # bot 自己掛了
+
+    page._potion_retry.clear()
+    page._watch_potion_alive()
+    assert card.auto_potion.isChecked() is True, "勾勾一律留著"
+    assert page._potions[1234].running is True, "應該重新開一個"
+
+
+def test_the_restart_backs_off_instead_of_spinning(qtbot, monkeypatch):
+    """沒登入時每秒重試只是洗日誌 —— 退避一下。"""
+    page = _page(qtbot, monkeypatch)
+    _potion_card(page, qtbot, monkeypatch)
+    page._potions[1234].running = False
+    page._potion_retry.clear()
+    page._watch_potion_alive()
+    second = page._potions[1234]
+    second.running = False
+    page._watch_potion_alive()               # 馬上再來一次：應該被擋住
+    assert page._potions[1234] is second
+
+
+# ---- 通知的長相與音量（使用者 2026-08-30 指定） ----------------------------
+
+
+def test_the_notice_is_a_plain_windows_message_box(qtbot):
+    """使用者：「全部通知換一下，不要這種很難看，Windows 那種驚嘆號就好」。"""
+    from PySide6.QtWidgets import QMessageBox
+
+    from ro_toolbox.ui.widgets.toast import TopToast
+
+    notice = TopToast("角色死亡", "白狐 已經死亡", seconds=0, icon="⚠", need_ok=True)
+    qtbot.addWidget(notice)
+    assert isinstance(notice, QMessageBox)
+    assert notice.icon() == QMessageBox.Icon.Warning, "要系統自己那顆驚嘆號"
+    assert notice.ok_button.text() == "確定"
+
+
+def test_the_message_box_still_stays_on_top(qtbot):
+    """⚠⚠ `setWindowModality()` 會把視窗旗標重新套一次，把置頂洗掉。
+
+    置頂沒了 = 通知躲在全螢幕遊戲後面 = 等於沒有通知。
+    所以旗標一定要**最後**設 —— 這條測試就是在釘那個順序。
+    """
+    from PySide6.QtCore import Qt
+
+    from ro_toolbox.ui.widgets.toast import TopToast
+
+    notice = TopToast("到了", "測試", seconds=0, icon="⚠", need_ok=True)
+    qtbot.addWidget(notice)
+    assert notice.windowFlags() & Qt.WindowType.WindowStaysOnTopHint
+    assert notice.testAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+    assert notice.isModal() is False, "modal 會擋住整個程式"
+
+
+class _DoneRestock:
+    running = False
+
+    def __init__(self) -> None:
+        self.stats = type("S", (), {
+            "broke": False, "done": True, "note": "",
+            "came_back": True, "summary": lambda self=None: "赤色藥水 144 個",
+        })()
+
+
+def test_an_automatic_supply_run_finishes_without_a_popup(qtbot, monkeypatch, caplog):
+    """使用者：「補給回去地圖要開始自動戰鬥，並且不用跳出通知或驚嘆號」。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    shown: list = []
+    monkeypatch.setattr(mod, "show_notice", lambda *a: shown.append(a))
+    monkeypatch.setattr(mod, "FarmBot", _ResumeFarmBot)
+    page = _page(qtbot, monkeypatch)
+    _wired_card(page, qtbot)
+    page._restocks[1234] = _DoneRestock()
+    page._auto_restock.add(1234)
+    with caplog.at_level("INFO"):
+        page._watch_restocks()
+    assert shown == [], "自己去補的那一趟不跳框"
+    assert "補水完成" in caplog.text, "但還是要記日誌，事後查得到"
+
+
+def test_a_supply_run_the_user_asked_for_still_pops_up(qtbot, monkeypatch):
+    """使用者自己按「補水」的時候他在等結果 —— 那一趟照跳。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    shown: list = []
+    monkeypatch.setattr(mod, "show_notice", lambda *a: shown.append(a))
+    page = _page(qtbot, monkeypatch)
+    _wired_card(page, qtbot)
+    page._restocks[1234] = _DoneRestock()
+    page._watch_restocks()
+    assert shown and shown[0][0] == "補水完成"
+
+
+def test_nothing_is_restarted_while_the_character_is_not_logged_in(qtbot, monkeypatch):
+    """沒登入就別重開 —— 那時候記憶體裡什麼都沒有，只會每 5 秒噴定位失敗。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot, monkeypatch)
+    card = _potion_card(page, qtbot, monkeypatch)
+    page._potions[1234].running = False
+    monkeypatch.setattr(mod, "find_server", lambda _pid: None)
+    page._potion_retry.clear()
+    page._watch_potion_alive()
+    assert page._potions[1234].running is False, "沒登入就不要動"
+    assert card.auto_potion.isChecked() is True, "但勾勾照樣留著"

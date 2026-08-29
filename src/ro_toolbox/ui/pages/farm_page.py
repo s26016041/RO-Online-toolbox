@@ -82,6 +82,12 @@ PROCESS_NAME = "ragexe.exe"
 
 _SCAN_INTERVAL_MS = 3000  # 多久重掃一次視窗清單
 _READ_INTERVAL_MS = 1000  # 多久更新一次數值
+#: 自動補水掉了之後多久重開一次。
+#: ⚠ 使用者指定（2026-08-30）：「**自動補水不管何時都不需要關閉**」。
+#: 喝水是活命的東西，關掉就是死（實機踩過：補水被停用之後角色死了）。
+#: 所以勾勾一律留著，bot 停掉就重新開一個 —— 退避只是為了沒登入時
+#: 不要每秒重試。
+_POTION_RETRY_SEC = 5.0
 _RETRY_AFTER_SEC = 10.0  # 定位失敗後隔多久重試（多半是還沒登入）
 #: 回連之後，最多等這麼久讓新遊戲的分頁長出來。
 #:
@@ -235,6 +241,12 @@ class CharacterCard(QWidget):
     potion_changed = Signal()
     #: 背景 PotionBot 回報狀態。
     potion_stats = Signal(object)
+    #: 補水那條用回程道具**回城了**。
+    #: ⚠ 卡片只負責講一聲，**不准自己去拿掉「自動打怪」的勾勾** ——
+    #: 頁面那邊會把「勾勾被拿掉」讀成「使用者不想掛機了」，
+    #: 把 `_want_farm` 清掉，於是補完貨走回練功點之後再也接不回去
+    #: （2026-08-30 實機：日誌印了「掛機接回去了」，FarmBot 卻從頭到尾沒啟動）。
+    went_home = Signal()
     #: 使用者按下／取消「自動尋路」。參數：是否開啟。
     travel_toggled = Signal(bool)
     #: 使用者按了「暫停」。**沒有參數** —— 這顆只會暫停，
@@ -892,15 +904,16 @@ class CharacterCard(QWidget):
             if stats.went_home and self.auto_hunt.isChecked():
                 # 已經用回程道具回城了。沒水又沒怪還勾著自動打怪，
                 # 只會站在城裡空轉 —— 而且看起來像「還在掛機」。
-                self.auto_hunt.setChecked(False)
-            if self.auto_potion.isChecked():
-                # ⚠ 這是 bot 自己停掉（沒登入、定位失敗…），**不是使用者關的**。
-                # 不加這道閘門，一次啟動失敗就會把使用者存的「開啟」覆蓋成「關閉」。
-                self.quiet = True
-                try:
-                    self.auto_potion.setChecked(False)
-                finally:
-                    self.quiet = False
+                # ⚠ 但**這不是使用者關的**，所以不能在這裡直接 setChecked(False)：
+                # 那條路會被當成「使用者不想掛了」而把意圖丟掉。交給頁面用
+                # `_set_auto_hunt(..., keep_intent=True)` 關（見 `went_home`）。
+                self.went_home.emit()
+            # ⚠⚠ **不准把「自動補水」的勾勾拿掉。**
+            # 使用者指定（2026-08-30）：「自動補水不管何時都不需要關閉」。
+            # 喝水是活命的東西 —— 停用不是安全退化，是致命的
+            # （實機踩過：補水被停用之後角色死了）。bot 自己停掉（沒登入、
+            # 定位失敗、沒水回城）就讓頁面把它重新開起來
+            # （`_watch_potion_alive()`），勾勾留著。
             return
         # ⚠ 這裡不記日誌 —— `PotionBot._note()` 已經記過了，兩邊都記會印兩次。
 
@@ -1177,6 +1190,8 @@ class FarmPage(BasePage):
         #: 這一趟補水是「沒水自動觸發」的（補完要把掛機接回去），
         #: 不是使用者自己按「補水」按鈕。
         self._auto_restock: set[int] = set()
+        #: 自動補水下次可以重開的時刻（見 `_watch_potion_alive`）。
+        self._potion_retry: dict[int, float] = {}
         #: **使用者要這隻角色掛機**（存角色名，不存 PID —— 重連之後 PID 會變）。
         #:
         #: ⚠⚠ 這是**意圖**，不是「現在有沒有在跑」。中間有一大堆東西會暫時
@@ -1266,6 +1281,7 @@ class FarmPage(BasePage):
         self._read_timer.timeout.connect(self._watch_restocks)
         self._read_timer.timeout.connect(self._watch_overweight)
         self._read_timer.timeout.connect(self._watch_supply_runs)
+        self._read_timer.timeout.connect(self._watch_potion_alive)
         self._read_timer.timeout.connect(self._watch_travel_resumes)
         #: 定期重掃技能。**不能放在每秒的計時器裡** —— 掃一趟 2 秒，
         #: 每秒掃一次會把整頁拖垮（[MEM-043] 就是這樣被 bag.as_dict 拖慢的）。
@@ -1459,6 +1475,9 @@ class FarmPage(BasePage):
         card.set_note(f"PID {pid}")
         card.farm_toggled.connect(lambda on, p=pid: self._toggle_farm(p, on))
         card.potion_toggled.connect(lambda on, p=pid: self._toggle_potion(p, on))
+        # 沒水回城了 → 暫停掛機，但**意圖留著**，補完貨走回去要接回來。
+        card.went_home.connect(
+            lambda p=pid: self._set_auto_hunt(p, False, keep_intent=True))
         card.potion_changed.connect(lambda p=pid: self._apply_potion_config(p))
         card.travel_toggled.connect(lambda on, p=pid: self._toggle_travel(p, on))
         card.travel_pause_pressed.connect(lambda p=pid: self._pause_travel(p))
@@ -1887,7 +1906,15 @@ class FarmPage(BasePage):
         使用者「要掛機」那件事要留著，等狀況結束再接回去。
         """
         card = self._cards.get(pid)
-        if card is None or card.auto_hunt.isChecked() == on:
+        if card is None:
+            return
+        if card.auto_hunt.isChecked() == on:
+            # ⚠ 勾勾已經是要的狀態了，但**東西不一定真的在跑**。
+            # 勾著卻沒有 bot ＝ 介面說「掛機中」、實際什麼都沒做，
+            # 那是規範說的「安靜地做錯事」—— 直接補一個起來。
+            if on and pid not in self._bots:
+                log.warning("「自動打怪」勾著但沒有東西在跑（PID %s），重新啟動", pid)
+                self._toggle_farm(pid, True)
             return
         if keep_intent:
             self._quiet_farm.add(pid)
@@ -1912,8 +1939,15 @@ class FarmPage(BasePage):
         if on:
             if who:
                 self._want_farm.add(who)      # 使用者要掛機
-            if pid in self._bots:
-                return
+            old = self._bots.get(pid)
+            if old is not None:
+                if old.stats.running:
+                    return
+                # ⚠ 停掉的 bot 還掛在這裡的話，下面永遠不會重開一個 ——
+                # 症狀是勾勾勾著、卻怎麼按都不動。收掉再開。
+                self._bots.pop(pid, None)
+                self._keep_loot(pid, old)
+                old.stop()
             # 背景 FarmBot 的回報在它自己的執行緒，用 card 的 signal 轉回 UI 執行緒。
             # start() 只起執行緒就返回（設定在背景做，UI 不卡）；成敗看回報的 note。
             bot = FarmBot(pid, on_update=lambda s, c=card: c.farm_stats.emit(s))
@@ -2225,6 +2259,36 @@ class FarmPage(BasePage):
             self._set_auto_hunt(pid, True, keep_intent=True)
             log.warning("「%s」走回練功地圖了，自動打怪接回去", who)
 
+    def _watch_potion_alive(self) -> None:
+        """勾著「自動補水」就**一定要有東西在跑**。
+
+        使用者指定（2026-08-30）：「自動補水不管何時都不需要關閉」。
+        以前 bot 自己停掉（沒登入、定位失敗、沒水回城）時卡片會順手把勾勾
+        拿掉 —— 那等於「安靜地把活命的功能關掉」，實機已經害死過一次角色。
+        現在勾勾留著，這裡負責把它重新開起來。
+
+        ⚠ 補給途中不管：那條路自己會在補完之後把補水接回去。
+        """
+        now = time.monotonic()
+        for pid, card in list(self._cards.items()):
+            if not card.auto_potion.isChecked() or pid in self._restocks:
+                continue
+            bot = self._potions.get(pid)
+            if bot is not None and bot.running:
+                continue
+            if now < self._potion_retry.get(pid, 0.0):
+                continue
+            self._potion_retry[pid] = now + _POTION_RETRY_SEC
+            # ⚠ **沒登入就別重開**：那時候記憶體裡什麼都沒有，重開只會每 5 秒
+            # 噴一行「AOB 定位失敗」，看起來像特徵壞了（[MEM-029]、[PKT-044]）。
+            # 有沒有登入一律問連線，不能看記憶體。
+            if find_server(pid) is None:
+                continue
+            if bot is not None:
+                self._potions.pop(pid, None)
+                bot.stop()
+            self._toggle_potion(pid, True)
+
     def _watch_supply_runs(self) -> None:
         """沒水自己回城了 → **接著去補給，補完走回練功點**（使用者指定）。
 
@@ -2245,6 +2309,12 @@ class FarmPage(BasePage):
             if card is None:
                 continue
             self._auto_restock.add(pid)
+            # ⚠ 停掉的補水 bot 要**收走**：它的 `went_home` 會一直是 True，
+            # 留著的話補完貨的下一拍又會被判定成「沒水回城了」，無限補給。
+            # （以前是靠卡片拿掉勾勾順手收走的，現在勾勾不拿掉了。）
+            stale = self._potions.pop(pid, None)
+            if stale is not None:
+                stale.stop()
             log.info("「%s」沒水回城了，接著去補給", self._names.get(pid) or pid)
             self._start_restock(pid, back_to=self._farm_map.get(pid, ""))
             # ⚠ `_start_restock()` 可能因為背包還沒讀到而把 pid 放回
@@ -2252,7 +2322,14 @@ class FarmPage(BasePage):
             # 下一拍（背包讀到之後）要再試一次。
 
     def _watch_restocks(self) -> None:
-        """跑完的補水收攤並跳通知（使用者指定「補完會跳通知」）。"""
+        """跑完的補水收攤。
+
+        ⚠ **自己去補的那一趟不跳框**（使用者 2026-08-30 指定：
+        「補給回去地圖要開始自動戰鬥，並且不用跳出通知或驚嘆號」）——
+        那是背景流程的一部分，半夜跳一堆驚嘆號只是騷擾。
+        使用者**自己按「補水」**的那一趟才跳，因為那是他在等結果。
+        自動的那一趟照樣記日誌，事後查得到。
+        """
         for pid, bot in list(self._restocks.items()):
             if bot.running:
                 continue
@@ -2261,15 +2338,20 @@ class FarmPage(BasePage):
             if card is not None:
                 card.set_restock_busy(False)
             who = self._names.get(pid) or f"PID {pid}"
-            if pid in self._auto_restock:
+            automatic = pid in self._auto_restock
+            if automatic:
                 self._auto_restock.discard(pid)
                 self._resume_after_supplies(pid, card, bot)
             if bot.stats.broke:
-                show_notice("補水", f"{who}：錢不夠，沒買完。")
+                title, body = "補水", f"{who}：錢不夠，沒買完。"
             elif bot.stats.done:
-                show_notice("補水完成", f"{who}：{bot.stats.summary()}")
+                title, body = "補水完成", f"{who}：{bot.stats.summary()}"
             else:
-                show_notice("補水沒完成", f"{who}：{bot.stats.note}")
+                title, body = "補水沒完成", f"{who}：{bot.stats.note}"
+            if automatic:
+                log.info("%s —— %s", title, body)
+                continue
+            show_notice(title, body)
 
     def _resume_after_supplies(self, pid: int, card, bot) -> None:  # noqa: ANN001
         """自動補給跑完了：把自動補水與自動打怪接回去。
@@ -2282,10 +2364,21 @@ class FarmPage(BasePage):
         if card is None or not getattr(bot.stats, "came_back", False):
             return
         card.auto_potion.setChecked(True)
-        if self._wants_farm(pid):
-            self._set_auto_hunt(pid, True, keep_intent=True)
-        log.info("「%s」補給完走回 %s，掛機接回去了",
-                 self._names.get(pid) or pid, self._farm_map.get(pid, ""))
+        who = self._names.get(pid) or pid
+        where = self._farm_map.get(pid, "")
+        # ⚠⚠ **不准報喜不報憂。** 這一行以前印在 if 外面 —— 意圖被別的地方
+        # 清掉的時候，日誌照樣說「掛機接回去了」，但 FarmBot 一次都沒啟動。
+        # 使用者看到的是「走回練功區直接壞掉，沒自己開自動戰鬥」，
+        # 而日誌裡最像線索的那一行是**假的**（2026-08-30 實機）。
+        if not self._wants_farm(pid):
+            log.warning("「%s」補給完走回 %s 了，但沒有「要掛機」的意圖，"
+                        "所以**沒有**接回自動打怪", who, where)
+            return
+        self._set_auto_hunt(pid, True, keep_intent=True)
+        if pid in self._bots:
+            log.info("「%s」補給完走回 %s，掛機接回去了", who, where)
+        else:
+            log.warning("「%s」補給完走回 %s，但自動打怪沒能啟動", who, where)
 
     def _apply_skill_config(self, pid: int, save: bool = True) -> None:
         """勾選或開關變了：存回設定，並讓自動補助技能跟上。
@@ -2387,13 +2480,9 @@ class FarmPage(BasePage):
                 self._pending_potion.add(pid)
                 log.info("自動補水先等背包讀到再啟動（PID %s）", pid)
                 return
+            # ⚠ 一樣不拿掉勾勾（見 `_POTION_RETRY_SEC`）：只講一聲，
+            # 選好道具之後 `_watch_potion_alive()` 會自己把它開起來。
             card.set_alert("⚠ 還沒選道具或百分比是 0，沒有東西可以補")
-            card.quiet = True
-            try:
-                # ⚠ 這是**程式**判定開不起來，不是使用者關的 —— 不能覆蓋掉存檔。
-                card.auto_potion.setChecked(False)
-            finally:
-                card.quiet = False
             return
         self._pending_potion.discard(pid)
         bot = PotionBot(pid, config, on_update=lambda s, c=card: c.potion_stats.emit(s))

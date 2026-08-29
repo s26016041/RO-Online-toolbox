@@ -1,30 +1,32 @@
-"""置頂通知窗：跑完一件會離開電腦的事（例：自動尋路到了）時，跳出來講一聲。
+"""通知窗：跑完一件會離開電腦的事（例：自動尋路到了）時，跳出來講一聲。
 
-## ⚠ 為什麼不是 QMessageBox
+## 長相：**Windows 自己那種驚嘆號框**
 
-`memory_page` 已經踩過並寫進註解：**QMessageBox 是強制回應（modal）的**，
-而 RO 通常全螢幕或置頂 —— 對話框會跳到遊戲**後面**，使用者看不到也點不到，
-整個工具箱看起來就像當機（實際回報過）。所以這裡用一個自己畫的置頂小窗。
+使用者 2026-08-30 指定：「全部通知換一下，不要這種很難看，Windows 那種
+預設驚嘆號通知就好」。所以這裡用 `QMessageBox` ——
+系統自己的驚嘆號圖示、系統自己的視窗外框與按鈕。
 
-## 兩件非做不可的事
+⚠ 顏色要**跳出程式的佈景**：整支程式套了一份深色／淺色 QSS，不擋的話
+訊息框會被染成跟卡片一樣的顏色，就不是「Windows 那種」了。
+所以在框上自己指定一份用 `palette(...)` 的樣式，讓它跟系統走。
+
+## 兩件非做不可的事（沿用舊版，踩過才知道）
 
 1. **`WindowStaysOnTopHint`**：不置頂就等於沒有通知 —— 使用者按下自動尋路
    之後會切回遊戲，工具箱的視窗在後面，寫在裡面的字沒有人看得到。
-2. **`WA_ShowWithoutActivating`（不搶焦點）**：這條比置頂更重要。
+2. **不搶焦點（`WA_ShowWithoutActivating`）＋ 不是 modal**：
    跳出來的視窗如果搶走焦點，**全螢幕的遊戲會被切到背景甚至最小化** ——
-   那比沒通知糟得多。所以：顯示、置頂、但**絕不 activateWindow()**。
-
-點一下就關；沒人理它就自己收掉（`AUTO_CLOSE_SEC`）。
-留在畫面上不收會擋住遊戲畫面，那也是一種騷擾。
+   那比沒通知糟得多。所以：顯示、置頂、但**絕不 `activateWindow()`**，
+   而且用 `show()` 不用 `exec()`（`exec()` 會卡住整個事件迴圈）。
 
 ## 「一定要按確定」的那一種（`show_notice`）
 
 有些事**不能讓它自己消失**：抵達目的地、角色死亡。使用者離開電腦回來時
-要看得到發生過什麼，自動收掉等於沒講（使用者指定：驚嘆號框、按確定才消失）。
-那一種用 `show_notice()` —— 一樣置頂、一樣不搶焦點，但**沒有自動關閉、
-點畫面也不會關**，只有按「確定」才收。
+要看得到發生過什麼，自動收掉等於沒講。那一種沒有自動關閉，只有按「確定」才收。
 
-⚠ 仍然**不是** QMessageBox：modal 會跳到全螢幕遊戲後面，看不到也點不到。
+⚠ **不是每件事都值得跳框。** 自動補給跑完走回練功點是背景流程的一部分
+（使用者：「補給回去地圖要開始自動戰鬥，並且不用跳出通知或驚嘆號」）——
+那種只記日誌，不打擾人。
 """
 
 from __future__ import annotations
@@ -33,13 +35,7 @@ import logging
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCursor, QGuiApplication
-from PySide6.QtWidgets import (
-    QHBoxLayout,
-    QLabel,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QMessageBox, QWidget
 
 log = logging.getLogger(__name__)
 
@@ -47,28 +43,22 @@ log = logging.getLogger(__name__)
 AUTO_CLOSE_SEC = 20.0
 #: 離螢幕上緣多遠。放上面是因為遊戲的重要資訊（血條、聊天）多半在下半部。
 TOP_MARGIN = 48
-WIDTH = 460
 
-_STYLE = """
-QWidget#toastBody {
-    background-color: #1b2230;
-    border: 2px solid #3b7bf5;
-    border-radius: 10px;
+#: ⚠ 讓訊息框**跳出程式的佈景**，用系統自己的顏色 ——
+#: 不寫的話 app 層的 QSS 會把它染成深色卡片的樣子。
+_SYSTEM_LOOK = """
+QMessageBox { background-color: palette(window); }
+QMessageBox QLabel { color: palette(window-text); font-size: 13px; }
+QMessageBox QPushButton {
+    background-color: palette(button);
+    color: palette(button-text);
+    border: 1px solid palette(mid);
+    border-radius: 4px;
+    padding: 5px 20px;
+    min-width: 68px;
 }
-QLabel#toastTitle { color: #ffffff; font-size: 16px; font-weight: 600; }
-QLabel#toastText  { color: #d7dce3; font-size: 13px; }
-QLabel#toastHint  { color: #8b95a5; font-size: 11px; }
-QLabel#toastIcon  { color: #ffcc44; font-size: 30px; }
-QPushButton#toastOk {
-    background-color: #3b7bf5;
-    color: #ffffff;
-    border: none;
-    border-radius: 6px;
-    padding: 6px 26px;
-    font-size: 13px;
-    font-weight: 600;
-}
-QPushButton#toastOk:hover { background-color: #5590ff; }
+QMessageBox QPushButton:hover { background-color: palette(light); }
+QMessageBox QPushButton:default { border: 2px solid palette(highlight); }
 """
 
 #: 已經跳出來的通知。**一定要留參考**：Qt 的頂層視窗沒人持有的話會被
@@ -76,8 +66,8 @@ QPushButton#toastOk:hover { background-color: #5590ff; }
 _LIVE: list[QWidget] = []
 
 
-class TopToast(QWidget):
-    """一個置頂、不搶焦點、點一下就關的小通知窗。"""
+class TopToast(QMessageBox):
+    """置頂、不搶焦點、按「確定」關掉的系統訊息框。"""
 
     def __init__(
         self,
@@ -90,82 +80,39 @@ class TopToast(QWidget):
     ) -> None:
         """`need_ok=True` = **要按「確定」才會消失**（不自動關、點畫面也不關）。
 
-        用在「不能自己消失」的事：抵達目的地、角色死亡。使用者離開電腦回來
-        要看得到發生過什麼 —— 自動收掉等於沒講。
+        `icon` 只用來分「警示」還是「一般通知」—— 圖案本身交給系統畫
+        （使用者要的就是 Windows 自己那顆驚嘆號）。
         """
-        super().__init__(
-            None,
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint,
+        super().__init__(None)
+        self.setWindowTitle(title)
+        self.setText(message)
+        self.setIcon(
+            QMessageBox.Icon.Warning if icon else QMessageBox.Icon.Information
         )
-        # ⚠ 不搶焦點：搶了的話全螢幕遊戲會被切到背景。
+        self.setStandardButtons(QMessageBox.StandardButton.Ok)
+        self.ok_button = self.button(QMessageBox.StandardButton.Ok)
+        self.ok_button.setText("確定")
+        self.setStyleSheet(_SYSTEM_LOOK)
+
+        # ⚠ 這幾行是命脈，見模組說明：不是 modal、置頂、不搶焦點。
+        #
+        # ⚠⚠ **順序不能換**：`setWindowModality()` 會把視窗旗標重新套一次，
+        # 把剛設好的 `WindowStaysOnTopHint` 洗掉（實測：設完是 True，
+        # 呼叫 setWindowModality 之後變 False）。置頂沒了＝通知躲在
+        # 全螢幕遊戲後面，等於沒有通知。所以旗標一定要**最後**設。
+        self.setWindowModality(Qt.WindowModality.NonModal)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        self.setStyleSheet(_STYLE)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        body = QWidget(self)
-        body.setObjectName("toastBody")
-        outer.addWidget(body)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
 
         self._need_ok = need_ok
-
-        box = QVBoxLayout(body)
-        box.setContentsMargins(18, 14, 18, 12)
-        box.setSpacing(6)
-
-        # 有圖示時左邊放一欄（驚嘆號），文字靠右排 —— 一眼看得出是警示還是通知
-        words = QWidget(body)
-        words_box = QVBoxLayout(words)
-        words_box.setContentsMargins(0, 0, 0, 0)
-        words_box.setSpacing(6)
-
-        head = QLabel(title, words)
-        head.setObjectName("toastTitle")
-        head.setWordWrap(True)
-        words_box.addWidget(head)
-
-        text = QLabel(message, words)
-        text.setObjectName("toastText")
-        text.setWordWrap(True)
-        words_box.addWidget(text)
-
-        if icon:
-            row = QHBoxLayout()
-            row.setContentsMargins(0, 0, 0, 0)
-            row.setSpacing(14)
-            mark = QLabel(icon, body)
-            mark.setObjectName("toastIcon")
-            mark.setAlignment(Qt.AlignmentFlag.AlignTop)
-            row.addWidget(mark, 0, Qt.AlignmentFlag.AlignTop)
-            row.addWidget(words, 1)
-            box.addLayout(row)
-        else:
-            box.addWidget(words)
-
-        if need_ok:
-            # ⚠ 要按確定才消失，所以**不能**再寫「點一下關閉」——
-            # 提示跟實際行為不一致比沒有提示更糟。
-            buttons = QHBoxLayout()
-            buttons.setContentsMargins(0, 6, 0, 0)
-            buttons.addStretch(1)
-            self.ok_button = QPushButton("確定", body)
-            self.ok_button.setObjectName("toastOk")
-            self.ok_button.clicked.connect(self.close)
-            buttons.addWidget(self.ok_button)
-            box.addLayout(buttons)
-        else:
-            hint = QLabel("點一下關閉", body)
-            hint.setObjectName("toastHint")
-            box.addWidget(hint)
-
-        self.setFixedWidth(WIDTH)
-        self.adjustSize()
-        self._place()
         if seconds > 0 and not need_ok:
             QTimer.singleShot(int(seconds * 1000), self.close)
+
+    def showEvent(self, event) -> None:  # noqa: ANN001, N802 - Qt 命名
+        """⚠ 位置要在 `showEvent` 裡算：訊息框的大小是 Qt 佈局完才知道的。"""
+        super().showEvent(event)
+        self._place()
 
     def _place(self) -> None:
         """放在滑鼠所在那面螢幕的上緣正中央。

@@ -1122,3 +1122,63 @@ def test_a_new_goal_starts_the_count_again(fake_warps):
     traveler.update("a", (5, 5))
     states = [_fail_leg(traveler, walker, (5, 5)) for _ in range(3)]
     assert "blocked" not in states, f"換目的地要重新起算：{states}"
+
+
+# ---- 傳點本體那一格 --------------------------------------------------------
+
+
+def test_the_door_cell_itself_is_the_first_thing_we_try(monkeypatch):
+    """⚠⚠ 2026-08-30 實機：一道**好好的門**被列進黑名單。
+
+    `Walker._reached_goal()` 的容忍是**一格**，所以角色常常停在門旁邊一格。
+    舊版踩傳點時先 `_warp_try += 1` 再取候選，於是 `_ring_cell` 的 index 0
+    （＝門本身）從來沒被試過 —— 只繞著門走它周圍，15 秒後把門黑名單掉。
+    狐狐狸因此改走「緊急傳送職員」，補給卡在野外。
+    """
+    monkeypatch.setattr(travel, "warps_on_map",
+                        lambda m: [(134, 221, "prt_in", 131, 71)] if m == "prontera" else [])
+    t, walker, clock = make(loader=lambda name: open_terrain(name, side=312))
+    t.set_goal("prt_in")
+    door = (134, 221)
+    t._route = [Hop("prontera", door[0], door[1], "prt_in", 131, 71)]
+    t._terrain = open_terrain("prontera", side=312)
+    t._warp_cell = door
+    t._warp_since = clock.now
+    t._warp_try = 0
+    walker.state = "arrived"
+    clock.now += travel.WARP_SETTLE_SEC + 0.1
+    t._push_warp((134, 219))          # 站在門旁邊一格
+    assert walker.paths, "應該要送一段路走上去"
+    assert walker.paths[-1][-1] == door, f"第一個要踩的就是門本身，卻走去 {walker.paths[-1][-1]}"
+
+
+def test_an_npc_we_cannot_talk_to_makes_us_take_another_route(monkeypatch):
+    """使用者的規矩：不要叫使用者持續配合。講不通就改走別條。"""
+    walk = {"prt_fild06": [(200, 200, "prontera", 10, 10)],
+            "prontera": [(50, 50, "prt_in", 20, 20)]}
+    npc = {"prt_fild06": [(28, 188, "prt_in", 100, 100, "緊急傳送 職員", 700)]}
+    monkeypatch.setattr(travel, "warps_on_map", lambda m: walk.get(m, []))
+    monkeypatch.setattr(travel, "npc_links_on_map", lambda m: npc.get(m, []))
+    t, _walker, _clock = make(loader=lambda name: open_terrain(name, side=312))
+    t.set_goal("prt_in")
+    hop = Hop("prt_fild06", 28, 188, "prt_in", 100, 100, npc="緊急傳送 職員")
+    t._route = [hop]
+    t._npc_wait = hop
+    assert t.npc_impassable() is True
+    assert hop.key in t._avoid
+    assert t.npc_hop is None
+
+
+def test_with_no_other_route_we_still_wait_for_the_user(monkeypatch):
+    """真的沒有別條路的時候，等人至少還有救 —— 那時候才可以停下來等。"""
+    npc = {"prt_fild06": [(28, 188, "prt_in", 100, 100, "緊急傳送 職員", 700)]}
+    monkeypatch.setattr(travel, "warps_on_map", lambda m: [])
+    monkeypatch.setattr(travel, "npc_links_on_map", lambda m: npc.get(m, []))
+    t, _walker, _clock = make(loader=lambda name: open_terrain(name, side=312))
+    t.set_goal("prt_in")
+    hop = Hop("prt_fild06", 28, 188, "prt_in", 100, 100, npc="緊急傳送 職員")
+    t._route = [hop]
+    t._npc_wait = hop
+    assert t.npc_impassable() is False
+    assert t.npc_hop is hop, "還是停在他面前等人"
+    assert hop.key not in t._avoid, "沒改走別條就不要把它記成走不通"

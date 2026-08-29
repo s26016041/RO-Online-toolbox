@@ -692,11 +692,21 @@ class TravelBot:
         while (data := talk.next_packet()) is not None:
             self._send(data)
         if talk.failed:
-            # ⚠ 保留 `_npc_want` 與 `_npc_gid`：認人是成功的，失敗的是「看不懂選單」。
-            # 清掉的話下一拍會重新走「認不出他」那條路，講出完全不對的原因。
-            self._note(f"{talk.note} —— 請自己跟「{hop.npc}」講話，我在這裡等")
             self._talk = None
             self._dialog_dead = key
+            # ⚠ 先自己想辦法：這隻 NPC 講不通，就把這一段當走不過去，改走別條。
+            # 站在他面前等 10 分鐘，對半夜掛機的人來說等於整晚沒動
+            # （使用者的規矩：不要叫使用者持續配合）。
+            if self._traveler.npc_impassable():
+                self._npc_want = None
+                self._npc_gid = None
+                self._dialog_dead = None
+                self._note(f"{talk.note} —— 改走別條路")
+                return
+            # ⚠ 保留 `_npc_want` 與 `_npc_gid`：認人是成功的，失敗的是「看不懂選單」。
+            # 清掉的話下一拍會重新走「認不出他」那條路，講出完全不對的原因。
+            self._note(f"{talk.note} —— 沒有別條路了，請自己跟「{hop.npc}」講話，"
+                       f"我在這裡等")
         elif talk.done and not self._said_waiting:
             self._said_waiting = True
             self._note(f"{talk.note}；等換圖…")

@@ -158,8 +158,12 @@ def test_the_list_still_works_without_any_icons(card, monkeypatch):
     assert card.potion_config().hp_item == RED
 
 
-def test_bot_stopping_unchecks_the_box(card):
-    """bot 自己停掉（藥水喝完／喝不到）就要把勾拿掉，不能勾著卻沒在跑。
+def test_the_box_stays_ticked_even_when_the_bot_stops(card):
+    """⚠⚠ 使用者指定（2026-08-30）：「**自動補水不管何時都不需要關閉**」。
+
+    藥水喝完是去補貨的理由，不是關掉補水的理由 —— 關掉就是下一次沒人喝水。
+    「勾著卻沒在跑」由頁面的 `_watch_potion_alive()` 負責把它補回來，
+    不是把勾勾拿掉。
 
     原因由 `PotionBot._note()` 記進執行日誌 —— 這裡**不能再記一次**，
     兩邊都記會把同一句話印兩遍。
@@ -169,7 +173,7 @@ def test_bot_stopping_unchecks_the_box(card):
     card.set_note("PID 1234")
     card.auto_potion.setChecked(True)
     card._apply_potion_stats(PotionStats(running=False, note="⚠ 藥水用完了"))
-    assert card.auto_potion.isChecked() is False
+    assert card.auto_potion.isChecked() is True
     assert card.status_label.text() == "PID 1234", "卡片上只放 PID"
 
 
@@ -205,18 +209,18 @@ def test_restoring_saved_settings_does_not_count_as_a_user_change(card):
     assert card.auto_potion.isChecked() is True
 
 
-def test_bot_failure_unchecking_is_not_a_user_change(card):
-    """bot 啟動失敗會自動取消勾選。那**不是**使用者關的 ——
-    當成使用者的意思就會把存檔覆蓋成「關閉」，設定一次啟動失敗就沒了。"""
+def test_a_failed_start_never_switches_auto_potion_off(card):
+    """⚠⚠ 使用者指定（2026-08-30）：「**自動補水不管何時都不需要關閉**」。
+
+    喝水是活命的東西 —— 停用不是安全退化，是致命的（實機踩過：補水被停用
+    之後角色死了）。啟動失敗（沒登入、定位失敗）只是這一次沒起來，
+    勾勾要留著，頁面的 `_watch_potion_alive()` 會把它重新開起來。
+    """
     from ro_toolbox.services.potion import PotionStats
 
     card.auto_potion.setChecked(True)
-    seen = []
-    card.potion_toggled.connect(lambda _on: seen.append(card.quiet))
     card._apply_potion_stats(PotionStats(running=False, note="找不到遊戲 socket"))
-
-    assert card.auto_potion.isChecked() is False
-    assert seen == [True], "自動取消勾選必須標記成『不是使用者做的』"
+    assert card.auto_potion.isChecked() is True
 
 
 def test_saved_settings_keep_the_item_id_not_the_slot(card):
@@ -286,15 +290,24 @@ def test_auto_hunt_is_deliberately_not_saved(card):
     assert card.auto_hunt.isChecked() is True, "還原設定不該去動自動戰鬥"
 
 
-def test_going_home_also_stops_auto_hunt(card):
-    """已經回城了還勾著自動打怪，只會站在城裡空轉 —— 而且看起來像還在掛機。"""
+def test_going_home_tells_the_page_instead_of_touching_auto_hunt(card):
+    """已經回城了還勾著自動打怪，只會站在城裡空轉 —— 但**卡片不准自己動它**。
+
+    ⚠⚠ 卡片直接 `setChecked(False)` 的話，頁面那邊會把它讀成「使用者不想
+    掛機了」而把 `_want_farm` 清掉 —— 補完貨走回練功點之後就再也接不回去
+    （2026-08-30 實機：日誌印了「掛機接回去了」，FarmBot 卻從頭到尾沒啟動）。
+    所以只發訊號，讓頁面用 `keep_intent=True` 去關。
+    """
     from ro_toolbox.services.potion import PotionStats
 
+    said = []
     card.auto_hunt.setChecked(True)
+    card.went_home.connect(lambda: said.append(True))
     card._apply_potion_stats(
         PotionStats(running=False, went_home=True, note="已用蝴蝶翅膀回程")
     )
-    assert card.auto_hunt.isChecked() is False
+    assert said == [True], "要通知頁面"
+    assert card.auto_hunt.isChecked() is True, "卡片不准自己拿掉勾勾"
 
 
 def test_the_card_only_ever_shows_the_pid(card):

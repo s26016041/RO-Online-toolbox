@@ -1114,6 +1114,32 @@ class Traveler:
         )
         return "waiting"
 
+    def npc_impassable(self) -> bool:
+        """跟 NPC 講不通（看不懂選單）—— 把這一段當走不過去，改走別條路。
+
+        使用者的規矩：**不要叫使用者持續配合。** 站在 NPC 面前等 10 分鐘，
+        對半夜掛機的人來說就是整晚不動（2026-08-30 實機：狐狐狸回程補給卡在
+        prt_fild06 的「緊急傳送職員」，選單裡一個地名都對不上）。
+
+        回 True = 已經改走別條；回 False = **真的沒有別條路**，
+        那就維持原本「停下來等人」的樣子 —— 那時候等人至少還有救。
+        """
+        hop = self._npc_wait
+        if hop is None:
+            return False
+        keep_route = list(self._route)
+        keep_map = self._route_map
+        self._npc_wait = None
+        state = self._give_up_leg(hop.from_map)
+        if state == "blocked":
+            self._avoid.discard(hop.key)
+            self._route = keep_route
+            self._route_map = keep_map
+            self._npc_wait = hop
+            self._npc_since = self._now()
+            return False
+        return True
+
     def _push_warp(self, pos: tuple[int, int]) -> str:
         """站上傳點格，等地圖名變 —— 換圖成功會在 update() 開頭被抓到。
 
@@ -1136,10 +1162,21 @@ class Traveler:
             return "walking"
 
         # 走到了（或沒路徑可走）卻還沒換圖 → 隔一段時間換這一圈的下一格再踩。
+        #
+        # ⚠⚠ **第一個候選一定要是傳點本體那一格**（`_ring_cell` 的 index 0）。
+        # 舊版先 `+= 1` 再取，於是 index 0 從來沒被用過 —— 而 `Walker` 判定
+        # 「走到了」的容忍是**一格**（`_reached_goal`），所以角色常常停在門
+        # **旁邊**一格。那之後我們只會繞著門走它周圍的格子，永遠不踩上去，
+        # 15 秒之後把一道**好好的門**列入黑名單。
+        #
+        # 實機 2026-08-30（狐狐狸）：prontera(134,221) → prt_in 是那張圖上
+        # 唯一能走到道具商人的門。角色停在 (134,219)、繞了 15 秒、門被黑名單，
+        # 於是改走 prt_fild06 的「緊急傳送職員」—— 那隻的選單我們看不懂，
+        # 補給就卡死在野外。
         if now - self._warp_since < WARP_SETTLE_SEC * (self._warp_try + 1):
             return "walking"
-        self._warp_try += 1
         cell = self._ring_cell(warp, self._warp_try)
+        self._warp_try += 1
         if cell is None or cell == pos:
             return "walking"
         path = terrain.find_path(pos, cell, node_budget=NODE_BUDGET)
