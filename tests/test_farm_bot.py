@@ -866,3 +866,15 @@ def test_a_live_position_is_left_alone(monkeypatch):
     monkeypatch.setattr(bot, "_send_move", lambda x, y: moves.append((x, y)))
     assert bot._wake_position(9000.0, (200, 200)) is True
     assert moves == []
+
+
+def test_the_wake_up_is_fast_enough_to_not_look_dead():
+    """⚠ 使用者實測回報「直接卡死」然後把自動打怪關掉 —— 而日誌顯示它其實
+    有在動，只是按下按鈕之後**站著不動 4 秒**（等 3 秒 ＋ 一拍）才推那一步。
+
+    按下按鈕的那一刻座標本來就一定是舊的（角色還沒走過路），等那麼久等於白站。
+    """
+    from ro_toolbox.services import farm_bot as mod
+
+    assert mod._STALE_POS_SEC <= 1.0, "按下去到動起來不能超過一秒級"
+    assert mod._STALE_POS_SEC > 0, "還是要擋一下單次讀取失敗的抖動"
