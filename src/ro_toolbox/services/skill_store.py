@@ -4,7 +4,6 @@ r"""技能面板的設定：**依角色名**存在使用者本機，下次開程
 
 - `buffs` —— 勾起來要自動補的補助技能：**技能編號 → 要用第幾級**。
 - `levels` —— 打怪型技能欄選的等級（目前只記著，還沒有動作）。
-- `auto` —— 有沒有開「自動補助技能」。跟自動打怪**完全獨立**（使用者指定）。
 
 「這個技能會上哪個狀態」不存在這裡：那是**查表**查得到的靜態知識
 （`assets/skills.json.gz` 的 `efst` 欄，見 `services/buffs.py`），不是使用者的設定。
@@ -39,10 +38,6 @@ class SkillSaved:
 
     buffs: dict[int, int] = field(default_factory=dict)
     levels: dict[int, int] = field(default_factory=dict)
-    #: 有沒有開「自動補助技能」。
-    #: ⚠ 跟補水不一樣，這個**會存**：它只對自己放 buff，不會自己跑去打怪，
-    #: 開著程式回來就繼續補 buff 不會有意外（自動打怪的開關刻意不存，見 potion_store）。
-    auto: bool = False
 
 
 def _path():
@@ -84,7 +79,6 @@ def _clean(data: dict) -> SkillSaved:
     return SkillSaved(
         buffs=_int_map(data.get("buffs"), _MAX_LEVEL),
         levels=_int_map(data.get("levels"), _MAX_LEVEL),
-        auto=bool(data.get("auto")),
     )
 
 
@@ -104,7 +98,6 @@ def save(character: str, saved: SkillSaved) -> None:
     everything[character] = {
         "buffs": {str(k): v for k, v in sorted(saved.buffs.items())},
         "levels": {str(k): v for k, v in sorted(saved.levels.items())},
-        "auto": saved.auto,
     }
     try:
         path = _path()

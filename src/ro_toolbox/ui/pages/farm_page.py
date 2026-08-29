@@ -1275,7 +1275,10 @@ class FarmPage(BasePage):
         # 只讀正在看的那一頁，切過去再讀。
         if self._current_pid() == pid:
             self._load_bag(pid)
-            self._load_skills(pid)
+        # ⚠ 技能**每個分頁都要掃**，不能只掃正在看的那個：勾起來的補助技能
+        # 一接上就要開始補，不該等使用者切過去才生效。掃一次 2 秒，而且技能
+        # 只有加點時才會變，所以整個程式生命週期裡一隻角色只掃這一次。
+        self._load_skills(pid)
         log.info("自動掛機：加入 %s（PID %s）", status.name, pid)
 
         # ⚠⚠ **一建卡就開始看著他。** 舊版只在 `_watch_connections` 的
@@ -1697,7 +1700,8 @@ class FarmPage(BasePage):
 
         plans = card.skills.buff_plans()
         bot = self._buffs.get(pid)
-        want = card.skills.auto_enabled and bool(plans)
+        # **勾了就是要它動**：沒有第二個總開關（使用者原話「打勾後…就會施放」）。
+        want = bool(plans)
         if want and bot is None:
             bot = BuffBot(pid, plans, on_update=lambda st, c=card: c.buff_stats.emit(st))
             self._buffs[pid] = bot

@@ -90,23 +90,16 @@ def test_snapshot_only_keeps_what_is_checked(panel):
     assert saved.levels == {}
 
 
-def test_auto_switch_is_remembered(panel):
-    """「自動補助技能」的開關要存 —— 它只對自己放 buff，不會意外跑去打怪。"""
+def test_checking_a_buff_is_the_only_switch(panel):
+    """**勾了就是要它動**，沒有第二個總開關。
+
+    回歸測試：一度在補助區標題多做了一個「自動補助技能」開關，使用者勾了技能
+    卻什麼都沒發生（設定檔留下 `buffs: {60: 7}, auto: false`）——
+    那個開關長得像標題，沒人會知道要按它。
+    """
+    panel.apply_saved(SkillSaved(buffs={QUICKEN.id: 7}))
     panel.set_skills([QUICKEN])
-    assert not panel.auto_enabled
-    panel.auto.setChecked(True)
-    assert panel.snapshot().auto
-
-    panel.apply_saved(SkillSaved(buffs={QUICKEN.id: 7}, auto=True))
-    assert panel.auto_enabled
-
-
-def test_applying_settings_does_not_look_like_a_click(panel, qtbot=None):
-    """套用設定不該被當成「使用者按了開關」，否則載入當下就會去啟動 bot。"""
-    seen = []
-    panel.changed.connect(lambda: seen.append(1))
-    panel.apply_saved(SkillSaved(auto=True))
-    assert seen == []
+    assert [(p.skill_id, p.level) for p in panel.buff_plans()] == [(QUICKEN.id, 7)]
 
 
 def test_buffs_without_a_status_cannot_be_checked(panel):

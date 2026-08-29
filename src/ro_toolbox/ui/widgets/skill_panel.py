@@ -10,8 +10,13 @@
 - 補助技能要查得到「它會上哪個狀態」才給勾，查不到的**格子鎖起來**並在
   tooltip 說明為什麼 —— 讓人勾了卻沒反應是最糟的。
 
-補助區的標題就是「自動補助技能」開關，**跟自動打怪完全獨立**（使用者指定）：
-不掛機也可以只開這個。打怪那一區的勾選目前沒有動作，但一樣會存起來。
+**勾起來就會補**，沒有第二個總開關 —— 使用者原話是「打勾後…如果打勾的沒有就會
+施放」。一度多做了一個「自動補助技能」總開關擺在補助區標題上，結果使用者勾了技能
+卻什麼都沒發生（設定檔留下 `buffs: {60: 7}, auto: false` 的證據）：那個開關長得像
+標題，沒人會知道要按它。**勾了就是要它動**，不要再加一層。
+
+跟自動打怪**完全獨立**（使用者指定）：不掛機也可以只補 buff。
+打怪那一區的勾選目前沒有動作，但一樣會存起來。
 """
 
 from __future__ import annotations
@@ -214,16 +219,15 @@ class SkillPanel(QWidget):
 
         self._grids: dict[str, QGridLayout] = {}
         self._sections: dict[str, QWidget] = {}
-        #: 「自動補助技能」的開關。**跟自動打怪完全獨立**（使用者指定）——
-        #: 不掛機也可以只開這個。
-        self.auto = QCheckBox("自動補助技能（沒有或剩不到 10 秒就補）")
-        self.auto.toggled.connect(lambda _on: self.changed.emit())
-        for kind, title in ((ACTIVE, "打怪技能"), (BUFF, "")):
+        for kind, title in (
+            (ACTIVE, "打怪技能"),
+            (BUFF, "補助技能（勾起來就會補：身上沒有、或剩不到 10 秒）"),
+        ):
             section = QWidget()
             column = QVBoxLayout(section)
             column.setContentsMargins(0, 0, 0, 0)
             column.setSpacing(2)
-            head = self.auto if kind == BUFF else QLabel(title)
+            head = QLabel(title)
             head.setObjectName("skillSection")
             column.addWidget(head)
             grid = QGridLayout()
@@ -292,16 +296,7 @@ class SkillPanel(QWidget):
 
     def apply_saved(self, saved: SkillSaved) -> None:
         self._saved = saved
-        # ⚠ 用 blockSignals：套用設定不該被當成「使用者按了開關」，
-        # 否則載入的當下就會去啟動 bot（而且是在還沒讀到技能之前）。
-        self.auto.blockSignals(True)
-        self.auto.setChecked(saved.auto)
-        self.auto.blockSignals(False)
         self._rebuild()
-
-    @property
-    def auto_enabled(self) -> bool:
-        return self.auto.isChecked()
 
     def snapshot(self) -> SkillSaved:
         """現在的勾選狀態。**只存勾起來的** —— 沒勾的存進去只是雜訊。"""
@@ -312,7 +307,7 @@ class SkillPanel(QWidget):
                 continue
             target = buffs if tile.skill.kind == BUFF else levels
             target[skill_id] = tile.level
-        return SkillSaved(buffs=buffs, levels=levels, auto=self.auto.isChecked())
+        return SkillSaved(buffs=buffs, levels=levels)
 
     def buff_plans(self) -> list[BuffPlan]:
         """勾起來的補助技能，交給 `BuffKeeper`。"""
