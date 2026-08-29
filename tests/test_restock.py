@@ -2,8 +2,8 @@
 
 釘住使用者指定的四條規則：
   1. **只補 HP**（回程補給完全不碰 SP，2026-08-29 指定）
-  2. 買到「現在負重 ＋ 買下去的重量」達到上限 69% 為止（硬上限 70%），
-     沒有數量上限；已經到 69% 就連探路那兩瓶都不買
+  2. 買到「現在負重 ＋ 買下去的重量」達到上限 65% 為止（硬上限 70%），
+     沒有數量上限；已經到 65% 就連探路那兩瓶都不買
   3. **錢不夠要講出來**（介面要停掉自動打怪並跳通知）
   4. 單位重量是**量出來的**，不是猜的也不是解說明字串
 """
@@ -116,8 +116,8 @@ def test_the_unit_weight_is_measured_not_guessed():
     bot.feed(*par(shop.SP_WEIGHT, 20100))          # 一瓶 = 100
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
     reopen(bot, (HP_ITEM, 50))
-    # 上限 48100 × 69% = 33189，現在 20100 → 還有 13089 → 130 個
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 130)])
+    # 上限 48100 × 65% = 31265，現在 20100 → 還有 11165 → 111 個
+    assert sent[-1] == shop.buy_packet([(HP_ITEM, 111)])
 
 
 def test_every_order_reopens_the_shop_first():
@@ -239,24 +239,25 @@ def test_buying_finishes_with_the_total():
     bot.feed(*par(shop.SP_WEIGHT, 20100))           # 一瓶 = 100
     bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 探路第二瓶
     reopen(bot, *catalog)
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 130)])
-    bot.feed(*par(shop.SP_WEIGHT, 33100))           # 買完之後的負重
+    # 上限 48100 × 65% = 31265，現在 20100 → 還有 11165 → 111 個
+    assert sent[-1] == shop.buy_packet([(HP_ITEM, 111)])
+    bot.feed(*par(shop.SP_WEIGHT, 31200))           # 買完之後的負重
     bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 大單成交
 
     assert bot.update() == "done"
-    assert bot.stats.bought == {HP_ITEM: 132}       # 探路 2 ＋ 大單 130
-    assert "132" in bot.stats.note
+    assert bot.stats.bought == {HP_ITEM: 113}       # 探路 2 ＋ 大單 111
+    assert "113" in bot.stats.note
 
 
 def test_already_heavy_enough_buys_nothing_at_all():
-    """⚠ 已經到 69% 就**連探路那兩瓶都不買** —— 探路是為了算「還能買幾個」，
+    """⚠ 已經到 65% 就**連探路那兩瓶都不買** —— 探路是為了算「還能買幾個」，
     答案已經是 0 的時候買它就是買過頭，而且會安靜地越過 70%。
     """
     bot, sent, _clock = make()
     bot.start(LOOK, CELL)
     bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
-    bot.feed(*par(shop.SP_WEIGHT, 33200))           # 69% 是 33189，已經超過
+    bot.feed(*par(shop.SP_WEIGHT, 31300))           # 65% 是 31265，已經超過
     bot.update()
     bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
     bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50)))
