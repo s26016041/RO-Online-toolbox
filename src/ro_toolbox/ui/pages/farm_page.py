@@ -1426,7 +1426,15 @@ class FarmPage(BasePage):
             if not who:
                 continue
             # 只在連線正常時更新快照 —— 斷線當下什麼都停了，那時候拍等於忘光
-            if find_server(pid) is not None:
+            #
+            # ⚠ **不能只看 `find_server()`**：伺服器把連線 reset 之後，那條
+            # 連線還留在 TCP 表裡，查得到卻一個封包都送不出去（[PKT-082]）。
+            # 舊版因此完全看不出角色已經斷線，自動回連從頭到尾沒被啟用。
+            bot = self._bots.get(pid)
+            connected = find_server(pid) is not None and not (
+                bot is not None and bot.link_dead
+            )
+            if connected:
                 self._snaps[who] = self.snapshot_for(pid)
                 self._deciders.pop(who, None)
                 self._no_snapshot_said.discard(who)

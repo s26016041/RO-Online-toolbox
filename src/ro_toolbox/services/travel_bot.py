@@ -423,6 +423,10 @@ class TravelBot:
     def _loop(self) -> None:
         while not self._stop.is_set():
             now = time.monotonic()
+            if self._link.dead:
+                # 連線斷了就停 —— 繼續送只會每拍噴一行錯誤（[PKT-082]）。
+                self._fail("⚠ 遊戲連線已中斷（送不出封包），自動尋路已停止")
+                return
             if not self._keep_in_sync(now):
                 return
             status = self._reader.read() if self._reader else None

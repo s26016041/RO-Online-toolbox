@@ -205,13 +205,29 @@ def open_game_socket(
         time.sleep(_SOCKET_POLL)
 
 
+#: 同一個 WSA 錯誤碼只吼一次，之後每這麼多次補一行摘要。
+#:
+#: ⚠ 不節流的後果是實測出來的：連線被伺服器 reset（10054）之後，bot 每一拍
+#: 都會再送一次，一小時噴了 **5,185 行** —— 日誌整個被沖掉，真正的原因反而
+#: 找不到（使用者實測回報「兩隻都停了，很怪」）。
+_SEND_ERROR_EVERY = 500
+_send_errors: dict[int, int] = {}
+
+
 def send_on_socket(sock: int, data: bytes) -> int:
     """在指定 socket 上送出 data，回傳送出的位元組數（-1 = 失敗）。"""
     buf = ctypes.create_string_buffer(data, len(data))
     sent = _ws2.send(sock, buf, len(data), 0)
     if sent < 0:
         err = _ws2.WSAGetLastError()
-        log.error("send 失敗，WSA 錯誤 %s", err)
+        count = _send_errors.get(err, 0) + 1
+        _send_errors[err] = count
+        if count == 1:
+            log.error("send 失敗，WSA 錯誤 %s（同一個錯誤之後只會定期摘要）", err)
+        elif count % _SEND_ERROR_EVERY == 0:
+            log.error("send 失敗，WSA 錯誤 %s —— 已經連續 %d 次", err, count)
+    elif _send_errors:
+        _send_errors.clear()
     return sent
 
 

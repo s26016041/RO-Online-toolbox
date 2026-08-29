@@ -26,6 +26,7 @@ CLAUDE.md 那條「同一個位址不准寫第二次」對**知識**同樣成立
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable
 
 from ro_toolbox.services import game_socket
@@ -34,6 +35,12 @@ from ro_toolbox.services.packet_capture import PacketCapture
 from ro_toolbox.services.ro_capture import find_server
 
 log = logging.getLogger(__name__)
+
+#: 連續送不出去多久就判定這條連線死了。
+#:
+#: 換頻道的那一兩拍也會送失敗（正常，重綁就好），所以門檻不能太短；
+#: 但也不能沒有 —— 沒有的話就是實測那個「一小時 5,185 行錯誤、沒有人喊停」。
+DEAD_AFTER_SEC = 15.0
 
 
 class GameLink:
@@ -58,6 +65,14 @@ class GameLink:
         self.capture: PacketCapture | None = None
         #: 上一次 `resync()` 有沒有真的重綁（呼叫端要拿來記日誌）
         self.rebound = False
+        #: 連續送失敗從什麼時候開始（None = 現在好好的）。見 `dead`。
+        self._failing_since: float | None = None
+        #: **正在失敗的是哪一條連線**。⚠ 一定要在這裡另外記一份 ——
+        #: `send()` 失敗時會把 `self.server` 清成 None（那是用來逼 `resync()`
+        #: 重綁的），清掉之後就再也認不出「重綁回來的是不是同一條死的」。
+        self._failing_server: tuple[str, int] | None = None
+        #: 「這條死了」講過了沒（不擋就是每拍一行）。
+        self._said_dead = False
 
     # ---- 建立與收攤 -------------------------------------------------
 
@@ -149,6 +164,11 @@ class GameLink:
             return None
         if server == self.server:
             return None
+        if self.dead and server == self._failing_server:
+            # ⚠ **綁到同一條死連線不算重綁。** 伺服器 reset 之後那條連線還留在
+            # TCP 表裡，`find_server()` 照樣讀得到 —— 舊版就是這樣「重綁成功」
+            # 了幾千次，每次都綁回同一條死的。
+            return "⚠ 遊戲連線已中斷（重綁還是同一條斷掉的連線）"
         log.info("連線 %s → %s，重新綁定", self.server, server)
         self._close_socket()
         sock = game_socket.open_game_socket(
@@ -159,7 +179,22 @@ class GameLink:
             return "⚠ 換頻道後找不到新的遊戲 socket"
         self.sock, self.server = sock, server
         self.rebound = True
+        self._revive()
         return None
+
+    @property
+    def dead(self) -> bool:
+        """這條連線已經**確定沒救了**嗎（連續送不出去超過 `DEAD_AFTER_SEC`）。
+
+        ⚠ 這個判斷不能只看「送失敗」：換頻道的那一兩拍也會失敗，那是正常的、
+        重綁一下就好。真正沒救的長相是**一直失敗**——實測伺服器把連線 reset
+        （WSA 10054）之後，`find_server()` 還是讀得到那條連線（TCP 表裡還在），
+        所以「重綁」每次都成功、每次都綁到同一條死的，一小時噴 5,185 行錯誤
+        而且**沒有人喊停**。呼叫端看到 `dead` 就該停下來大聲說。
+        """
+        if self._failing_since is None:
+            return False
+        return time.monotonic() - self._failing_since >= DEAD_AFTER_SEC
 
     def send(self, data: bytes) -> bool:
         """送一個封包。回 False 代表 socket 可能失效了（下一拍會重綁）。
@@ -170,7 +205,24 @@ class GameLink:
         if self.sock is None:
             return False
         if game_socket.send_on_socket(self.sock, data) < 0:
-            log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
+            now = time.monotonic()
+            if self._failing_since is None:
+                self._failing_since = now
+                self._failing_server = self.server
+                log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
+            elif self.dead and not self._said_dead:
+                self._said_dead = True
+                log.error(
+                    "這條連線連續 %.0f 秒送不出去，判定已經斷了（%s）—— 停止重試",
+                    now - self._failing_since, self._failing_server,
+                )
             self.server = None      # 逼下一次 resync() 重綁
             return False
+        self._revive()
         return True
+
+    def _revive(self) -> None:
+        """送出去了 = 這條連線好好的。把失敗的記錄全部清掉。"""
+        self._failing_since = None
+        self._failing_server = None
+        self._said_dead = False

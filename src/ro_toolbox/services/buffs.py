@@ -322,6 +322,9 @@ class BuffBot:
         assert keeper is not None
         reader = self._link.reader
         while not self._stop.is_set():
+            if self._link.dead:
+                self._fail("遊戲連線已中斷，先停下來")
+                return
             status = reader.read() if reader is not None else None
             if status is None:
                 # 角色不見了（登出／回到選角）—— 停下來，不要空轉送封包。

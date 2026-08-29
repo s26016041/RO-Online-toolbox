@@ -292,6 +292,15 @@ class FarmBot:
     def stats(self) -> FarmStats:
         return self._stats
 
+    @property
+    def link_dead(self) -> bool:
+        """連線已經確定送不出東西了嗎（見 `GameLink.dead`）。
+
+        介面要拿它判斷「斷線了」—— **不能只看 `find_server()`**：伺服器把連線
+        reset 之後那條連線還留在 TCP 表裡，查得到卻送不出去（[PKT-082]）。
+        """
+        return self._link.dead
+
     def loot(self) -> dict[int, int]:
         """已撿取的道具 {物品ID: 次數}。快照，可安全在其他執行緒讀。"""
         with self._loot_lock:
@@ -424,6 +433,8 @@ class FarmBot:
             self._expire(now)
             if not self._alive(now):
                 return
+            if not self._link_alive():
+                return
             if not self._keep_in_sync(now):
                 return
             pos = self._reader.read_position() if self._reader else None
@@ -481,6 +492,18 @@ class FarmBot:
 
             self._emit()
             self._stop.wait(_TICK)
+
+    def _link_alive(self) -> bool:
+        """連線還活著嗎。死了就大聲停用 —— 不准繼續空轉送封包。
+
+        ⚠ 這一條**每拍都要問**，不能等到 `_keep_in_sync` 那兩秒一次的節流：
+        實測連線被 reset 之後，bot 每拍照送、每拍失敗，一小時 5,185 行錯誤
+        而且從頭到尾沒有人喊停（[PKT-082]）。
+        """
+        if not self._link.dead:
+            return True
+        self._fail("⚠ 遊戲連線已中斷（送不出封包），自動打怪已停止")
+        return False
 
     def _keep_in_sync(self, now: float) -> bool:
         """換地圖／換伺服器頻道之後，重新綁定 socket 與地形。
