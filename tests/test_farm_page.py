@@ -1383,3 +1383,91 @@ def test_a_normal_stop_does_not_send_anyone_home(monkeypatch, qtbot):
     page._toggle_farm(pid, False)
     page._watch_overweight()
     assert potion.home_why is None
+
+
+# ---- 沒水回城 → 自己去補給 → 走回練功點 ------------------------------------
+
+
+class _FakePotionBot:
+    def __init__(self, went_home: bool, needs_supplies: bool) -> None:
+        self.stats = type("S", (), {
+            "running": False, "went_home": went_home,
+            "needs_supplies": needs_supplies,
+        })()
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_running_out_of_potions_starts_a_restock(monkeypatch, qtbot):
+    """使用者：「水沒了成功回去但沒去補水，自動補水還被關掉 ——
+    不是應該要開著自動補水去補給然後回地圖嗎」。"""
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    page._potions[pid] = _FakePotionBot(went_home=True, needs_supplies=True)
+    page._cards[pid] = make_card(qtbot)
+    page._farm_map[pid] = "mjolnir_07"
+    started = []
+    monkeypatch.setattr(page, "_start_restock",
+                        lambda p, back_to="": started.append((p, back_to)))
+    monkeypatch.setattr(page, "_save_potion", lambda *a: None)
+
+    # 卡片先收攤（真實世界的順序）
+    page._toggle_potion(pid, False)
+    assert page._potions == {}
+
+    page._watch_supply_runs()
+    assert started == [(pid, "mjolnir_07")], "要走回練功點，不是走回城裡"
+    assert pid in page._auto_restock
+
+
+def test_going_home_because_of_weight_does_not_restock(monkeypatch, qtbot):
+    """使用者指定負重滿了是「回程關閉自動戰鬥，**掛機不補給**」。"""
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    page._potions[pid] = _FakePotionBot(went_home=True, needs_supplies=False)
+    page._cards[pid] = make_card(qtbot)
+    started = []
+    monkeypatch.setattr(page, "_start_restock",
+                        lambda p, back_to="": started.append(p))
+    monkeypatch.setattr(page, "_save_potion", lambda *a: None)
+
+    page._toggle_potion(pid, False)
+    page._watch_supply_runs()
+    assert started == []
+
+
+class _FakeRestock:
+    def __init__(self, came_back: bool) -> None:
+        self.stats = type("S", (), {
+            "came_back": came_back, "broke": False, "done": True,
+            "note": "", "summary": lambda self=None: "買好了",
+        })()
+
+
+def test_the_bots_come_back_on_after_a_successful_supply_run(monkeypatch, qtbot):
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    card.auto_potion.setChecked(False)
+    card.auto_hunt.setChecked(False)
+
+    page._resume_after_supplies(pid, card, _FakeRestock(came_back=True))
+    assert card.auto_potion.isChecked()
+    assert card.auto_hunt.isChecked()
+
+
+def test_not_coming_back_leaves_everything_off(monkeypatch, qtbot):
+    """走不回去就不要開自動打怪 —— 人還在城裡，開了只會對著 NPC 亂繞。"""
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    card.auto_potion.setChecked(False)
+    card.auto_hunt.setChecked(False)
+
+    page._resume_after_supplies(pid, card, _FakeRestock(came_back=False))
+    assert not card.auto_potion.isChecked()
+    assert not card.auto_hunt.isChecked()

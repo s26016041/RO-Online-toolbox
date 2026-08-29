@@ -116,6 +116,12 @@ class PotionStats:
     #: 已經用回程道具回去了。UI 看到這個要把自動打怪也關掉 ——
     #: 人已經在城裡，繼續掛著打怪只會站在原地耗。
     went_home: bool = False
+    #: 回程的原因是**沒水了**（不是外面叫它回去的）。
+    #:
+    #: ⚠ 兩種回程要分開：藥水用完是「回去補給，補完再回來繼續掛」；
+    #: 負重滿了是使用者指定的「回程關掉自動打怪，**掛機不補給**」。
+    #: 混在一起的話，負重滿的那次會自己跑去買一堆東西然後更重。
+    needs_supplies: bool = False
     counts: dict[int, int] = field(default_factory=dict)
 
 
@@ -351,7 +357,8 @@ class PotionBot:
             if self._home_why:
                 why, self._home_why = self._home_why, ""
                 if self._cfg.wants_home():
-                    self._go_home(why)
+                    # 外面叫的（負重滿了）—— 使用者指定「掛機不補給」。
+                    self._go_home(why, supplies=False)
                 else:
                     self._fail(f"{why}，但沒有設定回程道具")
                 return
@@ -585,8 +592,12 @@ class PotionBot:
         self._fail(f"{text}；沒有其他設定，自動補水停止")
         return False
 
-    def _go_home(self, why: str) -> bool:
+    def _go_home(self, why: str, supplies: bool = True) -> bool:
         """用選好的道具回程，然後停掉自動補水。一律回 False（迴圈要結束）。
+
+        `supplies=True`（預設）代表**是沒水才回去的** —— 呼叫端看到這個
+        旗標就會接著跑補給、補完再走回練功點。外面叫它回去的（負重滿了）
+        要傳 `supplies=False`：使用者指定那種情況「掛機不補給」。
 
         ⚠ **格號現查**（[MEM-028]），而且要**確認真的用掉了**才算回程成功 ——
         「送了封包就當作回去了」是安靜地做錯事：人還在野外，UI 卻顯示已回程。
@@ -607,7 +618,9 @@ class PotionBot:
             )
             return False
         self._stats.went_home = True
-        self._fail(f"{why} → 已用 {item_name(item_id)} 回程，自動補水停止")
+        self._stats.needs_supplies = supplies
+        tail = "，接著去補給" if supplies else "，自動補水停止"
+        self._fail(f"{why} → 已用 {item_name(item_id)} 回程{tail}")
         return False
 
     # ---- 雜項 -------------------------------------------------------

@@ -711,3 +711,72 @@ def test_a_zero_max_weight_is_not_a_division_by_zero(monkeypatch):
     bot = _bot_with_terrain(monkeypatch)
     _weigh(bot, 100, 0)
     assert bot._too_heavy() is False
+
+
+# ---- 脫離傳點禁區：走不出去要換方向，不能一直撞同一面牆 --------------------
+
+
+def _warp_bot() -> FarmBot:
+    """一隻站在傳點禁區正中央的 bot。"""
+    bot = bot_with_map()
+    zone = {(x, y)
+            for x in range(198, 203)
+            for y in range(198, 203)}
+    bot._warp_zone = frozenset(zone)
+    bot._warp_cells = frozenset({(200, 200)})
+    return bot
+
+
+def test_an_escape_goal_that_cannot_be_reached_is_not_tried_again(monkeypatch):
+    """⚠ 使用者實測回報「掛機自己停了」，日誌最後一句是「太靠近傳點，先走開」。
+
+    `_nearest_outside()` 永遠回「最近的那一格」，所以走不成的話下一拍算出來
+    還是同一格、同一條路 —— 一直撞同一面牆，直到 45 秒沒進展的保護把自動
+    打怪關掉。走不成的目標要記下來，換一個方向。
+    """
+    bot = _warp_bot()
+    pos = (200, 200)
+
+    first = bot._nearest_outside(pos)
+    assert first is not None and first not in bot._warp_zone
+
+    # 第一次挑好目標、開始走
+    assert bot._escape_warp(pos) is True
+    assert bot._escape_goal == first
+
+    # 這一段走不成（伺服器不收／中間有樹）
+    monkeypatch.setattr(bot._walker, "update", lambda _p: "blocked")
+    bot._escape_warp(pos)
+    assert bot._is_bad_goal(first), "走不到的那一格要記起來"
+
+    # 下一次要換一個方向，不能又挑同一格
+    monkeypatch.undo()
+    again = bot._nearest_outside(pos)
+    assert again != first
+
+
+def test_a_reachable_escape_goal_is_left_alone(monkeypatch):
+    """走得成就不要亂記 —— `_bad_goals` 記太多會沒有地方可以去。"""
+    bot = _warp_bot()
+    pos = (200, 200)
+    assert bot._escape_warp(pos) is True
+    goal = bot._escape_goal
+
+    monkeypatch.setattr(bot._walker, "update", lambda _p: "walking")
+    assert bot._escape_warp(pos) is True
+    assert bot._escape_goal == goal
+    assert not bot._is_bad_goal(goal)
+
+
+def test_the_frozen_message_says_what_it_was_doing():
+    """只說「毫無進展」的話事後查不出原因 —— 細節都在 DEBUG，
+    使用者手上的檔案只有 INFO。"""
+    bot = _warp_bot()
+    assert bot._doing() == "沒有目標"
+
+    bot._escape_goal = (203, 200)
+    assert "傳點禁區" in bot._doing()
+
+    bot._escape_goal = None
+    bot._roam_goal = (250, 250)
+    assert "漫遊" in bot._doing()

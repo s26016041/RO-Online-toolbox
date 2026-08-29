@@ -87,10 +87,17 @@ class RestockBot:
         hp_item: int | None,
         home_item: int | None = None,
         on_update: Callable[[RestockRun], None] | None = None,
+        back_to: str = "",
     ) -> None:
         self._pid = pid
         self._hp_item = hp_item
         self._home_item = home_item
+        #: 補完要走回哪張圖。空字串 = 走回出發時站的那張。
+        #:
+        #: ⚠ 「沒水了自動回城補給」那條路一定要指定：那時候角色**已經被
+        #: 回程道具傳到城裡了**，出發點就是城裡，走回出發點等於原地不動 ——
+        #: 人還是沒回到練功點。
+        self._back_to = back_to
         self._on_update = on_update
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -171,7 +178,7 @@ class RestockBot:
             return None
 
         here = status.map_name
-        self.stats.home_map = here
+        self.stats.home_map = self._back_to or here
         sellers = potion_sellers_on(here)
         target_map = here
         if not sellers:

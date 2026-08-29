@@ -657,9 +657,28 @@ class FarmBot:
             self._progress = progress
             self._progress_at = now
         elif now - self._progress_at > _FROZEN_SEC:
-            self._fail(f"⚠ 角色 {_FROZEN_SEC:.0f} 秒毫無進展（可能死亡或卡住），已停止")
+            # ⚠ **要講在做什麼**：只說「毫無進展」的話，事後從日誌完全看不出
+            # 是打怪打不到、走位走不動、還是卡在傳點禁區出不來
+            # （細節都在 DEBUG，使用者手上的檔案只有 INFO）。
+            self._fail(
+                f"⚠ 角色 {_FROZEN_SEC:.0f} 秒毫無進展（{self._doing()}），已停止"
+            )
             return False
         return True
+
+    def _doing(self) -> str:
+        """卡住的時候在做什麼 —— 給日誌看的一句話。"""
+        if self._traveler is not None:
+            return "正在走回原本的地圖"
+        if self._escape_goal is not None:
+            return f"正在脫離傳點禁區（往 {self._escape_goal}）"
+        if self._aim is not None:
+            mob = self._world.get(self._aim.gid)
+            who = getattr(mob, "name", "") or f"GID {self._aim.gid}"
+            return f"正在打「{who}」"
+        if self._roam_goal is not None:
+            return f"正在漫遊（往 {self._roam_goal}）"
+        return "沒有目標"
 
     def _expire(self, now: float) -> None:
         for gid in [g for g, until in self._skip.items() if now > until]:
@@ -1189,8 +1208,19 @@ class FarmBot:
             return False
         if self._escape_goal is not None:
             # 已經在往外走了就讓它走完，別每一拍重算一條新路狂送走路封包。
-            if self._walker.update(pos) == "walking":
+            state = self._walker.update(pos)
+            if state == "walking":
                 return True
+            if state == "blocked":
+                # ⚠⚠ **走不出去的那一格要記下來。**
+                # `_nearest_outside()` 每次都回「最近的那一格」，所以走不成的話
+                # 下一拍算出來的還是同一格、同一條路 —— 一直撞同一面牆，
+                # 直到 45 秒沒進展的保護把自動打怪關掉。使用者實測回報
+                # 「掛機自己停了」，日誌上最後一句正是「太靠近傳點，先走開」。
+                self._bad_goals.append(
+                    (self._escape_goal, time.monotonic() + _BAD_GOAL_SEC)
+                )
+                log.info("走不到 %s，換一個方向脫離傳點禁區", self._escape_goal)
             self._escape_goal = None
         if not self._near_warp(pos):
             return False
@@ -1210,7 +1240,13 @@ class FarmBot:
         return True
 
     def _nearest_outside(self, pos: tuple[int, int]) -> tuple[int, int] | None:
-        """離 `pos` 最近、又在禁區外面的可走格。由近而遠一圈一圈找。"""
+        """離 `pos` 最近、又在禁區外面的可走格。由近而遠一圈一圈找。
+
+        ⚠ **跳過走不成的那些**（`_bad_goals`）。地形圖說「可以站」不代表
+        「走得過去」—— 中間可能隔著樹或整片走不通的地形。不跳過的話
+        每一拍都會挑到同一格、算出同一條走不成的路，一直撞到 45 秒沒進展
+        的保護把自動打怪關掉（使用者實測回報「掛機自己停了」）。
+        """
         terrain = self._terrain
         if terrain is None:
             return None
@@ -1223,6 +1259,8 @@ class FarmBot:
                     cell = (pos[0] + dx, pos[1] + dy)
                     if cell in self._warp_zone or not terrain.is_walkable(*cell):
                         continue
+                    if self._is_bad_goal(cell):
+                        continue        # 剛剛走不到，換一個
                     best = cell
                     break
                 if best is not None:

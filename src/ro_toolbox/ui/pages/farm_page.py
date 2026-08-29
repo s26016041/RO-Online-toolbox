@@ -1059,6 +1059,13 @@ class FarmPage(BasePage):
         #: 負重滿了、bot 已經被收走、但還沒把人帶回城的 PID。
         #: 見 `_watch_overweight` 裡那段「收攤的順序會咬人」。
         self._overweight_pending: set[int] = set()
+        #: 沒水了自己回城、等著去補給的 PID（同樣會被收攤順序咬到）。
+        self._supply_pending: set[int] = set()
+        #: PID → 開始自動打怪時人在哪張圖。補完要走回這裡，不是走回城裡。
+        self._farm_map: dict[int, str] = {}
+        #: 這一趟補水是「沒水自動觸發」的（補完要把掛機接回去），
+        #: 不是使用者自己按「補水」按鈕。
+        self._auto_restock: set[int] = set()
         self._potions: dict[int, PotionBot] = {}
         #: 自動補助技能。**跟自動打怪各跑各的**（使用者指定）——
         #: 不掛機也可以只開這個，掛機時兩邊互不干涉。
@@ -1123,6 +1130,7 @@ class FarmPage(BasePage):
         self._read_timer.timeout.connect(self._watch_connections)
         self._read_timer.timeout.connect(self._watch_restocks)
         self._read_timer.timeout.connect(self._watch_overweight)
+        self._read_timer.timeout.connect(self._watch_supply_runs)
         #: 定期重掃技能。**不能放在每秒的計時器裡** —— 掃一趟 2 秒，
         #: 每秒掃一次會把整頁拖垮（[MEM-043] 就是這樣被 bag.as_dict 拖慢的）。
         self._skill_timer = QTimer(self)
@@ -1704,6 +1712,9 @@ class FarmPage(BasePage):
             status = reader.read() if reader is not None else None
             if status is not None and status.has_exp:
                 self._exp_start[pid] = (time.monotonic(), status.base_exp, status.job_exp)
+            if status is not None and status.map_name:
+                # 沒水回城補給之後要走回**這裡**，不是走回城裡（見 `_watch_supply_runs`）。
+                self._farm_map[pid] = status.map_name
             bot.start()
         else:
             bot = self._bots.pop(pid, None)
@@ -1841,7 +1852,7 @@ class FarmPage(BasePage):
         card.skills.set_skills(rows)
         self._apply_skill_config(pid, save=False)
 
-    def _start_restock(self, pid: int) -> None:
+    def _start_restock(self, pid: int, back_to: str = "") -> None:
         """按下「補水」：走去最近的藥水商人，補完跳通知。
 
         ⚠ **先把自動打怪與自動尋路關掉**：三個都在送走路封包會互相搶目標，
@@ -1865,12 +1876,36 @@ class FarmPage(BasePage):
         bot = RestockBot(
             pid, config.hp_item, config.home_item,
             on_update=lambda st, c=card: c.restock_stats.emit(st),
+            back_to=back_to,
         )
         self._restocks[pid] = bot
         card.set_restock_busy(True)
         if not bot.start():
             self._restocks.pop(pid, None)
             card.set_restock_busy(False)
+
+    def _watch_supply_runs(self) -> None:
+        """沒水自己回城了 → **接著去補給，補完走回練功點**（使用者指定）。
+
+        使用者原話：「水沒了成功回去但沒去補水，自動補水還被關掉 ——
+        不是應該要開著自動補水去補給然後回地圖嗎」。
+
+        ⚠ 只處理「沒水」那一種。負重滿了也會回城，但使用者指定那種
+        **掛機不補給**（`needs_supplies` 就是用來分這兩種的）。
+        """
+        pids = {pid for pid, bot in self._potions.items()
+                if bot.stats.went_home and bot.stats.needs_supplies}
+        pids |= self._supply_pending
+        self._supply_pending.clear()
+        for pid in pids:
+            if pid in self._restocks:
+                continue                 # 已經在補了
+            card = self._cards.get(pid)
+            if card is None:
+                continue
+            self._auto_restock.add(pid)
+            log.info("「%s」沒水回城了，接著去補給", self._names.get(pid) or pid)
+            self._start_restock(pid, back_to=self._farm_map.get(pid, ""))
 
     def _watch_restocks(self) -> None:
         """跑完的補水收攤並跳通知（使用者指定「補完會跳通知」）。"""
@@ -1882,12 +1917,30 @@ class FarmPage(BasePage):
             if card is not None:
                 card.set_restock_busy(False)
             who = self._names.get(pid) or f"PID {pid}"
+            if pid in self._auto_restock:
+                self._auto_restock.discard(pid)
+                self._resume_after_supplies(pid, card, bot)
             if bot.stats.broke:
                 show_notice(self, "補水", f"{who}：錢不夠，沒買完。")
             elif bot.stats.done:
                 show_notice(self, "補水完成", f"{who}：{bot.stats.summary()}")
             else:
                 show_notice(self, "補水沒完成", f"{who}：{bot.stats.note}")
+
+    def _resume_after_supplies(self, pid: int, card, bot) -> None:  # noqa: ANN001
+        """自動補給跑完了：把自動補水與自動打怪接回去。
+
+        ⚠ **走回練功點才接**：沒走回去就開自動打怪的話，人會在城裡對著
+        NPC 亂繞（使用者實測過「走不回去」是可能的，那時候要人自己走）。
+        ⚠ 也**只接自動觸發的那一趟**：使用者自己按「補水」按鈕的時候，
+        該不該繼續掛機是他自己的決定，我們不要替他決定。
+        """
+        if card is None or not getattr(bot.stats, "came_back", False):
+            return
+        card.auto_potion.setChecked(True)
+        card.auto_hunt.setChecked(True)
+        log.info("「%s」補給完走回 %s，掛機接回去了",
+                 self._names.get(pid) or pid, self._farm_map.get(pid, ""))
 
     def _apply_skill_config(self, pid: int, save: bool = True) -> None:
         """勾選或開關變了：存回設定，並讓自動補助技能跟上。
@@ -1968,6 +2021,11 @@ class FarmPage(BasePage):
         if not on:
             bot = self._potions.pop(pid, None)
             if bot is not None:
+                if bot.stats.went_home and bot.stats.needs_supplies:
+                    # ⚠ 跟負重那條同一個坑：卡片一收到「不在跑了」就把勾勾
+                    # 拿掉，而拿掉勾勾會走到這裡把 bot 收走 —— 比計時器早。
+                    # 不在這裡記下來的話，`_watch_supply_runs()` 永遠看不到。
+                    self._supply_pending.add(pid)
                 bot.stop()
             self._save_potion(pid)
             return
