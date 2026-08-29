@@ -465,9 +465,9 @@ def test_a_mate_too_far_away_is_left_alone():
     ⚠ 判準是射程，不是一個寫死的格數 —— 使用者 2026-08-29 指定
     「隊友在我施放範圍就要馬上幫他放」。夾小的副作用是「明明放得到卻不放」。
     """
-    from ro_toolbox.services.buffs import skill_range
+    from ro_toolbox.services.buffs import MATE_NEAR_CELLS
 
-    reach = skill_range(INCAGI, 10)
+    reach = MATE_NEAR_CELLS
     fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])     # 自己已經有了
     far = FakeMate(MATE_AID, "白狐", cell=(MY_CELL[0] + reach + 1, MY_CELL[1]))
     keeper, _party = _party_keeper(fake, [far])
@@ -478,11 +478,15 @@ def test_a_mate_too_far_away_is_left_alone():
 
 
 def test_a_mate_right_on_the_line_still_gets_it():
-    """射程 9 的技能，隔 9 格照樣要放（這就是「在我施放範圍」）。"""
-    from ro_toolbox.services.buffs import skill_range
+    """剛好站在觸發距離上也要放。
 
-    reach = skill_range(INCAGI, 10)
-    assert reach == 9, "加速術射程 9"
+    ⚠ 使用者 2026-08-30 改了規則：「隊友只要離我 **3 格內** 我就會完全停下來
+    檢查幫她放」—— 所以觸發距離是 `MATE_NEAR_CELLS`，不是技能射程。
+    （指定型技能仍然要在自己的射程內，見 `_reach_for`。）
+    """
+    from ro_toolbox.services.buffs import MATE_NEAR_CELLS
+
+    reach = MATE_NEAR_CELLS
     fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
     edge = FakeMate(MATE_AID, "白狐", cell=(MY_CELL[0] + reach, MY_CELL[1]))
     keeper, _party = _party_keeper(fake, [edge])
@@ -722,3 +726,89 @@ def test_a_mate_who_walks_out_of_range_gives_the_road_back():
     keeper._mate_pending.clear()
     keeper.tick()
     assert holds[-1] == "release"
+
+
+# ---- 範圍型「幫隊友」技能：放自己身上，罩到旁邊的隊友 ----------------------
+
+
+def test_an_aura_skill_counts_as_helping_mates():
+    """⚠ 使用者兩次回報「天使之障壁放不出來」。
+
+    它的「對象」寫「立即施展」，所以 `can_target_others()` 是 False ——
+    舊版的「幫隊友放」整個跳過它。但它**內容**寫得很清楚：
+    「提升自己和**畫面內隊員**的 VIT 物理防禦力及 MaxHP」。
+
+    使用者：「以後會有更多這種技能，所以不能每次都壞掉」。
+    """
+    from ro_toolbox.services.buffs import (
+        can_target_others,
+        helps_mates,
+        is_party_aura,
+    )
+
+    for skill_id, name in ((33, "天使之障壁"), (74, "聖母之頌歌"),
+                           (75, "幸運之頌歌"), (66, "神威祈福")):
+        assert is_party_aura(skill_id), name
+        assert helps_mates(skill_id), name
+        assert not can_target_others(skill_id), f"{name} 不能指定目標"
+
+    for skill_id, name in ((8, "霸體"), (60, "雙手劍攻擊速度增加")):
+        assert not is_party_aura(skill_id), f"{name} 是純自己的"
+        assert not helps_mates(skill_id), name
+
+
+def test_an_aura_skill_is_cast_on_myself_not_on_the_mate():
+    """⚠ 目標填隊友的 GID 伺服器會直接丟掉（[DAT-045]）—— 要填自己。"""
+    from ro_toolbox.services.buffs import cast_target_of
+
+    assert cast_target_of(33, MATE_AID, AID) == AID, "天使之障壁放自己"
+    assert cast_target_of(INCAGI, MATE_AID, AID) == MATE_AID, "加速術指定隊友"
+
+
+def test_a_mate_missing_an_aura_buff_makes_me_cast_it_on_myself():
+    """隊友身上沒有天使之障壁 → 我在自己身上放一次，他就吃到了。"""
+    from ro_toolbox.services.buffs import buff_efst
+
+    angelus = 33
+    fake = Fake([FakeStatus(buff_efst(angelus), 200_000)])   # 我自己已經有了
+    mate = FakeMate(MATE_AID, "白狐")
+    keeper, _party = _party_keeper(fake, [mate])
+    keeper.set_plans([BuffPlan(angelus, 10)])
+
+    note = keeper.tick()
+    assert fake.sent == [build_use_skill(10, angelus, AID)], "目標要是自己"
+    assert "白狐" in (note or "")
+
+
+def test_my_own_buff_also_makes_everyone_hold_still():
+    """⚠⚠ 使用者兩次回報「天使之障壁還是沒放」—— 它其實一直在放，
+    只是每一發都被自動打怪的走路封包打斷：
+
+        「加速術」放了沒上身，1 秒後再試
+        「天使之障壁」放了沒上身，2 秒後再試
+        …退避到 30 秒…
+
+    移動會打斷詠唱，所以讓路不能只為隊友，**自己的 buff 也要**。
+    """
+    fake = Fake()                       # 自己身上什麼都沒有
+    holds = []
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now,
+                        hold=lambda _s: holds.append("hold"),
+                        release=lambda: holds.append("release"))
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    assert holds and holds[0] == "hold", "自己的 buff 也要叫大家別動"
+    assert fake.sent, "還是要真的送出去"
+
+
+def test_the_road_is_free_once_my_own_buffs_are_all_on():
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])   # 已經有了
+    holds = []
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now,
+                        hold=lambda _s: holds.append("hold"),
+                        release=lambda: holds.append("release"))
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+    keeper.tick()
+    assert holds == [] or holds[-1] == "release"
+    assert fake.sent == []

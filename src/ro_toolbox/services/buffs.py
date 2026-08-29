@@ -76,6 +76,9 @@ MATE_SESSION_MAX = 6.0
 #: 那個顧慮現在由**退避**接住（`_mate_retry`：放不上去就 1→2→4…秒），
 #: 用不著再犧牲射程 —— 夾在 5 格的副作用是「隊友明明放得到卻不放」。
 #: 這個常數只在**查不到射程**時當保守預設。
+#: 隊友離我幾格以內就停下來檢查（使用者 2026-08-30 指定：
+#: 「隊友只要離我 3 格內我就會完全停下來檢查幫她放」）。
+MATE_NEAR_CELLS = 3
 MATE_MAX_CELLS = 5
 #: 送出之後等這麼久還沒看到狀態上身，就當這一次沒成功。**只是放棄的上限**。
 CONFIRM_TIMEOUT = 5.0
@@ -110,6 +113,53 @@ def buff_efst(skill_id: int) -> int | None:
 #: 補助技能只出現這幾種：`目標1個`(32)、`1個目標`(4)、`自己和隊友1名`(1)、
 #: `自己以外的一名隊員`(1)。⚠ `地面1格` 是「格」不是「個」，不會誤中。
 _ONE_PERSON = ("1個", "1名", "一名")
+
+
+def helps_mates(skill_id: int) -> bool:
+    """這個技能**幫得到旁邊的隊友**嗎（指定放或範圍罩到都算）。
+
+    使用者 2026-08-30：「天使之障壁…是放了會給範圍的隊友施放 BUFF，
+    不用選目標的那種，**以後會有更多這種技能所以不能每次都壞掉**」。
+
+    兩種都算數，差別只在**封包的目標填誰**（見 `cast_target_of`）：
+
+    - `can_target_others()` → 指定隊友（天使之賜福、加速術…）
+    - `is_party_aura()`     → 放在自己身上，罩到周圍／畫面內的隊友
+      （天使之障壁、聖母之頌歌、幸運之頌歌、神威祈福、所有速度激發…）
+    """
+    return can_target_others(skill_id) or is_party_aura(skill_id)
+
+
+def is_party_aura(skill_id: int) -> bool:
+    """以自己為中心、**效果會罩到隊友**的技能嗎。
+
+    判準是遊戲說明的「內容」有沒有提到**隊員／隊友／我軍**：
+
+        天使之障壁：提升自己和**畫面內隊員**的 VIT 物理防禦力及 MaxHP
+        凶砍　　　：增加自己及**周圍隊員**的物理傷害
+        霸體　　　：在一定時間內即使受到攻擊也能移動或攻擊   ← 沒提到，純自己
+
+    ⚠ 為什麼不能只看「對象」欄位：天使之障壁與聖母之頌歌的對象都寫
+    「立即施展」—— 那一欄看不出它幫不幫得到隊友，只有內容講得出來。
+
+    掃過整份技能表核對（1605 個）：對象**不是**指定一個人的補助技能裡，
+    內容提到隊員的有 12 個（全部都是真的範圍隊伍 buff），
+    其餘 113 個純自己的一個都沒誤中。
+    """
+    if can_target_others(skill_id):
+        return False                 # 那是指定型，不走這條
+    body = (skill_table().get(skill_id) or {}).get("desc") or ""
+    if isinstance(body, list):
+        body = "\n".join(str(part) for part in body)
+    return any(word in body for word in ("隊員", "隊友", "我軍"))
+
+
+def cast_target_of(skill_id: int, mate_aid: int, my_aid: int) -> int:
+    """幫隊友放這個技能時，`0x0438` 的目標要填誰。
+
+    ⚠ 範圍型要填**自己**：填隊友的 GID 伺服器會直接丟掉（[DAT-045]）。
+    """
+    return mate_aid if can_target_others(skill_id) else my_aid
 
 
 def can_target_others(skill_id: int) -> bool:
@@ -298,7 +348,7 @@ class BuffKeeper:
             return self._note("讀不到身上的狀態，這一拍先不補")
         present = {row.efst: row for row in statuses}
 
-        self._mind_the_road(sp)
+        self._mind_the_road(sp, present)
         done = self._settle_mates()
         if done is not None:
             return done
@@ -417,7 +467,22 @@ class BuffKeeper:
             return self._note(f"補 {skill_name(plan.skill_id)} Lv{plan.level}")
         return None
 
-    def _mind_the_road(self, sp: int | None) -> None:
+    def _reach_for(self, plan) -> int:  # noqa: ANN001 - BuffPlan
+        """這個技能要幾格以內才幫隊友放。
+
+        使用者指定「隊友離我 3 格內就停下來檢查」，所以觸發距離是
+        `MATE_NEAR_CELLS`(3)。但**指定型技能還是要在它自己的射程內**才送得到
+        （塗毒射程 1，得貼著），所以取兩者的小的那個。
+        範圍型（放自己身上）也用 3 格 —— 隊友要在效果罩得到的地方才有意義。
+        """
+        reach = MATE_NEAR_CELLS
+        if can_target_others(plan.skill_id):
+            own = skill_range(plan.skill_id, plan.level)
+            if own is not None:
+                reach = min(reach, own)
+        return reach
+
+    def _mind_the_road(self, sp: int | None, present: dict) -> None:
         """還有隊友要補就**整段停下來**；沒有了（或停太久）就放行。
 
         使用者原話：「如果需要幫隊友放而且隊友在 BUFF 射程，就先停下一切動作
@@ -433,7 +498,7 @@ class BuffKeeper:
           不能讓打怪一直站著。
         """
         now = self._now()
-        if not self._mate_work_left(sp):
+        if not (self._mate_work_left(sp) or self._own_work_left(present, sp)):
             if self._mate_session:
                 self._mate_session = 0.0
                 self._release()
@@ -444,6 +509,35 @@ class BuffKeeper:
             self._release()               # 等太久了，先讓打怪繼續
             return
         self._hold(CAST_HOLD)
+
+    def _own_work_left(self, present: dict, sp: int | None) -> bool:
+        """**自己**身上還有 buff 要補嗎（含送出去還沒確認的那一發）。
+
+        ⚠⚠ 自己的 buff 也會被自己的走路打斷。實機 2026-08-30 日誌：
+
+            「加速術」放了沒上身，1 秒後再試
+            「天使之障壁」放了沒上身，2 秒後再試
+            …退避到 30 秒…
+
+        使用者回報「天使之障壁還是沒放」—— 它**其實一直在放**，只是每一發都
+        被自動打怪的走路封包打斷。所以讓路不能只為隊友，自己的也要。
+        """
+        if self._pending is not None:
+            return True
+        now = self._now()
+        for plan in self._plans:
+            efst = buff_efst(plan.skill_id)
+            if efst is None:
+                continue
+            until, _ = self._retry.get(plan.skill_id, (0.0, 0.0))
+            if now < until:
+                continue          # 退避中：不算「要做的事」，別占著路
+            cost = sp_cost(plan.skill_id, plan.level)
+            if sp is not None and cost is not None and sp < cost:
+                continue          # SP 不夠：安靜跳過
+            if self._needs(efst, present):
+                return True
+        return False
 
     def _mate_work_left(self, sp: int | None) -> bool:
         """現在還有「射程內、需要補」的隊友嗎（含已經送出去還沒確認的那幾發）。"""
@@ -458,12 +552,12 @@ class BuffKeeper:
         mates = self._party.mates()
         for plan in self._plans:
             efst = buff_efst(plan.skill_id)
-            if efst is None or not can_target_others(plan.skill_id):
+            if efst is None or not helps_mates(plan.skill_id):
                 continue
             cost = sp_cost(plan.skill_id, plan.level)
             if sp is not None and cost is not None and sp < cost:
                 continue              # SP 不夠：安靜跳過，也不要占著路
-            reach = skill_range(plan.skill_id, plan.level) or MATE_MAX_CELLS
+            reach = self._reach_for(plan)
             for mate in mates:
                 key = (plan.skill_id, mate.aid)
                 until, _ = self._mate_retry.get(key, (0.0, 0.0))
@@ -505,7 +599,7 @@ class BuffKeeper:
         self._said_no_pos = False
         for plan in self._plans:
             efst = buff_efst(plan.skill_id)
-            if efst is None or not can_target_others(plan.skill_id):
+            if efst is None or not helps_mates(plan.skill_id):
                 continue
             until, _ = self._retry.get(plan.skill_id, (0.0, 0.0))
             if now < until:
@@ -514,11 +608,7 @@ class BuffKeeper:
             if sp is not None and cost is not None and sp < cost:
                 self.stats.waiting_sp += 1
                 continue
-            # 用**技能自己的射程**（查不到才退回保守值）。夾小的話會變成
-            # 「隊友明明放得到卻不放」—— 那是使用者這次指出的問題。
-            reach = skill_range(plan.skill_id, plan.level)
-            if reach is None:
-                reach = MATE_MAX_CELLS
+            reach = self._reach_for(plan)
             for mate in mates:
                 key = (plan.skill_id, mate.aid)
                 if key in self._mate_pending:
@@ -538,7 +628,9 @@ class BuffKeeper:
                 # 詠唱一開始就被自己人打斷。（整段停多久由 `_mind_the_road`
                 # 決定，這裡只是確保這一發送出去的瞬間路是淨空的。）
                 self._hold(CAST_HOLD)
-                data = build_use_skill(plan.level, plan.skill_id, mate.aid)
+                # ⚠ 範圍型要把目標填**自己**（填隊友伺服器會丟掉，[DAT-045]）。
+                target = cast_target_of(plan.skill_id, mate.aid, self._aid)
+                data = build_use_skill(plan.level, plan.skill_id, target)
                 if not self._send(data):
                     self._release()
                     return self._note(f"{skill_name(plan.skill_id)} 送不出去")
