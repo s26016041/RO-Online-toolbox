@@ -87,13 +87,34 @@ DOOR_CLEAR = KEEP_OUT + 1
 #:
 #: ⚠ 每退一次要多跑一次 BFS，所以要有上限。用完**不是失敗**：照原本的路線走，
 #: 每進一張圖之前都會再驗一次（見 `_replan`）。
-ROUTE_TRIES = 8
+#: ⚠⚠ **本來是 8，不夠。** prontera 通往 prt_in 有 **15 道門**，而能走到
+#: 道具商人那一間的**只有 1 道**（(134,221)）。試 8 次還沒找到就放棄，
+#: 而且放棄時會把學到的黑名單**整個丟掉**（`self._avoid = keep`），
+#: 照原本那條走進錯的房間 —— 實機就是這樣，重算 40 次然後補給失敗。
+#:
+#: 實測（prontera → prt_in，目標是商人那一格）：
+#:     ROUTE_TRIES=8   挑到 (50,228)  ← 錯的房間
+#:     ROUTE_TRIES=20  挑到 (134,221) ← 唯一正確的那道，排除 11 道，10 ms
+ROUTE_TRIES = 20
 #: 一次規劃裡最多做幾次**沒算過的**泛洪。一次約 0.1 秒（實測 400×400），
 #: 整條路線幾十段都現算的話換一次圖就要卡好幾秒。
 #:
 #: ⚠ 這是**看多遠**的預算，不是「驗不完就當它是好的」的藉口 ——
 #: 沒驗到的段落等真的走到那張圖再驗，那時它會變成第一段。
-FILL_BUDGET = 4
+#: ⚠⚠ **本來是 4，太小了。** 實機 2026-08-29（狐狐狸回 prontera 補水）：
+#: prontera 通往 prt_in 有 **15 道門**，光是排除走不到的就用掉 4 次額度，
+#: 於是真正被採用的那道門 `_dead_end()` **一次都沒驗到** ——
+#: 額度用完時它 `break` 然後回 None，而 None 的意思是「沒問題」。
+#: 結果人被放在 prt_in (180,97)、商人在 (126,76)，兩間房永遠走不到彼此，
+#: 接著同一條路重算 40 次才放棄，藥水一瓶都沒補。
+#:
+#: 泛洪其實很便宜（實測 prt_in 300×200 只要 **0.9 ms**；戶外圖 82 ms 但那種
+#: 圖本來就是一整塊，很少需要判斷）。而且 `_entry_reach` 會把結果快取起來，
+#: 同一個落地點整趟只算一次 —— 加大額度不會隨重算次數放大。
+FILL_BUDGET = 24
+#: 同一張圖裡最多找幾層房間（見 `Traveler._inner_hop`）。
+#: 吉芬塔實測 20 個內部傳點，10 層綽綽有餘；有上限是因為每一層都要泛洪一次。
+_INNER_HOPS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,15 +661,29 @@ class Traveler:
         ⚠ 判斷不了（地形讀不到、泛洪預算用完）就**不擋**：「不確定」不等於
         「走不到」。沒驗到的段落等真的走到那張圖再驗 —— 那時它就是第一段。
         """
-        for index, hop in enumerate(route):
+        # ⚠ **最後一段先驗。** 它問的是「落地之後走不走得到目的地那一格」——
+        # 整趟的成敗就在這一題。照順序驗的話，前面幾段先把額度吃光，
+        # 最重要的那一段反而沒驗到（實機就是這樣走進錯的房間的）。
+        order = list(range(len(route)))
+        if len(order) > 1:
+            order = [order[-1]] + order[:-1]
+        for index in order:
+            hop = route[index]
             if self._fills <= 0:
-                break  # 這一拍看到這裡為止，剩下的等走到那張圖再說
+                # 額度用完 = **沒驗到**，不是「驗過沒問題」。講一句，
+                # 不然事後看不出「為什麼那道門沒被擋下來」。
+                log.info("路線驗到一半額度用完（%d 段），剩下的等走到那張圖再驗",
+                         len(route))
+                break
             if hop.npc:
                 continue  # 要跟人講話才過得去：過去之後落在哪裡我們不知道
             nxt = route[index + 1] if index + 1 < len(route) else None
             if nxt is None:
                 if self._goal_cell is None:
-                    return None  # 進得了那張圖就算抵達，不必判斷房間
+                    # 進得了那張圖就算抵達，不必判斷房間。
+                    # ⚠ 這裡是 `continue` 不是 `return`：最後一段現在**排在最前面**
+                    # 驗（見上面），直接 return 會把整條路線的檢查一起取消掉。
+                    continue
                 wanted = [self._goal_cell]
             else:
                 wanted = [nxt.cell]
@@ -879,6 +914,73 @@ class Traveler:
         near.sort(key=lambda h: max(abs(h.x - pos[0]), abs(h.y - pos[1])))
         return near
 
+    def _inner_hop(self, terrain, map_name: str, pos: tuple[int, int],
+                   targets: list[tuple[int, int]]):
+        """同一張圖裡走不到目標時，**下一個該踩的「同圖傳點」**。沒有就回 None。
+
+        ## 為什麼需要
+
+        使用者實測 2026-08-29（吉芬塔）：
+
+            gef_tower 上從 (52, 177) 到 gef_dun00 傳點 (153, 28) 的路徑…
+            ⚠ gef_tower 上走不到任何一道通往 gef_dun00 的傳點
+
+        而使用者說「明明傳點就在正前方」—— 兩件事都對。`gef_tower` 有
+        **21 個傳點，其中 20 個是塔內部的**（爬樓用），出去 `gef_dun00` 的
+        只有 (153,28)，跟角色站的那一塊**不連通**（那塊 1898 格 / 全圖 7397 格）。
+
+        規劃是**地圖層級**的（[DAT-032]）：它只知道「gef_tower 上有一道門通往
+        gef_dun00」，表達不出「同一張圖裡要先踩幾次內部傳點換房間」。
+        於是每次都算同一條算不出來的路，然後放棄。
+
+        ## 怎麼做
+
+        把「同一張圖」看成一張**房間圖**：節點是連通塊，邊是同圖傳點。
+        從現在站的那一塊開始廣度優先，找到第一條走得到目標的鏈，
+        回傳**這條鏈的第一步**（一個內部傳點的格子）。踩下去之後人會被挪到
+        別的房間，下一拍重算就會接著找下一步 —— 自然地一段一段接上去。
+
+        泛洪很便宜（實測室內圖 0.9 ms），而且每一塊只算一次。
+        """
+        inner = [
+            (x, y, dx, dy)
+            for x, y, dest, dx, dy in warps_on_map(map_name)
+            if dest == map_name
+        ]
+        if not inner:
+            return None
+        wanted = [c for c in (nearest_walkable(terrain, t) for t in targets) if c]
+        if not wanted:
+            return None
+        start = nearest_walkable(terrain, pos, radius=START_SNAP)
+        if start is None:
+            return None
+        here = terrain.reachable_from(start)
+        if any(cell in here for cell in wanted):
+            return None          # 走得到，不必換房間
+
+        seen = {start}
+        # 佇列：(這一塊走得到哪些格, 這條鏈的第一步)
+        queue = [(here, None)]
+        for _ in range(_INNER_HOPS):
+            if not queue:
+                break
+            reach, first = queue.pop(0)
+            for x, y, dx, dy in inner:
+                door = nearest_walkable(terrain, (x, y))
+                if door is None or door not in reach:
+                    continue
+                land = nearest_walkable(terrain, (dx, dy), radius=START_SNAP)
+                if land is None or land in seen:
+                    continue
+                seen.add(land)
+                step = first or door
+                beyond = terrain.reachable_from(land)
+                if any(cell in beyond for cell in wanted):
+                    return step
+                queue.append((beyond, step))
+        return None
+
     def _start_leg(self, map_name: str, pos: tuple[int, int]) -> str:
         terrain = self._terrain
         if terrain is None:
@@ -896,8 +998,17 @@ class Traveler:
             log.info("正在計算 %s 上從 %s 到目的地 %s 的路徑…", map_name, pos, goal)
             path, avoid = self._path_to(terrain, map_name, pos, goal)
             if not path:
-                self.note = f"⚠ {map_name} 上走不到 {goal}"
-                return self._give_up_leg(map_name)
+                # 目的地在別的房間 —— 先踩同圖傳點換過去（見 `_inner_hop`）。
+                # 實機踩過：回城補水挑了 prt_in 的商人，但門把人放在
+                # 走不到商人的那一間，重算 40 次然後放棄。
+                inner = self._inner_hop(terrain, map_name, pos, [goal])
+                if inner is not None:
+                    log.info("%s 上走不到 %s，先踩同圖傳點 %s 換房間",
+                             map_name, goal, inner)
+                    path, avoid = self._path_to(terrain, map_name, pos, inner)
+                if not path:
+                    self.note = f"⚠ {map_name} 上走不到 {goal}"
+                    return self._give_up_leg(map_name)
             self._walker.set_path(path, avoid=avoid)
             self._walker.update(pos)
             self.note = self._progress_note()
@@ -939,6 +1050,22 @@ class Traveler:
                 options = options[:index] + self._reachable_gates(
                     terrain, pos, options[index:]
                 )
+        # 一道門都走不到 —— 先別放棄：這張圖可能是**好幾個互不相連的房間**，
+        # 要先踩同圖的內部傳點換過去（吉芬塔就是這樣，見 `_inner_hop`）。
+        inner = self._inner_hop(
+            terrain, map_name, pos, [hop.cell for hop in self._gate_options(map_name)]
+        )
+        if inner is not None:
+            log.info("%s 上走不到通往 %s 的門，先踩同圖傳點 %s 換房間",
+                     map_name, self._route[0].to_map, inner)
+            # 目標本身就是一道傳點 —— `_warp_avoid()` 本來就不會擋住目標，
+            # 跟走去「通往下一張圖的門」是同一件事。
+            path, avoid = self._path_to(terrain, map_name, pos, inner)
+            if path:
+                self._walker.set_path(path, avoid=avoid)
+                self._walker.update(pos)
+                self.note = f"{map_name} 上先換個房間…"
+                return "walking"
         self.note = f"⚠ {map_name} 上走不到任何一道通往 {self._route[0].to_map} 的傳點"
         return self._give_up_leg(map_name)
 
