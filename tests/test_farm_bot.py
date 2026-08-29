@@ -618,13 +618,65 @@ def test_getting_warped_teaches_the_cell(monkeypatch):
     資料永遠會有漏網的（傳點是一片、只取樣幾點），所以踩到就記住，
     這次開著的期間都不再走那一段。"""
     bot = FarmBot(1234)
-    bot._recent.extend([(10, 10), (12, 10), (14, 10)])
+    bot._map = "prt_fild08"
+    bot._recent.extend([("prt_fild08", (10, 10)), ("prt_fild08", (12, 10)),
+                        ("prt_fild08", (14, 10))])
     monkeypatch.setattr(type(bot._walker), "target",
                         property(lambda _self: (20, 10)))
     bot._learn_warp("prt_fild08")
     learned = bot._learned["prt_fild08"]
     assert (14, 10) in learned and (20, 10) in learned
     assert (17, 10) in learned, "中間那段是伺服器走的，也要記"
+
+
+def test_coordinates_from_the_new_map_are_not_learned_as_warps():
+    """⚠⚠ 2026-08-30 實機災難：一次學了 347 格、652 格「傳點」。
+
+    座標 0.2 秒取樣一次、地圖名以前 2 秒才看一次，所以換圖之後那 2 秒裡
+    `_recent` 裝的是**新地圖**的座標。連成線就是一條橫跨整張圖的假傳點帶，
+    禁區再往外擴 3 格之後整張圖算不出路，45 秒沒進展就自己關掉自動打怪
+    （使用者：「他自動關閉自動戰鬥」）。
+    """
+    bot = FarmBot(1234)
+    bot._recent.extend([("mjolnir_07", (378, 358)), ("mjolnir_08", (32, 346))])
+    bot._learn_warp("mjolnir_07")
+    learned = bot._learned.get("mjolnir_07", set())
+    assert (32, 346) not in learned, "那是新地圖的座標"
+    assert (200, 350) not in learned, "更不准把兩張圖之間連成一條線"
+    assert learned <= {(378, 358)}, f"只該留舊圖那一點，卻學了 {len(learned)} 格"
+
+
+def test_a_jump_no_body_could_walk_is_thrown_away():
+    """就算地圖名對得上，跳幾百格的那一段也不是走出來的 —— 不准連。"""
+    bot = FarmBot(1234)
+    bot._recent.extend([("prt_fild08", (10, 10)), ("prt_fild08", (300, 300)),
+                        ("prt_fild08", (302, 300))])
+    bot._learn_warp("prt_fild08")
+    learned = bot._learned["prt_fild08"]
+    assert (150, 150) not in learned, "跳太遠的那一段是假的"
+    assert (301, 300) in learned, "後面那段是真的走出來的，照樣要學"
+    assert len(learned) < 20
+
+
+def test_learning_stops_before_it_seals_the_whole_map(caplog):
+    """學過頭代表判斷本身壞了 —— 停下來大聲說，不要安靜地把地圖封死。"""
+    from ro_toolbox.services.farm_bot import _LEARN_MAX_CELLS
+
+    bot = FarmBot(1234)
+    bot._learned["prt_fild08"] = {(x, 0) for x in range(_LEARN_MAX_CELLS)}
+    bot._recent.extend([("prt_fild08", (10, 10)), ("prt_fild08", (12, 10))])
+    with caplog.at_level("WARNING"):
+        bot._learn_warp("prt_fild08")
+    assert (12, 10) not in bot._learned["prt_fild08"]
+    assert "不再學" in caplog.text
+
+
+def test_nothing_is_learned_when_no_point_belongs_to_that_map():
+    """一點都不屬於那張圖時，寧可不學 —— 學了會擋到沒事的路。"""
+    bot = FarmBot(1234)
+    bot._recent.extend([("mjolnir_08", (32, 346))])
+    bot._learn_warp("mjolnir_07")
+    assert not bot._learned.get("mjolnir_07")
 
 
 def test_learned_cells_go_into_the_no_go_zone(monkeypatch):

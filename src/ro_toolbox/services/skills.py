@@ -57,6 +57,10 @@ from ro_toolbox.services.memory_scan import MemoryScanner
 
 log = logging.getLogger(__name__)
 
+#: SP 對不上幾個以上才算「整批」（還要同時過半）。
+#: 一兩個是可選施放等級的技能，天天都會有；那不是改版的訊號。
+_SP_MISMATCH_LOUD = 3
+
 #: 結構欄位（int32 索引，不是 byte 位移）。出處見模組開頭。
 #: 這是**同一個結構內部**的欄位距離，屬於「大更新才會壞」的類別，
 #: 允許寫死（CLAUDE.md）。跨結構的距離一律不准這樣算。
@@ -491,25 +495,39 @@ class SkillReader:
         整批都對不上通常代表改版動了結構版面，那是該回頭看 GAMEDATA 的訊號。
         """
         table = skill_table()
-        checked = bad = 0
+        checked = 0
+        odd: list[str] = []
         for skill in skills:
             costs = (table.get(skill.id) or {}).get("sp")
             if not costs or not 1 <= skill.level <= len(costs):
                 continue
             checked += 1
             if costs[skill.level - 1] != skill.sp:
-                bad += 1
+                odd.append(f"{skill.name} Lv{skill.level} "
+                           f"記憶體 {skill.sp}／表 {costs[skill.level - 1]}")
+        bad = len(odd)
         # ⚠ 5 秒一輪的刷新下，這一句不節流就是每 5 秒一行 WARNING。
         #   數字沒變就別再講（改版的話這個比例會跳，那時候才要再吼一次）。
-        if checked and bad and (bad, checked) != self._said_sp:
-            self._said_sp = (bad, checked)
+        if not bad:
+            self._said_sp = None
+            return
+        if (bad, checked) == self._said_sp:
+            return
+        self._said_sp = (bad, checked)
+        # ⚠⚠ **一兩個對不上不是改版**。實測就有：治癒術可以自己選施放等級，
+        # 記憶體存的是「上次選的那一級」的消耗，表裡放的是滿級的 —— 本來就不同。
+        # 每次開程式都吼一句「可能是改版動了結構版面」只會讓真的改版被當成雜訊
+        # （使用者 2026-08-30 貼上來問「還有奇怪的」就是這一句）。
+        # 整批對不上才是版面出事的形狀，那時候才吼。
+        if bad * 2 >= checked and bad >= _SP_MISMATCH_LOUD:
             log.warning(
                 "有 %d/%d 個技能的 SP 跟 skillinfolist.lub 對不上 —— "
-                "可能是改版動了結構版面，請重跑 tools/build_skill_table.py 並核對",
-                bad, checked,
+                "可能是改版動了結構版面，請重跑 tools/build_skill_table.py 並核對：%s",
+                bad, checked, "、".join(odd[:5]),
             )
-        elif not bad:
-            self._said_sp = None
+        else:
+            log.info("%d/%d 個技能的 SP 跟表對不上（多半是可選施放等級的技能）：%s",
+                     bad, checked, "、".join(odd[:5]))
 
     def close(self) -> None:
         if self._character is not None:

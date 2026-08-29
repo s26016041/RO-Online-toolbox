@@ -442,3 +442,43 @@ def test_the_online_check_reuses_one_character_reader(reader, clock):
     r.read()
     r.read()
     assert OnlineCharacter.attaches == 1
+
+
+# ---- SP 對照的音量 ---------------------------------------------------------
+
+
+def test_one_odd_skill_is_not_shouted_about(monkeypatch, caplog):
+    """⚠ 一兩個對不上**不是改版**。
+
+    治癒術可以自己選施放等級，記憶體存的是上次選的那一級、表裡是滿級的 ——
+    本來就不同。每次開程式都吼「可能是改版動了結構版面」，只會讓真的改版
+    被當成雜訊（使用者 2026-08-30 貼上來問「還有奇怪的」就是這一句）。
+    """
+    from ro_toolbox.services import skills as mod
+    from ro_toolbox.services.skills import Skill
+
+    table = {n: {"sp": [10]} for n in range(1, 16)}
+    rows = [Skill(id=n, key=f"K{n}", name=f"技能{n}", level=1, max_level=10, sp=10)
+            for n in range(1, 16)]
+    rows[0] = Skill(id=1, key="AL_HEAL", name="治癒術", level=1, max_level=10, sp=13)
+    monkeypatch.setattr(mod, "skill_table", lambda: table)
+    reader = SkillReader()
+    with caplog.at_level("INFO"):
+        reader._check_sp(rows)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+    assert "治癒術" in caplog.text, "還是要留下記錄，只是不用吼"
+
+
+def test_a_whole_batch_going_wrong_is_still_loud(monkeypatch, caplog):
+    """整批對不上才是版面出事的形狀 —— 那時候一定要吼。"""
+    from ro_toolbox.services import skills as mod
+    from ro_toolbox.services.skills import Skill
+
+    table = {n: {"sp": [10]} for n in range(1, 16)}
+    rows = [Skill(id=n, key=f"K{n}", name=f"技能{n}", level=1, max_level=10, sp=99)
+            for n in range(1, 16)]
+    monkeypatch.setattr(mod, "skill_table", lambda: table)
+    reader = SkillReader()
+    with caplog.at_level("WARNING"):
+        reader._check_sp(rows)
+    assert "改版" in caplog.text

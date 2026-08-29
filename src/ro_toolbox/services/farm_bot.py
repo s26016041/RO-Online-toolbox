@@ -173,7 +173,21 @@ _LOOT_TIMEOUT = 8.0  # 撿不到就放棄這一個，別卡住
 #: 怪打我之後多久內還算「正在打我」。太長會去追已經跑掉的怪。
 _AGGRO_SEC = 12.0
 _FROZEN_SEC = 45.0  # 完全沒進展（沒移動、沒擊殺、沒撿到）這麼久就停下來喊人
-_RESYNC_SEC = 2.0  # 多久檢查一次「地圖／連線有沒有換掉」
+#: 多久撈一次 TCP 表看「連線有沒有換掉」。**只管連線，不管地圖** ——
+#: 地圖名是一次記憶體讀取，每一拍都看得起，而且非看不可（見 `_keep_in_sync`）。
+_RESYNC_SEC = 2.0
+#: 相鄰兩拍的座標最多可能差幾格。一拍 `_TICK` 秒、一步最多 `MAX_STEP` 格，
+#: 再放寬一倍當餘裕。
+#:
+#: ⚠⚠ **超過這個距離的一段不是走出來的**，是其中一點已經在**別張地圖**了。
+#: 2026-08-30 實機踩過：`_learn_warp` 把這種段連起來，一次記了 347 格、
+#: 652 格「傳點」到 mjolnir_07／mjolnir_08 上（真的傳點帶只有幾十格），
+#: 禁區再往外擴 `KEEP_OUT` 格之後整張圖幾乎算不出路，45 秒沒進展就
+#: `_fail()` —— 使用者看到的是「他自動關閉自動戰鬥」。
+_LEARN_MAX_JUMP = MAX_STEP * 2
+#: 一張圖最多學到幾格傳點。學過頭代表判斷本身壞了，繼續學只會把圖封死；
+#: 那時候寧可**不再學**並大聲說一句，也不要安靜地把地圖變成不能走。
+_LEARN_MAX_CELLS = 400
 #: 負重到幾成就收工（使用者 2026-08-29 指定：**90% 含**就回程並關掉自動打怪）。
 #:
 #: ⚠ 掛機**不補給**：撿到走不動就該回城，繼續打只是把撿到的東西丟在地上。
@@ -273,8 +287,11 @@ class FarmBot:
         self._map = ""  # 目前綁定的地圖，換圖要重新載地形
         #: 按下自動打怪時人在哪張圖。**被傳走就走回這裡**（使用者指定的行為）。
         self._home_map = ""
-        #: 這張圖上最近幾拍的位置。被傳走時用來回推「踩到哪裡出事」。
-        self._recent: deque[tuple[int, int]] = deque(maxlen=4)
+        #: 最近幾拍的 `(地圖, 位置)`。被傳走時用來回推「踩到哪裡出事」。
+        #: ⚠ **一定要帶地圖名**：座標與地圖名是兩次獨立的記憶體讀取，
+        #: 換圖那一瞬間可能只更新了其中一個，不帶名字就會把新地圖的座標
+        #: 當成舊地圖的傳點學進去（見 `_LEARN_MAX_JUMP`）。
+        self._recent: deque[tuple[str, tuple[int, int]]] = deque(maxlen=4)
         #: {地圖: 實際被傳走過的格子}。**量到的事實**，不是猜的 ——
         #: 地圖名變了就是真的被傳走了。只活在這一次執行裡。
         self._learned: dict[str, set[tuple[int, int]]] = {}
@@ -518,7 +535,8 @@ class FarmBot:
             pos = self._reader.read_position() if self._reader else None
             if pos is not None:
                 # 被傳走時要回推「踩到哪裡出事」，所以隨手記著最近幾拍的位置。
-                self._recent.append(pos)
+                # ⚠ 記的時候就把**當下的地圖**綁上去，事後才分得出哪幾點可信。
+                self._recent.append((self._map, pos))
 
             # ⚠ 被傳到別張圖了：這一拍只做一件事 —— 走回去。
             # **一定要排在 `_escape_warp` 前面**：剛落地時人就站在回程傳點旁邊，
@@ -615,15 +633,23 @@ class FarmBot:
         這正是規範說的「安靜地做錯事」，所以要主動偵測並重綁。
         回傳 False = 重綁失敗，要大聲停用。
         """
-        if now - self._resync_at < _RESYNC_SEC or self._reader is None:
+        if self._reader is None:
             return True
-        self._resync_at = now
+        # ⚠⚠ **地圖名每一拍都要看。** 以前它跟連線一起被 `_RESYNC_SEC` 節流，
+        # 換圖最慢 2 秒才發現 —— 但座標是 `_TICK`（0.2 秒）取樣一次的，
+        # 那 2 秒裡 `_recent` 早就裝滿**新地圖**的座標了，`_learn_warp` 再把
+        # 新舊兩張圖的座標連成一條線，一次記幾百格假傳點（2026-08-30 實機）。
+        # 讀地圖名只是一次記憶體讀取，很便宜；貴的是 `find_server()`（撈 TCP 表），
+        # 那個才需要節流。
         status = self._reader.read()
-        server = find_server(self._pid)
         map_changed = status is not None and status.map_name and status.map_name != self._map
+        due = now - self._resync_at >= _RESYNC_SEC
+        server = find_server(self._pid) if due else None
+        if due:
+            self._resync_at = now
         server_changed = server is not None and server != self._server
         if not (map_changed or server_changed):
-            if server is None and self._server is not None:
+            if due and server is None and self._server is not None:
                 self._fail("⚠ 遊戲連線已中斷，自動打怪已停止")
                 return False
             return True
@@ -658,6 +684,9 @@ class FarmBot:
                 self._terrain = None
                 log.warning("新地圖沒有地形檔，不會漫遊：%s", exc)
             # 換圖之後舊的怪、掉落、走位、漫遊目標全部作廢
+            # ⚠ `_recent` 也要清：留著的話，新圖上頭幾拍會跟舊圖的座標混在一起，
+            # 萬一 0.8 秒內又被傳走，回推出來的又是一條橫跨兩張圖的假線。
+            self._recent.clear()
             self._world.clear()
             self._walker.clear()
             self._roam_goal = None
@@ -1181,21 +1210,44 @@ class FarmBot:
         只活在這一次執行裡。存到檔案的話，遊戲改版動了傳點就會擋到沒事的地方，
         而且沒有徵兆 —— 寧可每次重學（一次就夠）。
         """
-        points = list(self._recent)
+        # ⚠ 只信「確定是在那張圖上讀到的」那幾點（`_recent` 有帶地圖名）。
+        points = [cell for where, cell in self._recent if where == old_map]
         if not points:
+            log.warning("⚠ 在 %s 被傳走了，但最近幾拍的座標都不屬於那張圖，"
+                        "這次不學（學了會擋到沒事的路）", old_map)
             return
         target = self._walker.target
         if target is not None:
             points.append(target)
-        span: set[tuple[int, int]] = set(points)
+
+        # ⚠⚠ **一段一段檢查距離**。相鄰兩拍差超過 `_LEARN_MAX_JUMP` 格的
+        # 「一段」不是走出來的 —— 那條線橫跨整張圖，連起來就是幾百格假傳點。
+        span: set[tuple[int, int]] = {points[-1]}
+        dropped = 0
         for a, b in zip(points, points[1:], strict=False):
+            if max(abs(a[0] - b[0]), abs(a[1] - b[1])) > _LEARN_MAX_JUMP:
+                dropped += 1
+                span.clear()          # 這一點之前的都不可信，重新開始
+                span.add(b)
+                continue
+            span.add(a)
             span.update(line_cells(a, b))
+        if dropped:
+            log.warning("⚠ %s 的傳點回推丟掉 %d 段（座標跳太遠，多半是換圖那一拍"
+                        "讀到新地圖的座標）—— 只學剩下的部分", old_map, dropped)
+
         learned = self._learned.setdefault(old_map, set())
         before = len(learned)
+        if before >= _LEARN_MAX_CELLS:
+            log.warning("⚠ %s 已經學到 %d 格傳點（上限 %d），不再學 ——"
+                        "再學下去整張圖會算不出路。這通常代表座標讀取有問題",
+                        old_map, before, _LEARN_MAX_CELLS)
+            return
         learned |= span
         log.warning("⚠ 在 %s 被傳走了（最後看到 %s，正要走去 %s）——"
                     "把這一段 %d 格記成傳點，這次開著的期間都不再踩",
-                    old_map, points[-2] if len(points) > 1 else points[-1], target,
+                    old_map, points[-2] if len(points) > 1 else points[-1],
+                    target if target is not None else "沒有目標（站著）",
                     len(learned) - before)
 
     def _go_home_start(self, new_map: str, now: float) -> bool:

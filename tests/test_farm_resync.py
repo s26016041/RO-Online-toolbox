@@ -123,6 +123,21 @@ def test_send_failure_forces_rebind(monkeypatch):
     assert bot._resync_at == 0.0
 
 
+def test_a_map_change_is_noticed_on_the_very_next_tick(monkeypatch):
+    """⚠⚠ 地圖名**不准跟著連線一起節流**（2026-08-30 實機災難）。
+
+    座標 0.2 秒取樣一次，地圖名以前 2 秒才看一次 —— 中間那 2 秒
+    `_recent` 全裝新地圖的座標，`_learn_warp` 就把兩張圖連成一條線，
+    一次記幾百格假傳點，整張圖算不出路，最後自己關掉自動打怪。
+    """
+    bot = make_bot(monkeypatch)
+    monkeypatch.setattr(fb, "find_server", lambda pid: ("1.2.3.4", 10000))
+    bot._keep_in_sync(T0)                      # 這一拍用掉連線檢查的額度
+    bot._reader.map_name = "prt_fild08"
+    bot._keep_in_sync(T0 + 0.2)                # 還沒到 _RESYNC_SEC
+    assert bot._map == "prt_fild08", "換圖要當拍就發現，不能等節流"
+
+
 def test_check_is_throttled(monkeypatch):
     """不用每一拍都去列舉連線，太貴。"""
     calls = []

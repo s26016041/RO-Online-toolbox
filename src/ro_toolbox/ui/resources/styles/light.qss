@@ -345,3 +345,13 @@ QTabBar::tab:selected {
     color: #14406f;
     font-weight: 600;
 }
+
+/* ---- 自動寄信的設定說明（「自動尋路」下面那塊） ---- */
+QLabel#mailSummary {
+    background-color: #f2f7ff;
+    border: 1px solid #cfe0f7;
+    border-left: 3px solid #4a7fb5;
+    border-radius: 6px;
+    color: #33404f;
+    padding: 7px 10px;
+}

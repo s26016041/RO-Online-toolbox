@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import html
 import logging
 import time
 
@@ -213,6 +214,9 @@ class CharacterCard(QWidget):
     #: （使用者實際回報）。而且鎖死尺寸換一種字型或高 DPI 就會再夾一次。
     #: 讓它照內容自然長、只擋「不要太小」，字永遠不會被壓到。
     TRAVEL_BUTTON_MIN_W = 96
+    #: 「自動寄信」說明那塊的寬度上限。跟目的地選單同一欄，
+    #: 不設上限的話長道具名會把整條側欄撐開，把主欄擠掉。
+    MAIL_SUMMARY_MAX_W = 360
     TRAVEL_BUTTON_MIN_H = 34
     #: 按鈕左右的裝飾寬度（qss：內距 18px×2 ＋ 外框 1px×2，再留一點餘裕）。
     #: 寬度用「字寬 ＋ 這個」算出來，**不寫死像素** —— 字體與 DPI 一變，
@@ -306,6 +310,8 @@ class CharacterCard(QWidget):
         side_box.addWidget(self._make_travel_button(), 0, Qt.AlignmentFlag.AlignLeft)
         side_box.addWidget(self._make_pause_button(), 0, Qt.AlignmentFlag.AlignLeft)
         side_box.addWidget(self._make_destination_box())
+        # 自動寄信擺在目的地選單**下面**（使用者 2026-08-30 指定的位置）。
+        side_box.addWidget(self._make_mail_box())
         side_box.addStretch(1)
 
         top = QWidget()
@@ -532,6 +538,97 @@ class CharacterCard(QWidget):
                 f"{name} → {label}（{where}）{density_label(count)} {count}", where
             )
 
+    # ---- 自動寄信 ---------------------------------------------------
+
+    def _make_mail_box(self) -> QWidget:
+        """「寄信設定」按鈕 ＋ 下面那段「現在設定成什麼」的說明。
+
+        使用者 2026-08-30 指定：「自動寄信我要放在自動尋路選地圖的下面，
+        然後自動寄信啟動並選好之後他下面還要有文字說明：我的設定什麼東西、
+        幾個、寄給誰、目前那樣東西有幾個」。
+
+        ⚠ 說明是**看一眼就懂現在會不會寄**，所以每一列都要湊齊三件事：
+        寄什麼、要湊幾個、現在有幾個。少了「現在有幾個」就看不出還差多遠。
+        """
+        box = QWidget()
+        column = QVBoxLayout(box)
+        column.setContentsMargins(0, 6, 0, 0)
+        column.setSpacing(4)
+
+        self.mail_button = QPushButton("寄信設定")
+        # ⚠ 高度跟「自動尋路」一樣：qss 給 QPushButton 上下各 7px 內距，
+        #    不指定高度的話這顆會比旁邊矮一截。
+        self.mail_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
+        self.mail_button.setToolTip(
+            "挑背包裡的東西、各填一個數量、選寄給誰。"
+            "任何一樣湊到數量就自己寄一封 —— 不用等全部湊齊。"
+        )
+        self.mail_button.clicked.connect(self.mail_pressed)
+        column.addWidget(self.mail_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.mail_summary = QLabel()
+        self.mail_summary.setObjectName("mailSummary")
+        self.mail_summary.setTextFormat(Qt.TextFormat.RichText)
+        self.mail_summary.setWordWrap(True)
+        self.mail_summary.setMinimumWidth(self.TRAVEL_BUTTON_MIN_W)
+        self.mail_summary.setMaximumWidth(self.MAIL_SUMMARY_MAX_W)
+        self.mail_summary.hide()      # 沒設定就完全不佔位置
+        column.addWidget(self.mail_summary)
+        return box
+
+    def set_mail_summary(self, config, counts: dict[int, int] | None = None) -> None:
+        """把「寄什麼、幾個、給誰、現在有幾個」畫出來。沒啟用就整塊收起來。"""
+        if config is None or not config.usable:
+            self.mail_summary.hide()
+            return
+        have = counts or {}
+        lines = [
+            "<div style='font-weight:600'>自動寄信 → "
+            f"<span style='color:{self._MAIL_WHO}'>{html.escape(config.receiver)}</span>"
+            "</div>"
+        ]
+        for rule in config.rules:
+            name = html.escape(item_name(rule.item_id) or f"#{rule.item_id}")
+            now = have.get(rule.item_id, 0)
+            ready = now >= rule.amount
+            colour = self._MAIL_READY if ready else self._MAIL_WAIT
+            mark = "✔ 可以寄了" if ready else f"還差 {rule.amount - now}"
+            # ⚠ 一列要塞得下一行 —— 太長會折行，折出來的那半行很難看。
+            # 三件事的順序固定：寄什麼、要幾個、現在有幾個。
+            lines.append(
+                f"<div>{name} <b>{rule.amount}</b> 個（現有 <b>{now}</b>）"
+                f" <span style='color:{colour}'>{mark}</span></div>"
+            )
+        self.mail_summary.setText("".join(lines))
+        self.mail_summary.show()
+
+    @property
+    def _MAIL_WHO(self) -> str:      # noqa: N802 - 跟旁邊兩個顏色成套
+        return self._mail_colours()[0]
+
+    @property
+    def _MAIL_READY(self) -> str:    # noqa: N802
+        return self._mail_colours()[1]
+
+    @property
+    def _MAIL_WAIT(self) -> str:     # noqa: N802
+        return self._mail_colours()[2]
+
+    def _mail_colours(self) -> tuple[str, str, str]:
+        """(收件人, 湊夠了, 還在湊)。
+
+        ⚠ **不能寫死一組**：這支程式有明暗兩套佈景（`resources/styles/`），
+        淺色底上好看的深綠在深色底上會糊成一團。
+
+        ⚠⚠ 佈景是**用 QSS 換的，不是換 QPalette** —— 所以不能問
+        `self.palette()`，那回的永遠是系統的顏色，深色佈景下照樣說「這是淺色」
+        （實測：深色佈景抓圖出來，三個顏色跟淺色佈景一模一樣）。
+        要問就問設定檔裡現在選的是哪一套。
+        """
+        if current_settings().theme == "dark":
+            return ("#7fb3ff", "#5fd39a", "#e8c07d")
+        return ("#1f5fa8", "#1e8e56", "#a06a12")
+
     def pending_items(self):
         """還原存檔時選了、但**下拉裡還沒有**的道具編號（背包還沒讀到）。
 
@@ -606,12 +703,6 @@ class CharacterCard(QWidget):
         self.restock_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
         self.restock_button.clicked.connect(self.restock_pressed)
         head.addWidget(self.restock_button)
-        #: 自動寄信的設定（背包挑東西、數量、寄給誰、啟用）。
-        #: ⚠ 高度跟「補水」同一個理由：qss 的內距會把字夾扁（兩次回報過）。
-        self.mail_button = QPushButton("寄信設定")
-        self.mail_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
-        self.mail_button.clicked.connect(self.mail_pressed)
-        head.addWidget(self.mail_button)
         head.addStretch(1)
         box.addLayout(head)
 
@@ -1993,12 +2084,8 @@ class FarmPage(BasePage):
         who = self._names.get(pid, "")
         if card is None or not who:
             return
-        counts: dict[int, int] = {}
-        rows = self._bags.get(pid)
-        if rows:
-            for _slot, (item_id, amount) in rows.items():
-                counts[item_id] = counts.get(item_id, 0) + amount
-        elif pid not in self._bag_loaded:
+        counts = self._bag_counts(pid)
+        if not counts and pid not in self._bag_loaded:
             show_notice("寄信設定", "背包還在讀，等一下再按一次就看得到東西了。")
             return
 
@@ -2006,12 +2093,34 @@ class FarmPage(BasePage):
         if dialog.exec() and dialog.config is not None:
             self._apply_mail(pid, dialog.config)
 
+    def _bag_counts(self, pid: int) -> dict[int, int]:
+        """背包裡每種道具**總共**幾個（同一種散在好幾格要加起來）。"""
+        counts: dict[int, int] = {}
+        for _slot, (item_id, amount) in (self._bags.get(pid) or {}).items():
+            counts[item_id] = counts.get(item_id, 0) + amount
+        return counts
+
+    def _show_mail_summary(self, pid: int, counts: dict[int, int] | None = None) -> None:
+        """把「寄什麼、幾個、給誰、現在有幾個」寫在按鈕下面。
+
+        數量優先用**寄信那條自己看到的**（它每 3 秒重讀一次背包），
+        沒有才退回分頁這邊的背包快取。
+        """
+        card = self._cards.get(pid)
+        who = self._names.get(pid, "")
+        if card is None or not who:
+            return
+        card.set_mail_summary(mail_store.get(who), counts or self._bag_counts(pid))
+
     def _apply_mail(self, pid: int, config, save: bool = True) -> None:
         """套用寄信設定：存檔、然後照「啟用」決定要不要把 bot 帶起來。"""
         who = self._names.get(pid, "")
         if save and who:
             mail_store.save(who, config)
         bot = self._mails.get(pid)
+        card = self._cards.get(pid)
+        if card is not None:
+            card.set_mail_summary(config, self._bag_counts(pid))
         if not config.usable:
             if bot is not None:
                 self._mails.pop(pid, None)
@@ -2030,8 +2139,13 @@ class FarmPage(BasePage):
     def _mail_note(self, pid: int, stats) -> None:  # noqa: ANN001 - MailStats
         """⚠ 這裡**不記日誌** —— `MailBot._note()` 已經記過了，兩邊都記會印兩次。"""
         card = self._cards.get(pid)
-        if card is not None and stats.note:
+        if card is None:
+            return
+        if stats.note:
             card.set_note(stats.note)
+        # 寄信那條每 3 秒重讀一次背包 —— 說明裡的「現有幾個」就跟著它走。
+        if stats.counts:
+            self._show_mail_summary(pid, stats.counts)
 
     def _start_restock(self, pid: int, back_to: str = "") -> None:
         """按下「補水」：走去最近的藥水商人，補完跳通知。
@@ -2236,6 +2350,7 @@ class FarmPage(BasePage):
             return
         rows = self._bags.get(pid, {})
         card.set_slots(rows)
+        self._show_mail_summary(pid)
         if not rows:
             card.set_alert("⚠ 讀不到背包（AOB 定位失敗）")
             return
