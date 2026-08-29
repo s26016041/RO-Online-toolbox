@@ -277,6 +277,8 @@ class RestockBot:
         if self._walk(home, None) is not None:
             self.stats.came_back = True
             self._say(f"{self.stats.summary()}；已經走回 {where}")
+
+    def _home_count(self) -> int:
         """背包裡有幾個回程道具。**現查**，不存格號（[MEM-028]）。"""
         if not self._home_item:
             return 0

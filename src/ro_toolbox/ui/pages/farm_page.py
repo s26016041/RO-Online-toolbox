@@ -589,7 +589,11 @@ class CharacterCard(QWidget):
         head.addWidget(self.auto_potion)
         #: 按一下就去最近的藥水商人補一趟（不是開關，是一次性動作）。
         self.restock_button = QPushButton("補水")
-        self.restock_button.setFixedHeight(self.ROW_HEIGHT)
+        # ⚠ **不要鎖成 ROW_HEIGHT(26)** —— 跟「暫停」那顆同一個坑：
+        # qss 給 QPushButton 上下各 7px 內距 ＋ 1px 外框，光裝飾就吃掉 16px，
+        # 只剩十來個像素給字，**字會被壓扁**（使用者兩次回報）。
+        # 一樣只擋下限、讓它照內容自然長，換字型或高 DPI 都不會再夾一次。
+        self.restock_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
         self.restock_button.clicked.connect(self.restock_pressed)
         head.addWidget(self.restock_button)
         head.addStretch(1)

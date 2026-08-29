@@ -1471,3 +1471,18 @@ def test_not_coming_back_leaves_everything_off(monkeypatch, qtbot):
     page._resume_after_supplies(pid, card, _FakeRestock(came_back=False))
     assert not card.auto_potion.isChecked()
     assert not card.auto_hunt.isChecked()
+
+
+def test_the_restock_button_is_tall_enough_for_its_text(qtbot):
+    """⚠ 使用者兩次回報同一件事：「按鈕字被壓縮了」。
+
+    qss 給 QPushButton 上下各 7px 內距 ＋ 1px 外框，光裝飾就吃掉 16px ——
+    鎖成 ROW_HEIGHT(26) 只剩十來個像素給字。跟「暫停」那顆同一個坑。
+    """
+    card = make_card(qtbot)
+    button = card.restock_button
+    assert button.minimumHeight() >= card.TRAVEL_BUTTON_MIN_H
+    assert button.maximumHeight() > card.ROW_HEIGHT, "不准鎖死在一列的高度"
+    # 樣式表在測試裡沒套用，所以量不到真正的內距 —— 這裡釘的是
+    # 「不准鎖成固定 26」這個決定本身，那才是使用者踩到的東西。
+    assert button.minimumHeight() != button.maximumHeight(), "留給它自己長高"
