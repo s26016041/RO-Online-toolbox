@@ -10,6 +10,9 @@
    送一次封包（[PKT-061]），到了才開擷取是接不到的 —— 認不出商人就開不了店。
 3. **買**：`Restocker`（認人 → 開店 → 量單位重 → 買到負重 65%）。
    回程道具另外補到 20 個（`RestockOrder.home_needed()`）。
+   ⚠ 買完**一定要關掉商店視窗**（`0x09D4`）—— 對話開著時角色**不能移動**，
+   不關就走不回去（使用者實測回報）。
+4. **走回去**：回到出發時的那張圖。補完站在商人旁邊等於掛機停擺。
 
 ⚠ 這是**手動觸發**的一次性動作，不是常駐 bot：走完、買完、講一句話就收工。
 中途每一段都有放棄上限（不是成功依據），逾時就停下來說清楚卡在哪。
@@ -61,6 +64,10 @@ class RestockRun:
     #: 去哪家店（地圖代碼／中文名）。
     shop_map: str = ""
     shop_name: str = ""
+    #: 出發前在哪張圖（補完要走回去）。
+    home_map: str = ""
+    #: 走回去了沒。
+    came_back: bool = False
 
     def summary(self) -> str:
         """一句話講完這次補了什麼。給通知用。"""
@@ -139,6 +146,7 @@ class RestockBot:
             if known is None:
                 return
             self._buy(look, seller_cell, known)
+            self._go_back()
         except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
             log.exception("補水停了：%s", exc)
             self._say(f"補水停了：{exc}")
@@ -163,6 +171,7 @@ class RestockBot:
             return None
 
         here = status.map_name
+        self.stats.home_map = here
         sellers = potion_sellers_on(here)
         target_map = here
         if not sellers:
@@ -185,7 +194,7 @@ class RestockBot:
         cell = nearest_walkable(terrain, (x, y)) or (x, y)
         return target_map, cell, (x, y), look, name
 
-    def _walk(self, target_map: str, cell: tuple[int, int]) -> dict | None:
+    def _walk(self, target_map: str, cell: tuple[int, int] | None) -> dict | None:
         """走過去。回沿路看到的 NPC（認商人要用），走不到就回 None。"""
         bot = TravelBot(self._pid, destination=target_map, destination_cell=cell,
                         on_update=lambda s: self._say(s.note))
@@ -244,7 +253,23 @@ class RestockBot:
         self.stats.done = bool(shopper.stats.bought) or "不用補" in shopper.stats.note
         self._say(self.stats.summary() if self.stats.bought else shopper.stats.note)
 
-    def _home_count(self) -> int:
+    def _go_back(self) -> None:
+        """走回出發時那張圖。
+
+        補完站在商人旁邊等於掛機停擺 —— 使用者要的是「補完可以回原本練功點」。
+        ⚠ 這一段**失敗不算整趟失敗**：東西已經買到了，走不回去只是還要人自己走。
+        """
+        home = self.stats.home_map
+        if not home or self._stop.is_set():
+            return
+        if home == self.stats.shop_map:
+            self.stats.came_back = True
+            return          # 本來就在同一張圖，不用走
+        where = map_display_name(home) or home
+        self._say(f"買完了，走回 {where}…")
+        if self._walk(home, None) is not None:
+            self.stats.came_back = True
+            self._say(f"{self.stats.summary()}；已經走回 {where}")
         """背包裡有幾個回程道具。**現查**，不存格號（[MEM-028]）。"""
         if not self._home_item:
             return 0

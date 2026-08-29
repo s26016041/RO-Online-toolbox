@@ -54,6 +54,14 @@ OP_SHOP_LIST = 0x00C6
 OP_BUY = 0x00C8
 #: ↓ 買賣結果（ZC_PC_PURCHASE_RESULT）
 OP_BUY_RESULT = 0x00CA
+#: 關閉商店視窗。**payload 是空的**（長度表說 2 = 只有 opcode）。
+#:
+#: ⚠⚠ **買完一定要送這一包。** 商店對話開著的時候**角色不能移動** ——
+#: 買完不關就走不回練功點（使用者實測回報）。跟 [PKT-075] 的「最後那個
+#: 『離開』不按掉，傳送永遠不會發生」是同一類問題。
+#: 出處：使用者擷取的購買流程 `封包/購買藥水.txt` #29/#30 —— 買完
+#: （`0x00C8`）之後 29 ms 內連送兩次 `0x09D4`，payload 皆為空。
+OP_CLOSE_SHOP = 0x09D4
 #: ↓ 數值變動（ZC_PAR_CHANGE，type u16 + value u32）
 OP_PAR_CHANGE = 0x00B0
 #: ↓ 數值變動的大數版（ZC_LONGPAR_CHANGE，type u16 + value i32）
@@ -120,6 +128,11 @@ def contact_npc(gid: int) -> bytes:
 def choose_buy(gid: int) -> bytes:
     """↑ 0x00C5：在「買／賣」的選單選買。"""
     return struct.pack("<HIB", OP_ACK_DEAL_TYPE, gid, DEAL_BUY)
+
+
+def close_shop() -> bytes:
+    """關閉商店視窗。買完（或放棄）都要送 —— 不關的話角色動不了。"""
+    return OP_CLOSE_SHOP.to_bytes(2, "little")
 
 
 def buy_packet(orders: list[tuple[int, int]]) -> bytes:

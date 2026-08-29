@@ -384,3 +384,49 @@ def test_special_shops_are_still_listed_just_not_first():
     names = [r[2] for r in potion_sellers_on("izlude_in")]
     assert "高級藥水商人" in names
     assert names.index("道具商人") < names.index("高級藥水商人")
+
+
+# ---- 買完要把商店關掉（不然角色不能移動）----------------------------------
+
+
+def test_the_shop_is_closed_when_the_buying_is_done():
+    """⚠ 商店對話開著的時候**角色不能移動** —— 買完不關就走不回練功點。
+
+    使用者實測回報。跟 [PKT-075] 的「最後那個『離開』不按掉，傳送永遠不會
+    發生」是同一類問題。封包出處：`封包/購買藥水.txt` #29/#30。
+    """
+    bot, sent, _clock = make()
+    bot.start(LOOK, CELL)
+    bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
+    bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
+    bot.feed(*par(shop.SP_WEIGHT, 47000))          # 早就超過目標 → 一瓶都不買
+    bot.feed(*par(shop.SP_ZENY, 1_000_000))
+    bot.update()
+    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
+    bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50)))
+
+    assert bot.update() == "done"
+    assert sent[-1] == shop.close_shop(), "收尾一定要關店"
+
+
+def test_the_shop_is_closed_even_when_it_fails():
+    """失敗的路徑也要關 —— 那時候商店多半也開著。"""
+    bot, sent, _clock = make()
+    walk_up_to_the_shop_list(bot, sent, (611, 40))   # 只賣不相干的東西
+
+    assert bot.update() == "blocked"
+    assert sent[-1] == shop.close_shop()
+
+
+def test_the_close_packet_is_just_the_opcode():
+    """`0x09D4` 的 payload 是空的（長度表說 2 = 只有 opcode）。"""
+    assert shop.close_shop() == b"\xd4\x09"
+
+
+def test_a_shop_that_never_opened_is_not_closed():
+    """沒開過就不要送關閉 —— 送一包沒必要的封包不是無害的。"""
+    bot, sent, clock = make()
+    bot.start(LOOK, CELL)
+    clock.now += 999
+    assert bot.update() == "blocked"
+    assert shop.close_shop() not in sent

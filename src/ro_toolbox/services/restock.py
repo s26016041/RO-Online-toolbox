@@ -143,6 +143,8 @@ class Restocker:
         self._want: int | None = None
         self._step = ""                  # 現在在等什麼
         self._since = 0.0
+        #: 商店視窗開著嗎。**開著的時候角色不能移動** —— 收尾一定要關掉。
+        self._opened = False
         self.stats = RestockStats()
 
     # ---- 控制 -------------------------------------------------------
@@ -198,6 +200,7 @@ class Restocker:
             self._enter("等商品清單")
         elif opcode == shop.OP_SHOP_LIST and self._step == "等商品清單":
             self._items = shop.parse_shop_list(payload)
+            self._opened = True
             log.info("商店有 %d 項商品", len(self._items))
             if self._want is not None:
                 amount, self._want = self._want, None
@@ -240,7 +243,20 @@ class Restocker:
             return "working"
         return self._fail(why)
 
+    def _close_shop(self) -> None:
+        """把商店視窗關掉。**每一條收尾路徑都要走這裡。**
+
+        商店開著的時候角色**不能移動** —— 買完不關就走不回練功點
+        （使用者實測回報）。跟 [PKT-075] 的「最後那個『離開』不按掉，
+        傳送永遠不會發生」是同一類問題。
+        失敗的路徑也要關：那時候商店多半也開著。
+        """
+        if self._opened:
+            self._opened = False
+            self._send(shop.close_shop())
+
     def _fail(self, why: str) -> str:
+        self._close_shop()
         self.stats.running = False
         self.stats.note = why
         self._step = ""
@@ -248,6 +264,7 @@ class Restocker:
         return "blocked"
 
     def _finish(self, why: str) -> str:
+        self._close_shop()
         self.stats.running = False
         self.stats.note = why
         self._step = ""
