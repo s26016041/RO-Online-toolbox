@@ -1069,6 +1069,10 @@ class FarmPage(BasePage):
         self._deciders: dict = {}
         #: 已經講過「沒有快照」的角色。那條路每拍都會走到，不擋會洗版。
         self._no_snapshot_said: set = set()
+        #: 帳號頁裡沒有設定、**救不了**的角色。講一次就不要再碰。
+        self._no_account: set = set()
+        #: 每個角色上一句等待訊息（倒數每秒都會變一次，同一句只印一次）。
+        self._said_wait: dict = {}
         #: 角色 → 他上次連線正常時住在哪個 PID。**閃退偵測靠它** ——
         #: 分頁會跟著行程一起消失，只看分頁的話最需要救的情況沒人在看。
         self._watching: dict = {}
@@ -1453,12 +1457,19 @@ class FarmPage(BasePage):
                 self._no_snapshot_said.discard(who)
                 self._watching[who] = pid      # 記住他現在住在哪個行程
                 continue
+            if who in self._no_account:
+                continue        # 沒有帳號設定就救不了，已經講過一次了
             decider = self._deciders.setdefault(who, ReconnectDecider())
             state = decider.decide(False, local_network_up(), now)
             if state == RECONNECT:
                 self._begin_reconnect(pid, who, decider)
                 return
-            log.info("「%s」%s", who, decider.note)
+            # ⚠ 這一段**每秒都會走到**（退避可以長達 60 秒）。不擋就是一分鐘
+            #   60 行「還要等 N 秒」把日誌洗光（使用者實測回報）。
+            #   同一句才印一次 —— 倒數的每一秒都是同一件事。
+            if self._said_wait.get(who) != decider.note:
+                self._said_wait[who] = decider.note
+                log.info("「%s」%s", who, decider.note)
 
         if self._watch_for_crashes(now):
             return
@@ -1538,6 +1549,24 @@ class FarmPage(BasePage):
             # 「回連失敗之後就卡在那裡」。
             # 放回去的是那個已經關掉的 PID：下一拍照樣判定「行程不見了」，
             # 走同一個 decider，退避到期就自動再重連一次。
+            if "找不到角色" in why:
+                # ⚠ **這種失敗重試一萬次也不會成功** —— 帳號頁沒有這隻角色，
+                #   自動登入根本無從登起。舊版照樣走退避（30→60→…秒）並且
+                #   每秒印一行倒數，使用者看到的是「一直數，永遠不會好」。
+                #   講一次、記下來、不要再碰他。
+                self._no_account.add(who)
+                self._deciders.pop(who, None)
+                self._watching.pop(who, None)
+                log.error(
+                    "「%s」沒辦法自動回連：%s。"
+                    "要它自己重開的話，請到帳號頁把這隻角色的帳號設定加進去。",
+                    who, why,
+                )
+                show_notice(
+                    "自動回連停用",
+                    f"{who}：{why}。請到帳號頁補上這隻角色的帳號設定。",
+                )
+                return
             self._watching[who] = self._reconnect_pid
             log.warning("「%s」自動回連失敗：%s；%s", who, why,
                         self._reconnect_decider.note)

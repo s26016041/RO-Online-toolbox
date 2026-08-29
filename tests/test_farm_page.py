@@ -1248,3 +1248,76 @@ def test_the_plain_toast_still_closes_on_a_click(qtbot):
     toast.close = lambda: closed.append(1)
     toast.mousePressEvent(None)
     assert closed == [1]
+
+
+# ---- 自動回連：不要洗版，也不要救一個救不了的角色 --------------------------
+
+
+def _card(page, pid: int, who: str):
+    """放一張真的卡片進去 —— 收尾路徑會對它做 `tabs.indexOf()`，假物件會炸。"""
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    card = CharacterCard()
+    card.character = who
+    page._cards[pid] = card
+    page.tabs.addTab(card, who)
+    return card
+
+
+def _blank_page(monkeypatch, qtbot):
+    from ro_toolbox.services import window_list
+    from ro_toolbox.ui.pages.farm_page import FarmPage
+
+    monkeypatch.setattr(window_list, "enumerate_windows", lambda *a, **k: [])
+    page = FarmPage()
+    qtbot.addWidget(page)
+    page._scan_timer.stop()
+    page._read_timer.stop()
+    page._skill_timer.stop()
+    return page
+
+
+def test_the_reconnect_countdown_is_not_logged_every_second(monkeypatch, qtbot, caplog):
+    """退避可以長達 60 秒，每秒印一行就是一分鐘 60 行（使用者實測回報）。"""
+    import logging
+
+    from ro_toolbox.services import reconnect
+    from ro_toolbox.ui.pages import farm_page as page_mod
+
+    page = _blank_page(monkeypatch, qtbot)
+    _card(page, 1, "白狐")
+    page._names[1] = "白狐"
+    monkeypatch.setattr(page_mod, "find_server", lambda _pid: None)
+    monkeypatch.setattr(page_mod, "local_network_up", lambda: True)
+    monkeypatch.setattr(page_mod, "current_settings",
+                        lambda: type("S", (), {"auto_reconnect": True})())
+    decider = reconnect.ReconnectDecider()
+    decider.note = "上次重連失敗，還要等 42 秒"
+    monkeypatch.setattr(decider, "decide", lambda *a: "wait")
+    page._deciders["白狐"] = decider
+
+    with caplog.at_level(logging.INFO):
+        for _ in range(20):
+            page._watch_connections()
+    assert caplog.text.count("還要等 42 秒") == 1
+    page.shutdown()
+
+
+def test_a_character_with_no_account_is_left_alone(monkeypatch, qtbot, caplog):
+    """「帳號設定裡找不到角色」重試一萬次也不會成功 —— 講一次就別再碰。"""
+    import logging
+
+    from ro_toolbox.ui.pages import farm_page as page_mod
+
+    page = _blank_page(monkeypatch, qtbot)
+    _card(page, 1, "白狐")
+    page._no_account.add("白狐")
+    monkeypatch.setattr(page_mod, "find_server", lambda _pid: None)
+    monkeypatch.setattr(page_mod, "current_settings",
+                        lambda: type("S", (), {"auto_reconnect": True})())
+
+    with caplog.at_level(logging.INFO):
+        page._watch_connections()
+    assert "重連" not in caplog.text, "不該再喊重連"
+    assert "白狐" not in page._deciders, "不該再建 decider 去數秒"
+    page.shutdown()
