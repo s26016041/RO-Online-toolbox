@@ -34,6 +34,7 @@ import time
 from dataclasses import dataclass, field
 
 from ro_toolbox.core.ro_protocol import build_query, build_use_skill
+from ro_toolbox.services import cast_lock
 from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import skill_name, skill_table
 from ro_toolbox.services.party import PartyWatch
@@ -48,16 +49,25 @@ REFRESH_BELOW_MS = 10_000
 #: 隊友的只能從封包裡的 total 自己倒數 —— 誤差比較大，用比例比較穩，
 #: 而且幫別人放本來就該早一點（他不會等你）。
 MATE_REFRESH_RATIO = 0.5
-#: 幫隊友放的距離上限（格）。使用者 2026-08-29 指定：
-#: 「感覺幫隊友放要控制在隊友在我 5 格距離才會放，不然會無腦一直放」。
+#: 詠唱期間叫走路與打怪讓路的秒數。
 #:
-#: ⚠ 這是**上限**，不是唯一判準：技能自己的射程（`assets/skills.json.gz`
-#: 的 `range`）比較短的話以射程為準（例：塗毒射程 1，要貼著才放；
-#: 天使之賜福射程 9，會被這個上限夾到 5）。
+#: **移動與攻擊會打斷詠唱** —— 而自動打怪一路在送走路封包，所以不讓路的話
+#: 幫隊友放的每一發都會被自己人打斷（實機日誌連續三次「沒上身」，
+#: 使用者回報「反應很慢」）。使用者指定：幫隊友放 buff **最高優先**。
 #:
-#: 為什麼要夾：隊友位置只有在他**移動**的時候才會更新（`0x0107`，[PKT-084]），
-#: 而且他可能已經換圖了。放不到的時候伺服器只是安靜地丟掉，我們永遠等不到
-#: 狀態變化，於是那個技能一直重試 → 退避 → 再重試。距離擋住就不會空放。
+#: 抓 1.2 秒：一般補助技能的詠唱都在一秒內，上身之後 `_settle_mates()`
+#: 會馬上 `release()`，所以真正讓路的時間通常更短。
+CAST_HOLD = 1.2
+#: 查不到技能射程時，幫隊友放的距離上限（格）。
+#:
+#: **判準是技能自己的射程**（`assets/skills.json.gz` 的 `range`：天使之賜福
+#: 與加速術是 9、塗毒是 1）—— 使用者 2026-08-29 指定：
+#: 「隊友在我施放範圍、又沒有該 BUFF 或剩下時間不到一半，就要馬上幫他放」。
+#:
+#: ⚠ 同一天稍早先做過「一律夾在 5 格」，理由是使用者怕「無腦一直空放」。
+#: 那個顧慮現在由**退避**接住（`_mate_retry`：放不上去就 1→2→4…秒），
+#: 用不著再犧牲射程 —— 夾在 5 格的副作用是「隊友明明放得到卻不放」。
+#: 這個常數只在**查不到射程**時當保守預設。
 MATE_MAX_CELLS = 5
 #: 送出之後等這麼久還沒看到狀態上身，就當這一次沒成功。**只是放棄的上限**。
 CONFIRM_TIMEOUT = 5.0
@@ -199,7 +209,7 @@ class BuffKeeper:
     """
 
     def __init__(self, send, aid: int, read_statuses, now, party=None,
-                 read_position=None) -> None:
+                 read_position=None, hold=None, release=None) -> None:
         #: `send(data) -> bool`：把封包送出去。
         self._send = send
         #: 自己的 AID。對自己放補助技能就是把目標填自己（[PKT-041]）。
@@ -215,6 +225,14 @@ class BuffKeeper:
         self._read_position = read_position
         #: 「不知道自己在哪」講過了沒（不擋就是每拍一行）。
         self._said_no_pos = False
+        #: `hold(seconds)` / `release()`：叫走路與打怪讓路。
+        #:
+        #: **移動與攻擊會打斷詠唱**，而自動打怪一路在送走路封包 —— 不讓路的話
+        #: buff 每一次都被自己人打斷（實機：連續三次「沒上身」）。
+        #: 使用者指定「幫隊友放 buff 最高優先，高於打怪跟尋路」。
+        #: 見 `services/cast_lock.py`。
+        self._hold = hold or (lambda _seconds: None)
+        self._release = release or (lambda: None)
         #: 要不要幫隊友放（使用者在介面上勾）。
         self.help_mates = False
         self._plans: list[BuffPlan] = []
@@ -226,6 +244,14 @@ class BuffKeeper:
         self._last_mate_cast = 0.0
         #: (技能, 隊友AID) → 送出時刻。同一個目標的同一個技能一次只送一發。
         self._mate_pending: dict[tuple[int, int], float] = {}
+        #: (技能, 隊友AID) → (下次可以再試的時間, 目前的退避秒數)
+        #:
+        #: ⚠⚠ **一定要有。** 幫隊友放會叫打怪讓路（`cast_lock`），
+        #: 而放不上去的時候如果每 `MIN_GAP` 秒就重試一次，等於**一直占著路**，
+        #: 打怪永遠不動 —— 45 秒之後還會被「毫無進展」判定成卡住。
+        #: 放不上去的原因多半是短時間內好不了的（隊友換圖了、伺服器判定
+        #: 距離不夠、技能對他無效），退避才是對的。
+        self._mate_retry: dict[tuple[int, int], tuple[float, float]] = {}
         self.stats = BuffStats()
 
     def set_plans(self, plans) -> None:
@@ -235,6 +261,9 @@ class BuffKeeper:
         for skill_id in list(self._retry):
             if skill_id not in alive:
                 self._retry.pop(skill_id, None)
+        for key in list(self._mate_retry):
+            if key[0] not in alive:
+                self._mate_retry.pop(key, None)
         self.stats.unusable = {
             p.skill_id for p in self._plans if buff_efst(p.skill_id) is None
         }
@@ -320,16 +349,23 @@ class BuffKeeper:
             efst = buff_efst(skill_id)
             mate = self._mate(aid)
             name = skill_name(skill_id)
+            key = (skill_id, aid)
             if efst is not None and mate is not None and mate.has(efst, now):
-                del self._mate_pending[(skill_id, aid)]
+                del self._mate_pending[key]
+                self._mate_retry.pop(key, None)      # 成功了就把退避歸零
                 self.stats.mate_cast += 1
+                self._release()          # 上身了，馬上把路讓回去
                 return self._note(f"幫 {mate.label()} 補上 {name}")
             if now - sent_at < CONFIRM_TIMEOUT:
                 continue
-            del self._mate_pending[(skill_id, aid)]
+            del self._mate_pending[key]
+            self._release()
+            _, backoff = self._mate_retry.get(key, (0.0, 0.0))
+            backoff = min(BACKOFF_MAX, backoff * 2 if backoff else BACKOFF_START)
+            self._mate_retry[key] = (now + backoff, backoff)
             who = mate.label() if mate is not None else f"#{aid}"
-            log.info("幫「%s」放的「%s」沒上身，等下再試", who, name)
-            return self._note(f"{who} 的 {name} 沒上身，等下再試")
+            log.info("幫「%s」放的「%s」沒上身，%.0f 秒後再試", who, name, backoff)
+            return self._note(f"{who} 的 {name} 沒上身，{backoff:.0f} 秒後再試")
         return None
 
     def _mate(self, aid: int | None):
@@ -408,21 +444,35 @@ class BuffKeeper:
             if sp is not None and cost is not None and sp < cost:
                 self.stats.waiting_sp += 1
                 continue
+            # 用**技能自己的射程**（查不到才退回保守值）。夾小的話會變成
+            # 「隊友明明放得到卻不放」—— 那是使用者這次指出的問題。
             reach = skill_range(plan.skill_id, plan.level)
-            reach = MATE_MAX_CELLS if reach is None else min(reach, MATE_MAX_CELLS)
+            if reach is None:
+                reach = MATE_MAX_CELLS
             for mate in mates:
-                if (plan.skill_id, mate.aid) in self._mate_pending:
+                key = (plan.skill_id, mate.aid)
+                if key in self._mate_pending:
                     continue        # 這一發還在等結果，別重送
+                until, _ = self._mate_retry.get(key, (0.0, 0.0))
+                if now < until:
+                    continue        # 上一發沒上身，等退避時間到
                 if cells_between(me, mate.cell) > reach:
                     # 太遠 —— 伺服器只會安靜地丟掉，放了等於白放（見 MATE_MAX_CELLS）。
                     continue
                 if not self._party.needs(mate, efst, MATE_REFRESH_RATIO):
+                    # 他身上已經有了 —— 上一發其實成功了（只是確認來得晚），
+                    # 或別人幫他放了。退避沒有意義了，清掉：下次掉了要馬上補。
+                    self._mate_retry.pop(key, None)
                     continue
+                # ⚠ **先要求讓路再送。** 反過來的話走路那一拍已經送出去了，
+                # 詠唱一開始就被自己人打斷。
+                self._hold(CAST_HOLD)
                 data = build_use_skill(plan.level, plan.skill_id, mate.aid)
                 if not self._send(data):
+                    self._release()
                     return self._note(f"{skill_name(plan.skill_id)} 送不出去")
                 self._last_mate_cast = now
-                self._mate_pending[(plan.skill_id, mate.aid)] = now
+                self._mate_pending[key] = now
                 return self._note(
                     f"幫 {mate.label()} 補 {skill_name(plan.skill_id)} Lv{plan.level}"
                 )
@@ -505,6 +555,8 @@ class BuffBot:
         return True
 
     def stop(self, timeout: float = 3.0) -> None:
+        # ⚠ 收攤一定要放行：不放的話打怪會空等到 `MAX_HOLD` 才動。
+        cast_lock.release(self._pid)
         self._stop.set()
         thread = self._thread
         if thread is not None and thread.is_alive():
@@ -541,6 +593,8 @@ class BuffBot:
         self._keeper = BuffKeeper(
             self._link.send, status.aid, reader.status_effects, time.monotonic,
             party=self._party, read_position=reader.read_position,
+            hold=lambda seconds: cast_lock.hold(self._pid, seconds),
+            release=lambda: cast_lock.release(self._pid),
         )
         self._keeper.set_plans(self._plans)
         self._keeper.help_mates = self._help_mates

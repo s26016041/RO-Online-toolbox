@@ -460,16 +460,16 @@ def test_the_same_mate_is_not_spammed():
 
 
 def test_a_mate_too_far_away_is_left_alone():
-    """使用者 2026-08-29：「幫隊友放要控制在隊友在我 5 格距離才會放」。
+    """超過**技能自己的射程**就不放：伺服器只會安靜地丟掉，等於白放。
 
-    放不到的時候伺服器只是**安靜地丟掉** —— 我們永遠等不到狀態變化，
-    於是那個技能一直重試 → 退避 → 再重試，什麼事都沒發生。
+    ⚠ 判準是射程，不是一個寫死的格數 —— 使用者 2026-08-29 指定
+    「隊友在我施放範圍就要馬上幫他放」。夾小的副作用是「明明放得到卻不放」。
     """
-    from ro_toolbox.services.buffs import MATE_MAX_CELLS
+    from ro_toolbox.services.buffs import skill_range
 
+    reach = skill_range(INCAGI, 10)
     fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])     # 自己已經有了
-    far = FakeMate(MATE_AID, "白狐",
-                   cell=(MY_CELL[0] + MATE_MAX_CELLS + 1, MY_CELL[1]))
+    far = FakeMate(MATE_AID, "白狐", cell=(MY_CELL[0] + reach + 1, MY_CELL[1]))
     keeper, _party = _party_keeper(fake, [far])
     keeper.set_plans([BuffPlan(INCAGI, 10)])
 
@@ -478,11 +478,13 @@ def test_a_mate_too_far_away_is_left_alone():
 
 
 def test_a_mate_right_on_the_line_still_gets_it():
-    from ro_toolbox.services.buffs import MATE_MAX_CELLS
+    """射程 9 的技能，隔 9 格照樣要放（這就是「在我施放範圍」）。"""
+    from ro_toolbox.services.buffs import skill_range
 
+    reach = skill_range(INCAGI, 10)
+    assert reach == 9, "加速術射程 9"
     fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
-    edge = FakeMate(MATE_AID, "白狐",
-                    cell=(MY_CELL[0] + MATE_MAX_CELLS, MY_CELL[1]))
+    edge = FakeMate(MATE_AID, "白狐", cell=(MY_CELL[0] + reach, MY_CELL[1]))
     keeper, _party = _party_keeper(fake, [edge])
     keeper.set_plans([BuffPlan(INCAGI, 10)])
 
@@ -512,14 +514,14 @@ def test_no_position_means_no_mate_buffs():
 
 
 def test_a_short_range_skill_uses_its_own_range():
-    """門檻是**技能自己的射程**，`MATE_MAX_CELLS` 只是上限。
+    """門檻是**技能自己的射程**，`MATE_MAX_CELLS` 只在查不到射程時才用。
 
     塗毒（138）射程 1 —— 要貼著才放得到，5 格是放不到的。
     """
     from ro_toolbox.services.buffs import skill_range
 
     assert skill_range(138, 1) == 1, "塗毒射程 1"
-    assert skill_range(INCAGI, 10) == 9, "加速術射程 9（會被 5 格上限夾住）"
+    assert skill_range(INCAGI, 10) == 9, "加速術射程 9"
 
     from ro_toolbox.services.buffs import buff_efst
 
@@ -557,3 +559,114 @@ def test_skills_that_name_one_person_are_still_targetable():
     assert can_target_others(29), "加速術（目標1個）"
     assert can_target_others(34), "天使之賜福（目標1個）"
     assert can_target_others(138), "塗毒（自己和隊友1名 —— 說明寫「指定目標」）"
+
+
+# ---- 詠唱時要叫走路讓路 ----------------------------------------------------
+
+
+def test_casting_for_a_mate_asks_everyone_else_to_hold_still():
+    """使用者：「自動戰鬥時也要幫隊友放，並且是最高優先，高於打怪跟尋路」。
+
+    ⚠ **移動與攻擊會打斷詠唱。** 實機日誌：封包送得出去、隊友也在旁邊，
+    就是連續三次「沒上身」—— 被自己的走路封包打斷。
+    """
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])     # 自己已經有了
+    party = FakeParty([FakeMate(MATE_AID, "白狐")])
+    holds = []
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party,
+                        read_position=lambda: MY_CELL,
+                        hold=holds.append, release=lambda: holds.append("release"))
+    keeper.help_mates = True
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    assert holds and holds[0] > 0, "送出去之前就要先叫大家別動"
+    assert fake.sent, "還是要真的送出去"
+
+
+def test_the_road_is_given_back_as_soon_as_it_lands():
+    """讓路是為了讓那一發打得出去，不是為了等結果 —— 上身就馬上放行。"""
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    mate = FakeMate(MATE_AID, "白狐")
+    party = FakeParty([mate])
+    holds = []
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party,
+                        read_position=lambda: MY_CELL,
+                        hold=lambda _s: holds.append("hold"),
+                        release=lambda: holds.append("release"))
+    keeper.help_mates = True
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+    keeper.tick()
+
+    mate._has[INCAGI_EFST] = True          # 隊友身上出現了
+    party.needed[INCAGI_EFST] = False
+    fake.clock += 0.5
+    keeper.tick()
+    assert "release" in holds
+
+
+def test_a_send_failure_gives_the_road_back_too():
+    """送不出去就不要占著路，不然打怪白站 MAX_HOLD 秒。"""
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    fake.ok = False
+    party = FakeParty([FakeMate(MATE_AID, "白狐")])
+    holds = []
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party,
+                        read_position=lambda: MY_CELL,
+                        hold=lambda _s: holds.append("hold"),
+                        release=lambda: holds.append("release"))
+    keeper.help_mates = True
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+    keeper.tick()
+    assert holds[-1] == "release"
+
+
+def test_a_mate_buff_that_never_lands_backs_off():
+    """⚠⚠ **沒有退避的話打怪會永遠不動。**
+
+    幫隊友放會叫打怪讓路（`cast_lock`）。放不上去卻每 `MIN_GAP` 秒重試一次的話
+    等於一直占著路 —— 打怪站在原地，45 秒之後還會被「毫無進展」判成卡住。
+    放不上去的原因多半是短時間內好不了的（隊友換圖了、伺服器判定距離不夠）。
+    """
+    from ro_toolbox.services.buffs import BACKOFF_START, CONFIRM_TIMEOUT
+
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])     # 自己已經有了
+    keeper, _party = _party_keeper(fake, [FakeMate(MATE_AID, "白狐")])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    assert len(fake.sent) == 1
+
+    fake.clock += CONFIRM_TIMEOUT + 0.1
+    keeper.tick()                                  # 沒上身 → 開始退避
+    assert len(fake.sent) == 1
+
+    fake.clock += BACKOFF_START / 2
+    keeper.tick()
+    assert len(fake.sent) == 1, "退避時間還沒到，不准再送"
+
+    fake.clock += BACKOFF_START
+    keeper.tick()
+    assert len(fake.sent) == 2, "退避時間到了要再試一次"
+
+
+def test_a_successful_mate_buff_clears_the_backoff():
+    """成功一次就把退避歸零 —— 下次他掉了要馬上補回去。"""
+    from ro_toolbox.services.buffs import CONFIRM_TIMEOUT
+
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    mate = FakeMate(MATE_AID, "白狐")
+    keeper, party = _party_keeper(fake, [mate])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    fake.clock += CONFIRM_TIMEOUT + 0.1
+    keeper.tick()                                  # 第一次沒上身
+    assert keeper._mate_retry
+
+    mate._has[INCAGI_EFST] = True
+    party.needed[INCAGI_EFST] = False
+    fake.clock += 60
+    keeper.tick()
+    keeper.tick()
+    assert not keeper._mate_retry, "上身了就把退避清掉"

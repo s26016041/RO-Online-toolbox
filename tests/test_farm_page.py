@@ -1486,3 +1486,111 @@ def test_the_restock_button_is_tall_enough_for_its_text(qtbot):
     # 樣式表在測試裡沒套用，所以量不到真正的內距 —— 這裡釘的是
     # 「不准鎖成固定 26」這個決定本身，那才是使用者踩到的東西。
     assert button.minimumHeight() != button.maximumHeight(), "留給它自己長高"
+
+
+def test_a_supply_run_survives_a_disconnect(monkeypatch, qtbot):
+    """⚠⚠ 使用者實測：「補給買完藥水出商店準備要回練功地圖時斷線，
+    回來沒有繼續，他就停在商店門口了」。日誌是 **「已接回：（無）」**。
+
+    補給途中三個旗標**全都是空的**：自動打怪被補給關掉了、自動補水回城
+    之後就停了、走路是補給自己內部的 TravelBot（不在頁面的 `_travelers`）。
+    所以快照要另外記一筆。
+    """
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    page._farm_map[pid] = "mjolnir_07"
+    page._restocks[pid] = object()          # 正在補給
+
+    snap = page.snapshot_for(pid)
+    assert snap.supply_back_to == "mjolnir_07"
+    assert snap.anything, "有事情在做，不能算成空快照"
+
+    # 回連之後接回去
+    page._restocks.pop(pid)
+    started = []
+    monkeypatch.setattr(page, "_start_restock",
+                        lambda p, back_to="": started.append((p, back_to)))
+    page.restore_into(pid, snap)
+    assert started == [(pid, "mjolnir_07")]
+    assert pid in page._auto_restock, "接回來的這一趟跑完也要把掛機接回去"
+
+
+def test_a_normal_snapshot_has_no_supply_run(monkeypatch, qtbot):
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    page._cards[pid] = make_card(qtbot)
+    assert page.snapshot_for(pid).supply_back_to == ""
+
+
+# ---- 斷線回來要自己走回練功地圖，然後繼續打 --------------------------------
+
+
+class _ArrivalTraveler:
+    def __init__(self, running: bool, arrived: bool) -> None:
+        self.running = running
+        self.stats = type("S", (), {"arrived": arrived})()
+
+
+def test_a_reconnect_walks_back_to_the_farm_map_first(monkeypatch, qtbot):
+    """⚠⚠ 使用者：「斷線也要回復原本，不然我睡覺怎辦」。
+
+    **重登之後角色在存檔點（城裡），不在練功地圖。** 只把「自動打怪」的勾勾
+    打回去的話，人就在城裡對著 NPC 空轉。順序要是「先走回去、到了再開打」。
+    """
+    from ro_toolbox.services.reconnect_bot import Snapshot
+
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    page._names[pid] = "白狐"
+    # 下拉裡要有這張圖，不然走不過去
+    target = card.destination.itemData(1)
+    assert isinstance(target, str) and target
+
+    snap = Snapshot(farming=True, farm_map=target, labels=["自動打怪"])
+    page.restore_into(pid, snap)
+
+    assert card.auto_travel.isChecked(), "先趕路"
+    assert not card.auto_hunt.isChecked(), "趕路途中不打怪（會互相搶走路封包）"
+    assert pid in page._resume_farm, "到了要有人把打怪接回去"
+
+
+def test_arriving_turns_farming_back_on(monkeypatch, qtbot):
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    page._resume_farm.add(pid)
+    page._travelers[pid] = _ArrivalTraveler(running=False, arrived=True)
+
+    page._watch_travel_resumes()
+    assert card.auto_hunt.isChecked()
+    assert pid not in page._resume_farm
+
+
+def test_failing_to_get_back_does_not_start_farming(monkeypatch, qtbot):
+    """走不到就不要開打 —— 人可能還在半路或城裡，開了只會空轉。"""
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    page._resume_farm.add(pid)
+    page._travelers[pid] = _ArrivalTraveler(running=False, arrived=False)
+
+    page._watch_travel_resumes()
+    assert not card.auto_hunt.isChecked()
+
+
+def test_the_snapshot_remembers_where_he_was_farming(monkeypatch, qtbot):
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    card.auto_hunt.setChecked(True)
+    page._farm_map[pid] = "mjolnir_07"
+
+    snap = page.snapshot_for(pid)
+    assert snap.farm_map == "mjolnir_07"

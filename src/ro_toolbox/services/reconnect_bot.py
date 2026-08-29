@@ -59,12 +59,28 @@ class Snapshot:
     potion: Any = None
     #: 自動尋路的**目的地地圖**（不是走到第幾段）。None = 沒在趕路
     destination: str | None = None
+    #: 斷線時在哪張圖掛機。"" = 沒在掛機。
+    #:
+    #: ⚠⚠ **重登之後角色在存檔點（城裡），不在練功地圖。** 只把「自動打怪」
+    #: 打勾回去的話，人就在城裡對著 NPC 空轉 —— 使用者實測回報
+    #: 「斷線也要回復原本，不然我睡覺怎辦」。所以要記著回哪裡，
+    #: 接回去的順序是**先走回去，到了再開打**。
+    farm_map: str = ""
+    #: 斷線時**正在跑補給**，補完要走回這張圖。"" = 沒在補給。
+    #:
+    #: ⚠⚠ 沒有這一欄的話，補給途中斷線＝快照整個是空的：自動打怪被補給
+    #: 關掉了、自動補水回城之後也停了、走路是補給自己內部的 `TravelBot`
+    #: （不在頁面的 `_travelers` 裡）。實機日誌就是那句
+    #: **「已接回 PID 58976：（無）」** —— 回來什麼都沒接，人就停在商店門口
+    #: （使用者實測回報）。
+    supply_back_to: str = ""
     #: 給人看的說明
     labels: list[str] = field(default_factory=list)
 
     @property
     def anything(self) -> bool:
-        return bool(self.farming or self.potion is not None or self.destination)
+        return bool(self.farming or self.potion is not None or self.destination
+                    or self.supply_back_to or self.farm_map)
 
 
 class ReconnectSupervisor:

@@ -1070,6 +1070,12 @@ class FarmPage(BasePage):
         #: 這一趟補水是「沒水自動觸發」的（補完要把掛機接回去），
         #: 不是使用者自己按「補水」按鈕。
         self._auto_restock: set[int] = set()
+        #: 走到目的地之後要自己把「自動打怪」打開的 PID。
+        #:
+        #: ⚠ 回連之後角色在存檔點（城裡），不在練功地圖 —— 只把勾勾打回去
+        #: 等於讓他在城裡空轉。順序是**先走回去、到了再開打**，中間沒有人
+        #: 在看（使用者：「不然我睡覺怎辦」），所以「到了」這件事要有人接。
+        self._resume_farm: set[int] = set()
         self._potions: dict[int, PotionBot] = {}
         #: 自動補助技能。**跟自動打怪各跑各的**（使用者指定）——
         #: 不掛機也可以只開這個，掛機時兩邊互不干涉。
@@ -1135,6 +1141,7 @@ class FarmPage(BasePage):
         self._read_timer.timeout.connect(self._watch_restocks)
         self._read_timer.timeout.connect(self._watch_overweight)
         self._read_timer.timeout.connect(self._watch_supply_runs)
+        self._read_timer.timeout.connect(self._watch_travel_resumes)
         #: 定期重掃技能。**不能放在每秒的計時器裡** —— 掃一趟 2 秒，
         #: 每秒掃一次會把整頁拖垮（[MEM-043] 就是這樣被 bag.as_dict 拖慢的）。
         self._skill_timer = QTimer(self)
@@ -1619,8 +1626,10 @@ class FarmPage(BasePage):
             return Snapshot()
         labels = []
         farming = card.auto_hunt.isChecked()
+        farm_map = self._farm_map.get(pid, "") if farming else ""
         if farming:
-            labels.append("自動打怪")
+            where = map_display_name(farm_map) or farm_map
+            labels.append(f"自動打怪（在 {where}）" if where else "自動打怪")
         potion = card.potion_config() if card.auto_potion.isChecked() else None
         if potion is not None:
             labels.append("自動補水")
@@ -1631,8 +1640,16 @@ class FarmPage(BasePage):
         dest = travel.destination if travel is not None else None
         if dest:
             labels.append(f"前往 {map_display_name(dest) or dest}")
-        return Snapshot(farming=farming, potion=potion,
-                        destination=dest, labels=labels)
+        # ⚠ 補給途中斷線的話，上面三個**全都是空的**：自動打怪被補給關掉了、
+        # 自動補水回城之後就停了、走路是補給自己內部的 TravelBot。
+        # 不特別記一筆的話，回來就是「已接回：（無）」，人停在商店門口。
+        back_to = ""
+        if pid in self._restocks:
+            back_to = self._farm_map.get(pid, "")
+            where = map_display_name(back_to) or back_to
+            labels.append(f"補給（補完回 {where}）" if where else "補給")
+        return Snapshot(farming=farming, potion=potion, destination=dest,
+                        farm_map=farm_map, supply_back_to=back_to, labels=labels)
 
     def _restore_if_pending(self, pid: int) -> None:
         """這個分頁是回連後在等的那個嗎？是就把設定接回去。"""
@@ -1666,14 +1683,39 @@ class FarmPage(BasePage):
             return
         if snap.potion is not None and not card.auto_potion.isChecked():
             card.auto_potion.setChecked(True)
-        if snap.destination:
-            position = card.destination.findData(snap.destination)
-            if position >= 0:
-                card.destination.setCurrentIndex(position)
+        if snap.supply_back_to or (pid in self._supply_pending):
+            # 補給途中斷線 —— **從頭再跑一次**。已經買到的部分不會重買
+            # （`Restocker` 是「補到目標數量」不是「買固定幾個」），
+            # 而斷在半路的情況也一樣接得下去。這一趟跑完會把掛機接回去。
+            self._supply_pending.discard(pid)
+            self._auto_restock.add(pid)
+            if snap.supply_back_to:
+                self._farm_map[pid] = snap.supply_back_to
+            log.warning("「%s」補給途中斷線，回來接著補完再走回去",
+                        self._names.get(pid) or pid)
+            self._start_restock(pid, back_to=snap.supply_back_to)
+            return
+        # 要走去哪：斷線前正在趕路就照原本的目的地；本來在掛機的話，
+        # 目的地就是**練功地圖**（重登之後人在存檔點，不在那裡）。
+        goto = snap.destination or (snap.farm_map if snap.farming else "")
+        if goto:
+            position = card.destination.findData(goto)
+            if position < 0:
+                # 下拉裡沒有這張圖 —— 走不過去。**大聲說**，然後至少把
+                # 打怪接回去（人在城裡空轉總比什麼都不做容易被發現）。
+                log.warning("⚠「%s」回連後找不到目的地 %s，沒辦法自己走回去",
+                            self._names.get(pid) or pid, goto)
+                if snap.farming and not card.auto_hunt.isChecked():
+                    card.auto_hunt.setChecked(True)
+                return
+            card.destination.setCurrentIndex(position)
+            if snap.farming:
+                # ⚠ **趕路途中不打怪**（兩個都在送走路封包會互相搶目標），
+                # 所以先只開趕路；`_watch_travel_resumes()` 會在到站之後
+                # 把自動打怪接回去。中間沒有人在看，這一步不能交給使用者。
+                self._resume_farm.add(pid)
             card.auto_travel.setChecked(True)     # 這會觸發 _toggle_travel
         elif snap.farming and not card.auto_hunt.isChecked():
-            # 趕路途中不打怪（兩個都在送走路封包會互相打架），所以只有
-            # 「沒有要趕路」時才把自動打怪接回去；到站之後使用者自己開。
             card.auto_hunt.setChecked(True)
         log.warning("已接回 PID %s：%s", pid, "、".join(snap.labels) or "（無）")
 
@@ -1887,6 +1929,31 @@ class FarmPage(BasePage):
         if not bot.start():
             self._restocks.pop(pid, None)
             card.set_restock_busy(False)
+
+    def _watch_travel_resumes(self) -> None:
+        """回連後自己走回練功地圖的那一趟：**到了就把自動打怪接回去**。
+
+        使用者：「斷線也要回復原本，不然我睡覺怎辦」。走回去要幾十秒到幾分鐘，
+        中間沒有人在看 —— 沒有這一步的話，角色會走到練功點然後站在那裡。
+
+        ⚠ **走不到就不要開打**：那時候人可能還在半路或城裡，開了只會空轉。
+        那種情況大聲講一句，讓早上起來看得到。
+        """
+        for pid in list(self._resume_farm):
+            traveler = self._travelers.get(pid)
+            if traveler is not None and traveler.running:
+                continue                      # 還在走
+            self._resume_farm.discard(pid)
+            card = self._cards.get(pid)
+            who = self._names.get(pid) or f"PID {pid}"
+            arrived = traveler is not None and getattr(traveler.stats, "arrived", False)
+            if card is None:
+                continue
+            if not arrived:
+                log.warning("⚠「%s」沒能走回練功地圖，自動打怪沒有接回去", who)
+                continue
+            card.auto_hunt.setChecked(True)
+            log.warning("「%s」走回練功地圖了，自動打怪接回去", who)
 
     def _watch_supply_runs(self) -> None:
         """沒水自己回城了 → **接著去補給，補完走回練功點**（使用者指定）。

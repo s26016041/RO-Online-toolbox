@@ -26,7 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ro_toolbox.core.ro_protocol import build_move, unpack_move, unpack_position
-from ro_toolbox.services import mapdata, npc_dialog
+from ro_toolbox.services import cast_lock, mapdata, npc_dialog
 from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import map_display_name, npc_links_on_map
 from ro_toolbox.services.navigation import NavigationReader
@@ -450,6 +450,18 @@ class TravelBot:
                 return
             if not self._keep_in_sync(now):
                 return
+            # ⚠⚠ **幫隊友放 buff 的時候讓路**（使用者 2026-08-29 指定：
+            # 「自動戰鬥時也要幫隊友放，並且是最高優先，高於打怪跟尋路」）。
+            #
+            # RO 裡**移動與攻擊都會打斷詠唱**，而這裡一路在送走路封包 ——
+            # 不讓路的話 buff 每一次都被自己人打斷，實機日誌是連續三次
+            # 「沒上身」然後退避重試（使用者：「反應很慢」）。
+            #
+            # 讓路只是**這一拍不動**，不是等待：`held()` 有到期時間，
+            # 補 buff 那條收到上身就馬上放行（見 `services/cast_lock.py`）。
+            if cast_lock.held(self._pid):
+                self._stop.wait(_TICK)
+                continue
             status = self._reader.read() if self._reader else None
             pos = self._reader.read_position() if self._reader else None
             if status is not None and status.hp <= 0:
