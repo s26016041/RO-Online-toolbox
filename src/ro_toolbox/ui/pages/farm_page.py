@@ -1070,6 +1070,22 @@ class FarmPage(BasePage):
         #: 這一趟補水是「沒水自動觸發」的（補完要把掛機接回去），
         #: 不是使用者自己按「補水」按鈕。
         self._auto_restock: set[int] = set()
+        #: **使用者要這隻角色掛機**（存角色名，不存 PID —— 重連之後 PID 會變）。
+        #:
+        #: ⚠⚠ 這是**意圖**，不是「現在有沒有在跑」。中間有一大堆東西會暫時
+        #: 把自動打怪關掉：趕路、補給、斷線、bot 自己停。用勾勾當意圖的話，
+        #: 那些事情一發生意圖就沒了 —— 實機日誌就是那句
+        #: 「已接回：自動補水、前往 妙勒妙勒尼山脈南區」（沒有自動打怪），
+        #: 於是走到練功點只跳一個通知就結束。使用者：
+        #: 「這個功能就是要以免我人不在電腦前，所以通知根本沒用」。
+        #:
+        #: 只有兩種情況會把意圖清掉：**使用者自己按掉**，或使用者指定要停的
+        #: 狀況（負重滿了、角色死亡）。
+        self._want_farm: set[str] = set()
+        #: 正在「程式自己關掉自動打怪」的 PID —— 那不算使用者的意思。
+        self._quiet_farm: set[int] = set()
+        #: 趕路結束、等著把自動打怪接回去的 PID（收攤順序會咬人，見 `_toggle_travel`）。
+        self._arrived_pending: set[int] = set()
         #: 走到目的地之後要自己把「自動打怪」打開的 PID。
         #:
         #: ⚠ 回連之後角色在存檔點（城裡），不在練功地圖 —— 只把勾勾打回去
@@ -1625,7 +1641,9 @@ class FarmPage(BasePage):
         if card is None:
             return Snapshot()
         labels = []
-        farming = card.auto_hunt.isChecked()
+        # ⚠ 用**意圖**不是用勾勾：斷線的時候 bot 早就停了、勾勾也被拿掉了
+        # （實機：「已接回：自動補水、前往 …」，自動打怪不見了）。
+        farming = card.auto_hunt.isChecked() or self._wants_farm(pid)
         farm_map = self._farm_map.get(pid, "") if farming else ""
         if farming:
             where = map_display_name(farm_map) or farm_map
@@ -1683,6 +1701,9 @@ class FarmPage(BasePage):
             return
         if snap.potion is not None and not card.auto_potion.isChecked():
             card.auto_potion.setChecked(True)
+        who = self._names.get(pid)
+        if snap.farming and who:
+            self._want_farm.add(who)     # 意圖跟著快照回來
         if snap.supply_back_to or (pid in self._supply_pending):
             # 補給途中斷線 —— **從頭再跑一次**。已經買到的部分不會重買
             # （`Restocker` 是「補到目標數量」不是「買固定幾個」），
@@ -1705,8 +1726,8 @@ class FarmPage(BasePage):
                 # 打怪接回去（人在城裡空轉總比什麼都不做容易被發現）。
                 log.warning("⚠「%s」回連後找不到目的地 %s，沒辦法自己走回去",
                             self._names.get(pid) or pid, goto)
-                if snap.farming and not card.auto_hunt.isChecked():
-                    card.auto_hunt.setChecked(True)
+                if snap.farming:
+                    self._set_auto_hunt(pid, True, keep_intent=True)
                 return
             card.destination.setCurrentIndex(position)
             if snap.farming:
@@ -1715,8 +1736,8 @@ class FarmPage(BasePage):
                 # 把自動打怪接回去。中間沒有人在看，這一步不能交給使用者。
                 self._resume_farm.add(pid)
             card.auto_travel.setChecked(True)     # 這會觸發 _toggle_travel
-        elif snap.farming and not card.auto_hunt.isChecked():
-            card.auto_hunt.setChecked(True)
+        elif snap.farming:
+            self._set_auto_hunt(pid, True, keep_intent=True)
         log.warning("已接回 PID %s：%s", pid, "、".join(snap.labels) or "（無）")
 
     def _watch_overweight(self) -> None:
@@ -1735,9 +1756,10 @@ class FarmPage(BasePage):
         pids |= self._overweight_pending
         self._overweight_pending.clear()
         for pid in pids:
-            card = self._cards.get(pid)
-            if card is not None:
-                card.auto_hunt.setChecked(False)      # 這會走 _toggle_farm 收攤
+            # 使用者指定「負重到 90% 就回程**關閉自動戰鬥**」—— 這是真的要停，
+            # 意圖也一起清掉，不要在補給或回連之後又自己開起來。
+            self._forget_farm_intent(pid)
+            self._set_auto_hunt(pid, False, keep_intent=False)
             potion = self._potions.get(pid)
             if potion is not None and potion.running:
                 potion.request_home("負重滿了")
@@ -1745,9 +1767,38 @@ class FarmPage(BasePage):
                 who = self._names.get(pid) or f"PID {pid}"
                 log.warning("%s 負重滿了，但自動補水沒在跑，回不了城", who)
 
+    def _set_auto_hunt(self, pid: int, on: bool, *, keep_intent: bool) -> None:
+        """程式自己開關自動打怪。
+
+        `keep_intent=True` 代表**這不是使用者的意思**（趕路、補給、斷線），
+        使用者「要掛機」那件事要留著，等狀況結束再接回去。
+        """
+        card = self._cards.get(pid)
+        if card is None or card.auto_hunt.isChecked() == on:
+            return
+        if keep_intent:
+            self._quiet_farm.add(pid)
+        try:
+            card.auto_hunt.setChecked(on)
+        finally:
+            self._quiet_farm.discard(pid)
+
+    def _forget_farm_intent(self, pid: int) -> None:
+        """使用者指定要停的狀況（負重滿了、角色死亡）—— 意圖也一起清掉。"""
+        who = self._names.get(pid)
+        if who:
+            self._want_farm.discard(who)
+
+    def _wants_farm(self, pid: int) -> bool:
+        who = self._names.get(pid)
+        return bool(who and who in self._want_farm)
+
     def _toggle_farm(self, pid: int, on: bool) -> None:
         card = self._cards.get(pid)
+        who = self._names.get(pid)
         if on:
+            if who:
+                self._want_farm.add(who)      # 使用者要掛機
             if pid in self._bots:
                 return
             # 背景 FarmBot 的回報在它自己的執行緒，用 card 的 signal 轉回 UI 執行緒。
@@ -1764,6 +1815,12 @@ class FarmPage(BasePage):
             bot.start()
         else:
             bot = self._bots.pop(pid, None)
+            # ⚠ **bot 自己停下來的不算使用者關的。** 斷線、卡住、死亡都會讓
+            # 卡片把勾勾拿掉 —— 把那個當成「使用者不想掛了」的話，回連之後
+            # 就永遠接不回去了。使用者按下去的時候 bot 還在跑，分得出來。
+            stopped_itself = bot is not None and not bot.stats.running
+            if who and not stopped_itself and pid not in self._quiet_farm:
+                self._want_farm.discard(who)
             if bot is not None:
                 if bot.stats.overweight:
                     # 負重滿了才被收攤 —— 記下來，`_watch_overweight` 要用它
@@ -1787,6 +1844,11 @@ class FarmPage(BasePage):
         if not on:
             traveler = self._travelers.pop(pid, None)
             if traveler is not None:
+                # ⚠ 收攤順序會咬人（第三次了）：卡片一看到「不在跑了」就把
+                # 勾勾拿掉，而拿掉勾勾會走到這裡把 traveler 移走 —— 比計時器早。
+                # 到站這件事要在這裡記下來，不然 `_watch_travel_resumes()` 看不到。
+                if getattr(traveler.stats, "arrived", False):
+                    self._arrived_pending.add(pid)
                 traveler.stop()
             if card is not None:
                 card.set_travel_busy(False)
@@ -1802,8 +1864,9 @@ class FarmPage(BasePage):
             return
 
         if pid in self._bots and card is not None and card.auto_hunt.isChecked():
-            # 先讓 UI 走正常的關閉流程（_toggle_farm 會停 bot、保留戰利品）
-            card.auto_hunt.setChecked(False)
+            # 先讓 UI 走正常的關閉流程（_toggle_farm 會停 bot、保留戰利品）。
+            # ⚠ 保留意圖：趕路是暫時的，到站之後要把掛機接回去。
+            self._set_auto_hunt(pid, False, keep_intent=True)
             card.set_alert("已先關掉自動打怪（趕路途中不打怪）")
         if card is None:
             return  # 沒有卡片就沒有回報去處，別讓它在背景默默走
@@ -1913,7 +1976,8 @@ class FarmPage(BasePage):
             return
 
         if pid in self._bots:
-            card.auto_hunt.setChecked(False)
+            # 補給途中不打怪，但**使用者還是要掛機** —— 補完要接回去。
+            self._set_auto_hunt(pid, False, keep_intent=True)
         traveler = self._travelers.get(pid)
         if traveler is not None:
             card.set_travel_paused(False)
@@ -1939,20 +2003,27 @@ class FarmPage(BasePage):
         ⚠ **走不到就不要開打**：那時候人可能還在半路或城裡，開了只會空轉。
         那種情況大聲講一句，讓早上起來看得到。
         """
-        for pid in list(self._resume_farm):
+        pids = set(self._resume_farm) | set(self._arrived_pending)
+        for pid in pids:
             traveler = self._travelers.get(pid)
             if traveler is not None and traveler.running:
                 continue                      # 還在走
             self._resume_farm.discard(pid)
+            latched = pid in self._arrived_pending
+            self._arrived_pending.discard(pid)
             card = self._cards.get(pid)
             who = self._names.get(pid) or f"PID {pid}"
-            arrived = traveler is not None and getattr(traveler.stats, "arrived", False)
             if card is None:
                 continue
+            arrived = latched or (
+                traveler is not None and getattr(traveler.stats, "arrived", False)
+            )
+            if not self._wants_farm(pid):
+                continue                      # 使用者本來就沒有要掛機
             if not arrived:
                 log.warning("⚠「%s」沒能走回練功地圖，自動打怪沒有接回去", who)
                 continue
-            card.auto_hunt.setChecked(True)
+            self._set_auto_hunt(pid, True, keep_intent=True)
             log.warning("「%s」走回練功地圖了，自動打怪接回去", who)
 
     def _watch_supply_runs(self) -> None:
@@ -2009,7 +2080,8 @@ class FarmPage(BasePage):
         if card is None or not getattr(bot.stats, "came_back", False):
             return
         card.auto_potion.setChecked(True)
-        card.auto_hunt.setChecked(True)
+        if self._wants_farm(pid):
+            self._set_auto_hunt(pid, True, keep_intent=True)
         log.info("「%s」補給完走回 %s，掛機接回去了",
                  self._names.get(pid) or pid, self._farm_map.get(pid, ""))
 

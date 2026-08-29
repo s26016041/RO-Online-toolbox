@@ -584,8 +584,13 @@ def test_casting_for_a_mate_asks_everyone_else_to_hold_still():
     assert fake.sent, "還是要真的送出去"
 
 
-def test_the_road_is_given_back_as_soon_as_it_lands():
-    """讓路是為了讓那一發打得出去，不是為了等結果 —— 上身就馬上放行。"""
+def test_the_road_is_given_back_once_there_is_nothing_left_to_do():
+    """使用者：「停下一切動作幫她把**需要的放完**再繼續」。
+
+    所以放行的條件不是「這一發上身了」，是「沒有隊友還需要補了」——
+    可能還有第二個 buff、第二個隊友。⚠ 但也不能傻傻一直等
+    （`MATE_SESSION_MAX`），對方有可能只是經過。
+    """
     fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
     mate = FakeMate(MATE_AID, "白狐")
     party = FakeParty([mate])
@@ -601,7 +606,8 @@ def test_the_road_is_given_back_as_soon_as_it_lands():
     mate._has[INCAGI_EFST] = True          # 隊友身上出現了
     party.needed[INCAGI_EFST] = False
     fake.clock += 0.5
-    keeper.tick()
+    keeper.tick()          # 這一拍把那一發結算掉
+    keeper.tick()          # 沒事做了 → 放行
     assert "release" in holds
 
 
@@ -670,3 +676,49 @@ def test_a_successful_mate_buff_clears_the_backoff():
     keeper.tick()
     keeper.tick()
     assert not keeper._mate_retry, "上身了就把退避清掉"
+
+
+def test_a_mate_just_passing_through_does_not_stall_farming():
+    """⚠ 使用者：「當然不要傻傻一直等，因為對方有可能只是經過」。
+
+    停是整段停（放完為止），但整段有上限；時間到就放行，剩下的交給退避。
+    """
+    from ro_toolbox.services.buffs import MATE_SESSION_MAX
+
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    mate = FakeMate(MATE_AID, "白狐")
+    party = FakeParty([mate])
+    holds = []
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party,
+                        read_position=lambda: MY_CELL,
+                        hold=lambda _s: holds.append("hold"),
+                        release=lambda: holds.append("release"))
+    keeper.help_mates = True
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    assert holds and holds[0] == "hold"
+
+    fake.clock += MATE_SESSION_MAX + 1
+    keeper.tick()
+    assert holds[-1] == "release", "停太久要放行，不能讓打怪一直站著"
+
+
+def test_a_mate_who_walks_out_of_range_gives_the_road_back():
+    """他走遠了就沒事做了 —— 馬上放行，別占著路。"""
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    mate = FakeMate(MATE_AID, "白狐")
+    party = FakeParty([mate])
+    holds = []
+    keeper = BuffKeeper(fake.send, AID, fake.read, fake.now, party=party,
+                        read_position=lambda: MY_CELL,
+                        hold=lambda _s: holds.append("hold"),
+                        release=lambda: holds.append("release"))
+    keeper.help_mates = True
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+    keeper.tick()
+
+    mate.cell = (MY_CELL[0] + 50, MY_CELL[1])     # 走掉了
+    keeper._mate_pending.clear()
+    keeper.tick()
+    assert holds[-1] == "release"

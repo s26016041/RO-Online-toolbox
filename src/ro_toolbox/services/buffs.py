@@ -58,6 +58,14 @@ MATE_REFRESH_RATIO = 0.5
 #: 抓 1.2 秒：一般補助技能的詠唱都在一秒內，上身之後 `_settle_mates()`
 #: 會馬上 `release()`，所以真正讓路的時間通常更短。
 CAST_HOLD = 1.2
+#: 為了幫隊友放，最多讓打怪停這麼久。
+#:
+#: 使用者要的是「隊友在射程內又需要 buff 就**停下一切動作幫她放完再繼續**」，
+#: 但同一句話後面接著：「⚠ 當然不要傻傻一直等，因為對方有可能只是經過」。
+#:
+#: 所以停是**整段**停（放完為止），但整段有上限。時間到就放行，
+#: 剩下的交給退避（`_mate_retry`）—— 隊友還在的話下一輪再補。
+MATE_SESSION_MAX = 6.0
 #: 查不到技能射程時，幫隊友放的距離上限（格）。
 #:
 #: **判準是技能自己的射程**（`assets/skills.json.gz` 的 `range`：天使之賜福
@@ -244,6 +252,8 @@ class BuffKeeper:
         self._last_mate_cast = 0.0
         #: (技能, 隊友AID) → 送出時刻。同一個目標的同一個技能一次只送一發。
         self._mate_pending: dict[tuple[int, int], float] = {}
+        #: 這一段「為了隊友停下來」是什麼時候開始的（0 = 沒有停）。
+        self._mate_session = 0.0
         #: (技能, 隊友AID) → (下次可以再試的時間, 目前的退避秒數)
         #:
         #: ⚠⚠ **一定要有。** 幫隊友放會叫打怪讓路（`cast_lock`），
@@ -288,6 +298,7 @@ class BuffKeeper:
             return self._note("讀不到身上的狀態，這一拍先不補")
         present = {row.efst: row for row in statuses}
 
+        self._mind_the_road(sp)
         done = self._settle_mates()
         if done is not None:
             return done
@@ -354,12 +365,13 @@ class BuffKeeper:
                 del self._mate_pending[key]
                 self._mate_retry.pop(key, None)      # 成功了就把退避歸零
                 self.stats.mate_cast += 1
-                self._release()          # 上身了，馬上把路讓回去
+                # ⚠ 這裡**不放行**：可能還有第二個 buff／第二個隊友要補，
+                # 使用者要的是「放完再繼續」。放行由 `_mind_the_road()` 統一
+                # 決定（沒事做了、或停太久）。
                 return self._note(f"幫 {mate.label()} 補上 {name}")
             if now - sent_at < CONFIRM_TIMEOUT:
                 continue
             del self._mate_pending[key]
-            self._release()
             _, backoff = self._mate_retry.get(key, (0.0, 0.0))
             backoff = min(BACKOFF_MAX, backoff * 2 if backoff else BACKOFF_START)
             self._mate_retry[key] = (now + backoff, backoff)
@@ -404,6 +416,64 @@ class BuffKeeper:
             self._pending = _Pending(plan.skill_id, now)
             return self._note(f"補 {skill_name(plan.skill_id)} Lv{plan.level}")
         return None
+
+    def _mind_the_road(self, sp: int | None) -> None:
+        """還有隊友要補就**整段停下來**；沒有了（或停太久）就放行。
+
+        使用者原話：「如果需要幫隊友放而且隊友在 BUFF 射程，就先停下一切動作
+        幫她把需要的放完再繼續」，緊接著：「當然不要傻傻一直等，
+        因為對方有可能只是經過」。
+
+        所以這裡每一拍重算一次：
+
+        - **還有事情要做** → 續住讓路（`cast_lock` 每次最多 2.5 秒，
+          所以一定要每拍續，停不住太久）。
+        - **沒事了**（放完了、隊友走出射程、隊友不見了）→ 馬上放行。
+        - **停太久**（`MATE_SESSION_MAX`）→ 放行。放不上去的原因交給退避，
+          不能讓打怪一直站著。
+        """
+        now = self._now()
+        if not self._mate_work_left(sp):
+            if self._mate_session:
+                self._mate_session = 0.0
+                self._release()
+            return
+        if not self._mate_session:
+            self._mate_session = now
+        elif now - self._mate_session > MATE_SESSION_MAX:
+            self._release()               # 等太久了，先讓打怪繼續
+            return
+        self._hold(CAST_HOLD)
+
+    def _mate_work_left(self, sp: int | None) -> bool:
+        """現在還有「射程內、需要補」的隊友嗎（含已經送出去還沒確認的那幾發）。"""
+        if not self.help_mates or self._party is None:
+            return False
+        if self._mate_pending:
+            return True
+        me = self._read_position() if self._read_position is not None else None
+        if me is None:
+            return False
+        now = self._now()
+        mates = self._party.mates()
+        for plan in self._plans:
+            efst = buff_efst(plan.skill_id)
+            if efst is None or not can_target_others(plan.skill_id):
+                continue
+            cost = sp_cost(plan.skill_id, plan.level)
+            if sp is not None and cost is not None and sp < cost:
+                continue              # SP 不夠：安靜跳過，也不要占著路
+            reach = skill_range(plan.skill_id, plan.level) or MATE_MAX_CELLS
+            for mate in mates:
+                key = (plan.skill_id, mate.aid)
+                until, _ = self._mate_retry.get(key, (0.0, 0.0))
+                if now < until:
+                    continue          # 退避中：不算「要做的事」，別占著路
+                if cells_between(me, mate.cell) > reach:
+                    continue
+                if self._party.needs(mate, efst, MATE_REFRESH_RATIO):
+                    return True
+        return False
 
     def _cast_for_mates(self, sp: int | None) -> str | None:
         """幫隊友補一個。**一拍只補一個人的一個技能**。
@@ -464,8 +534,9 @@ class BuffKeeper:
                     # 或別人幫他放了。退避沒有意義了，清掉：下次掉了要馬上補。
                     self._mate_retry.pop(key, None)
                     continue
-                # ⚠ **先要求讓路再送。** 反過來的話走路那一拍已經送出去了，
-                # 詠唱一開始就被自己人打斷。
+                # ⚠ **先續一次讓路再送。** 反過來的話走路那一拍已經送出去了，
+                # 詠唱一開始就被自己人打斷。（整段停多久由 `_mind_the_road`
+                # 決定，這裡只是確保這一發送出去的瞬間路是淨空的。）
                 self._hold(CAST_HOLD)
                 data = build_use_skill(plan.level, plan.skill_id, mate.aid)
                 if not self._send(data):

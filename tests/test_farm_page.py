@@ -1453,6 +1453,8 @@ def test_the_bots_come_back_on_after_a_successful_supply_run(monkeypatch, qtbot)
     page._cards[pid] = card
     card.auto_potion.setChecked(False)
     card.auto_hunt.setChecked(False)
+    page._names[pid] = "白狐"
+    page._want_farm.add("白狐")          # 補給前使用者本來就在掛機
 
     page._resume_after_supplies(pid, card, _FakeRestock(came_back=True))
     assert card.auto_potion.isChecked()
@@ -1563,6 +1565,8 @@ def test_arriving_turns_farming_back_on(monkeypatch, qtbot):
     pid = 4242
     card = make_card(qtbot)
     page._cards[pid] = card
+    page._names[pid] = "白狐"
+    page._want_farm.add("白狐")          # 使用者要掛機
     page._resume_farm.add(pid)
     page._travelers[pid] = _ArrivalTraveler(running=False, arrived=True)
 
@@ -1577,8 +1581,23 @@ def test_failing_to_get_back_does_not_start_farming(monkeypatch, qtbot):
     pid = 4242
     card = make_card(qtbot)
     page._cards[pid] = card
+    page._names[pid] = "白狐"
+    page._want_farm.add("白狐")
     page._resume_farm.add(pid)
     page._travelers[pid] = _ArrivalTraveler(running=False, arrived=False)
+
+    page._watch_travel_resumes()
+    assert not card.auto_hunt.isChecked()
+
+
+def test_arriving_does_nothing_if_the_user_never_wanted_to_farm(monkeypatch, qtbot):
+    """使用者只是按了「自動尋路」去某個地方 —— 到了不該自己開始打怪。"""
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    page._names[pid] = "白狐"
+    page._arrived_pending.add(pid)
 
     page._watch_travel_resumes()
     assert not card.auto_hunt.isChecked()
