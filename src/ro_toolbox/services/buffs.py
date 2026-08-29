@@ -53,10 +53,16 @@ CONFIRM_TIMEOUT = 5.0
 #: 沒成功時的退避：第一次等 1 秒，之後翻倍，最多 30 秒。
 BACKOFF_START = 1.0
 BACKOFF_MAX = 30.0
-#: 兩次施放之間至少隔多久 —— 一拍只做一件事，免得整排 buff 一起噴出去。
-MIN_GAP = 0.6
+#: 兩次施放之間至少隔多久 —— 免得整排 buff 一起噴出去。
+#:
+#: 🔬 2026-08-29 從 0.6 降到 0.3（使用者回報「幫隊友放有點慢」）。
+#: 真正的大頭不在這裡（見 `PartyWatch` 的說明：隊友**動一下**我們才認得出他），
+#: 但這一段是我們控制得了的部分。
+MIN_GAP = 0.3
 #: 主迴圈多久跑一拍。
-TICK = 0.4
+#:
+#: 🔬 同上，從 0.4 降到 0.2。一拍的成本只是讀一次記憶體狀態（微秒級）。
+TICK = 0.2
 #: 多久檢查一次「連線有沒有換掉」。
 #:
 #: ⚠ 沒有這一條的代價是實測出來的：換地圖時伺服器會把連線移到另一台地圖伺服器
@@ -120,8 +126,6 @@ class BuffPlan:
 class _Pending:
     skill_id: int
     sent_at: float
-    #: 放給誰的 AID（`None` = 自己）。確認的時候要看對的人。
-    target: int | None = None
 
 
 @dataclass
@@ -163,6 +167,10 @@ class BuffKeeper:
         #: 技能編號 → (下次可以再試的時間, 目前的退避秒數)
         self._retry: dict[int, tuple[float, float]] = {}
         self._last_cast = 0.0
+        #: 幫隊友放的節流跟自己的分開 —— 兩邊互相卡住只會讓兩邊都慢。
+        self._last_mate_cast = 0.0
+        #: (技能, 隊友AID) → 送出時刻。同一個目標的同一個技能一次只送一發。
+        self._mate_pending: dict[tuple[int, int], float] = {}
         self.stats = BuffStats()
 
     def set_plans(self, plans) -> None:
@@ -196,16 +204,25 @@ class BuffKeeper:
             return self._note("讀不到身上的狀態，這一拍先不補")
         present = {row.efst: row for row in statuses}
 
+        done = self._settle_mates()
+        if done is not None:
+            return done
+        waiting = False
         if self._pending is not None:
             settled = self._settle(present)
             if settled is not None:
                 return settled     # 這一拍的工作就是「確認上一個的結果」
-            return None            # 還在等，先不做別的事
-        mine = self._cast_next(present, sp)
-        if mine is not None:
-            return mine
+            waiting = True
+        if not waiting:
+            mine = self._cast_next(present, sp)
+            if mine is not None:
+                return mine
         # 自己的都補好了才輪到隊友 —— 自己倒了就沒人補得成（使用者指定的
         # 是「多一個按鈕幫隊友放」，不是「改成幫隊友放」）。
+        #
+        # ⚠ **等自己那一發確認的時候照樣可以幫隊友放**：目標不同、狀態也分開
+        # 確認，序列化沒有好處，只會讓「幫隊友」慢上好幾秒
+        # （使用者回報「等 10 秒才放」）。同一個目標仍然一次一發。
         return self._cast_for_mates(sp)
 
     # ---- 確認上一次 -------------------------------------------------
@@ -217,8 +234,6 @@ class BuffKeeper:
         efst = buff_efst(pending.skill_id)
         name = skill_name(pending.skill_id)
 
-        if pending.target is not None:
-            return self._settle_mate(pending, efst, name)
         if efst is not None and efst in present:
             self._pending = None
             self._retry.pop(pending.skill_id, None)
@@ -237,25 +252,30 @@ class BuffKeeper:
         log.info("「%s」放了沒上身，%.0f 秒後再試", name, backoff)
         return self._note(f"{name} 沒上身，{backoff:.0f} 秒後再試")
 
-    def _settle_mate(self, pending: _Pending, efst: int | None,
-                     name: str) -> str | None:
-        """幫隊友放的那一發成功了沒。看的是**他**身上有沒有那個狀態。"""
-        mate = self._mate(pending.target)
-        if efst is not None and mate is not None and mate.has(efst, self._now()):
-            self._pending = None
-            self._retry.pop(pending.skill_id, None)
-            self.stats.mate_cast += 1
-            return self._note(f"幫 {mate.label()} 補上 {name}")
-        now = self._now()
-        if now - pending.sent_at < CONFIRM_TIMEOUT:
+    def _settle_mates(self) -> str | None:
+        """幫隊友放的那幾發成功了沒。看的是**他**身上有沒有那個狀態。
+
+        ⚠ 每個 `(技能, 隊友)` 各自獨立 —— 序列化只會讓「三個隊友」變成
+        三倍的等待時間（使用者回報「等 10 秒才放」）。
+        """
+        if not self._mate_pending:
             return None
-        self._pending = None
-        _, backoff = self._retry.get(pending.skill_id, (0.0, 0.0))
-        backoff = min(BACKOFF_MAX, backoff * 2 if backoff else BACKOFF_START)
-        self._retry[pending.skill_id] = (now + backoff, backoff)
-        who = mate.label() if mate is not None else f"#{pending.target}"
-        log.info("幫「%s」放的「%s」沒上身，%.0f 秒後再試", who, name, backoff)
-        return self._note(f"{who} 的 {name} 沒上身，{backoff:.0f} 秒後再試")
+        now = self._now()
+        for (skill_id, aid), sent_at in list(self._mate_pending.items()):
+            efst = buff_efst(skill_id)
+            mate = self._mate(aid)
+            name = skill_name(skill_id)
+            if efst is not None and mate is not None and mate.has(efst, now):
+                del self._mate_pending[(skill_id, aid)]
+                self.stats.mate_cast += 1
+                return self._note(f"幫 {mate.label()} 補上 {name}")
+            if now - sent_at < CONFIRM_TIMEOUT:
+                continue
+            del self._mate_pending[(skill_id, aid)]
+            who = mate.label() if mate is not None else f"#{aid}"
+            log.info("幫「%s」放的「%s」沒上身，等下再試", who, name)
+            return self._note(f"{who} 的 {name} 沒上身，等下再試")
+        return None
 
     def _mate(self, aid: int | None):
         if self._party is None or aid is None:
@@ -306,7 +326,7 @@ class BuffKeeper:
         if not self.help_mates or self._party is None:
             return None
         now = self._now()
-        if now - self._last_cast < MIN_GAP:
+        if now - self._last_mate_cast < MIN_GAP:
             return None
         mates = self._party.mates()
         if not mates:
@@ -323,13 +343,15 @@ class BuffKeeper:
                 self.stats.waiting_sp += 1
                 continue
             for mate in mates:
+                if (plan.skill_id, mate.aid) in self._mate_pending:
+                    continue        # 這一發還在等結果，別重送
                 if not self._party.needs(mate, efst, MATE_REFRESH_RATIO):
                     continue
                 data = build_use_skill(plan.level, plan.skill_id, mate.aid)
                 if not self._send(data):
                     return self._note(f"{skill_name(plan.skill_id)} 送不出去")
-                self._last_cast = now
-                self._pending = _Pending(plan.skill_id, now, target=mate.aid)
+                self._last_mate_cast = now
+                self._mate_pending[(plan.skill_id, mate.aid)] = now
                 return self._note(
                     f"幫 {mate.label()} 補 {skill_name(plan.skill_id)} Lv{plan.level}"
                 )

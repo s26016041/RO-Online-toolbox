@@ -156,3 +156,16 @@ def test_no_target_data_means_no():
     from ro_toolbox.services.buffs import can_target_others
 
     assert not can_target_others(999999)
+
+
+def test_a_mate_who_never_moves_is_never_seen():
+    """⚠ 這是**已知限制**，不是 bug：`0x0107` 只在隊友移動時送。
+
+    實測站著不動 30 秒只收到 3 筆，隊友那一筆是第 26.8 秒他動了才來。
+    使用者回報「在白狐旁邊等 10 秒才放」等的就是這個 —— 隊友動一下就會
+    被認出來，之後都是即時的。
+    """
+    watch, _clock = _watch()
+    # 只收到狀態封包（隊友有動作但沒移動）—— 還是認不出他是隊友
+    watch.feed(OP_STATE_TIMED, _timed(BLESSING_EFST, MATE, 1, 240000, 240000))
+    assert watch.mates() == []

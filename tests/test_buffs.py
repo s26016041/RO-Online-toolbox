@@ -399,3 +399,49 @@ def test_the_mate_cast_is_confirmed_on_the_mate():
     fake.clock += 0.3
     assert "補上" in (keeper.tick() or "")
     assert keeper.stats.mate_cast == 1
+
+
+def test_helping_a_mate_does_not_wait_for_my_own_confirmation():
+    """等自己那一發確認的時候照樣可以幫隊友放。
+
+    使用者回報「在白狐旁邊等 10 秒才放」—— 序列化沒有好處：目標不同、
+    狀態也分開確認，硬排隊只會讓「幫隊友」慢上好幾秒。
+    """
+    fake = Fake()                                       # 自己什麼都沒有
+    mate = FakeMate(MATE_AID, "白狐")
+    keeper, _party = _party_keeper(fake, [mate])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()                                       # 先補自己
+    assert fake.sent == [build_use_skill(10, INCAGI, AID)]
+
+    fake.clock += MIN_GAP                               # 自己那發還沒確認
+    keeper.tick()
+    assert fake.sent[-1] == build_use_skill(10, INCAGI, MATE_AID), "不該等"
+
+
+def test_several_mates_are_not_serialised():
+    """三個隊友不該變成三倍的等待 —— 每個 (技能, 隊友) 各自獨立。"""
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])     # 自己已經有了
+    mates = [FakeMate(100 + i) for i in range(3)]
+    keeper, _party = _party_keeper(fake, mates)
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    for _ in range(3):
+        keeper.tick()
+        fake.clock += MIN_GAP + 0.01      # 浮點數：剛好等於門檻會擦邊
+    targets = [int.from_bytes(p[6:10], "little") for p in fake.sent]
+    assert sorted(targets) == [100, 101, 102]
+
+
+def test_the_same_mate_is_not_spammed():
+    """同一個 (技能, 隊友) 還在等結果就不要重送。"""
+    fake = Fake([FakeStatus(INCAGI_EFST, 200_000)])
+    keeper, _party = _party_keeper(fake, [FakeMate(MATE_AID)])
+    keeper.set_plans([BuffPlan(INCAGI, 10)])
+
+    keeper.tick()
+    for _ in range(5):
+        fake.clock += MIN_GAP
+        keeper.tick()
+    assert len(fake.sent) == 1
