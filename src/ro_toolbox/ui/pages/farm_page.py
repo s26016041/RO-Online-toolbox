@@ -1056,6 +1056,9 @@ class FarmPage(BasePage):
         self._cards: dict[int, CharacterCard] = {}
         self._workers: dict[int, AttachWorker] = {}
         self._bots: dict[int, FarmBot] = {}
+        #: 負重滿了、bot 已經被收走、但還沒把人帶回城的 PID。
+        #: 見 `_watch_overweight` 裡那段「收攤的順序會咬人」。
+        self._overweight_pending: set[int] = set()
         self._potions: dict[int, PotionBot] = {}
         #: 自動補助技能。**跟自動打怪各跑各的**（使用者指定）——
         #: 不掛機也可以只開這個，掛機時兩邊互不干涉。
@@ -1668,9 +1671,16 @@ class FarmPage(BasePage):
         ⚠ 使用者指定「**掛機不補給**」—— 這裡只負責把人帶回城，
         不會自己跑去買東西。要補貨請按「補水」。
         """
-        for pid, bot in list(self._bots.items()):
-            if not bot.stats.overweight:
-                continue
+        pids = {pid for pid, bot in self._bots.items() if bot.stats.overweight}
+        # ⚠⚠ **收攤的順序會咬人。** 卡片一收到「不在跑了」的回報就自己把
+        # 「自動打怪」的勾勾拿掉，而拿掉勾勾會走 `_toggle_farm()` 把 bot 從
+        # `self._bots` 移走 —— 那比這個計時器早。舊版只看 `self._bots`，
+        # 所以到這裡的時候 bot 已經不見了，`overweight` 永遠是看不到的：
+        # **通知照跳「正在回城」，回程從頭到尾沒有發生**（使用者實測回報）。
+        # 所以收攤那一刻要把 PID 記下來（`_overweight_pending`），這裡一起處理。
+        pids |= self._overweight_pending
+        self._overweight_pending.clear()
+        for pid in pids:
             card = self._cards.get(pid)
             if card is not None:
                 card.auto_hunt.setChecked(False)      # 這會走 _toggle_farm 收攤
@@ -1698,6 +1708,10 @@ class FarmPage(BasePage):
         else:
             bot = self._bots.pop(pid, None)
             if bot is not None:
+                if bot.stats.overweight:
+                    # 負重滿了才被收攤 —— 記下來，`_watch_overweight` 要用它
+                    # 把人帶回城（bot 這時候已經不在 `self._bots` 裡了）。
+                    self._overweight_pending.add(pid)
                 self._keep_loot(pid, bot)
                 bot.stop()
             self._exp_start.pop(pid, None)

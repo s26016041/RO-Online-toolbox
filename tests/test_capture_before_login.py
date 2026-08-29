@@ -89,17 +89,29 @@ def test_packets_are_attributed_by_port_before_the_server_is_known():
     assert [p.outbound for p in seen] == [True, False]
 
 
-def test_known_server_still_filters_by_address():
-    """認出伺服器之後回到位址過濾，行為跟以前一樣。"""
-    cap, seen = _capture(_server_ip="203.0.113.7", _pid_ports=frozenset())
+def test_the_server_address_alone_never_claims_a_frame():
+    """⚠⚠ **多開的時候「連到同一台伺服器」不代表「是我的」。**
 
-    cap._handle_frame(_frame(51000, 6900, b"\x64\x00hello"))   # 送往伺服器
+    實測 2026-08-29：兩個客戶端同時在同一張地圖，`find_server()` 兩邊都回
+    `219.84.200.101:10009` —— 位址、連接埠全都一樣，唯一分得出來的只有
+    **本機連接埠**（作業系統保證唯一）。舊版有一條「來源或目的是伺服器位址
+    就算我的」的捷徑，於是兩條連線的位元組被串進同一個重組緩衝，切出來的
+    封包互相污染（15 秒實測誤收 81 個影格，佔 41%）。
+
+    症狀完全不像封包問題，全都長得像記憶體讀錯：負重 101%、打到空氣、
+    換圖之後尋路從別人的座標開始算然後安靜卡住（[PKT-085]）。
+    """
+    cap, seen = _capture(_server_ip="203.0.113.7", _pid_ports=frozenset({51000}))
+
+    cap._handle_frame(_frame(51000, 6900, b"\x64\x00mine"))    # 我的連線
+    cap._handle_frame(_frame(64080, 6900, b"\x64\x00nope"))    # 隔壁那隻，同一台伺服器
     cap._handle_frame(
         _frame(1234, 5678, b"\x64\x00nope", src_ip="10.0.0.1", dst_ip="198.51.100.9")
     )  # 與伺服器無關的流量
 
     assert len(seen) == 1
     assert seen[0].outbound is True
+    assert seen[0].payload == b"mine"
 
 
 def test_empty_payload_is_ignored():
@@ -187,8 +199,14 @@ def test_new_connection_is_captured_before_the_watchdog_notices():
 
 
 def test_old_server_still_captured_after_the_switch():
-    """舊連線上還沒收完的封包也要繼續收，不能因為換了就丟。"""
-    cap, seen = _capture(_server_ip="175.99.88.7", _pid_ports=frozenset({52000}))
+    """舊連線上還沒收完的封包也要繼續收，不能因為換了就丟。
+
+    ⚠ 靠的是**本機連接埠**：舊的 socket 只要還開著，它的本機埠就還在
+    `local_ports_of(pid)` 裡（實測換圖後舊連線會留 11 分鐘才收掉，[PKT-063]）。
+    不是靠「位址等於某台伺服器」—— 那條在多開時會收到隔壁那隻的封包。
+    """
+    cap, seen = _capture(_server_ip="175.99.88.7",
+                         _pid_ports=frozenset({51000, 52000}))
     cap._handle_frame(
         _frame(51000, 6900, b"\x64\x00old", src_ip="10.0.0.1", dst_ip="175.99.88.7")
     )

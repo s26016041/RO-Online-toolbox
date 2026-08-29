@@ -88,3 +88,50 @@ def test_a_move_ack_clears_it():
     bot._entry_fresh = True
     bot._on_packet(_packet(0x0087, b"\x00" * 4 + _move(65, 87, 70, 90)))
     assert not bot._entry_fresh
+
+
+# ---- 座標讀不到：不准安靜地空轉 --------------------------------------------
+
+
+def test_an_unreadable_position_eventually_nudges(monkeypatch):
+    """⚠ 實機踩過（2026-08-29，白狐）：換到 mjolnir_06 之後移動元件失效，
+
+    而「走一步就會接上」的那一步**永遠不會發生** —— 要走路得先知道自己在哪。
+    舊版每一拍靜靜 `continue`，日誌整整 42 秒一行都沒有，最後是使用者自己
+    走一步再按一次尋路才救回來。出口跟換圖那條一樣：**推一步問位置**。
+    """
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = TravelBot(1234)
+    terrain = _terrain(200, 200)
+    monkeypatch.setattr(bot, "_terrain_for", lambda _m: terrain)
+    nudged = []
+    monkeypatch.setattr(bot, "_nudge", lambda t, m: nudged.append(m))
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+
+    bot._no_position("mjolnir_06")
+    assert nudged == [], "第一拍只記時間 —— 換圖那一兩拍讀不到是正常的"
+
+    clock["now"] += mod._POS_LOST_SEC + 0.1
+    bot._no_position("mjolnir_06")
+    assert nudged == ["mjolnir_06"], "撐過去就要推一步，不能繼續空轉"
+
+
+def test_no_terrain_still_says_something(monkeypatch):
+    """沒有地形就推不動 —— 那也要**講出來**，不准安靜地停在那裡。"""
+    from ro_toolbox.services import travel_bot as mod
+
+    bot = TravelBot(1234)
+    monkeypatch.setattr(bot, "_terrain_for", lambda _m: None)
+    notes = []
+    monkeypatch.setattr(bot, "_note", lambda text, level=0: notes.append(text))
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+    bot._no_position("mjolnir_06")
+    clock["now"] += mod._POS_LOST_SEC + 0.1
+    bot._no_position("mjolnir_06")
+
+    assert notes and "讀不到角色座標" in notes[-1]

@@ -1321,3 +1321,65 @@ def test_a_character_with_no_account_is_left_alone(monkeypatch, qtbot, caplog):
     assert "重連" not in caplog.text, "不該再喊重連"
     assert "白狐" not in page._deciders, "不該再建 decider 去數秒"
     page.shutdown()
+
+
+# ---- 負重滿了要真的回城，不是只跳通知 --------------------------------------
+
+
+class _FakeFarmBot:
+    def __init__(self, overweight: bool) -> None:
+        self.stats = type("S", (), {"overweight": overweight, "running": False})()
+        self.stopped = False
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+class _FakePotion:
+    running = True
+
+    def __init__(self) -> None:
+        self.home_why = None
+
+    def request_home(self, why: str) -> None:
+        self.home_why = why
+
+
+def test_overweight_still_goes_home_after_the_bot_was_removed(monkeypatch, qtbot):
+    """⚠⚠ 使用者實測回報：「90% 跳通知也沒使用回程道具」。
+
+    順序是這樣咬到的：卡片一收到「不在跑了」就自己把「自動打怪」的勾勾拿掉，
+    而拿掉勾勾會走 `_toggle_farm()` 把 bot 從 `page._bots` 移走 ——
+    那比 `_watch_overweight` 那個計時器**早**。於是計時器跑到的時候
+    `page._bots` 已經是空的，`overweight` 永遠看不到：通知照跳「正在回城」，
+    回程從頭到尾沒有發生。
+    """
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    bot = _FakeFarmBot(overweight=True)
+    page._bots[pid] = bot
+    potion = _FakePotion()
+    page._potions[pid] = potion
+    monkeypatch.setattr(page, "_keep_loot", lambda *a: None)
+
+    # 卡片先收攤（真實世界就是這個順序）
+    page._toggle_farm(pid, False)
+    assert page._bots == {}, "bot 已經被收走了"
+    assert bot.stopped
+
+    page._watch_overweight()
+    assert potion.home_why == "負重滿了", "收攤之後照樣要把人帶回城"
+
+
+def test_a_normal_stop_does_not_send_anyone_home(monkeypatch, qtbot):
+    """使用者自己按停止（沒有超重）不准觸發回程。"""
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    page._bots[pid] = _FakeFarmBot(overweight=False)
+    potion = _FakePotion()
+    page._potions[pid] = potion
+    monkeypatch.setattr(page, "_keep_loot", lambda *a: None)
+
+    page._toggle_farm(pid, False)
+    page._watch_overweight()
+    assert potion.home_why is None

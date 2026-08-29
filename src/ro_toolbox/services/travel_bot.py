@@ -59,6 +59,9 @@ _OP_MAP_MOVE = (0x0091, 0x0092, 0x0AC7)
 #: 只有「開始尋路時人就已經在別張圖上」才會用到（那時換圖那一包早就過去了）。
 #: 逾時只是**放棄的上限**：真正的成功依據是伺服器回的 0x0087 起點。
 _NUDGE_EVERY_SEC = 0.5
+#: 座標連續讀不到多久就開始推一步問位置（見 `_no_position`）。
+#: 換圖那一兩拍讀不到是正常的，所以要留一點餘裕再動手。
+_POS_LOST_SEC = 3.0
 _NUDGE_TRIES = 60
 #: 推的目標彼此至少隔這麼遠就夠了 —— 移動封包超過這個距離伺服器直接忽略
 #: （[PKT-030] 實測 ≤17 接受、18 被忽略），所以每一格可走的地方都會落在
@@ -169,6 +172,8 @@ class TravelBot:
         self._server_pos_map = ""
         #: 剛被伺服器移到新圖、角色還沒走過一步。見 `_trusted_position`。
         self._entry_fresh = False
+        #: 座標從什麼時候開始讀不到（0 = 現在讀得到）。見 `_no_position`。
+        self._pos_lost_at = 0.0
         #: 上次為了「問出自己在哪」而推一下的時間，以及推了幾次。
         self._nudged_at = 0.0
         self._nudges = 0
@@ -452,8 +457,10 @@ class TravelBot:
             # 座標讀不到（換圖中、或定位失效）就這一拍不動 ——
             # 絕不拿讀不到當成「在原點」，那正是 [MEM-039] 踩過的坑。
             if status is None or not status.map_name or pos is None:
+                self._no_position(status.map_name if status else "")
                 self._stop.wait(_TICK)
                 continue
+            self._pos_lost_at = 0.0
 
             pos = self._trusted_position(status.map_name, pos)
             if pos is None:
@@ -705,6 +712,34 @@ class TravelBot:
             self._resync_at = 0.0     # 逼下一拍立刻重綁，不要等節流時間
             return False
         return True
+
+    def _no_position(self, map_name: str) -> None:
+        """座標讀不到。**不准安靜地空轉** —— 推一步把位置逼出來。
+
+        實機踩過（2026-08-29，白狐）：換到 mjolnir_06 之後移動元件失效，
+        而「走一步就會接上」的那一步**永遠不會發生** —— 要走路得先知道自己
+        在哪，而知道自己在哪要先走一步。於是這裡每 `_TICK` 秒 `continue`
+        一次，日誌整整 42 秒一行都沒有，使用者只好自己走一步再按一次尋路。
+
+        「讀不到就這一拍不動」本身是對的（[MEM-039]：不准把讀不到當成原點），
+        錯的是**沒有出口**。出口跟 `_trusted_position` 用的是同一招：往這張圖
+        上站得住的地方送一步。角色一動，客戶端就會把座標寫回記憶體，
+        移動元件也跟著找得到；`_nudge` 自己會節流、會試不同的房間、
+        試完還是問不出來就大聲停用。
+        """
+        now = time.monotonic()
+        if not self._pos_lost_at:
+            self._pos_lost_at = now
+            return
+        if now - self._pos_lost_at < _POS_LOST_SEC:
+            return
+        terrain = self._terrain_for(map_name) if map_name else None
+        if terrain is None:
+            self._note("⚠ 讀不到角色座標，也沒有這張圖的地形可以推一步 —— 原地等",
+                       logging.WARNING)
+            return
+        self._note("讀不到角色座標，送一步移動把位置逼出來", logging.WARNING)
+        self._nudge(terrain, map_name)
 
     def _trusted_position(self, map_name: str, pos: tuple[int, int]):
         """回一個**確定在這張圖上**的座標；問不出來回 None（這一拍不動）。
