@@ -80,9 +80,15 @@ _RETRY_AFTER_SEC = 10.0  # 定位失敗後隔多久重試（多半是還沒登�
 #: 而定位失敗的重試冷卻本身就是 10 秒。
 _RESTORE_TIMEOUT_SEC = 180.0
 _MAX_READ_FAILURES = 3  # 連續讀取失敗幾次就當它登出／關閉了
-#: 多久重掃一次技能。升等會**當場**重掃（見 `_watch_level_up`），這個計時器是
-#: 為了接住「沒升等、只是把存著的點數加下去」那種變動。掃一趟約 2 秒。
-_SKILL_REFRESH_MS = 120_000
+#: 多久重掃一次技能（使用者指定 5 秒）。
+#:
+#: ⚠ 這個頻率只有在 `SkillReader` 走**快路徑**時才成立：它只重讀上次記住的
+#: 那幾個結構位址（微秒級），每 60 秒才全掃一次 507 MB。
+#: 沒有快路徑之前這裡是 120 秒，因為每次都要掃 2 秒。
+#:
+#: ⚠ **不看升等**：升等不會改技能，要玩家自己點下去才會變（使用者指出）。
+#: 所以只有定期重掃，沒有「升等就掃」那條。
+_SKILL_REFRESH_MS = 5_000
 
 
 class AttachWorker(QThread):
@@ -138,20 +144,20 @@ class SkillWorker(QThread):
 
     done = Signal(int, object)  # pid, list[Skill] 或 None
 
-    def __init__(self, pid: int) -> None:
+    def __init__(self, pid: int, reader: SkillReader) -> None:
         super().__init__()
         self._pid = pid
+        #: ⚠ **共用的 reader**，不是每次新建：新建要跑一次 AOB 定位（1~2 秒），
+        #: 而且快取會被丟掉，5 秒一輪的刷新就變成每 5 秒全掃 507 MB。
+        #: 同一個 pid 同時只會有一個 worker（`_skill_workers` 擋著），所以安全。
+        self._reader = reader
 
     def run(self) -> None:
-        reader = SkillReader()
         rows = None
         try:
-            if reader.attach(self._pid):
-                rows = reader.read(should_stop=self.isInterruptionRequested)
+            rows = self._reader.read(should_stop=self.isInterruptionRequested)
         except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
             log.debug("PID %s 讀技能失敗：%s", self._pid, exc)
-        finally:
-            reader.close()
         self.done.emit(self._pid, rows)
 
 
@@ -1042,12 +1048,12 @@ class FarmPage(BasePage):
         self._reconnect_pid = 0
         self._bag_workers: dict[int, BagWorker] = {}
         self._bag_loaded: set[int] = set()
-        #: 技能：接上時掃一次，之後**升等當場重掃**＋每隔幾分鐘定期重掃
-        #: （加點不需要升等，所以只看升等會漏）。掃一趟 1.8~2.6 秒。
+        #: 技能：接上時掃一次，之後每 5 秒重掃（使用者指定）。撐得住是因為
+        #: `SkillReader` 有快路徑，只重讀記住的結構位址、60 秒才全掃一次。
         self._skill_workers: dict[int, SkillWorker] = {}
         self._skill_loaded: set[int] = set()
-        #: 角色 → 上次看到的 (Base, Job) 等級。變了就重掃技能。
-        self._levels: dict[int, tuple[int, int]] = {}
+        #: 每個行程一個 SkillReader，**重用**（見 `SkillWorker`）。
+        self._skill_readers: dict[int, SkillReader] = {}
         # 每個角色最近一次讀到的背包 {格號: (道具編號, 數量)}
         self._bags: dict[int, dict[int, tuple[int, int]]] = {}
         self._names: dict[int, str] = {}
@@ -1336,13 +1342,15 @@ class FarmPage(BasePage):
         if buff_bot is not None:
             buff_bot.stop()
         self._skill_loaded.discard(pid)
-        self._levels.pop(pid, None)
+        skill_reader = self._skill_readers.pop(pid, None)
         # ⚠ 一定要等它結束再往下 —— QThread 還在跑就被解構會**殺掉整支程式**
         # （[ENV-006]，收尾用等待不是丟掉）。
         skill_worker = self._skill_workers.pop(pid, None)
         if skill_worker is not None:
             skill_worker.requestInterruption()
             skill_worker.wait(5000)
+        if skill_reader is not None:
+            skill_reader.close()   # ⚠ 一定要等 worker 收工才關，它還在用
 
         card = self._cards.pop(pid, None)
         if card is not None:
@@ -1681,31 +1689,28 @@ class FarmPage(BasePage):
             return
         if find_server(pid) is None:
             return
+        reader = self._skill_readers.get(pid)
+        if reader is None:
+            reader = SkillReader()
+            if not reader.attach(pid):
+                return
+            self._skill_readers[pid] = reader
         self._skill_loaded.add(pid)
-        worker = SkillWorker(pid)
+        worker = SkillWorker(pid, reader)
         worker.done.connect(self._skills_ready)
         worker.finished.connect(lambda p=pid: self._skill_workers.pop(p, None))
         self._skill_workers[pid] = worker
         worker.start()
 
-    def _watch_level_up(self, pid: int, status: CharacterStatus) -> None:
-        """升等了就立刻重掃技能 —— 升等常常伴隨點出新技能。
-
-        純加點（沒升等）由 `_skill_timer` 每隔幾分鐘掃一次補上。
-        """
-        levels = (status.base_level, status.job_level)
-        before = self._levels.get(pid)
-        self._levels[pid] = levels
-        if before is not None and before != levels:
-            log.info("%s 升等了（%s → %s），重掃技能", status.name, before, levels)
-            self._load_skills(pid, again=True)
-
     def _refresh_skills(self) -> None:
-        """定期重掃所有分頁的技能。
+        """定期重掃所有分頁的技能（每 5 秒，使用者指定）。
 
-        為什麼要定期而不是只在升等時掃：**加點不需要升等** ——
-        技能點數可以存著，想加的時候再加。使用者要求「一直跑刷新，避免我升等
-        點出新技能或者技能等級變高」。掃一趟約 2 秒，隔幾分鐘一次不痛不癢。
+        **不看升等**：升等本身不會改技能，要玩家自己點下去才會變（使用者指出），
+        所以「升等就掃」那條沒有意義，定期掃就夠。
+
+        撐得住 5 秒一輪是因為 `SkillReader` 有快路徑：只重讀記住的結構位址
+        （微秒級），每 60 秒才全掃一次。**每個分頁共用同一個 reader**，
+        不然每次都要重新 AOB 定位（1~2 秒），那才是真正的成本。
         """
         for pid in list(self._cards):
             self._load_skills(pid, again=True)
@@ -1868,7 +1873,6 @@ class FarmPage(BasePage):
                 continue
 
             self._failures[pid] = 0
-            self._watch_level_up(pid, status)
             card.update_status(status)
             card.set_exp_gain(self._exp_gain_text(pid, status))
             card.set_buffs(reader.status_effects())

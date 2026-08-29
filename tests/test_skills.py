@@ -60,6 +60,8 @@ class FakeScanner:
         self._next_string = STRINGS
         self._slot = 0
         self.closed = False
+        #: 掃過幾次整塊記憶體。快路徑不該讓這個數字增加。
+        self.full_scans = 0
 
     # ---- 佈置 ----
 
@@ -92,6 +94,7 @@ class FakeScanner:
         return [(REGION, REGION_SIZE)]
 
     def _read_region(self, base, size):
+        self.full_scans += 1
         if base != REGION:
             return None
         return bytes(self.region[:size])
@@ -106,9 +109,16 @@ class FakeScanner:
 
 
 class OnlineCharacter:
-    """假的角色狀態讀取器：有角色在場上。"""
+    """假的角色狀態讀取器：有角色在場上。
+
+    `attaches` 數的是「跑了幾次 AOB 定位」—— 真的那一個要 1~2 秒，
+    5 秒一輪的刷新每次都重跑就等於白做快路徑。
+    """
+
+    attaches = 0
 
     def attach(self, pid):  # noqa: ARG002
+        type(self).attaches += 1
         return True
 
     def read(self):
@@ -128,13 +138,27 @@ class OfflineCharacter(OnlineCharacter):
 @pytest.fixture(autouse=True)
 def _character_online(monkeypatch):
     """預設「有角色在場上」，否則每條測試都會卡在線上檢查。"""
+    OnlineCharacter.attaches = 0
     monkeypatch.setattr(skills_mod, "CharacterReader", OnlineCharacter)
 
 
+class Clock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
 @pytest.fixture
-def reader():
+def clock():
+    return Clock()
+
+
+@pytest.fixture
+def reader(clock):
     scanner = FakeScanner()
-    reader = SkillReader(scanner)
+    reader = SkillReader(scanner, now=clock)
     assert reader.attach(1234)
     return reader, scanner
 
@@ -310,3 +334,76 @@ def test_close_releases_only_owned_scanner():
 
     owned = SkillReader()
     owned.close()          # 自己建的 scanner，關掉不該丟例外
+
+
+# ---- 快路徑（5 秒刷新撐得住的原因）----------------------------------------
+
+
+def test_second_read_does_not_rescan_memory(reader, clock):
+    """第二次讀只重驗記住的結構位址 —— 不然 5 秒一輪等於每 5 秒掃 507 MB。"""
+    r, scanner = reader
+    scanner.add_skill(5, 10, 15)
+    scanner.add_skill(60, 7, 38)
+
+    assert r.read() is not None
+    after_full = scanner.full_scans
+    assert after_full > 0
+
+    clock.t += 5
+    again = r.read()
+    assert [s.id for s in again] == [5, 60]
+    assert scanner.full_scans == after_full, "快路徑不該再掃整塊記憶體"
+
+
+def test_the_fast_path_sees_a_skill_point_being_spent(reader, clock):
+    """加點不會換結構位址，只是把 level 從 0 改成 1 —— 快路徑要看得到。"""
+    r, scanner = reader
+    addr = scanner.add_skill(56, 0, 7)          # KN_PIERCE，學得起但沒點
+    assert (r.read() or [])[0].level == 0
+
+    offset = addr - REGION
+    struct.pack_into("<I", scanner.region, offset + 0x08, 3)   # 點到 Lv3
+    clock.t += 5
+    assert (r.read() or [])[0].level == 3
+
+
+def test_a_broken_cache_falls_back_to_a_full_scan(reader, clock, caplog):
+    """結構動了（換角色／轉職）就整份不採用，重新全掃認一次。"""
+    r, scanner = reader
+    addr = scanner.add_skill(5, 10, 15)
+    assert r.read() is not None
+    before = scanner.full_scans
+
+    offset = addr - REGION
+    struct.pack_into("<I", scanner.region, offset, 999999)     # 把 ID 弄壞
+    clock.t += 1
+    with caplog.at_level(logging.INFO):
+        assert r.read() is None                # 這塊記憶體裡沒有別的技能了
+    assert scanner.full_scans > before
+    assert "快取失效" in caplog.text
+
+
+def test_a_full_scan_still_happens_now_and_then(reader, clock):
+    """轉職會多出一整批新技能，那些結構不在快取裡 —— 靠定期全掃接住。"""
+    r, scanner = reader
+    scanner.add_skill(5, 10, 15)
+    assert [s.id for s in r.read() or []] == [5]
+    before = scanner.full_scans
+
+    scanner.add_skill(60, 7, 38)               # 轉職後新增的技能
+    clock.t += 5
+    assert [s.id for s in r.read() or []] == [5], "還在快取期間，看不到新的"
+    assert scanner.full_scans == before
+
+    clock.t += skills_mod.FULL_RESCAN_SEC
+    assert [s.id for s in r.read() or []] == [5, 60]
+    assert scanner.full_scans > before
+
+
+def test_the_online_check_reuses_one_character_reader(reader, clock):
+    """`_online()` 每次都重新 attach 的話，5 秒一輪等於每 5 秒跑一次 AOB 定位。"""
+    r, scanner = reader
+    scanner.add_skill(5, 10, 15)
+    r.read()
+    r.read()
+    assert OnlineCharacter.attaches == 1

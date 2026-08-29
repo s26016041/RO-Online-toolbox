@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -72,6 +73,21 @@ _FIELDS = _I_MAXLV + 1
 
 #: 英文代號最長多少（實測最長 26，取 48 有餘裕又不會讀進太多雜訊）。
 _NAME_BYTES = 48
+
+#: 全掃之間隔多久。中間每次 `read()` 都走**快路徑**：只重讀上次記住的那幾個
+#: 結構位址（25 個 × 0x24 bytes，微秒級），不再掃 507 MB。
+#:
+#: 為什麼快路徑抓得到加點：**加點不會新增結構**。實測狐狐狸 25 個技能節點裡
+#: 10 個已學、15 個 `level == 0`（學得起但沒點）—— 客戶端在登入時就把可學的
+#: 都建好了，加點只是把那個 `level` 欄位從 0 改成 1，位址不動。
+#:
+#: 那全掃還留著做什麼：**轉職**會多出一整批新技能，那些結構是新配置的、
+#: 不在快取裡。所以每隔這麼久還是全掃一次接住它。
+FULL_RESCAN_SEC = 60.0
+
+#: 角色狀態連續讀不到幾次才當成「登出了」。換地圖那一瞬間也會讀不到，
+#: 一次就當真的話會白白丟掉快取（見 `_online()`）。
+_OFFLINE_TOLERANCE = 3
 
 #: 數值欄位的合理範圍。這只是**粗篩**，真正的判別是字串↔ID 交叉驗證。
 #: ⚠ 只准拿**確認過意義**的欄位來篩：拿沒把握的欄位篩會安靜漏掉技能（見模組開頭）。
@@ -209,15 +225,31 @@ def _candidates(u32: np.ndarray, maxlv_of: np.ndarray, top_id: int) -> np.ndarra
 class SkillReader:
     """掃出角色目前的技能表。
 
-    ⚠ **不要每一拍呼叫。** `read()` 每次都重掃整個行程的可寫記憶體（實測約
-    數秒），跟 `bag.as_dict()` 當初拖慢自動補水是同一類問題（[MEM-043]）。
-    技能表是「使用者按一下才看」的東西，變動也只在加點時發生。
+    `read()` 有兩條路：
+
+    - **快路徑**（預設）：只重讀上次記住的那幾個結構位址（25 個 × 0x24 bytes，
+      微秒級）。加點抓得到 —— 加點不會新增結構，只是改 `level` 欄位。
+    - **全掃**：每 `FULL_RESCAN_SEC` 一次，或快路徑驗不過時（換角色、轉職）。
+      實測 1.8~2.6 秒。
+
+    ⚠ 沒有快路徑之前這裡是「每次呼叫都掃 507 MB」，跟 `bag.as_dict()` 當初拖慢
+    自動補水是同一類問題（[MEM-043]）。使用者要求每 5 秒刷新一次技能面板，
+    那個頻率下全掃是不可能的。
     """
 
-    def __init__(self, scanner: MemoryScanner | None = None) -> None:
+    def __init__(self, scanner: MemoryScanner | None = None, now=time.monotonic) -> None:
         self._scanner = scanner or MemoryScanner()
         self._owns = scanner is None
         self._pid: int | None = None
+        self._now = now
+        #: 上次全掃找到的「技能編號 → 結構位址」。快路徑只重讀這一份。
+        self._known: dict[int, int] = {}
+        self._full_at = 0.0
+        #: 「有沒有角色在場上」的判準來源。**留著重用** —— 每次重新 attach
+        #: 要跑一次 AOB 定位（1~2 秒），5 秒一輪的刷新扛不住。
+        self._character: CharacterReader | None = None
+        #: 連續幾次讀不到角色狀態（見 `_online()`）。
+        self._offline_reads = 0
 
     @property
     def pid(self) -> int | None:
@@ -234,6 +266,12 @@ class SkillReader:
         self._pid = pid
         return True
 
+    def forget(self) -> None:
+        """丟掉快取，下一次 `read()` 重新全掃。換角色／換行程時用。"""
+        self._known = {}
+        self._full_at = 0.0
+        self._offline_reads = 0
+
     def _online(self) -> bool:
         """這個分身現在真的有角色在遊戲裡嗎？
 
@@ -247,11 +285,29 @@ class SkillReader:
         """
         if self._pid is None:
             return False
+        if self._character is not None:
+            if self._character.read() is not None:
+                self._offline_reads = 0
+                return True
+            # ⚠ **一次讀不到不算登出。** 換地圖那一瞬間也會讀不到，而丟掉
+            #   `CharacterReader` 的代價是下一次要重跑一次 AOB 定位（1~2 秒），
+            #   還會順手把技能快取清掉 —— 於是 5 秒一輪的刷新裡就會冒出
+            #   一次 2 秒的全掃（實測 10 次刷新的平均被拉到 199 ms）。
+            #   連續幾次讀不到才當真（跟 farm_page 的 `_MAX_READ_FAILURES` 同理）。
+            self._offline_reads += 1
+            if self._offline_reads < _OFFLINE_TOLERANCE:
+                return False
+            self._character.close()
+            self._character = None
+            self.forget()
+            return False
         reader = CharacterReader()
-        try:
-            return reader.attach(self._pid) and reader.read() is not None
-        finally:
-            reader.close()
+        if reader.attach(self._pid) and reader.read() is not None:
+            self._character = reader        # 留著重用，不要每次都重新定位
+            self._offline_reads = 0
+            return True
+        reader.close()
+        return False
 
     def read(self, should_stop=None, *, require_online: bool = True) -> list[Skill] | None:
         """回傳技能清單（依 ID 排序）。定位失敗回 None，**不回空清單充數**。
@@ -266,6 +322,16 @@ class SkillReader:
                 "記憶體裡的技能表是上一次登入的殘留 —— 不採用",
             )
             return None
+
+        # 快路徑：只重讀記住的那幾個結構。加點不會換位址，所以抓得到等級變化。
+        if self._known and self._now() - self._full_at < FULL_RESCAN_SEC:
+            quick = self._read_known()
+            if quick is not None:
+                return quick
+            # 驗不過＝結構動了（換角色、轉職、改版）——落回全掃重新認一次。
+            log.info("技能結構的快取失效了，重新全掃")
+            self.forget()
+
         codes = skill_codes()
         if not codes:
             log.warning("技能表（assets/skills.json.gz）載不到，技能功能停用")
@@ -276,6 +342,7 @@ class SkillReader:
             return None
 
         found: dict[int, Skill] = {}
+        where: dict[int, int] = {}
         conflicts: set[int] = set()
         scanned = 0
         for base, size in self._scanner._iter_regions(writable_only=True):
@@ -297,6 +364,9 @@ class SkillReader:
                 previous = found.get(skill.id)
                 if previous is None:
                     found[skill.id] = skill
+                    # ⚠ `int()` 不能省：`index` 是 numpy int64，
+                    #   直接餵給 ReadProcessMemory 會丟 ctypes.ArgumentError。
+                    where[skill.id] = int(base + index * 4)
                 elif previous != skill:
                     # 兩份都通過了交叉驗證卻不一樣 —— 多開？上一隻角色的殘留？
                     # 這種時候不准挑一個用，賭錯就是照著別人的技能等級做決策。
@@ -315,12 +385,35 @@ class SkillReader:
             return None
 
         skills = sorted(found.values(), key=lambda s: s.id)
+        self._known = dict(where)
+        self._full_at = self._now()
         log.info(
             "技能表定位成功：%d 個技能（已學會 %d 個），粗篩候選 %d 個",
             len(skills), sum(1 for s in skills if s.learned), scanned,
         )
         self._check_sp(skills)
         return skills
+
+    def _read_known(self) -> list[Skill] | None:
+        """快路徑：只重讀記住的結構位址。**任何一個驗不過就整份不採用**。
+
+        整份不採用而不是「跳過壞的那個」：結構會動通常代表整批都換了
+        （換角色、轉職），拿剩下的湊一份出來就是安靜地回舊資料。
+        """
+        codes = skill_codes()
+        if not codes:
+            return None
+        found: list[Skill] = []
+        for skill_id, addr in self._known.items():
+            raw = self._scanner._read_bytes(addr, _FIELDS * 4)
+            if raw is None or len(raw) < _FIELDS * 4:
+                return None
+            u32 = np.frombuffer(raw, dtype=np.uint32)
+            skill = self._verify(u32, 0, codes)
+            if skill is None or skill.id != skill_id:
+                return None
+            found.append(skill)
+        return sorted(found, key=lambda s: s.id)
 
     def _verify(self, u32: np.ndarray, index: int, codes: dict[str, int]) -> Skill | None:
         """字串↔ID 交叉驗證。對不上就丟掉 —— 這是判別的主力。"""
@@ -366,6 +459,10 @@ class SkillReader:
             )
 
     def close(self) -> None:
+        if self._character is not None:
+            self._character.close()
+            self._character = None
         if self._owns:
             self._scanner.close()
         self._pid = None
+        self.forget()
