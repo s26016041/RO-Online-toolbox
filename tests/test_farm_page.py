@@ -450,7 +450,7 @@ def test_a_vanished_game_is_treated_as_a_crash(qtbot, monkeypatch):
     _remember_where_he_lives(page, mod, monkeypatch, tick)
     called = []
     monkeypatch.setattr(page, "_begin_reconnect", lambda *a: called.append(a))
-    tick(5)
+    tick(20)          # 觀察期是 GRACE_SEC（30 秒），一拍 3 秒
     assert called, "遊戲不見了要重開"
     assert called[0][1] == "狐狐狸"
 

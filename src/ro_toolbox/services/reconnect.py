@@ -50,14 +50,23 @@ import logging
 
 log = logging.getLogger(__name__)
 
-#: 連線消失多久才算真的斷線。
+#: 連線消失多久才算真的斷線（使用者 2026-08-29 指定：**30 秒**）。
 #:
 #: ⚠ 這**不是**在等換地圖（換圖不會讓連線表變空，見檔頭與 [PKT-063]），
 #: 是在避免「只憑一拍的 TCP 讀數就把遊戲關掉重開」。呼叫端每秒取樣一次，
-#: 所以 5 秒 ≈ 連續 5 拍都沒有連線才動手。
-GRACE_SEC = 5.0
-#: 重連失敗後的退避間隔（秒）。用完就一直用最後一個 —— **不會無腦一直試**。
-BACKOFF_SEC = (30.0, 60.0, 120.0, 300.0, 600.0)
+#: 所以 30 秒 ≈ 連續 30 拍都沒有連線才動手。
+#:
+#: 為什麼從 5 秒放寬到 30：關掉重開的代價很大（要重登、重選角、重新掛機），
+#: 而斷線有時候會自己回來。**寧可多等半分鐘，也不要白重開一次。**
+GRACE_SEC = 30.0
+#: 重連失敗後的退避間隔（秒）。
+#:
+#: ⚠ **前幾次是 0** —— 使用者 2026-08-29 指定：「登入到一半出錯或登入失敗
+#: 都不等待，馬上關閉重開作登入」。登入失敗多半是卡登／輸入被搶走那種
+#: **重來就好**的問題，等 30 秒只是讓角色多躺 30 秒。
+#: 連續失敗幾次之後才開始退避 —— 那時候多半是真的有問題（帳密錯、伺服器維修），
+#: 一直狂開遊戲只會更糟。
+BACKOFF_SEC = (0.0, 0.0, 0.0, 30.0, 60.0, 300.0, 600.0)
 
 #: 回傳的狀態
 OK = "ok"                       # 連線正常
@@ -90,8 +99,14 @@ class ReconnectDecider:
         wait = BACKOFF_SEC[index]
         self._failures += 1
         self._next_try = now + wait
-        self._lost_at = None      # 重新開始觀察，不要一失敗就立刻再試
-        self.note = f"重連失敗第 {self._failures} 次，{wait:.0f} 秒後再試"
+        if wait > 0:
+            self._lost_at = None      # 要等的話就重新觀察
+            self.note = f"重連失敗第 {self._failures} 次，{wait:.0f} 秒後再試"
+        else:
+            # ⚠ **馬上再試**（使用者指定）：`_lost_at` 留著，下一拍
+            # `decide()` 就會直接回 RECONNECT，不必再觀察 30 秒。
+            self._lost_at = now - self._grace
+            self.note = f"重連失敗第 {self._failures} 次，馬上再試一次"
         log.warning("%s", self.note)
 
     def decide(self, has_server: bool, network_up: bool, now: float) -> str:

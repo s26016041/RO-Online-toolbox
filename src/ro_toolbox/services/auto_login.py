@@ -368,7 +368,7 @@ class AutoLogin:
                 ratio = self._agree_ratio()
                 spot = game_screen.agree_button_position(hwnd, ratio)
                 source = AGREE_LEARNED if ratio else AGREE_GUESS
-            input_helper.send(hwnd, [input_helper.click(*spot)])
+            self._type(hwnd, [input_helper.click(*spot)])
         except (input_helper.InputHelperError, game_screen.ScreenError) as exc:
             log.debug("點合約書失敗（可能沒有合約書）：%s", exc)
             source = AGREE_FAILED
@@ -758,7 +758,7 @@ class AutoLogin:
         沒事亂按只會多送一次錯的帳密、再多跳一個框。
         """
         try:
-            input_helper.send(hwnd, [input_helper.key(_VK_RETURN)])
+            self._type(hwnd, [input_helper.key(_VK_RETURN)])
         except input_helper.InputHelperError as exc:
             log.debug("關錯誤框失敗：%s", exc)
 
@@ -1039,7 +1039,7 @@ class AutoLogin:
                 return True
 
             mark = len(self._packets)
-            input_helper.send(hwnd, [input_helper.key(_VK_RETURN)])
+            self._type(hwnd, [input_helper.key(_VK_RETURN)])
             self._step(f"已按下 Enter 選第 {slot} 格")
 
             if not self._wait_name_written(screen, wanted):
@@ -1071,7 +1071,7 @@ class AutoLogin:
             if here == slot:
                 return True
             key = _VK_RIGHT if here < slot else _VK_LEFT
-            input_helper.send(hwnd, [input_helper.key(key)])
+            self._type(hwnd, [input_helper.key(key)])
             time.sleep(_SELECT_KEY_PAUSE)
             moved = screen.index()
             if moved is None or moved == here:
@@ -1284,9 +1284,9 @@ class AutoLogin:
                 # （只寫日誌，不做決定 —— 見 `_note_field_placement`）。
                 *typing, enter = self._credential_batches(hwnd)
                 for batch in typing:
-                    input_helper.send(hwnd, batch)
+                    self._type(hwnd, batch)
                 self._note_field_placement()
-                input_helper.send(hwnd, enter)
+                self._type(hwnd, enter)
             except input_helper.InputHelperError as exc:
                 log.debug("第 %d 次送不進去：%s", attempt, exc)
                 if self._stop_if_gone(hwnd, "輸入帳號密碼"):
@@ -1429,6 +1429,18 @@ class AutoLogin:
         # 抓不到不算失敗，但要講一聲 —— 不然使用者會納悶那顆按鈕為什麼不亮。
         self._step("這次沒抓到登入密文（擷取可能漏了那一包），下次登入再試")
 
+    def _type(self, hwnd: int, actions: list[dict]) -> None:
+        """送一批輸入。**每一批之前都先確認遊戲在最前面。**
+
+        ⚠ `login_lock.reassert()` 以前是寫好了沒人叫 —— 於是使用者只要在
+        登入那幾秒點了別的視窗（或另一個角色的登入搶走前景），字就餵到別人的
+        視窗去了，而且完全沒有徵兆。使用者實測回報：兩個角色前後斷線，
+        後面那個的登入把前面那個卡死，**兩個都登不進去**。
+        """
+        if self._lock is not None:
+            self._lock.reassert()
+        input_helper.send(hwnd, actions)
+
     def _sent_account(self) -> str | None:
         """從擷取到的 0x0064 讀出送出去的帳號（明文，見 [PKT-046]）。"""
         for packet in self._packets:
@@ -1541,14 +1553,14 @@ class AutoLogin:
             ]
             try:
                 for batch in batches:
-                    input_helper.send(hwnd, batch)
+                    self._type(hwnd, batch)
                 # OTP 過了之後客戶端會跳出伺服器選單 —— 順手把它選掉。
                 # ⚠ **只在第一次送**。每次重試都補送的話，OTP 沒過時那些方向鍵
                 # 和 Enter 會打進 OTP 畫面，把狀態弄亂 —— 實測會讓後面每一次
                 # 都失敗（送了 9 次都沒過）。沒指定伺服器時這裡什麼都不會送。
                 if attempt == 1:
                     for batch in self._pick_server_actions():
-                        input_helper.send(hwnd, batch)
+                        self._type(hwnd, batch)
             except input_helper.InputHelperError as exc:
                 # ⚠ 這裡以前只記 DEBUG 就 continue —— DEBUG 沒開的話**完全看不到**，
                 # 外面看到的是「0.4 秒送一次、送了 145 次」的鬼打牆，

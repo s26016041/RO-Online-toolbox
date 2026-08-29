@@ -166,18 +166,35 @@ def test_nothing_running_means_nothing_to_restore(world):
 # ---- 失敗要退避，不准無腦重試 ------------------------------------------
 
 
-def test_a_failed_launch_backs_off(world):
-    """使用者：「無腦嘗試很糟糕」。伺服器維修時我們分不出來，退避是唯一保護。"""
+def test_a_failed_launch_retries_at_once_then_backs_off(world):
+    """兩條使用者指令在這裡碰頭，順序是：**先馬上重試，撐不住才退避**。
+
+    「登入到一半出錯或登入失敗都不等待，馬上關閉重開」（2026-08-29）——
+    所以前幾次失敗**下一拍就再開一次**，不必再等 30 秒觀察期。
+    「無腦嘗試很糟糕」（更早）—— 所以連續失敗幾次之後開始等，
+    伺服器維修我們分不出來，退避是唯一保護。
+    """
     world.launch_ok = False
     bot = world.build()
     bot.tick(0.0)
     _drop(world)
     bot.tick(1.0)
-    assert bot.tick(1.0 + reconnect.GRACE_SEC + 1) == BACKOFF
+
+    now = 1.0 + reconnect.GRACE_SEC + 1
+    bot.tick(now)
     assert world.launched == 1
-    # 退避期間不准再試
-    assert bot.tick(1.0 + reconnect.GRACE_SEC + 5) == BACKOFF
-    assert world.launched == 1
+    # 前幾次：下一拍就再開一次，沒有等待
+    immediate = sum(1 for w in reconnect.BACKOFF_SEC if w == 0)
+    for _ in range(immediate):
+        now += 1
+        bot.tick(now)
+    assert world.launched == immediate + 1, "前幾次失敗要馬上再試"
+
+    # 撐不住了就開始退避 —— 這一拍之後就不准再開遊戲
+    now += 1
+    assert bot.tick(now) == BACKOFF
+    assert bot.tick(now + 5) == BACKOFF
+    assert world.launched == immediate + 1
 
 
 def test_a_failed_login_also_backs_off(world):
@@ -192,17 +209,27 @@ def test_a_failed_login_also_backs_off(world):
 
 
 def test_backoff_grows_so_it_does_not_hammer(world):
+    """開始退避之後，間隔只准越等越久 —— 伺服器維修時不該一直狂開遊戲。"""
     world.launch_ok = False
     bot = world.build()
     bot.tick(0.0)
     _drop(world)
     now = 1.0
+    bot.tick(now)
+    now += reconnect.GRACE_SEC + 1
+
     waits = []
-    for _ in range(3):
+    for _ in range(len(reconnect.BACKOFF_SEC)):
+        bot.tick(now)                      # 這一拍會嘗試並失敗
+        wait = bot._decider._next_try - now
+        waits.append(wait)
+        if wait <= 0:
+            now += 1
+            continue
+        # 要等的時候 `_lost_at` 會被清掉 —— 等完還得重走一次觀察期才會再試
+        now += wait + 1
         bot.tick(now)
         now += reconnect.GRACE_SEC + 1
-        bot.tick(now)                      # 這一拍會嘗試並失敗
-        waits.append(bot._decider._next_try - now)
-        now += waits[-1] + 1
-    assert waits == sorted(waits), f"間隔要越來越長，實際 {waits}"
-    assert waits[0] < waits[-1]
+    assert waits == sorted(waits), f"間隔只准越等越久，實際 {waits}"
+    assert waits[0] == 0.0, "前幾次馬上重試（使用者指定）"
+    assert waits[-1] > 0.0, "最後總要開始等"

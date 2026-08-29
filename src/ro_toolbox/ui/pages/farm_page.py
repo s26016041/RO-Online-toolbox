@@ -1484,7 +1484,10 @@ class FarmPage(BasePage):
         ⚠ 也**不能只憑一拍**就重開 —— 行程清單一樣有讀不到的時候。
         所以照樣走 `ReconnectDecider`（`has_server=False`），連續幾拍都不見才動手。
         """
-        if not self._watching:
+        if not self._watching or self._reconnecting:
+            # ⚠ **一次只准一個登入。** 兩個角色前後斷線時，後面那個的登入會
+            # 把前面那個卡死（前景被搶、輸入餵到別的視窗）——
+            # 使用者實測回報「兩個都壞掉登入不了」。
             return False
         try:
             from ro_toolbox.services import game_launcher

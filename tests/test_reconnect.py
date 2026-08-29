@@ -72,26 +72,38 @@ def test_real_disconnect_asks_for_a_reconnect():
     assert d.decide(has_server=False, network_up=True, now=T0 + 21) == RECONNECT
 
 
-def test_failures_back_off_instead_of_retrying_blindly():
-    """**使用者明確說「無腦嘗試很糟糕」。** 維修時我們分不出來，
-    所以至少不能一直重開遊戲 —— 間隔要一次比一次長。"""
+def test_the_first_few_failures_retry_immediately():
+    """使用者 2026-08-29 指定：「登入到一半出錯或登入失敗都不等待，馬上關閉重開」。
+
+    登入失敗多半是卡登／輸入被搶走那種**重來就好**的問題 ——
+    等 30 秒只是讓角色多躺 30 秒。
+    """
     d = ReconnectDecider(grace=20)
     d.decide(has_server=False, network_up=True, now=T0)
     assert d.decide(has_server=False, network_up=True, now=T0 + 21) == RECONNECT
 
-    now = T0 + 21
+    d.note_attempt_failed(T0 + 21)
+    assert "馬上" in d.note
+    assert d.decide(has_server=False, network_up=True, now=T0 + 22) == RECONNECT
+
+
+def test_failures_back_off_eventually_instead_of_retrying_forever():
+    """**使用者也說過「無腦嘗試很糟糕」。** 連續失敗幾次之後就開始等 ——
+    那時候多半是真的有問題（帳密錯、伺服器維修），一直狂開遊戲只會更糟。"""
+    d = ReconnectDecider(grace=20)
+    now = T0
     waits = []
-    for _ in range(4):
+    for _ in range(len(reconnect.BACKOFF_SEC)):
         d.note_attempt_failed(now)
-        assert d.decide(has_server=False, network_up=True, now=now + 1) == BACKOFF
-        wait = reconnect.BACKOFF_SEC[min(d.failures - 1, len(reconnect.BACKOFF_SEC) - 1)]
-        waits.append(wait)
-        now += wait + 1
-        d.decide(has_server=False, network_up=True, now=now)          # 觀察期重新開始
-        now += 21
-        assert d.decide(has_server=False, network_up=True, now=now) == RECONNECT
-    assert waits == sorted(waits), "間隔要越等越久"
-    assert waits[0] < waits[-1]
+        waits.append(reconnect.BACKOFF_SEC[
+            min(d.failures - 1, len(reconnect.BACKOFF_SEC) - 1)])
+        now += waits[-1] + 1
+    assert waits == sorted(waits), "間隔只准越等越久"
+    assert waits[0] == 0.0, "前幾次馬上重試"
+    assert waits[-1] > 0.0, "最後總要開始等"
+    # 退避期間問它，要老實說「還在等」，不准又叫人開遊戲
+    assert d.decide(has_server=False, network_up=True,
+                    now=now - waits[-1]) == BACKOFF
 
 
 def test_backoff_is_cleared_once_we_are_connected_again():
@@ -102,15 +114,15 @@ def test_backoff_is_cleared_once_we_are_connected_again():
     assert d.failures == 0, "連上了就把退避歸零，下次斷線不該被上次的失敗拖累"
 
 
-def test_the_grace_window_is_short_because_it_is_only_about_sampling():
-    """觀察期只需要「連續幾拍」，不需要幾十秒。
+def test_the_grace_window_gives_the_connection_a_chance_to_come_back():
+    """使用者 2026-08-29 指定：斷線要**等 30 秒**才關閉重開。
 
-    呼叫端每秒取樣一次，所以預設 5 秒 ≈ 連續 5 拍都沒有連線。
-    整條回連（關遊戲→重開→重新登入）本來就要三十秒級，
-    前面這 5 秒在體感上等於即時。
+    關掉重開的代價很大（重登、重選角、重新掛機），而斷線有時候會自己回來 ——
+    寧可多等半分鐘，也不要白重開一次。呼叫端每秒取樣一次，
+    所以 30 秒 ≈ 連續 30 拍都沒有連線。
     """
-    assert reconnect.GRACE_SEC == 5.0
+    assert reconnect.GRACE_SEC == 30.0
     d = ReconnectDecider()
-    for i in range(5):
-        assert d.decide(False, True, T0 + i) == WATCHING, "5 秒內不准動手"
-    assert d.decide(False, True, T0 + 6) == RECONNECT
+    for i in range(30):
+        assert d.decide(False, True, T0 + i) == WATCHING, "30 秒內不准動手"
+    assert d.decide(False, True, T0 + 31) == RECONNECT

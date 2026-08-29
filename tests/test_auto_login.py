@@ -1265,3 +1265,52 @@ def test_an_account_without_an_otp_secret_fails_immediately():
     assert login._send_otp(hwnd=0) is False
     assert "沒有密鑰" in login.progress.detail
     assert login.progress.failed_at == "送出 OTP"
+
+
+def test_every_batch_grabs_the_foreground_back():
+    """⚠ 每一批輸入之前都要把遊戲搶回最前面。
+
+    `login_lock.reassert()` 以前是寫好了**沒人叫** —— 使用者只要在登入那幾秒
+    點了別的視窗（或另一個角色的登入搶走前景），字就餵到別人的視窗去了，
+    而且完全沒有徵兆。使用者實測：兩個角色前後斷線，後面那個的登入把前面
+    那個卡死，**兩個都登不進去**。
+    """
+    from ro_toolbox.services import auto_login as mod
+
+    class FakeLock:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def reassert(self) -> bool:
+            self.calls += 1
+            return True
+
+    sent = []
+    login = mod.AutoLogin.__new__(mod.AutoLogin)
+    login._lock = FakeLock()
+    original = mod.input_helper.send
+    mod.input_helper.send = lambda hwnd, actions: sent.append(actions)
+    try:
+        login._type(1234, [{"kind": "key"}])
+        login._type(1234, [{"kind": "text"}])
+    finally:
+        mod.input_helper.send = original
+
+    assert login._lock.calls == 2, "每一批都要 reassert，不是只有第一批"
+    assert len(sent) == 2
+
+
+def test_typing_still_works_without_a_lock():
+    """沒有鎖的路徑（測試、或鎖還沒建）不該炸。"""
+    from ro_toolbox.services import auto_login as mod
+
+    sent = []
+    login = mod.AutoLogin.__new__(mod.AutoLogin)
+    login._lock = None
+    original = mod.input_helper.send
+    mod.input_helper.send = lambda hwnd, actions: sent.append(actions)
+    try:
+        login._type(1234, [{"kind": "key"}])
+    finally:
+        mod.input_helper.send = original
+    assert len(sent) == 1
