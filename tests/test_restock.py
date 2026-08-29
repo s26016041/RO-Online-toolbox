@@ -358,3 +358,29 @@ def test_return_item_purchase_ignores_the_weight_target():
     """回程道具不看負重比例 —— 它是「有沒有」的問題，不是「幾成」的問題。"""
     order = restock.RestockOrder(home_item=HOME_ITEM, home_have=0)
     assert order.home_needed() == restock.HOME_TARGET
+
+
+# ---- 挑哪一家店（實機踩過：挑到高級藥水商人，那家沒有回程道具）--------------
+
+
+def test_the_plain_shop_comes_first():
+    """名字剛好等於關鍵字的排前面 —— `restock_bot` 拿 `[0]` 當目標。
+
+    izlude_in 有三個：高級藥水商人(558)、忍術道具商人(636)、道具商人(47)。
+    使用者要的是**一般**那家（貨架長、有回程道具），不是「高級藥水商人」。
+    """
+    from ro_toolbox.services.gamedata import potion_sellers_on
+
+    for map_name in ("izlude_in", "prt_in"):
+        rows = potion_sellers_on(map_name)
+        assert rows, f"{map_name} 應該有藥水商人"
+        assert rows[0][2] == "道具商人", f"{map_name} 挑錯家了：{rows[0][2]}"
+
+
+def test_special_shops_are_still_listed_just_not_first():
+    """特殊商人不是丟掉，只是排後面 —— 有些地圖可能只有他們。"""
+    from ro_toolbox.services.gamedata import potion_sellers_on
+
+    names = [r[2] for r in potion_sellers_on("izlude_in")]
+    assert "高級藥水商人" in names
+    assert names.index("道具商人") < names.index("高級藥水商人")

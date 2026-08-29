@@ -50,6 +50,13 @@ BACKOFF_MAX = 30.0
 MIN_GAP = 0.6
 #: 主迴圈多久跑一拍。
 TICK = 0.4
+#: 多久檢查一次「連線有沒有換掉」。
+#:
+#: ⚠ 沒有這一條的代價是實測出來的：換地圖時伺服器會把連線移到另一台地圖伺服器
+#: （[PKT-038]），舊 socket 就送不出去了。`BuffBot` 一開始沒有重綁，於是換一次圖
+#: 就被自己的「連線已中斷」判斷停掉（使用者日誌：14:44:46 換圖 → 14:45:00 送失敗
+#: → 14:45:15 停止）。**換圖不是斷線**，要重綁不是要收攤。
+RESYNC_SEC = 2.0
 
 
 def buff_efst(skill_id: int) -> int | None:
@@ -321,7 +328,17 @@ class BuffBot:
         keeper = self._keeper
         assert keeper is not None
         reader = self._link.reader
+        resync_at = 0.0
         while not self._stop.is_set():
+            now = time.monotonic()
+            if now - resync_at >= RESYNC_SEC:
+                resync_at = now
+                # ⚠ 換圖／換頻道會把連線移走（[PKT-038]）—— 先重綁再說。
+                # 少了這一步，換一次圖就會被下面的 `dead` 判斷停掉。
+                problem = self._link.resync()
+                if problem:
+                    self._fail(problem)
+                    return
             if self._link.dead:
                 self._fail("遊戲連線已中斷，先停下來")
                 return

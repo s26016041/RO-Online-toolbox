@@ -167,6 +167,8 @@ class TravelBot:
         self._server_pos: tuple[int, int] | None = None
         #: 上面那個座標是**哪張圖**的。不同圖的座標不能拿來用。
         self._server_pos_map = ""
+        #: 剛被伺服器移到新圖、角色還沒走過一步。見 `_trusted_position`。
+        self._entry_fresh = False
         #: 上次為了「問出自己在哪」而推一下的時間，以及推了幾次。
         self._nudged_at = 0.0
         self._nudges = 0
@@ -366,6 +368,9 @@ class TravelBot:
             x, y = struct.unpack_from("<HH", packet.payload, 16)
             self._server_pos = (x, y)
             self._server_pos_map = name
+            # ⚠ **剛被移過來，記憶體裡的座標還是上一張圖的。**
+            # 在角色真的走一步之前，伺服器說的這個才是對的（見 `_trusted_position`）。
+            self._entry_fresh = True
             log.info("伺服器說我被移到 %s (%d, %d)", name, x, y)
             return
         if packet.opcode == _OP_MOVE_ACK and len(packet.payload) >= 10:
@@ -375,6 +380,9 @@ class TravelBot:
             # 那時候這個值是唯一可信的來源（見 `_trusted_position`）。
             self._server_pos = start
             self._server_pos_map = self._stats.here
+            # 角色動了 —— 記憶體的座標從這一刻起會逐格更新，比 `0x0087` 的
+            # 「這一段的起點」新，所以之後改回以記憶體為準。
+            self._entry_fresh = False
             self._walker.note_move_ack(dest)
             return
         talk = self._talk
@@ -727,7 +735,6 @@ class TravelBot:
         terrain = self._terrain_for(map_name)
         if terrain is None:
             return pos          # 沒有地形就沒得驗，照舊用記憶體的值
-        # 判準要跟 `Traveler._settle()` **完全一樣**：在範圍內，**而且**附近
         # `START_SNAP` 格內站得住。
         #
         # ⚠⚠ 舊版只看範圍。那對「換到比較小的圖」有效（[MEM-022] 就是這樣抓的），
@@ -738,10 +745,28 @@ class TravelBot:
         # 等 10 秒就大聲停用 —— 兩層用不同判準，中間那個縫就是卡住的地方。
         #
         # 站在傳點上／邊界格上照樣過得了：那些地方 3 格內一定有站得住的格子。
+        server = self._server_pos
+        # ⚠⚠ **剛換圖的那幾拍，記憶體的座標是上一張圖的殘留** —— 而且換到
+        # 差不多大的圖時它**照樣站得住**，所以下面那道「站得住就採用」的檢查
+        # 完全攔不住它。使用者實測：從 izlude 走進 izlude_in，記憶體還停在
+        # (114,177)，伺服器 `0x0091` 明明說了 (65,87)，結果 A* 從錯的起點算，
+        # 得到「走不到目的地」然後卡在門口，**要人手動走一步才會動**。
+        #
+        # 伺服器剛講過的那一句是**權威**：角色走第一步之前一律用它。
+        # 走過之後（收到 `0x0087`）記憶體會逐格更新，那時才換回記憶體。
+        if (
+            self._entry_fresh
+            and server is not None
+            and self._server_pos_map == map_name
+            and 0 <= server[0] < terrain.width
+            and 0 <= server[1] < terrain.height
+        ):
+            self._nudges = 0
+            return server
+        # 判準要跟 `Traveler._settle()` **完全一樣**：在範圍內，**而且**附近
         if nearest_walkable(terrain, pos, radius=START_SNAP) is not None:
             self._nudges = 0
             return pos
-        server = self._server_pos
         # ⚠ 一定要確認那個座標是**這張圖**的 —— 不同圖的座標拿來用等於亂走。
         if (
             server is not None

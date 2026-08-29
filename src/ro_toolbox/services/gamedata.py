@@ -363,11 +363,25 @@ POTION_SELLER_WORDS = ("道具商人", "工具商人", "藥水商人", "雜貨�
 
 
 def potion_sellers_on(map_name: str) -> list[tuple[int, int, str, int]]:
-    """這張圖上**可能賣藥水**的商人。名字比對，命不中就回空的。"""
-    return [
+    """這張圖上**可能賣藥水**的商人。名字比對，命不中就回空的。
+
+    **一般的排在前面**：名字剛好等於關鍵字（「道具商人」）的先，
+    有前綴的特殊商人（「高級藥水商人」「忍術道具商人」）後。
+
+    ⚠ 這個順序有實際後果：`restock_bot` 拿 `[0]` 當目標。實機踩過 ——
+    izlude_in 有三個（高級藥水商人 558、忍術道具商人 636、道具商人 47），
+    舊版挑到**高級藥水商人**，那家的貨架很短、**沒有回程道具**
+    （使用者回報「要找一般藥水商人，賣的東西比較多」）。
+
+    ⚠ 不能用外觀編號當判準：同一種「道具商人」在 izlude_in 是 47、
+    在 prt_in 是 53。名字才是穩定的身分。
+    """
+    rows = [
         npc for npc in npcs_on_map(map_name)
         if any(word in npc[2] for word in POTION_SELLER_WORDS)
     ]
+    rows.sort(key=lambda npc: 0 if npc[2] in POTION_SELLER_WORDS else 1)
+    return rows
 
 
 def maps_with_potion_sellers() -> list[str]:

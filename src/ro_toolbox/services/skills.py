@@ -280,6 +280,8 @@ class SkillReader:
         self._offline_reads = 0
         #: 上次抱怨過哪些技能矛盾。5 秒一輪，不擋就是每 5 秒一行。
         self._said_conflict: set[int] = set()
+        #: 上次抱怨過的「SP 對不上」比例（同上，不擋會洗版）。
+        self._said_sp: tuple[int, int] | None = None
 
     @property
     def pid(self) -> int | None:
@@ -482,8 +484,7 @@ class SkillReader:
             kind=_classify(skill_id, int(u32[index + _I_INF])),
         )
 
-    @staticmethod
-    def _check_sp(skills: list[Skill]) -> None:
+    def _check_sp(self, skills: list[Skill]) -> None:
         """拿 `skillinfolist.lub` 的 `SpAmount[level-1]` 再對一次消耗 SP。
 
         對不上**不排除**（主判別已經是字串↔ID 交叉驗證，夠強了），但要留下記錄：
@@ -498,12 +499,17 @@ class SkillReader:
             checked += 1
             if costs[skill.level - 1] != skill.sp:
                 bad += 1
-        if checked and bad:
+        # ⚠ 5 秒一輪的刷新下，這一句不節流就是每 5 秒一行 WARNING。
+        #   數字沒變就別再講（改版的話這個比例會跳，那時候才要再吼一次）。
+        if checked and bad and (bad, checked) != self._said_sp:
+            self._said_sp = (bad, checked)
             log.warning(
                 "有 %d/%d 個技能的 SP 跟 skillinfolist.lub 對不上 —— "
                 "可能是改版動了結構版面，請重跑 tools/build_skill_table.py 並核對",
                 bad, checked,
             )
+        elif not bad:
+            self._said_sp = None
 
     def close(self) -> None:
         if self._character is not None:
