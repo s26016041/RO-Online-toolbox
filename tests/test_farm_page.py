@@ -1613,3 +1613,25 @@ def test_the_snapshot_remembers_where_he_was_farming(monkeypatch, qtbot):
 
     snap = page.snapshot_for(pid)
     assert snap.farm_map == "mjolnir_07"
+
+
+def test_a_supply_run_waits_for_the_bag_instead_of_giving_up(monkeypatch, qtbot):
+    """⚠⚠ 實機（白狐）：回連之後印了「補給途中斷線，回來接著補完再走回去」，
+    然後**什麼都沒發生**。分頁才剛長出來 1 秒，背包還在背景讀，
+    `potion_config()` 是空的 —— 舊版就跳一個「請先選道具」的框然後 return。
+    人整晚站在城裡。背包還在讀不等於使用者沒設定。
+    """
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    # 還原存檔時選了道具，但背包還沒讀到 → 下拉是空的、pending 有值
+    card._want_item["hp"] = 501
+    notices = []
+    monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.show_notice",
+                        lambda *a: notices.append(a))
+
+    page._start_restock(pid, back_to="mjolnir_07")
+    assert page._restocks == {}, "還不能開始"
+    assert notices == [], "不准跳「請先選道具」—— 使用者明明選了"
+    assert pid in page._supply_pending, "要留著，背包讀到再試"

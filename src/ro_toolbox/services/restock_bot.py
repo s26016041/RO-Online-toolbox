@@ -47,6 +47,11 @@ WALK_GIVEUP = 240.0
 #: 站到商人旁邊之後，整段買賣最多花多久。
 SHOP_GIVEUP = 90.0
 #: 主迴圈一拍。
+#: 走不到就換一家，最多試這麼多家。
+#:
+#: ⚠ 要有上限：每一家都要走過去才知道走不走得到，一趟幾十秒 ——
+#: 無限試下去等於整晚都在城裡繞。
+_SHOP_TRIES = 3
 TICK = 0.2
 
 
@@ -141,16 +146,33 @@ class RestockBot:
 
     def _run(self) -> None:
         try:
-            plan = self._find_shop()
-            if plan is None:
-                return
-            target_map, cell, seller_cell, look, name = plan
-            self.stats.shop_map = target_map
-            self.stats.shop_name = name
-            where = map_display_name(target_map) or target_map
-            self._say(f"往 {where} 的{name}…")
-            known = self._walk(target_map, cell)
-            if known is None:
+            # ⚠⚠ **走不到那家店要換一家，不是整趟放棄。**
+            #
+            # 實機 2026-08-29（狐狐狸，蝴蝶翅膀回到 prontera）：挑了 prt_in
+            # 的道具商人，但踩進去的門把人放在 (180,97)，而商人在 (126,76)
+            # —— **prt_in 是一張地圖裡好幾個互不相連的房間**（[DAT-029]），
+            # 那兩格永遠走不到彼此。結果是重新規劃 40 次同一條算不出來的路，
+            # 然後「沒走到商人那裡」，藥水一瓶都沒補，人就留在城裡。
+            #
+            # 換一張有藥水商人的圖就好了（izlude_in 那家一直都走得到）。
+            skip: set[str] = set()
+            for _ in range(_SHOP_TRIES):
+                plan = self._find_shop(skip)
+                if plan is None:
+                    return
+                target_map, cell, seller_cell, look, name = plan
+                self.stats.shop_map = target_map
+                self.stats.shop_name = name
+                where = map_display_name(target_map) or target_map
+                self._say(f"往 {where} 的{name}…")
+                known = self._walk(target_map, cell)
+                if known is not None:
+                    break
+                skip.add(target_map)
+                self._say(f"⚠ 走不到 {where} 的{name}，換一家試試")
+                if self._stop.is_set():
+                    return
+            else:
                 return
             self._buy(look, seller_cell, known)
             self._go_back()
@@ -161,8 +183,12 @@ class RestockBot:
             self.stats.running = False
             self._emit()
 
-    def _find_shop(self):
-        """回 (地圖, 走到哪一格, 商人格, 外觀, 名字)。找不到就回 None 並說明。"""
+    def _find_shop(self, skip: set[str] | None = None):
+        """回 (地圖, 走到哪一格, 商人格, 外觀, 名字)。找不到就回 None 並說明。
+
+        `skip` 是**這一趟已經試過、走不到的地圖** —— 換一家的時候要跳過它們，
+        不然 `nearest_map_with()` 每次都回同一張最近的圖。
+        """
         from ro_toolbox.services.character import CharacterReader
 
         reader = CharacterReader()
@@ -179,10 +205,12 @@ class RestockBot:
 
         here = status.map_name
         self.stats.home_map = self._back_to or here
-        sellers = potion_sellers_on(here)
+        skip = skip or set()
+        sellers = [] if here in skip else potion_sellers_on(here)
         target_map = here
         if not sellers:
-            found = nearest_map_with(here, set(maps_with_potion_sellers()))
+            candidates = set(maps_with_potion_sellers()) - skip
+            found = nearest_map_with(here, candidates) if candidates else None
             if found is None:
                 self._say("⚠ 附近找不到藥水商人 —— 沒有路線可以走過去")
                 return None

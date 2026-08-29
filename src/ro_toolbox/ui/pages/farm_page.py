@@ -1972,6 +1972,19 @@ class FarmPage(BasePage):
             return
         config = card.potion_config()
         if not config.hp_item and not config.home_item:
+            if any(card.pending_items()):
+                # ⚠⚠ **背包還沒讀到，下拉是空的 —— 這不是「沒設定」。**
+                #
+                # 實機 2026-08-29（白狐）：補給途中斷線，回連之後
+                # 「補給途中斷線，回來接著補完再走回去」印出來了，然後
+                # **什麼都沒發生** —— 因為分頁才剛長出來 1 秒，背包還在背景讀，
+                # `potion_config()` 是空的，於是這裡跳一個「請先選道具」的框
+                # 就 return 了。人整晚站在城裡。
+                #
+                # 背包讀到會再跑一次（`_apply_bag` → `_watch_supply_runs`）。
+                self._supply_pending.add(pid)
+                log.info("補給先等背包讀到再開始（PID %s）", pid)
+                return
             show_notice("補水", "請先在下面選要補的補血藥水（或回程道具）。")
             return
 
@@ -2048,6 +2061,9 @@ class FarmPage(BasePage):
             self._auto_restock.add(pid)
             log.info("「%s」沒水回城了，接著去補給", self._names.get(pid) or pid)
             self._start_restock(pid, back_to=self._farm_map.get(pid, ""))
+            # ⚠ `_start_restock()` 可能因為背包還沒讀到而把 pid 放回
+            # `_supply_pending` —— 那時候**不要**把它從待辦裡拿掉，
+            # 下一拍（背包讀到之後）要再試一次。
 
     def _watch_restocks(self) -> None:
         """跑完的補水收攤並跳通知（使用者指定「補完會跳通知」）。"""
