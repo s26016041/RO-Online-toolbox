@@ -120,6 +120,11 @@ _PACKET_TIMEOUT = 25.0
 _CREDENTIAL_TIMEOUT = 8.0
 #: 反覆「打字→讀記憶體確認」的放棄上限。**逾時只是放棄的上限，
 #: 不是成功的依據** —— 成功一律以「記憶體裡讀到那串字」為準。
+#: 認不出畫面時，等這麼久才准「盲打」。
+#: 前面那幾秒客戶端多半還在載入 —— 實機在亮度 55、什麼都不像的
+#: 載入畫面上打了一輪，整輪報銷。撐過去之後還是要打，因為別人的
+#: 機器可能永遠認不出畫面（[INP-010]）。
+_BLIND_AFTER = 25.0
 #: 畫面平均亮度低於這個值就當作「客戶端還在載」——那時候做什麼都是白做。
 #: 實機：亮度 14 的時候打了 25 秒，合約書其實還沒出來。
 _DARK_SCREEN = 40.0
@@ -461,6 +466,17 @@ class AutoLogin:
         self._said_stage = stage
         self._step(f"畫面現在是「{stage.value}」（{note}）")
 
+    @staticmethod
+    def _blind_ok(started: float) -> bool:
+        """認不出畫面的時候，還准不准盲打？
+
+        **前 `_BLIND_AFTER` 秒不准**：那幾秒客戶端多半還在載入，打下去
+        只會把欄位弄髒（實機：亮度 55 的載入畫面上打了一輪，整輪報銷）。
+        撐過那段之後就准 —— 因為**別人的機器可能永遠認不出畫面**
+        （解析度不同，[INP-010]），那時候寧可盲打也不要卡死。
+        """
+        return time.monotonic() - started >= _BLIND_AFTER
+
     def _give_up_on_credentials(self, hwnd: int, attempt: int,
                                 stage: Stage) -> None:
         """帳密這一關逾時了：**說清楚卡在哪一關、憑什麼這樣說**。
@@ -780,26 +796,36 @@ class AutoLogin:
         回 True 代表「該送的都送了」；打對格了沒由送出後的閉環驗證
         （`0x0064` 的明文帳號）做最後把關。
         """
-        # ★ **整組一個子行程、一口氣送完**（使用者要求：登入會占用畫面，
-        #   所以要**快**）。實機 0.9 秒打完兩格。
-        #   ⚠ 開頭一定要 `focus()`：前景 `SendInput` 打的是「當下的前景視窗」，
-        #     搶不到就整批失敗（寧可不做，也不要打進使用者正在用的視窗）。
-        self._decide_focus(hwnd)
-        pair = ((self._account.password, self._account.username) if self._tab_first
-                else (self._account.username, self._account.password))
-        gap = input_helper.pause(_STEP_GAP)
-        clear = self._clear_actions() if self._typed_once else []
-        actions = [input_helper.focus(), input_helper.ime_off()]
-        actions += [*clear, *self._type_actions(pair[0]), gap]
-        actions += [*self._tab_actions(), gap]
-        actions += [*clear, *self._type_actions(pair[1]), gap]
-        self._type(hwnd, actions)
+        user, password = self._account.username, self._account.password
+        clear = self._clear_actions()
+        tab = self._tab_actions()
+
+        # ① **兩格都清乾淨。** 這一步是後面那個判斷的前提：清完之後，
+        #    記憶體裡再出現我們的帳號，就**一定是我們剛剛打進去的**
+        #    （客戶端記住的那份已經被清掉了）。
+        self._type(hwnd, [input_helper.focus(), input_helper.ime_off(),
+                          *clear, *tab, input_helper.pause(_STEP_GAP), *clear])
+        # ② 先把帳號打進**現在這一格**（不管它是哪一格）。
+        self._type(hwnd, [input_helper.focus(), *self._type_actions(user)])
         self._typed_once = True
-        # ★ 打完**當場回頭確認帳號整串進去了**（讀記憶體，不看畫面）。
-        self._verify_account(hwnd)
-        # ⚠ 這裡以前還多做一次「純觀察」的記憶體掃描（`_note_field_placement`），
-        #   每一輪多花 2~4 秒。`_verify_account()` 已經看過同一件事而且會修，
-        #   使用者的要求是**越快越好**（登入會占用他的畫面），所以拿掉。
+        # ③ 問記憶體：找得到帳號 ⇒ 剛剛那一格就是**帳號欄**（[MEM-032] 的不對稱：
+        #    打進帳號欄的字在堆積上找得到，打進密碼欄的找不到）。
+        if self._field_has(user):
+            self._step("焦點在帳號欄（記憶體確認過）—— Tab 過去打密碼")
+            self._type(hwnd, [input_helper.focus(), *tab,
+                              input_helper.pause(_STEP_GAP),
+                              *self._type_actions(password)])
+        else:
+            # 剛剛那一格是**密碼欄**（使用者說的規則：客戶端記住帳號時就是這樣）。
+            # 帳號誤打進密碼欄了 —— 清掉，Tab 到帳號欄打帳號，再 Tab 回來打密碼。
+            self._step("焦點在密碼欄（帳號沒出現在堆積上）—— 換過去重打")
+            self._type(hwnd, [input_helper.focus(), *clear, *tab,
+                              input_helper.pause(_STEP_GAP),
+                              *self._type_actions(user)])
+            self._verify_account(hwnd)
+            self._type(hwnd, [input_helper.focus(), *tab,
+                              input_helper.pause(_STEP_GAP),
+                              *self._type_actions(password)])
         self._type(hwnd, [input_helper.key(_VK_RETURN)])
         return True
 
@@ -1574,6 +1600,19 @@ class AutoLogin:
                 #   一個一個失敗，日誌上只留下 debug 級的「送不進去」——
                 #   使用者看到的是「已經在打帳號密碼，可是合約還沒按下」。
                 #   按了就回頭再看一眼，不要在這裡假裝有進度。
+                if time.monotonic() >= deadline:
+                    self._give_up_on_credentials(hwnd, attempt, stage)
+                    return False
+                continue
+
+            if stage is not Stage.LOGIN and not self._blind_ok(started):
+                # ★ **認不出是登入畫面就不要打字。** 客戶端多半還在載入 ——
+                #   實機：亮度 55、合約書差 154、登入框差 188（＝什麼都不像），
+                #   工具照樣把帳密打下去，然後那一輪就毀了（欄位錯、順序錯）。
+                #   使用者的要求是「不能有出錯機會，要一次就成」。
+                #   ⚠ 但**不能無限等**：別人的機器可能永遠認不出畫面
+                #   （解析度不同，[INP-010]）—— 等 `_BLIND_AFTER` 秒之後
+                #   還是要盲打，寧可試也不要卡死。
                 if time.monotonic() >= deadline:
                     self._give_up_on_credentials(hwnd, attempt, stage)
                     return False

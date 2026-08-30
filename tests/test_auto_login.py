@@ -98,6 +98,12 @@ def wired(monkeypatch, fast):
                 sent.append("enter" if vk == 0x0D else f"key:{vk}")
 
     monkeypatch.setattr(auto_login.input_helper, "send", _fake_send)
+    # 預設「看畫面」就回登入畫面 —— 沒有這一行的話會真的去開子行程，
+    # 而且新規則「認不出畫面就先別打字」會讓那些測試整個空轉。
+    monkeypatch.setattr(
+        auto_login.input_helper, "look_at_screen",
+        lambda hwnd: game_screen.ScreenReport(Stage.LOGIN, (10, 20), "測試畫面", 165.0),
+    )
 
     # 流程的兩個訊號都是「客戶端連到哪」：
     #   帳密送出 → 連上登入伺服器
@@ -1025,11 +1031,11 @@ def test_the_field_after_tab_is_always_cleared(monkeypatch, wired):
     """
     bot = _bot(monkeypatch, findable=("demo01",))
     sent = _capture_sends(monkeypatch)
-    bot._type_credentials(0x1234)          # 第一次：欄位內容是選取狀態，不清
-    assert not [a for b in sent for a in b if a.get("key") == 0x24], "第一次不該清"
-    sent.clear()
-    bot._type_credentials(0x1234)          # 重打：裡面是我們自己的字，要清
-    assert [a for b in sent for a in b if a.get("key") == 0x24], "重打一定要清"
+    bot._type_credentials(0x1234)
+    # ★ 現在是**開頭就把兩格都清乾淨**（Home 是清空那組的第一個動作）——
+    #   那是「打進去之後用記憶體判斷焦點在哪一格」的前提：清完之後，
+    #   記憶體裡再出現我們的帳號，就一定是剛剛打進去的那一份。
+    assert len([a for b in sent for a in b if a.get("key") == 0x24]) >= 2, sent
 
 
 def test_a_retry_always_clears_because_our_own_text_is_still_there(monkeypatch, wired):
@@ -1151,8 +1157,11 @@ def test_the_whole_thing_goes_in_one_subprocess(monkeypatch, wired):
     #   所以**同一批的開頭一定要有 `focus()`**，而且要在打字之前 ——
     #   搶不到前景就整批失敗，寧可不做也不要打進使用者正在用的視窗。
     assert {"focus", "ime_off", "text_fg", "key_fg"} <= kinds, kinds
-    order = [k for a in sent[0] for k in a]
-    assert order.index("focus") < order.index("text_fg"), sent[0]
+    for batch in sent:
+        if any("text_fg" in a or "key_fg" in a for a in batch):
+            order = [k for a in batch for k in a]
+            assert "focus" in order, batch
+            assert order.index("focus") == 0, batch
     assert sent[-1][-1]["key"] == 0x0D, "最後一定是 Enter"
 
 
@@ -1531,3 +1540,74 @@ def test_the_character_list_just_received_is_used_for_the_slot(monkeypatch, wire
     assert bot._select_character(0x1234) is True
     assert picked == {"slot": 4, "wanted": "狐狐狸"}, picked
     assert not bot.progress.stopped_at_character, bot.progress.stopped_at_character
+
+
+def test_it_will_not_type_into_a_screen_it_cannot_recognise(monkeypatch, wired):
+    """★ 認不出是登入畫面就先別打字 —— 客戶端多半還在載入。
+
+    ⚠ 實機（2026-08-31）：亮度 55、合約書差 154、登入框差 188（什麼都不像），
+    工具照樣把帳密打下去，那一輪就毀了。使用者的要求是「不能有出錯機會」。
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(
+        AutoLogin, "_type_credentials",
+        lambda self, hwnd: calls.append("typed") or True,
+    )
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
+    monkeypatch.setattr(auto_login, "_INPUT_TIMEOUT", 1.0)
+    result = _run(monkeypatch, [Stage.UNKNOWN], [])
+    assert not result.ok
+    assert not calls, "認不出畫面的前幾秒不該打字"
+
+
+def test_but_it_still_types_blind_on_a_screen_it_never_recognises(monkeypatch, wired):
+    """⚠ 反面：別人的機器可能**永遠**認不出畫面（解析度不同，[INP-010]）——
+    撐過 `_BLIND_AFTER` 之後還是要打，寧可試也不要卡死。"""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        AutoLogin, "_type_credentials",
+        lambda self, hwnd: calls.append("typed") or True,
+    )
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
+    monkeypatch.setattr(auto_login, "_BLIND_AFTER", 0.0)
+    monkeypatch.setattr(auto_login, "_INPUT_TIMEOUT", 1.0)
+    _run(monkeypatch, [Stage.UNKNOWN], [])
+    assert calls, "認不出畫面也要有盲打的退路"
+
+
+def _typed_order(sent):
+    """把送出去的動作攤平成「打了什麼字、按了幾次 Tab」的順序。"""
+    out = []
+    for batch in sent:
+        for a in batch:
+            if "text_fg" in a:
+                out.append(a["text_fg"])
+            elif a.get("key_fg") == 0x09:
+                out.append("TAB")
+    return out
+
+
+def test_it_finds_out_which_box_has_focus_instead_of_guessing(monkeypatch, wired):
+    """★ 焦點在哪一格是**問出來的**，不是猜的（使用者：不能有出錯機會）。
+
+    先把兩格都清乾淨（這樣記憶體裡再出現我們的帳號，就一定是剛打進去的），
+    打帳號進去，再問記憶體 —— 找得到就是帳號欄。
+    """
+    bot = _bot(monkeypatch, findable=("demo01",))       # 打進去就找得到＝帳號欄
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    assert _typed_order(sent) == ["TAB", "demo01", "TAB", "pw"], _typed_order(sent)
+    assert any("焦點在帳號欄" in s for s in bot.progress.steps), bot.progress.steps
+
+
+def test_when_the_focus_was_the_password_box_it_moves_over_and_retypes(monkeypatch, wired):
+    """★ 反面：客戶端記住帳號時焦點在**密碼欄**（使用者實測的規則）——
+    帳號會誤打進密碼欄，要清掉、換過去重打，而不是就這樣送出去。"""
+    bot = _bot(monkeypatch, findable=())                # 怎麼打都找不到＝不是帳號欄
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    order = _typed_order(sent)
+    assert order[:2] == ["TAB", "demo01"], order        # 先試這一格
+    assert "TAB" in order[2:], order                    # 換過去
+    assert order[-1] == "pw", order                     # 最後才打密碼
+    assert any("焦點在密碼欄" in s for s in bot.progress.steps), bot.progress.steps
