@@ -910,6 +910,16 @@ class AutoLogin:
         self.progress.fail(where, "遊戲已經關掉了 —— 不再重試。")
         return True
 
+    @staticmethod
+    def _dismiss_error_actions() -> list[dict]:
+        """關掉客戶端自己跳的訊息框（按一下 `確定`）。
+
+        那個框是**模態**的：不關掉的話，後面打的字全部餵給它。
+        實機踩過：OTP 打不進去 → 客戶端跳「不是6位認證碼」→ 接下來 10 次
+        重試全部落空，而日誌只寫「還沒換伺服器，再送一次」。
+        """
+        return [input_helper.key(_VK_RETURN), input_helper.pause(_TAB_SETTLE)]
+
     def _dismiss_error(self, hwnd: int) -> None:
         """關掉「帳密錯誤」對話框。按一次 Enter 就回到登入畫面（使用者實測）。
 
@@ -1744,20 +1754,26 @@ class AutoLogin:
                 f"送出 OTP（第 {attempt} 次，"
                 f"這組還剩 {self._remaining(secret)} 秒）"
             )
-            # ⚠ **打之前先清空那一格。**
-            # 不清的話重試時第二組 6 碼會接在第一組後面變成 12 碼，必然失敗 ——
-            # 而且看起來就像「OTP 不對」，完全誤導。
+            # ★ **跟打帳密同一套**（[INP-024]）：認證碼那一格也是**一開始沒有
+            #   焦點**，直接打字整串掉進黑洞 —— 實機抓到客戶端自己跳出
+            #   「不是6位認證碼。請您再次確認」，也就是那六碼一個都沒進去。
+            #   所以：先按 Tab 把焦點放進去、停一下、再用視窗訊息打字。
             #
-            # 文字走真的按鍵（Unicode，繞過輸入法），清空與 Enter 走視窗訊息。
-            # ⚠ 兩種通道**可以在同一個子行程裡混著送**（[INP-022] 實測；
-            #   舊版照 [INP-009] 拆三批，等於讓 GameGuard 多擋兩次機會 ——
-            #   使用者實機的 OTP 就是這樣連 5 次一個都沒送進去）。
-            actions = [
-                *self._clear_actions(),
+            # ⚠ 第 2 次以後要先按一下 Enter 把上一輪那個錯誤框關掉，
+            #   不然後面打的字都餵給那個框（實機連送 10 次全部落空）。
+            #
+            # ⚠ **不要清空。** 那 48 個按鍵是一次爆量，客戶端的訊息迴圈跟不上
+            #   就掉訊息（[INP-024]）。Tab 進去的時候那一格是空的／被選取，
+            #   打字就取代掉了；真的有殘留時，錯誤框那條路也會重來一次。
+            actions = list(self._dismiss_error_actions() if attempt > 1 else [])
+            actions += [
+                *self._tab_actions(),
+                input_helper.pause(_TAB_SETTLE),
                 *self._type_actions(code),
                 input_helper.key(_VK_RETURN),
             ]
             try:
+                self._type(hwnd, [input_helper.ime_off()])
                 self._type(hwnd, actions)
                 # OTP 過了之後客戶端會跳出伺服器選單 —— 順手把它選掉。
                 # ⚠ **只在第一次送**。每次重試都補送的話，OTP 沒過時那些方向鍵

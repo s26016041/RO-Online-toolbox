@@ -1431,3 +1431,26 @@ def test_typing_still_works_without_a_lock():
     finally:
         mod.input_helper.send = original
     assert len(sent) == 1
+
+
+def test_the_otp_is_typed_the_same_way_as_the_credentials(monkeypatch, wired):
+    """★ 認證碼那一格也是**一開始沒有焦點** —— 要先按 Tab（[INP-024]）。
+
+    實機抓到客戶端自己跳出「不是6位認證碼。請您再次確認」，也就是那六碼
+    一個都沒進去；而日誌只寫「還沒換伺服器，再送一次」，連送 10 次。
+    第 2 次以後還要先按 Enter 把那個框關掉，不然字都餵給它。
+    """
+    bot = _bot(monkeypatch)
+    bot._account.secret = _account().secret
+    sent = _capture_sends(monkeypatch)
+    monkeypatch.setattr(auto_login, "_OTP_TIMEOUT", 0.5)
+    monkeypatch.setattr(auto_login, "_OTP_STEP_TIMEOUT", 0.05)
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: ("1.2.3.4", 6900))
+    monkeypatch.setattr(AutoLogin, "_pick_server_actions", lambda self: [])
+    bot._login_server = ("1.2.3.4", 6900)
+    bot._send_otp(0x1234)
+    first = next(b for b in sent if any("key_fg" in a for a in b))
+    kinds = [k for a in first for k in a]
+    assert kinds.index("key_fg") < kinds.index("text"), f"Tab 要在打字之前：{first}"
+    assert any("ime_off" in a for b in sent for a in b), "要先關輸入法"
+    assert not any(a.get("key") == 0x2E for b in sent for a in b), "不該清空（會灌爆客戶端）"
