@@ -1461,3 +1461,44 @@ def test_the_otp_is_typed_the_same_way_as_the_credentials(monkeypatch, wired):
     # ★ OTP 也不准要前景 —— 同一個理由（見 `_tab_actions`）。
     assert not any("key_fg" in a or "focus" in a or "text_fg" in a
                    for b in sent for a in b), "OTP 也不該要前景"
+
+
+def test_the_account_is_verified_and_retyped_when_it_did_not_land(monkeypatch, wired):
+    """★ 打完帳號**當場讀記憶體確認整串進去了**，沒有就清掉重打同一格。
+
+    使用者 2026-08-31 把輸入法切成英數之後回報：「英文不是被輸入法吃掉，
+    而是你壓根沒打出來」—— 也就是**訊息掉了**，而且常常掉第一個。
+    帳號長 `s26016041` 這樣（一個英文字母＋八個數字）時，掉第一個字
+    看起來完全像「英文被吃掉」。所以不要再想「怎麼送才不會掉」，送完就確認。
+    """
+    found = {"n": 0}
+
+    def flaky(pid, text):
+        if text != "demo01":
+            return []
+        found["n"] += 1
+        return [0x1825] if found["n"] > 2 else []      # 前兩次沒進去
+
+    monkeypatch.setattr(auto_login.input_helper, "field_addresses", flaky)
+    bot = AutoLogin(_account(), 4242)
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    retypes = [b for b in sent
+               if any(a.get("text") == "demo01" for a in b)
+               and any(a.get("key") == 0x08 for a in b)]     # 清空＋重打
+    assert len(retypes) == 2, f"該補打兩次：{sent}"
+    assert any("帳號沒完整進到欄位裡" in s for s in bot.progress.steps), bot.progress.steps
+
+
+def test_it_gives_up_repairing_instead_of_looping_forever(monkeypatch, wired):
+    """確認不到就重打幾次，還是不行就**照樣送出去**，讓封包驗證收尾。
+
+    ⚠ 不准在這裡自作主張改別的東西（[INP-015]：拿模稜兩可的訊號去觸發
+    修正動作，會把本來對的弄壞）。
+    """
+    monkeypatch.setattr(auto_login.input_helper, "field_addresses", lambda pid, t: [])
+    bot = AutoLogin(_account(), 4242)
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    assert sent[-1][-1]["key"] == 0x0D, "最後還是要送出去"
+    assert any("照樣送出去" in s for s in bot.progress.steps), bot.progress.steps

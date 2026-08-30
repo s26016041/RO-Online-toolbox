@@ -120,6 +120,8 @@ _PACKET_TIMEOUT = 25.0
 _CREDENTIAL_TIMEOUT = 8.0
 #: 反覆「打字→讀記憶體確認」的放棄上限。**逾時只是放棄的上限，
 #: 不是成功的依據** —— 成功一律以「記憶體裡讀到那串字」為準。
+#: 帳號沒完整打進欄位時，最多清掉重打幾次（同一格，冪等）。
+_FIELD_TRIES = 3
 #: 按完 Tab 之後停多久再打字。**這是節流不是等待**：Tab 走的是
 #: `SendInput`（視窗訊息的 Tab 不生效，實測），客戶端還在處理那一下時
 #: 緊接著送的第一個字會被吃掉（實機：`PWaa1234` 只進去 `Waa1234`）。
@@ -803,11 +805,48 @@ class AutoLogin:
                 else (self._account.username, self._account.password))
         for value in pair:
             self._type(hwnd, [*tab, *clear, *self._type_actions(value)])
+            if value == self._account.username:
+                # ★ **打完帳號當場回頭確認**（讀記憶體，不看畫面）。
+                self._verify_account(hwnd)
         self._typed_once = True
         # 純觀察，只寫日誌不做決定（見 `_note_field_placement`）。
         self._note_field_placement()
         self._type(hwnd, [input_helper.key(_VK_RETURN)])
         return True
+
+    def _verify_account(self, hwnd: int) -> bool:
+        """確認帳號**整串**真的進了帳號欄；沒有就清掉重打。回傳確認到了沒。
+
+        ## 為什麼非有這一步不可（2026-08-31）
+
+        使用者自己把輸入法切成英數之後再測，結論是：
+
+            「英文不是被輸入法吃掉，而是你壓根沒打出來」
+
+        —— 也就是**訊息掉了**，跟 IME 無關。這跟先前量到的另一個現象是同一件事：
+        客戶端的訊息迴圈忙起來就會掉訊息（[INP-024]），而**掉的常常是第一個**。
+        帳號長 `s26016041` 這樣（一個英文字母 ＋ 八個數字）的時候，
+        掉第一個字看起來就完全像「英文被吃掉」。
+
+        所以不要再想「怎麼送才不會掉」——**送完就去確認**（CLAUDE.md：
+        做 → 讀 → 確認 → 再往下）。依據是記憶體：打進帳號欄的字在堆積上
+        找得到（[MEM-032]），而且**找的是完整字串**，掉一個字就對不上。
+
+        ⚠ 只用正面訊號：找得到＝確定好了；找不到＝**清掉重打同一格**
+        （冪等，不會把對的弄壞）。重打幾次都確認不到就照舊往下走，
+        讓送出後的 `0x0064` 閉環驗證收尾 —— 不准在這裡自作主張改別的東西
+        （[INP-015] 的教訓）。
+        """
+        for attempt in range(1, _FIELD_TRIES + 1):
+            if self._field_has(self._account.username):
+                if attempt > 1:
+                    self._step(f"帳號補打成功（第 {attempt} 次，記憶體確認過）")
+                return True
+            self._step(f"帳號沒完整進到欄位裡（第 {attempt} 次）—— 清掉重打同一格")
+            self._type(hwnd, [*self._clear_actions(),
+                              *self._type_actions(self._account.username)])
+        self._step("帳號重打幾次都確認不到 —— 照樣送出去，讓封包驗證收尾")
+        return False
 
     def _note_field_placement(self) -> None:
         """把「帳號／密碼現在在不在堆積上」記進日誌。**只觀察，不做任何決定。**
