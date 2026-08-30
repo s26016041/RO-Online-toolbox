@@ -257,6 +257,42 @@ def test_it_does_not_type_while_the_eula_is_still_up(monkeypatch, wired):
     assert "合約書" in result.detail, result.detail
 
 
+def test_it_stops_when_the_client_submitted_but_cannot_reach_the_server(
+    monkeypatch, wired
+):
+    """★ 字進去了、客戶端也送出了，但**連不上伺服器** —— 再打幾次都沒用。
+
+    2026-08-30 實機：客戶端停在自己畫的「與伺服器斷線」訊息框上，自動登入
+    一路「客戶端還沒連上伺服器，再打一次」，等於對著錯誤框打字打到逾時。
+
+    ⚠ 分辨「字沒進去」與「連不上」的依據是**記憶體**（客戶端按下送出時自己
+    寫下的那串帳號，[MEM-032]），不是畫面 —— 在那個卡住的行程上當場驗過：
+    連線從頭到尾沒建立，那塊緩衝照樣是我們的帳號。
+    """
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
+    monkeypatch.setattr(
+        auto_login.input_helper, "submitted_account", lambda pid: "demo01"
+    )
+    result = _run(monkeypatch, [Stage.LOGIN], [])
+    assert not result.ok
+    assert "連不上伺服器" in result.detail, result.detail
+    assert wired.count("enter") == 1, "確定送不出去就不該再打第二次"
+
+
+def test_it_keeps_trying_when_the_client_never_recorded_a_submit(monkeypatch, wired):
+    """反面：客戶端**沒有**記下我們的帳號＝字可能根本沒進去 → 不准提早收手。
+
+    只驗「不走那條捷徑」：真的重試幾次由預算決定，不是這一條要釘的東西。
+    """
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
+    monkeypatch.setattr(auto_login.input_helper, "submitted_account", lambda pid: None)
+    monkeypatch.setattr(auto_login, "_INPUT_TIMEOUT", 1.0)
+    result = _run(monkeypatch, [Stage.LOGIN], [])
+    assert not result.ok
+    assert "連不上伺服器" not in result.detail, result.detail
+    assert "沒有連上" in result.detail, result.detail
+
+
 def test_minimised_window_is_refused(monkeypatch, wired):
     """最小化的視窗收不到輸入，要當場說清楚而不是硬送。"""
     monkeypatch.setattr(game_screen, "is_minimised", lambda hwnd: True)

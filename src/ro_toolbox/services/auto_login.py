@@ -409,6 +409,38 @@ class AutoLogin:
                 log.info("同意按鈕的位置來自「%s」→ %s", source, where)
         return source
 
+    def _client_already_submitted(self) -> bool:
+        """客戶端**自己記下來**「我送出的帳號是這個」了嗎（讀記憶體，不看畫面）。
+
+        ## 為什麼需要這一支
+
+        「客戶端沒連上伺服器」有兩個完全不同的原因，而它們長得一模一樣：
+
+        1. **字沒進去** —— 打到別的欄位、或前面那一關擋著。再打一次才有意義。
+        2. **字進去了、也按了送出，但客戶端連不到伺服器** ——
+           再打幾次都不會有結果。
+
+        2026-08-30 實機就是第 2 種：使用者的客戶端停在自己畫的
+        「與伺服器斷線」訊息框上，而自動登入一路「再打一次」，
+        等於對著錯誤框打字打到逾時。
+
+        **分辨的依據是記憶體，不是畫面**：`submitted_account()` 讀的是客戶端
+        按下送出時自己寫下的那串帳號（[MEM-032]，位址用程式碼特徵定位）。
+        當場在那個卡住的行程上驗過：連線從頭到尾沒建立起來，
+        這塊緩衝**照樣**是 `s26016041` —— 也就是「送出」這件事確定發生過。
+
+        ⚠ 它會有**上一次登入的殘留**（[PKT-083]）。所以最壞情況是：字其實沒進去，
+        而殘留剛好等於我們的帳號 → 我們提早放棄、交給回連關掉重開。
+        代價是重開一次遊戲；而繼續打的代價是**對著錯誤框打滿 120 秒再重開一次**。
+        兩邊都會重開，早一點承認比較好。
+        """
+        try:
+            sent = input_helper.submitted_account(self._pid)
+        except Exception as exc:  # noqa: BLE001 - 讀不到就當作「不知道」
+            log.debug("讀不到客戶端送出的帳號：%s", exc)
+            return False
+        return bool(sent) and sent == self._account.username
+
     def _say_stage(self, stage: Stage, note: str) -> None:
         """畫面判定變了就講一聲。**每一輪都判、只在變化時講。**
 
@@ -1524,6 +1556,21 @@ class AutoLogin:
                     time.monotonic() - started, attempt,
                 )
                 break
+            # ★ 沒連上。**先問清楚是誰的問題，再決定要不要再打一次。**
+            #   兩種原因完全不同，卻長得一模一樣（都是「沒連上」）：
+            #     a) 字沒進去（打到別的欄位、合約書擋著）→ 再打一次才有意義
+            #     b) 字進去了、客戶端也送出了，但**它連不到伺服器** →
+            #        再打幾次都不會有結果，只是對著「與伺服器斷線」那個框打字
+            #   分辨的依據是**記憶體**（[MEM-032] 的「送出去的帳號」），不是畫面。
+            if self._client_already_submitted():
+                self.progress.fail(
+                    "輸入帳號密碼",
+                    f"客戶端收下帳密也送出了（記憶體裡送出的帳號 = "
+                    f"{self._account.username!r}），但**連不上伺服器** —— "
+                    "畫面上多半是「與伺服器斷線」。再打幾次都沒有用，"
+                    "交給自動回連關掉重開。",
+                )
+                return False
             if time.monotonic() >= deadline:
                 self._give_up_on_credentials(hwnd, attempt, stage)
                 return False
