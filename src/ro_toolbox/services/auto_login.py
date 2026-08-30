@@ -683,11 +683,32 @@ class AutoLogin:
         return [input_helper.text(text)]
 
     def _tab_actions(self) -> list[dict]:
-        """換行。**Tab 要送真的按鍵**（用視窗訊息送的 Tab 不生效，實測）。
+        """換到下一格。**走視窗訊息，不搶前景**（[INP-024]）。
 
-        使用者手動確認：Tab 在帳號／密碼兩格之間來回，Enter 是直接送出。
+        ## 「視窗訊息的 Tab 不生效」是**少帶了那個字元碼**
+
+        舊註解寫著「Tab 要送真的按鍵，視窗訊息送的不生效（實測）」，
+        所以這一支一直是 `focus()` ＋ `SendInput`。2026-08-30 重測才發現
+        差別不在通道，而在 **`WM_CHAR(9)`**：
+
+            KEYDOWN + KEYUP（無 CHAR）      → **不換格**（舊測就是這樣測的）
+            KEYDOWN + CHAR(9) + KEYUP      → **換格** ★
+
+        跟 Enter 一模一樣的坑（[INP-010]：Enter 少帶 `WM_CHAR(13)` 就不送出）。
+        `input_helper.key()` 本來就會替 Tab／Enter 補上字元碼，用它就對了。
+
+        ## 為什麼非改不可
+
+        `SendInput` 要**前景**。使用者實機日誌：
+
+            第 1 個子行程整批被擋掉（一個動作都沒送出）：
+            搶不到前景，不敢打字（會打進別的視窗）
+
+        使用者只要在登入那幾秒用電腦，這一下就失敗；而它失敗在整批的中間，
+        後面的字就打到別格去 —— 那就是他說的「**會打反**」。
+        改成視窗訊息之後**整段帳密都不需要前景**，他可以照常用電腦。
         """
-        return [input_helper.focus(), input_helper.key_foreground(_VK_TAB)]
+        return [input_helper.key(_VK_TAB)]
 
     def _decide_focus(self, hwnd: int) -> None:
         """決定 `self._tab_first`（要不要先打密碼）。只在第一次做。
