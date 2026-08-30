@@ -76,3 +76,61 @@ def test_the_child_reports_how_far_it_got():
     assert input_helper._actions_done("DONE 0") == 0
     assert input_helper._actions_done("沒有這一行") is None
     assert input_helper._actions_done(None) is None
+
+
+# ---- 送輸入要走「小 exe」，看畫面才走主 exe（[INP-023]）-------------------
+
+
+def test_input_goes_to_the_small_exe_when_frozen(monkeypatch, tmp_path):
+    """打包版送輸入一律走小 exe —— 大的那顆會被 GameGuard 隨機整批擋掉。"""
+    worker = tmp_path / input_helper.INPUT_WORKER_EXE
+    worker.write_bytes(b"")
+    monkeypatch.setattr(input_helper.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(input_helper.sys, "_MEIPASS", str(tmp_path), raising=False)
+    cmd = input_helper._command(0x1234, "s.json", [{"key": 0x0D}])
+    assert cmd[0] == str(worker), cmd
+
+
+def test_looking_at_the_screen_still_goes_to_the_main_exe(monkeypatch, tmp_path):
+    """看畫面要 Qt（樣板比對），小 exe 沒有 —— 那件事只讀不送，不會被擋。"""
+    (tmp_path / input_helper.INPUT_WORKER_EXE).write_bytes(b"")
+    monkeypatch.setattr(input_helper.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(input_helper.sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setattr(input_helper.sys, "executable", r"C:\big\RO-Online-toolbox.exe")
+    cmd = input_helper._command(0x1234, "s.json", [{"look": True}])
+    assert cmd[0] == r"C:\big\RO-Online-toolbox.exe", cmd
+
+
+def test_without_the_small_exe_it_falls_back_to_the_main_one(monkeypatch, tmp_path):
+    """小 exe 漏收就退回主 exe：會被擋、會慢，但至少還會動（`--selftest` 會抓）。"""
+    monkeypatch.setattr(input_helper.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(input_helper.sys, "_MEIPASS", str(tmp_path), raising=False)
+    monkeypatch.setattr(input_helper.sys, "executable", r"C:\big\RO-Online-toolbox.exe")
+    assert input_helper.input_worker() is None
+    cmd = input_helper._command(0x1234, "s.json", [{"key": 0x0D}])
+    assert cmd[0] == r"C:\big\RO-Online-toolbox.exe", cmd
+
+
+def test_the_small_exe_never_imports_qt():
+    """⚠ 小 exe 的進入點**不准 import** 任何會拉到 Qt／numpy 的東西。
+
+    PyInstaller 連函式裡面的 import 都會跟著收 —— 一不小心這顆就從 7 MB
+    變回 83 MB，然後照樣被 GameGuard 擋掉，而且沒有任何徵兆。
+    所以這條用 AST 檢查真正的 import（文件字串裡提到名字不算）。
+    """
+    import ast
+    from pathlib import Path
+
+    banned = ("PySide6", "numpy", "game_screen", "input_helper", "ro_toolbox.app")
+    source = Path(__file__).resolve().parents[1] / "src" / "ro_toolbox"
+    for name in ("input_worker.py", "services/input_actions.py"):
+        tree = ast.parse((source / name).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                names = [f"{node.module or ''}.{a.name}" for a in node.names]
+            else:
+                continue
+            for imported in names:
+                assert not any(b in imported for b in banned), f"{name} import 了 {imported}"

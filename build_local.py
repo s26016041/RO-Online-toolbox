@@ -52,6 +52,37 @@ def ensure_pyinstaller() -> bool:
     return True
 
 
+#: 送輸入的小 exe。**它的重點就是小**（[INP-023]）。
+WORKER_SPEC = "ro-input.spec"
+WORKER_NAME = "ro-input.exe"
+#: 超過這個大小就是打包設定寫錯了（Qt 或 numpy 被收進來）。
+#:
+#: ⚠ 這個上限不是美感問題：實測 83 MB 的主 exe 送輸入會被 GameGuard
+#: 隨機整批擋掉（PostMessage 5/10、SendInput 4/10 失敗），7 MB 的小 exe
+#: 20/20 全過。這顆一旦胖起來，自動登入就會安靜地退回「打 22 次才成功」。
+WORKER_MAX_MB = 20.0
+
+
+def build_input_worker() -> bool:
+    """編出送輸入的小 exe，並**把大小釘住**。編不出來或太肥就回 False。"""
+    print("\n=== 編譯送輸入的小 exe（ro-input.exe）===")
+    if sh([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm",
+           WORKER_SPEC]) != 0:
+        print("✗ 小 exe 編譯失敗。")
+        return False
+    exe = ROOT / "dist" / WORKER_NAME
+    if not exe.exists():
+        print(f"✗ 找不到小 exe：{exe}")
+        return False
+    size = exe.stat().st_size / 1048576
+    if size > WORKER_MAX_MB:
+        print(f"✗ 小 exe 太肥了：{size:.1f} MB（上限 {WORKER_MAX_MB:.0f} MB）"
+              " —— 八成是 Qt 或 numpy 被收進來了，看 ro-input.spec 的 excludes。")
+        return False
+    print(f"✓ 小 exe 完成：{exe}（{size:.1f} MB）")
+    return True
+
+
 def build(debug: bool = False) -> Path | None:
     """編 exe。回傳 exe 路徑，失敗回 None。"""
     if not ensure_pyinstaller():
@@ -83,6 +114,9 @@ def build(debug: bool = False) -> Path | None:
         print("\n=== 編譯正式版（無主控台，GUI）===")
 
     started = time.monotonic()
+    # ★ **先編送輸入的小 exe**，主 exe 才收得到它（它是主 exe 的資料檔）。
+    if not build_input_worker():
+        return None
     if sh([sys.executable, "-m", "PyInstaller", "--clean", "--noconfirm", SPEC], env=env) != 0:
         print("✗ 編譯失敗，請看上面 PyInstaller 的訊息。")
         return None

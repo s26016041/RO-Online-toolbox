@@ -30,6 +30,11 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 datas = [
     ("VERSION", "."),
+    # ★ 送輸入的**小 exe**（先由 build_local.build_input_worker() 編出來）。
+    #   收不進來的話輸入會退回主 exe 自己送，而那顆 83 MB 的會被 GameGuard
+    #   隨機整批擋掉（[INP-023]）—— 症狀是自動登入要打十幾二十次才成功，
+    #   而且沒有任何錯誤訊息。`--selftest` 會檢查它在不在。
+    ("dist/ro-input.exe", "."),
     ("assets", "assets"),
     ("src/ro_toolbox/ui/resources", "ro_toolbox/ui/resources"),
 ]

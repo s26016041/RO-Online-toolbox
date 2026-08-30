@@ -156,6 +156,13 @@ def _check(window, problems: list[str]) -> int:
     if not (RESOURCES_DIR / AGREE_TEMPLATE_FILE).exists():
         problems.append(f"合約書按鈕樣板沒收進來：{RESOURCES_DIR / AGREE_TEMPLATE_FILE}")
 
+    # ★ 送輸入的小 exe。漏收的話輸入會退回主 exe 自己送，而那顆 83 MB 的
+    # 會被 GameGuard **隨機整批擋掉**（[INP-023]）—— 症狀是自動登入要打
+    # 十幾二十次才成功，而且沒有任何錯誤訊息，最難查的那一種。
+    from ro_toolbox.services.input_helper import INPUT_WORKER_EXE, input_worker
+    if getattr(sys, "frozen", False) and input_worker() is None:
+        problems.append(f"送輸入的小 exe 沒收進來：{INPUT_WORKER_EXE}")
+
     # WinDivert 的驅動檔漏收的話，抓封包整個不能用（自動登入的二次密碼、
     # 角色清單全靠它），而錯誤訊息會長得像「相依沒裝好」，很難查。
     from ro_toolbox.services import packet_capture

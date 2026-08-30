@@ -4614,6 +4614,69 @@ BFS 只看「這張圖上有沒有一道門通往 rachel」，所以它挑了
 
 ---
 
+### [INP-023] ★★★ 被擋的是**那顆 83 MB 的 exe**：送輸入改用一顆 7 MB 的小 exe
+
+- **狀態**：已驗證（2026-08-30，自己開遊戲反覆量；已實作並實機驗收）
+- **使用者要求**：「找到原因修好」
+
+[INP-022] 量到「打包版的輸入會被整批擋掉、python 不會」，但沒查到**為什麼**。
+這一條把變因一個一個拆開，找到了。
+
+#### 拆變因：不是 PyInstaller、不是自解壓、不是簽章 —— 是**大小**
+
+寫一支只用 ctypes 送 `PostMessage` / `SendInput` 的最小程式，用三種方式打包，
+跟主 exe、python 一起在**同一個遊戲視窗、同一時間交錯**各送 10 次：
+
+| 送的人 | PostMessage 失敗 | SendInput 失敗 |
+|---|---|---|
+| 主 exe（83 MB、onefile、**有簽章**） | 5/10 | 4/10 |
+| 小 exe（7 MB、onefile、**沒簽章**） | 0/10 | 0/10 |
+| 小 exe（1.7 MB、onedir、沒簽章） | 0/10 | 0/10 |
+| `python.exe` | 0/10 | 0/10 |
+
+- **不是 PyInstaller**：小的那兩顆也是 PyInstaller 編的。
+- **不是自解壓**：onefile（會解到 `_MEI`）與 onedir（不解）都沒事。
+- **不是簽章**：小的那兩顆**根本沒簽**，照樣全過；有簽的大顆反而被擋。
+- **不是 UPX**：這台機器沒裝 upx，PyInstaller 一直是安靜跳過的（查證過）。
+- ⇒ 剩下的變因是**那顆大的本身**：83 MB、要解壓一兩秒、載入幾十個 Qt／numpy DLL。
+  GameGuard 大概是在那段時間裡把它盯上了。**確切機制沒有再往下追** ——
+  因為修法不依賴它。
+
+⚠ 量的時候踩過一個坑：最小程式的 `SendInput` 一開始 10/10 全失敗，
+看起來像「小 exe 也被擋」。其實是**我的 `INPUT` 結構寫錯**：64 位元的 `INPUT`
+是 **40 bytes**（最大的成員是 `MOUSEINPUT`），只宣告 `KEYBDINPUT` 會算成 32，
+`SendInput` 直接回 0 —— 跟被擋長得一模一樣。要量「有沒有被擋」之前，
+先確認自己送得出去。
+
+#### 修法：送輸入的活交給一顆小 exe
+
+    ro-input.exe（7.3 MB）   只有 ctypes ＋ pywin32，**不含 Qt／numpy**
+      ├ 進入點 `ro_toolbox/input_worker.py`
+      ├ 動作迴圈與主 exe 共用 `services/input_actions.py`（一份實作、兩個入口）
+      └ 由 `ro-input.spec` 編，`build_local.build_input_worker()` 先編它再編主 exe
+
+- 主 exe 把它當**資料檔**收進去，執行時在 `sys._MEIPASS/ro-input.exe`
+  （`input_helper.input_worker()`）。
+- **看畫面還是主 exe 的活**（樣板比對要 Qt）—— 那件事**只讀不送，不會被擋**。
+  `input_helper._command()` 就照這個分：動作清單裡有 `look` 走大的，其他走小的。
+- ⚠ **小 exe 不准 import 任何會拉到 Qt 的東西**：PyInstaller 連函式裡的 import
+  都會收，一不小心這顆就變回 80 MB，然後照樣被擋、而且完全沒有徵兆。
+  `ro-input.spec` 的 `excludes` ＋ `build_local.WORKER_MAX_MB`（20 MB 上限）
+  ＋ `tests/test_input_helper.py::test_the_small_exe_never_imports_qt`（AST 檢查）
+  三道一起釘。
+- 漏收的話 `--selftest` 會擋下來（`app.selftest`），不會安靜地退回大 exe。
+
+#### 實機驗收（完全走打包好的正式路徑）
+
+    小 exe 擋掉率：PostMessage 0/10、SendInput 0/10（同時間主 exe 是 5/10、3/10）
+    全新開一局 → 按 1 次同意 → 13.2 秒到登入畫面
+    整組帳密（清空→打字→Tab→清空→打字）**1.7 秒**打完，零重試
+    抓圖確認：ID 欄 `IDTEST11`、密碼欄 8 個星號
+
+對照使用者今天早上的日誌：**22 次、73 秒**。
+
+---
+
 ### [INP-022] ★★★ GameGuard **隨機整批擋掉一個子行程的輸入**；打包版被擋 40~70%
 
 - **狀態**：已驗證（2026-08-30，同一個視窗、同一時間交錯 A/B，多輪）

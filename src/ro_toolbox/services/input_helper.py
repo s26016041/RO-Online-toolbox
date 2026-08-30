@@ -1,29 +1,39 @@
-"""所有送進遊戲的輸入，一律交給**短命的子行程**執行。
+"""所有送進遊戲的輸入，一律交給**短命的小子行程**執行。
 
 ## 這是實測結論，不是設計偏好
 
-最小化 A/B（同一個遊戲、同一份程式碼、同一瞬間交錯呼叫）：
-
-    啟動遊戲的那個行程：第 1 次送得進去，之後**全部失敗**
-    另外開的子行程    ：5/5 全部成功
-
-失敗的樣子有兩種，都很難看懂：
+失敗的樣子有兩種，都很難看懂（兩個都是「被攔截」，不是參數錯）：
 
 - `PostMessage` 回 FALSE，`GetLastError` 是 0（pywin32 訊息寫「No error message」）
 - `SendInput` 回 0，`GetLastError` 也是 0
 
-多半是 GameGuard 認得「開這個遊戲的那個行程」，在它送出第一個輸入之後就封鎖它。
-今天繞了很久的「點不動合約書」「打字打不進去」全部都是這一條。
+**GameGuard 會整批擋掉某些行程的輸入。** 2026-08-30 量清楚了（[INP-023]）——
+同一個遊戲視窗、同一時間交錯，各 10 次：
+
+    主 exe（83 MB, onefile）   PostMessage 5/10 失敗、SendInput 4/10 失敗
+    小 exe（7 MB, onefile）    0/10、0/10
+    小 exe（1.7 MB, onedir）   0/10、0/10
+    python.exe                 0/10、0/10
+
+⇒ 不是 PyInstaller、不是自解壓、也不是簽章（小 exe 沒簽照樣過）——
+**是那顆大的被擋**。而且是「這個行程能不能送」一次決定：能送的行程
+連送 20 個動作都進得去（8 回裡 7 回整包成功）。
 
 ## 所以
 
 - 主行程**只負責決定要做什麼**，不自己送。
-- 每次要送輸入，開一個子行程，把動作清單餵給它，做完就結束。
-- 密碼走 **stdin**，不走命令列參數 —— 命令列在工作管理員裡看得到。
+- 送輸入交給**另外一顆小 exe**（`ro-input.exe`，見 `input_worker`）——
+  打包版一定走它；找不到才退回主 exe（會被擋，但 `send()` 會換一個重送）。
+- **看畫面**（找同意按鈕、判斷在哪一關）要 Qt，還是主 exe 的活 ——
+  那件事只讀不送，不會被擋。
+- 動作清單走**暫存檔**，不走命令列 —— 密碼會出現在工作管理員裡。
 
-## 打包成單一 exe 也走同一套
+## 舊的說法已經作廢
 
-凍結之後 `sys.executable` 就是我們自己，旗標由 `app.run()` 在建 Qt 之前攔下來。
+[INP-009] 原本寫「一個行程送過第一次輸入之後就會被封鎖，所以每次都要開新的
+子行程」，還有「送過 `SendInput` 之後視窗訊息會被封鎖，所以要拆批」。
+**兩條實測都不成立**（[INP-022]、[INP-023]）：能送的行程可以一直送、
+視窗訊息與按鍵可以在同一個行程混著送。拆批的唯一效果是**讓被擋的機率乘上去**。
 """
 
 from __future__ import annotations
@@ -36,15 +46,13 @@ import sys
 import tempfile
 from pathlib import Path
 
+from ro_toolbox.services import input_actions
+
 log = logging.getLogger(__name__)
 
 #: 命令列旗標。`app.run()` 會在建 Qt 之前攔下來。
+#: 送輸入的小 exe（`ro_toolbox.input_worker`）用同一個，主行程才不用記兩套。
 HELPER_FLAG = "--send-input"
-
-#: 切輸入法用的 Win32 常數。
-_WM_IME_CONTROL = 0x0283
-_IMC_SETOPENSTATUS = 0x0006
-_SMTO_ABORTIFHUNG = 0x0002
 
 #: 子行程最多跑多久。它只送幾十個視窗訊息，正常不到一秒。
 _TIMEOUT = 20.0
@@ -154,10 +162,44 @@ def key(virtual_key: int, times: int = 1) -> dict:
 # ---- 主行程這一側 -----------------------------------------------------------
 
 
-def _command(hwnd: int, script: str) -> list[str]:
-    if getattr(sys, "frozen", False):
-        return [sys.executable, HELPER_FLAG, str(hwnd), script]
-    return [sys.executable, "-m", "ro_toolbox", HELPER_FLAG, str(hwnd), script]
+#: 送輸入的小 exe 的檔名（打包時收進主 exe 裡，見 `RO-Online-toolbox.spec`）。
+INPUT_WORKER_EXE = "ro-input.exe"
+
+
+def input_worker() -> Path | None:
+    """送輸入用的**小 exe** 在哪。沒打包、或沒收進來就回 None。
+
+    ⚠ **打包版一定要用它送輸入**（[INP-023]）：83 MB 的主 exe 送輸入會被
+    GameGuard 隨機整批擋掉（實測 `PostMessage` 5/10、`SendInput` 4/10），
+    同一台機器上 7 MB 的小 exe **20/20 全過**。
+
+    找不到就退回主 exe —— 會慢、會被擋，但至少還會動（而且 `send()` 有重送）。
+    """
+    root = getattr(sys, "_MEIPASS", None)
+    if not root:
+        return None
+    path = Path(root) / INPUT_WORKER_EXE
+    return path if path.is_file() else None
+
+
+def _command(hwnd: int, script: str, actions: list[dict]) -> list[str]:
+    """要開哪一顆子行程。
+
+    **看畫面走主 exe，送輸入走小 exe。**「看畫面」要 Qt（樣板比對），
+    而 Qt 就是主 exe 那 83 MB 的來源；但看畫面**只讀不送**，不會被擋，
+    所以那一顆大的照用。送輸入則一定要小的（[INP-023]）。
+    """
+    if not getattr(sys, "frozen", False):
+        return [sys.executable, "-m", "ro_toolbox", HELPER_FLAG, str(hwnd), script]
+    worker = None if _needs_qt(actions) else input_worker()
+    if worker is not None:
+        return [str(worker), HELPER_FLAG, str(hwnd), script]
+    return [sys.executable, HELPER_FLAG, str(hwnd), script]
+
+
+def _needs_qt(actions: list[dict]) -> bool:
+    """這批動作裡有沒有「看畫面」——那一個只有主 exe 做得到。"""
+    return any("look" in action for action in actions)
 
 
 def _environment() -> dict[str, str]:
@@ -171,9 +213,6 @@ def _environment() -> dict[str, str]:
     env["PYTHONIOENCODING"] = "utf-8"
     return env
 
-
-#: 子行程回報「做完幾個動作」用的開頭。**重試安不安全全靠它。**
-_DONE_PREFIX = "DONE "
 
 #: 一批輸入最多換幾個子行程重送。見 `send()`。
 #:
@@ -248,7 +287,7 @@ def _run(actions: list[dict], hwnd: int) -> str:
 
     try:
         done = subprocess.run(
-            _command(hwnd, script),
+            _command(hwnd, script, actions),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -270,7 +309,7 @@ def _run(actions: list[dict], hwnd: int) -> str:
 
     if done.returncode != 0:
         lines = [line for line in (done.stderr or "").strip().splitlines()
-                 if not line.startswith(_DONE_PREFIX)]
+                 if not line.startswith(input_actions.DONE_PREFIX)]
         lines = lines or (done.stdout or "").strip().splitlines()
         detail = lines[-1] if lines else f"結束碼 {done.returncode}"
         raise InputHelperError(f"輸入沒送出去：{detail}", _actions_done(done.stdout))
@@ -280,9 +319,9 @@ def _run(actions: list[dict], hwnd: int) -> str:
 def _actions_done(output: str | None) -> int | None:
     """子行程說它做完幾個動作。問不出來回 None（＝不知道，不准重送）。"""
     for line in reversed((output or "").splitlines()):
-        if line.startswith(_DONE_PREFIX):
+        if line.startswith(input_actions.DONE_PREFIX):
             try:
-                return int(line[len(_DONE_PREFIX):].strip())
+                return int(line[len(input_actions.DONE_PREFIX):].strip())
             except ValueError:
                 return None
     return None
@@ -329,52 +368,6 @@ def look_at_screen(hwnd: int):
 # ---- 子行程這一側 -----------------------------------------------------------
 
 
-def _speak_utf8() -> None:
-    """子行程的輸出一律講 UTF-8。**打包之後這一步是必要的。**
-
-    ⚠ 實機（2026-08-30，打包版）：主行程日誌裡的說明整段是亂碼 ——
-
-        子行程在畫面上找不到同意按鈕（�e�� 1942x1256�...）
-
-    「畫面」的 Big5 是 `B5 65`，UTF-8 解不出 `B5` 就換成 `�`，`65` 剛好是 `e`
-    —— 也就是子行程用 **cp950** 印出來、主行程用 utf-8 讀。
-    主行程明明有設 `PYTHONIOENCODING=utf-8`，但 **PyInstaller 的啟動器用
-    isolated config，`PYTHON*` 環境變數整批不生效**，所以凍結之後那一行等於沒設。
-    唯一保險的做法是在子行程自己這一側把輸出串流轉成 UTF-8。
-
-    這不是「只是難看」：那一句是別人的機器上唯一查得到的線索
-    （[INP-009]，子行程的 `log` 不會進主程式日誌），看不懂就等於沒有。
-    """
-    for stream in (sys.stdout, sys.stderr):
-        try:
-            stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception as exc:  # noqa: BLE001 - 轉不了就照舊，不該讓輸入失敗
-            print(f"輸出轉不成 UTF-8（略過）：{exc}", file=sys.stderr)
-
-
-def _switch_ime_off(hwnd: int) -> None:
-    """把視窗的輸入法關掉（切英數）。做不到就記一筆，不要中斷輸入。"""
-    import ctypes
-    from ctypes import wintypes
-
-    try:
-        imm32 = ctypes.WinDLL("imm32", use_last_error=True)
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        imm32.ImmGetDefaultIMEWnd.argtypes = [wintypes.HWND]
-        imm32.ImmGetDefaultIMEWnd.restype = wintypes.HWND
-        ime = imm32.ImmGetDefaultIMEWnd(wintypes.HWND(hwnd))
-        if not ime:
-            print("找不到 IME 視窗，略過切換", file=sys.stderr)
-            return
-        result = wintypes.DWORD(0)
-        user32.SendMessageTimeoutW(
-            ime, _WM_IME_CONTROL, wintypes.WPARAM(_IMC_SETOPENSTATUS),
-            wintypes.LPARAM(0), _SMTO_ABORTIFHUNG, 1000, ctypes.byref(result),
-        )
-    except Exception as exc:  # noqa: BLE001 - 切不掉不該讓整串輸入失敗
-        print(f"切換輸入法失敗（略過）：{exc}", file=sys.stderr)
-
-
 def _report_screen(hwnd: int) -> None:
     """看一眼畫面，把「在哪一關」與「同意按鈕在哪」印出來給主行程。
 
@@ -395,73 +388,12 @@ def _report_screen(hwnd: int) -> None:
 
 
 def run_helper(argv: list[str]) -> int:
-    """子行程本體。由 `app.run()` 在建 Qt 之前呼叫。
+    """子行程本體（**主 exe 這一顆**）。由 `app.run()` 在建 Qt 之前呼叫。
 
-    只做被交代的動作，**不做任何判斷** —— 要做什麼是主行程決定的，
-    這裡多一個判斷就多一個會錯的地方。
+    動作迴圈與送輸入的小 exe 共用同一份（`services/input_actions.py`）——
+    這一顆只多會一件事：**看畫面**（那要 Qt，見 `_report_screen`）。
     """
-    from ro_toolbox.services import input as game_input
-
-    _speak_utf8()
-    try:
-        index = argv.index(HELPER_FLAG)
-        hwnd = int(argv[index + 1])
-        script = argv[index + 2]
-    except (ValueError, IndexError):
-        print(f"用法：{HELPER_FLAG} <hwnd> <動作清單檔>", file=sys.stderr)
-        return 2
-
-    try:
-        with open(script, encoding="utf-8") as fp:
-            actions = json.load(fp)
-    except (OSError, ValueError) as exc:
-        print(f"讀不到動作清單：{exc}", file=sys.stderr)
-        return 2
-
-    # ⚠ 一定要在碰任何視窗 API 之前宣告，否則座標會差一個縮放倍率（[INP-002]）。
-    game_input.ensure_dpi_aware()
-    # ★ **做完幾個動作要回報。** GameGuard 會整批擋掉一個子行程的輸入
-    #   （見 `send()`），主行程要靠這個數字判斷「重送安不安全」——
-    #   0 個代表什麼都沒發生，重送不會打兩次。
-    done = 0
-    try:
-        for action in actions:
-            if "focus" in action:
-                if not game_input.focus_window(hwnd, 2.0):
-                    print("搶不到前景，不敢打字（會打進別的視窗）", file=sys.stderr)
-                    print(f"{_DONE_PREFIX}{done}")
-                    return 1
-            elif "ime_off" in action:
-                _switch_ime_off(hwnd)
-            elif "look" in action:
-                _report_screen(hwnd)
-            elif "click" in action:
-                x, y = action["click"]
-                game_input.click_foreground(hwnd, int(x), int(y))
-            elif "text" in action:
-                game_input.type_background(hwnd, action["text"])
-            elif "text_fg" in action:
-                game_input.type_foreground(action["text_fg"])
-            elif "key_fg" in action:
-                for _ in range(int(action.get("times", 1))):
-                    game_input.press_foreground(int(action["key_fg"]))
-            elif "key" in action:
-                char = action.get("char")
-                for _ in range(int(action.get("times", 1))):
-                    game_input.press_background(
-                        hwnd, int(action["key"]), None if char is None else int(char)
-                    )
-            else:
-                print(f"看不懂的動作：{action!r}", file=sys.stderr)
-                print(f"{_DONE_PREFIX}{done}")
-                return 2
-            done += 1
-    except game_input.InputError as exc:
-        print(str(exc), file=sys.stderr)
-        print(f"{_DONE_PREFIX}{done}")
-        return 1
-    print(f"{_DONE_PREFIX}{done}")
-    return 0
+    return input_actions.run(argv, HELPER_FLAG, on_look=_report_screen)
 
 
 def login_probe(pid: int, marker: str) -> bool:
