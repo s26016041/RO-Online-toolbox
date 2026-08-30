@@ -1500,3 +1500,34 @@ def test_it_gives_up_repairing_instead_of_looping_forever(monkeypatch, wired):
     bot._type_credentials(0x1234)
     assert sent[-1][-1]["key"] == 0x0D, "最後還是要送出去"
     assert any("照樣送出去" in s for s in bot.progress.steps), bot.progress.steps
+
+
+def test_the_character_list_just_received_is_used_for_the_slot(monkeypatch, wired):
+    """★ 這一輪剛從伺服器收到的角色清單就是最新的 —— 要拿它查格號。
+
+    ⚠ 實機踩過（2026-08-31）：日誌前一行才印
+    「記住角色清單：1 雪色狐狸、2 雪狐u、3 光狐、**4 狐狐狸**」，
+    下一行卻說「這一台上沒有角色『狐狐狸』」—— 因為那份清單這一輪才收到、
+    還沒寫回帳號設定（存檔是登入結束才做），而選角只查了設定裡的舊清單。
+    """
+    from dataclasses import dataclass
+
+    @dataclass
+    class _Entry:
+        slot: int
+        name: str
+
+    account = _account()
+    account.server = "波利"
+    account.character = "狐狐狸"
+    bot = AutoLogin(account, 4242, lambda _t: None)
+    bot.server_name = "波利"
+    bot.characters = [_Entry(1, "雪色狐狸"), _Entry(4, "狐狐狸")]
+    picked = {}
+    monkeypatch.setattr(
+        AutoLogin, "_pick_in_client",
+        lambda self, slot, wanted, hwnd: picked.update(slot=slot, wanted=wanted) or True,
+    )
+    assert bot._select_character(0x1234) is True
+    assert picked == {"slot": 4, "wanted": "狐狐狸"}, picked
+    assert not bot.progress.stopped_at_character, bot.progress.stopped_at_character

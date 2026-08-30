@@ -1180,6 +1180,21 @@ class AutoLogin:
             + "、".join(f"{e.slot} {e.name}" for e in self.characters)
         )
 
+    def _slot_in_fresh_list(self, name: str) -> int | None:
+        """在**這一次剛收到的角色清單**裡查格號。沒有回 None。
+
+        清單是伺服器這一輪送來的 `0x0B72`，所以它一定是「這個帳號、這一台」
+        的實況 —— 比設定裡存的那份新。名字前後的空白要吃掉再比
+        （設定是使用者手打的）。
+        """
+        wanted = (name or "").strip()
+        if not wanted:
+            return None
+        for entry in self.characters:
+            if (getattr(entry, "name", "") or "").strip() == wanted:
+                return int(entry.slot)
+        return None
+
     def _select_character(self, hwnd: int) -> bool:
         """選角。**這一包是明文**（實測 payload 就一個格號），走封包。
 
@@ -1205,7 +1220,18 @@ class AutoLogin:
         # 實測踩過：波利留下的格號 4 被拿去查爾斯用，而查爾斯只有 0~3。
         wanted_character = (self._account.character or "").strip()
         if wanted_character:
-            slot = self._account.slot_of(wanted_character, self.server_name or "")
+            # ★ **先查這一次剛從伺服器收到的清單**（`0x0B72`，見
+            #   `_remember_characters`）。那是**現在這個帳號在現在這一台**的
+            #   實況，比設定裡存的還新。
+            #
+            #   ⚠ 實機踩過（2026-08-31）：日誌前一行才印出
+            #   「記住角色清單：1 雪色狐狸、2 雪狐u、3 光狐、**4 狐狐狸**」，
+            #   下一行卻說「這一台上沒有角色『狐狐狸』」—— 因為那份清單這一輪
+            #   才收到，還沒寫回帳號設定（存檔是登入結束之後才做的），
+            #   而這裡只查了設定裡的舊清單（第一次登入時它是空的）。
+            slot = self._slot_in_fresh_list(wanted_character)
+            if slot is None:
+                slot = self._account.slot_of(wanted_character, self.server_name or "")
             if slot is None:
                 reason = (
                     f"「{self.server_name or '這一台'}」上沒有角色「{wanted_character}」"
