@@ -48,6 +48,14 @@ class AppSettings:
     #: 預設**關閉** —— 它會關掉並重開你的遊戲，那種事不該預設發生。
     #: ⚠ 只在「你的網路正常但遊戲沒有連線」時才動作；你自己的網路斷了
     #: 一律什麼都不做（見 services/reconnect.py）。
+    #: 登入畫面的焦點預設在哪一格：True＝密碼欄、False＝帳號欄、None＝還不知道。
+    #:
+    #: 使用者實測的規則：**客戶端記住帳號時焦點在密碼欄**，沒記住時在帳號欄。
+    #: 這是那台客戶端的性質（存檔勾了沒），登入幾次都一樣 ——
+    #: 所以**問一次就好**：第一次登入用「清乾淨→打進去→問記憶體」查出來
+    #: （[INP-026]，要 5~6 秒），查到就記在這裡，之後直接走快路（1~2 秒）。
+    #: 猜錯不會出事：送出後的 `0x0064` 明文帳號會抓到，翻面重打並改掉這一格。
+    login_focus_password: bool | None = None
     auto_reconnect: bool = False
     window: WindowSettings = field(default_factory=WindowSettings)
 

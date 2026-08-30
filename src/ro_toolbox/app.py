@@ -285,6 +285,72 @@ def probe() -> int:
     return 0
 
 
+#: 診斷用：在**這顆 exe 裡面**跑一次完整自動登入。
+#:
+#: ⚠ 為什麼要有它：使用者的要求是「**要用要發上 GitHub 的那種 exe 測試**」。
+#: 從原始碼跑雖然走同一份程式碼，但**行程不一樣** —— 而這個專案已經證實
+#: 「誰在送輸入」會改變結果（[INP-023]：83 MB 的 exe 會被 GameGuard 擋、
+#: 小 exe 不會）。所以驗收一定要用真的那顆。
+#:
+#: 用法：`RO-Online-toolbox.exe --login "白狐"`（帳號頁上的名稱）
+LOGIN_FLAG = "--login"
+
+
+def login_once(argv: list[str]) -> int:
+    """跑一次自動登入並把每一步印出來。回 0 代表登入完成。"""
+    import logging
+
+    # ⚠ **一定要寫進檔案。** 無主控台的版本 `stdout` 是 PyInstaller 的
+    #   NullWriter，`print` 全部進黑洞（[ENV-005] 踩過）—— 驗收會「沒反應」。
+    from ro_toolbox.config.paths import log_dir
+    from ro_toolbox.services import game_launcher
+    from ro_toolbox.services.accounts import load
+    from ro_toolbox.services.auto_login import AutoLogin
+
+    report = log_dir() / "login-test.txt"
+    lines: list[str] = []
+
+    def say(text: str) -> None:
+        lines.append(text)
+        print(text)
+        try:
+            report.write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            pass
+
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s | %(message)s")
+    try:
+        wanted = argv[argv.index(LOGIN_FLAG) + 1]
+    except IndexError:
+        print(f"用法：{LOGIN_FLAG} <帳號頁上的名稱>")
+        return 2
+    store = load()
+    account = next((a for a in store.accounts if a.name == wanted), None)
+    if account is None:
+        have = "、".join(a.name for a in store.accounts)
+        say(f"找不到帳號「{wanted}」—— 有的是：{have}")
+        return 2
+
+    from pathlib import Path
+
+    from ro_toolbox.config.settings import current_settings
+
+    paths = game_launcher.GamePaths(Path(current_settings().game_path))
+    problem = paths.problem()
+    if problem:
+        say(f"遊戲路徑有問題：{problem}")
+        return 2
+    pid = game_launcher.launch_game_directly(paths)
+    say(f"[--login] 報告寫到 {report}")
+    say(f"[--login] 開了遊戲 PID {pid}，帳號「{account.name}」")
+    progress = AutoLogin(account, pid, lambda text: say(f"[--login] {text}")).run()
+    say(f"[--login] {'成功' if progress.ok else '失敗'}：{progress.summary}")
+    if progress.stopped_at_character:
+        say(f"[--login] 停在選角：{progress.stopped_at_character}")
+    return 0 if progress.ok else 1
+
+
 def run(argv: list[str] | None = None) -> int:
     args = argv if argv is not None else sys.argv
     # ⚠ 這一支要在**建 Qt 之前**攔下來：所有送進遊戲的輸入都由它執行。
@@ -296,6 +362,8 @@ def run(argv: list[str] | None = None) -> int:
         return selftest()
     if "--probe" in args:
         return probe()
+    if LOGIN_FLAG in args:
+        return login_once(args)
     app, window = create_app(args)
     window.show()
     return app.exec()

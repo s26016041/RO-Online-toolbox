@@ -42,6 +42,20 @@ def _account() -> Account:
     return Account("測試", "demo01", "pw", parse(SECRET)[0])
 
 
+@pytest.fixture(autouse=True)
+def _clean_settings(monkeypatch):
+    """每一條測試都從「什麼都沒記過」的設定開始。
+
+    ⚠ `AppSettings` 是模組層級的單例，測試之間會互相污染 ——
+    `login_focus_password`（焦點在哪一格）被前一條測試寫進去之後，
+    後面那條就會走**快路**，測到的完全是另一件事（實際踩過）。
+    """
+    from ro_toolbox.config import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "_current", settings_module.AppSettings())
+    monkeypatch.setattr(settings_module, "save_settings", lambda s: None)
+
+
 @pytest.fixture
 def fast(monkeypatch):
     """把等待縮短，測試才不會真的等幾十秒。"""
@@ -51,6 +65,9 @@ def fast(monkeypatch):
         "_INPUT_TIMEOUT",
         "_OTP_TIMEOUT",
         "_OTP_STEP_TIMEOUT",
+        "_OTP_SENT_TIMEOUT",
+        "_OTP_ACCEPT_TIMEOUT",
+        "_OTP_PROMPT_TIMEOUT",
         "_PIN_SEED_TIMEOUT",
         "_PIN_SOCKET_TIMEOUT",
         "_PIN_REPLY_TIMEOUT",
@@ -64,6 +81,10 @@ def fast(monkeypatch):
         if hasattr(auto_login, name):
             monkeypatch.setattr(auto_login, name, 0.4)
     monkeypatch.setattr(auto_login, "_POLL", 0.02)
+    # 選角那一段要容得下「頭幾下被吃掉」，不能縮到只按得了一下。
+    monkeypatch.setattr(auto_login, "_SELECT_MOVE_TIMEOUT", 3.0)
+    monkeypatch.setattr(auto_login, "_SELECT_MOVE_WAIT", 0.1)
+    monkeypatch.setattr(auto_login, "_SELECT_KEY_PAUSE", 0.02)
     monkeypatch.setattr(auto_login, "_OTP_MIN_SECONDS", 0)
     # 帳密這一關的預算要**容得下好幾輪**：合約書那幾輪現在很便宜（看一眼、
     # 按一下就回頭再看），0.4 秒會讓第一輪按完就逾時，測不到後面的流程。
@@ -140,10 +161,15 @@ class _Capture:
     那是刻意的（先前那一輪的回應不能算數）。全部先塞好的話等於沒送。
     """
 
-    def __init__(self, script):
+    #: 伺服器**不可能在客戶端送出認證碼之前**回這兩包，所以假的擷取器也不准。
+    #: （`_send_otp` 現在會確認「這一次打完之後」客戶端有沒有真的送 `0x0A74`。）
+    AFTER_OTP = (0x0A74, 0x0B60)
+
+    def __init__(self, script, gate=None):
         self.script = list(script)
         self.sink = None
         self._thread = None
+        self._gate = gate
 
     def factory(self, pid, sink, **_kw):
         self.sink = sink
@@ -154,6 +180,8 @@ class _Capture:
 
         def feed():
             for opcode in self.script:
+                if opcode in self.AFTER_OTP and self._gate is not None:
+                    self._gate.wait(60)   # 帳密那幾輪重試就要 20 秒，等短了會提前放行
                 time.sleep(0.05)
                 self.sink(FakePacket(opcode, _login_payload() if opcode == 0x0064 else b''))
 
@@ -172,9 +200,32 @@ def _run(monkeypatch, stages, packets, sent_ref=None):
 
     monkeypatch.setattr(game_screen, "capture", _forbidden)
     _looks_like(monkeypatch, stages)
-    cap = _Capture(packets)
+    cap = _Capture(packets, gate=_otp_gate(monkeypatch))
     monkeypatch.setattr(auto_login, "PacketCapture", cap.factory)
     return AutoLogin(_account(), 4242).run()
+
+
+def _otp_gate(monkeypatch):
+    """回一個 Event：客戶端**真的把六位數打出去**的那一刻才會被設起來。
+
+    假的擷取器拿它當閘門 —— 這樣 `0x0A74`／`0x0B60` 才會落在
+    「打完認證碼之後」，跟真實世界一樣。以前是 start() 就全部推完，
+    於是「這一次到底有沒有送出去」永遠驗不到。
+    """
+    import threading
+
+    gate = threading.Event()
+    inner = auto_login.input_helper.send
+
+    def _send(hwnd, actions):
+        inner(hwnd, actions)
+        for action in actions:
+            text = action.get("text_fg", action.get("text", ""))
+            if len(text) == 6 and text.isdigit():
+                gate.set()
+
+    monkeypatch.setattr(auto_login.input_helper, "send", _send)
+    return gate
 
 
 def _looks_like(monkeypatch, stages, agree=(10, 20)):
@@ -366,21 +417,38 @@ def test_packets_arriving_together_are_not_skipped(monkeypatch, wired):
     """
 
     class Burst:
-        """四個封包**一次全到**，模擬同一瞬間的批次。"""
+        """`0x0064` 與 `0x0A73` **一次全到**，模擬同一瞬間的批次。
+
+        後面兩包要等客戶端真的打出認證碼才會到（伺服器不可能提前回）。
+        """
+
+        def __init__(self, gate):
+            self._gate = gate
 
         def factory(self, pid, sink, **_kw):
             self.sink = sink
             return self
 
         def start(self):
-            for op in (0x0064, 0x0A73, 0x0A74, 0x0B60):
-                self.sink(FakePacket(op, _login_payload() if op == 0x0064 else b''))
+            import threading
+
+            self.sink(FakePacket(0x0064, _login_payload()))
+            self.sink(FakePacket(0x0A73, b''))
+
+            def answer():
+                self._gate.wait(60)   # 帳密那幾輪重試就要 20 秒，等短了會提前放行
+                self.sink(FakePacket(0x0A74, b''))
+                self.sink(FakePacket(0x0B60, b''))
+
+            threading.Thread(target=answer, daemon=True).start()
             return True
 
         def stop(self, *_a, **_k):
             pass
 
-    monkeypatch.setattr(auto_login, "PacketCapture", Burst().factory)
+    monkeypatch.setattr(
+        auto_login, "PacketCapture", Burst(_otp_gate(monkeypatch)).factory
+    )
     result = AutoLogin(_account(), 4242).run()
     assert result.ok, result.summary
 
@@ -433,15 +501,19 @@ class _FakeClient:
     - 空的格子按下去什麼都不會發生（名字不會被寫）。
     """
 
-    def __init__(self, chars, start=0, stuck=False, writes=True):
+    def __init__(self, chars, start=0, stuck=False, writes=True, drops=0):
         self.chars = {c.slot: c.name for c in chars}
         self.cursor = start
         self.stuck = stuck          # 模擬「按了游標不動」
         self.writes = writes        # 模擬「按了名字沒寫進來」
+        self.drops = drops          # 前幾下被客戶端吃掉（換畫面之後很常見）
         self.name = ""
         self.entered = None         # 客戶端自己送出去的格號
 
     def press(self, vk):
+        if self.drops > 0:
+            self.drops -= 1
+            return
         if vk == 0x27 and not self.stuck:          # →
             self.cursor = min(self.cursor + 1, 14)
         elif vk == 0x25 and not self.stuck:        # ←
@@ -454,7 +526,7 @@ class _FakeClient:
 
 def _at_character_select(
     monkeypatch, account, characters, server="查爾斯", reply=0x0AC5,
-    start=0, stuck=False, writes=True, wrong_name=None,
+    start=0, stuck=False, writes=True, wrong_name=None, drops=0,
 ):
     """做一個「已經連上、角色清單也收到了」的狀態機，只測選角這一步。
 
@@ -466,7 +538,9 @@ def _at_character_select(
     """
     from ro_toolbox.services import character as character_module
 
-    client = _FakeClient(characters, start=start, stuck=stuck, writes=writes)
+    client = _FakeClient(
+        characters, start=start, stuck=stuck, writes=writes, drops=drops
+    )
     bot = AutoLogin(account, 4321, lambda _: None)
     bot.server_name = server
     bot.characters = list(characters)
@@ -975,8 +1049,24 @@ def _capture_sends(monkeypatch):
     return sent
 
 
+def _forget_focus(monkeypatch):
+    """讓這個測試走「查焦點」的慢路（設定裡沒有記過答案）。"""
+    from ro_toolbox.config import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "_current", settings_module.AppSettings())
+    monkeypatch.setattr(AutoLogin, "_learn_focus", lambda self, v: None)
+
+
 def _bot(monkeypatch, findable=()):
-    """做一個 AutoLogin，並決定「哪些字串在堆積上找得到」（只影響觀察用的日誌）。"""
+    """做一個 AutoLogin，並決定「哪些字串在堆積上找得到」。
+
+    ⚠ 順便把「焦點在哪一格」的記憶清掉 —— 這些測試驗的是**查出來**那條路
+    （慢路）。設定裡記過答案的話會走快路，測到的就是別的東西。
+    """
+    from ro_toolbox.config import settings as settings_module
+
+    monkeypatch.setattr(settings_module, "_current", settings_module.AppSettings())
+    monkeypatch.setattr(settings_module, "save_settings", lambda s: None)
     bot = AutoLogin(_account(), 4242)
     monkeypatch.setattr(
         auto_login.input_helper, "field_addresses",
@@ -1611,3 +1701,181 @@ def test_when_the_focus_was_the_password_box_it_moves_over_and_retypes(monkeypat
     assert "TAB" in order[2:], order                    # 換過去
     assert order[-1] == "pw", order                     # 最後才打密碼
     assert any("焦點在密碼欄" in s for s in bot.progress.steps), bot.progress.steps
+
+
+def test_the_answer_is_remembered_so_the_next_login_is_fast(monkeypatch, wired):
+    """★ 查到「焦點在哪一格」之後要**記起來** —— 那是客戶端的性質，不會變。
+
+    使用者：「非常完美但速度超慢，可以很快速嗎？畢竟要占用使用者的畫面」。
+    查一次要 5~6 秒（兩次清空＋一次記憶體掃描），記起來之後走快路 1~2 秒。
+    """
+    from ro_toolbox.config import settings as settings_module
+
+    bot = _bot(monkeypatch, findable=())          # 找不到＝焦點在密碼欄
+    saved = {}
+    # ⚠ 要在 `_bot()` **之後**才換掉 `save_settings` —— 它自己也會換一個假的。
+    monkeypatch.setattr(settings_module, "save_settings", lambda s: saved.update(v=s))
+    _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    assert settings_module.current_settings().login_focus_password is True
+    assert saved, "查到答案要存起來"
+
+
+def test_the_fast_path_skips_the_clearing_and_the_memory_scan(monkeypatch, wired):
+    """記過答案就走快路：**一個子行程、不清空、不掃記憶體**。"""
+    from ro_toolbox.config import settings as settings_module
+
+    monkeypatch.setattr(
+        settings_module, "_current",
+        settings_module.AppSettings(login_focus_password=True),
+    )
+    scans = []
+    monkeypatch.setattr(auto_login.input_helper, "field_addresses",
+                        lambda pid, t: scans.append(t) or [])
+    bot = AutoLogin(_account(), 4242)
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    assert len(sent) == 1, f"快路只該送一批：{sent}"
+    assert not [a for b in sent for a in b if a.get("key") == 0x24], "快路不清空"
+    assert not scans, "快路不掃記憶體"
+    assert _typed_order(sent) == ["pw", "TAB", "demo01"], _typed_order(sent)
+    # ⚠ 送出的 Enter 要跟打字**同一條路**（前景 SendInput）——
+    #   混著背景 PostMessage 的話兩條佇列沒有先後保證，Enter 會排到字前面。
+    assert sent[-1][-1]["key_fg"] == 0x0D, "最後要送出去，而且要走前景"
+
+
+def test_pin_state_7_means_the_account_has_no_pin(monkeypatch, wired):
+    """★ 狀態 7 ＝「這個帳號沒在用二次密碼」—— 不要停在選角畫面。
+
+    2026-08-31 實機（帳號 87103030，使用者確認沒設二次密碼）：伺服器回 7，
+    而工具只認得 0／1，於是「不敢往下走」停在選角 —— 帳號其實好好的。
+    對照 rAthena 的 0x08B9 狀態表：7 是「選角畫面顯示按鈕」。
+    """
+    from ro_toolbox.services import login_packets
+
+    account = _account()
+    account.pin = ""
+    bot = AutoLogin(account, 4242, lambda _t: None)
+    seed_aid = bytes(8)
+    bot._packets = [FakePacket(login_packets.OP_PIN_STATE,
+                               seed_aid + (7).to_bytes(2, "little"))]
+    assert bot._pin_already_ok() is True
+    assert any("不需要二次密碼" in s for s in bot.progress.steps), bot.progress.steps
+
+
+def _otp_bot(monkeypatch, packets):
+    """準備一個只跑 OTP 那一關的 bot。`packets` 是擷取到的東西。"""
+    monkeypatch.setattr(auto_login, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(auto_login, "_window_alive", lambda hwnd: True)
+    bot = _bot(monkeypatch)
+    bot._account.secret = _account().secret
+    bot._packets = list(packets)
+    bot._login_server = ("1.2.3.4", 6900)
+    monkeypatch.setattr(auto_login, "_OTP_TIMEOUT", 0.6)
+    monkeypatch.setattr(auto_login, "_OTP_STEP_TIMEOUT", 0.05)
+    monkeypatch.setattr(auto_login, "_OTP_SENT_TIMEOUT", 0.05)
+    monkeypatch.setattr(auto_login, "_OTP_ACCEPT_TIMEOUT", 0.05)
+    monkeypatch.setattr(auto_login, "_OTP_PROMPT_TIMEOUT", 0.05)
+    monkeypatch.setattr(auto_login, "_OTP_MIN_SECONDS", 0)
+    monkeypatch.setattr(AutoLogin, "_pick_server_actions", lambda self: [{"key_fg": 0x28}])
+    return bot
+
+
+def test_the_otp_is_retyped_at_once_when_the_client_never_sent_it(monkeypatch):
+    """★ 打完要確認客戶端**真的送出去**（`0x0A74`）—— 沒送就立刻重打。
+
+    實機踩過（2026-08-31，帳號 s26016041）：第 1 次打完等 6 秒沒反應，
+    這時碼只剩 7 秒 → 判定「等下一組」→ 空等的那 7 秒裡登入台把連線收掉，
+    整段登入報「客戶端已經沒有連線了」。那六碼其實**一個都沒進去**，
+    是可以當場再打一次的。
+
+    同一條也釘住：**沒送出去就不准補送「選伺服器」的按鍵** ——
+    那幾下會直接打進 OTP 畫面，把狀態弄亂（舊版就是這樣，每一次都失敗）。
+    """
+    bot = _otp_bot(monkeypatch, [FakePacket(0x0A73, b"")])
+    sent = _capture_sends(monkeypatch)
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: ("1.2.3.4", 6900))
+
+    assert bot._send_otp(0x1234) is False
+    assert any("沒送出去" in s for s in bot.progress.steps), bot.progress.steps
+    assert not any({"key_fg": 0x28} in batch for batch in sent), sent
+
+
+def test_a_dead_capture_does_not_block_the_otp(monkeypatch):
+    """★ 一包都沒擷取到的機器上，**不准拿封包當關卡**。
+
+    Npcap 沒裝／raw socket 被擋的話 `0x0A74` 永遠看不到 —— 那時候
+    「沒看到」不代表沒送出去。成敗要退回舊訊號：客戶端有沒有**換台**。
+    """
+    bot = _otp_bot(monkeypatch, [])
+    _capture_sends(monkeypatch)
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: ("2.2.2.2", 6121))
+
+    assert bot._send_otp(0x1234) is True
+    assert any("OTP 過了" in s for s in bot.progress.steps), bot.progress.steps
+
+
+def test_the_first_arrow_key_may_be_swallowed(fast, monkeypatch):
+    """★ 換到選角畫面之後的**第一下按鍵很常被吃掉** —— 不准按一下就放棄。
+
+    實機踩過（2026-08-31，帳號 87103030）：客戶端記得上一次登入選的位置
+    （第 4 格，跟哪個帳號無關），這個帳號只有 3 隻，按了一下左沒動就停手，
+    停在**空格**上 —— 使用者看到的就是「選錯角色選到空的變成創建角色」。
+
+    重按不是盲按：每一下按完都**讀游標**，讀到動了才往下算。
+    """
+    account = _account()
+    account.character = "白狐"
+    bot, client = _at_character_select(
+        monkeypatch, account,
+        [FakeChar(0, "白雪狐"), FakeChar(1, "白狐"), FakeChar(2, "白尾狐")],
+        server="波利", start=4, drops=2,
+    )
+    bot._account.server = "波利"
+
+    bot._select_character(0x1234)
+
+    assert client.entered == 1, "要真的移到第 1 格才按 Enter"
+    assert not bot.progress.stopped_at_character, bot.progress.stopped_at_character
+
+
+def test_a_really_stuck_cursor_still_stops(fast, monkeypatch):
+    """連按都沒動 → 還是要停手（不准按到目的地就閉眼 Enter）。"""
+    account = _account()
+    account.character = "白狐"
+    bot, client = _at_character_select(
+        monkeypatch, account,
+        [FakeChar(0, "白雪狐"), FakeChar(1, "白狐")],
+        server="波利", start=4, stuck=True,
+    )
+    bot._account.server = "波利"
+
+    bot._select_character(0x1234)
+
+    assert client.entered is None
+    assert "移不到" in bot.progress.stopped_at_character
+    assert "按了" in bot.progress.stopped_at_character
+
+
+def test_a_cursor_that_never_moves_is_a_real_failure(fast, monkeypatch):
+    """★ 游標按不動 ＝ **登入失敗**，不是「登入成功、停在選角」。
+
+    實機踩過（2026-08-31）：客戶端掉進「創立角色」對話框（游標停在空格上，
+    前面某一下 Enter 把它打開了）。那個框**鍵盤關不掉** —— Esc 跳的是
+    「是否同意終止」，方向鍵一律無效。唯一的出路是關掉重開，
+    而那是回連那一層的工作；報成 ok=True 的話就沒有人會去重開。
+    """
+    account = _account()
+    account.character = "白狐"
+    account.server = "波利"
+    bot, client = _at_character_select(
+        monkeypatch, account,
+        [FakeChar(0, "白雪狐"), FakeChar(1, "白狐")],
+        server="波利", start=4, stuck=True,
+    )
+
+    bot._select_character(0x1234)
+
+    assert client.entered is None
+    assert bot.progress.failed_at == "選角", bot.progress.failed_at
+    assert "關掉重登" in bot.progress.stopped_at_character

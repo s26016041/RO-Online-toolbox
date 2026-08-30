@@ -14,10 +14,17 @@
 
   這兩條是 2026-08-25 實機擷取到的順序（[PKT-046]、[PKT-052]）。
 
-## 佔用使用者的只有一步
+## 送輸入：**登入這一段全部走前景**（連上線之後才改走封包）
 
-合約書要 `SendInput` 點一下（約一秒，會搶前景）—— 那是客戶端唯一不吃背景
-訊息的畫面（[INP-001]）。**其餘全部背景完成，不占鍵盤滑鼠。**
+合約書、帳號密碼、OTP 三個畫面都用 `SendInput`（會搶前景，整段約 15 秒）。
+背景 `PostMessage` 在合約書上根本不吃（[INP-001]），在其他畫面則慢五倍又掉字
+（[INP-025]）。
+
+⚠⚠ **同一批動作裡不准混前景與背景。** 兩者走不同的佇列，**沒有先後保證**：
+`text_fg` 還在路上，`key(Enter)` 就先被客戶端處理掉，於是它拿**空欄位**去送。
+實機症狀是「OTP 第 1 次永遠失敗」，還會讓那顆早到的 Enter 落到**下一個畫面**
+（選角游標停在空格 → 跳出「創立角色」，鍵盤關不掉）。
+送出的 Enter 一律用 `_submit_actions()`（[INP-027]）。
 
 ## 失敗一律說得出卡在哪
 
@@ -101,12 +108,31 @@ _VK_LBUTTON = 0x01
 #: 「請按一次同意」，他只好去按當下唯一那顆按鈕（公告框的「確定」），
 #: 於是把「確定」學成了「同意」。
 _AGREE_ASK_AFTER = 60.0
+#: 學按鈕位置時，離邊界這麼近就不學（比例）。
+#: 合約書是畫在**畫面正中**的小視窗，按鈕不可能在角落 ——
+#: 實機兩次都是使用者隨手點了角落，工具就把那裡記成「同意」。
+_AGREE_EDGE = 0.15
 #: 等使用者手動按同意的上限。
 _AGREE_LEARN_SEC = 60.0
 
 #: 兩下方向鍵之間的間隔。這不是「等它穩定」——按完一定會**再讀一次**確認
 #: 游標真的動了，這個間隔只是給客戶端一個處理訊息的機會。
 _SELECT_KEY_PAUSE = 0.15
+#: 「把游標移到那一格」整段的上限。
+#:
+#: ⚠ **不能只按一下就放棄。** 實機踩過（2026-08-31，帳號 87103030）：
+#: 角色清單一到就開始按，而**選角畫面那時候還沒建好** —— 按下去的方向鍵
+#: 全部掉進黑洞，游標讀出來一直是上一次登入留下的第 4 格（客戶端記得位置，
+#: 跟哪個帳號無關）。這個帳號只有 3 隻，於是停在**空格**上，
+#: 使用者看到的就是「選錯角色選到空的變成創建角色」。
+#:
+#: 有二次密碼的帳號反而不會中 —— 送密碼那幾秒剛好等到畫面建好。
+#:
+#: 所以這一段給**時間預算**而不是「按幾下」：一直按到讀得到游標真的動了為止。
+#: 每一下按完都還是**讀游標**才算數（做→讀→確認），所以重按不是盲按。
+_SELECT_MOVE_TIMEOUT = 15.0
+#: 按一下之後等游標動的時間。動了就馬上往下，不用等滿。
+_SELECT_MOVE_WAIT = 0.6
 
 #: 每一步的等待上限。取得夠寬鬆 —— 讀取慢的時候寧可多等，也不要誤判成失敗。
 #: 等遊戲畫出視窗。客戶端有 Themida 加殼要先解殼，而且 GameGuard 也要初始化 ——
@@ -142,7 +168,21 @@ _FIELD_TRIES = 3
 #: 這只是放棄的上限。
 _INPUT_TIMEOUT = 120.0
 #: OTP 剩不到這麼多秒就等下一組 —— 送快過期的碼等於浪費一輪重試。
-_OTP_MIN_SECONDS = 8
+#:
+#: ⚠ 這個門檻**不能訂太高**。實機踩過（2026-08-31，帳號 s26016041）：
+#: 第 1 次送完等 6 秒沒反應，這時碼只剩 7 秒 → 判定「等下一組」→
+#: 空等的那 7 秒裡登入台把連線收掉了，整段登入報「客戶端已經沒有連線了」。
+#: 現在一次嘗試最快 2.5 秒就知道結果（見 `_OTP_SENT_TIMEOUT`），
+#: 所以門檻降到 5 秒 —— 打完到伺服器收到大約 1 秒，還留 4 秒餘裕。
+_OTP_MIN_SECONDS = 5
+#: 打完認證碼之後，等**客戶端自己送出 `0x0A74`** 的上限。
+#: 這是「那六碼有沒有真的打進去」唯一確定的訊號 —— 沒送出去就是掉黑洞，
+#: 立刻重打，不要把整組碼的有效期浪費在空等上。
+_OTP_SENT_TIMEOUT = 2.5
+#: 送出去之後等伺服器回 `0x0B60`（登入成功＋伺服器清單）的上限。
+_OTP_ACCEPT_TIMEOUT = 6.0
+#: 等伺服器說「要 OTP 了」（`0x0A73`）的上限。看到它才代表認證碼那一格存在。
+_OTP_PROMPT_TIMEOUT = 20.0
 #: 每送一次 OTP，等客戶端換伺服器的上限。
 _OTP_STEP_TIMEOUT = 6.0
 #: 整個 OTP 階段的上限。要含得下「等一組新碼」（最多 30 秒）加幾輪重試。
@@ -360,6 +400,11 @@ class AutoLogin:
             self.progress.stopped_at_character = reason
             self._step(reason)
 
+        if self.progress.failed_at:
+            # ⚠ 選角那一步可以**大聲失敗**（例：客戶端掉進「創立角色」對話框，
+            #   鍵盤救不回來）。以前這裡無條件蓋成 ok=True，於是那種失敗
+            #   被報成「登入成功、只是停在選角」—— 回連那一層就不會關掉重開。
+            return self.progress
         self.progress.ok = True
         self._step("登入完成，接下來走封包")
         return self.progress
@@ -557,6 +602,17 @@ class AutoLogin:
             ratio = game_screen.window_ratio_of(hwnd, *point)
             if ratio is None or not (0.0 < ratio[0] < 1.0 and 0.0 < ratio[1] < 1.0):
                 return False
+            # ⚠ **太靠邊的位置一定不是「同意」。** 合約書是畫在**畫面正中**的
+            #   小視窗，它的按鈕不可能在角落。實機踩過兩次：使用者隨手點了
+            #   右下角（比例 0.966, 0.898），工具就把那裡記成同意按鈕，
+            #   之後每次都很有自信地點空氣。
+            if not (_AGREE_EDGE < ratio[0] < 1 - _AGREE_EDGE
+                    and _AGREE_EDGE < ratio[1] < 1 - _AGREE_EDGE):
+                self._step(
+                    f"你按的位置太靠邊了（視窗的 {ratio[0]:.2f}, {ratio[1]:.2f}）——"
+                    "合約書是畫在正中間的，那裡不會是「同意」，這次不學"
+                )
+                return False
             # ★ 先學**長什麼樣**（那才是換一台電腦還能用的東西），
             #   比例只是它找不到時的最後退路。
             self._learn_look(hwnd, shot, point)
@@ -722,6 +778,22 @@ class AutoLogin:
         """
         return [input_helper.key_foreground(_VK_TAB)]
 
+    @staticmethod
+    def _submit_actions() -> list[dict]:
+        """送出用的 Enter。**跟打字同一條路（前景）。**
+
+        ⚠⚠ **同一批裡不准混著前景與背景。** 打字走 `SendInput`（系統輸入佇列）、
+        `input_helper.key()` 走 `PostMessage`（視窗訊息佇列）——**兩條佇列
+        沒有先後保證**，Enter 可以排在字前面被處理掉。
+
+        實機症狀（2026-08-31）：OTP 第 1 次**每一場**都「打的字沒送出去」
+        （客戶端沒送 `0x0A74`）—— 因為 Enter 先到，客戶端拿空欄位去送，
+        跳「不是6位認證碼」；那一批的字才姍姍來遲。更糟的是那顆早到的 Enter
+        有時候會落到**下一個畫面**上：登入完成後選角畫面的游標停在空格，
+        Enter 一按就跳出「創立角色」對話框，鍵盤關不掉，整場登入報銷。
+        """
+        return [input_helper.key_foreground(_VK_RETURN)]
+
     def _decide_focus(self, hwnd: int) -> None:
         """決定 `self._tab_first`（要不要先打密碼）。只在第一次做。
 
@@ -770,61 +842,113 @@ class AutoLogin:
             return False
 
     def _type_credentials(self, hwnd: int) -> bool:
-        """把帳號密碼打進去並送出。**順序是量出來的，不是猜的**（[INP-024]）。
+        """把帳號密碼打進去並送出。**焦點在哪一格是查出來的，不是猜的。**
 
-        使用者的要求原話：「輸入帳密正確要一次完美輸入，所以基本上要知道
-        你在帳號還是密碼然後輸入了啥」。2026-08-30 用假帳密在真的登入畫面上
-        一種一種試、每次抓圖看兩格的內容，才把這條順序定下來：
+        ## 兩條路（使用者要「不能出錯」，也要「快」）
 
-            Tab → 打帳號 → Tab → 打密碼      ID 欄 `IDTEST11`、密碼欄 8 個星號，
-                                             2.1 秒，一次到位
+            快路 `_type_fast`      1~2 秒　一個子行程、不清空、不掃記憶體
+            慢路 `_type_by_probing` 5~6 秒　清乾淨 → 打進去 → 問記憶體
 
-        沿路推翻的三個前提（每一個都害過一次登入）：
+        走哪一條看**上次查到的答案**（`AppSettings.login_focus_password`）：
+        沒查過就走慢路查一次並記起來，之後都走快路。
 
-        1. **「焦點一開始在某一格」** —— 兩格**都沒有焦點**。直接打字整串掉進
-           黑洞（欄位空的、記憶體也搜不到），所以要先按一次 Tab。
-           舊版在猜「帳號欄還是密碼欄」，那個問題本身就是錯的。
-        2. **「打字要用 `SendInput`」** —— 那是打給**前景視窗**的，使用者
-           在登入那幾秒點了別的視窗，字就跑掉了（實機看到 ID 欄只剩一個字母）。
-           改用 `WM_CHAR` 指名送給遊戲視窗，**使用者照樣可以用電腦**。
-           前提是先關輸入法（見下）。
-        3. **「欄位要先清空」** —— 剛到登入畫面時欄位是空的（或內容被選取，
-           打字就取代）。硬清的代價很實際：24+24 個按鍵是一次爆量，
-           客戶端的訊息迴圈跟不上就掉訊息（實機：`s26016041` 只被刪掉 4 個字
-           變成 `s2601`，接著打的字一個都沒進去）。只有重打那幾輪才清。
+        ## 為什麼「上次的答案」可以信
 
-        回 True 代表「該送的都送了」；打對格了沒由送出後的閉環驗證
-        （`0x0064` 的明文帳號）做最後把關。
+        使用者實測的規則：**客戶端記住帳號時焦點在密碼欄**，沒記住時在帳號欄。
+        那是**那台客戶端的性質**（存檔勾了沒），不會每次登入不一樣。
+
+        而且猜錯不會安靜地錯：送出後的閉環驗證（`0x0064` 的明文帳號）會抓到，
+        整輪重來時就走慢路重查、順便把記住的答案改掉。
+
+        ## 沿路推翻過的東西（別再走一次）
+
+        - **「焦點固定在某一格」** —— 不是。看客戶端有沒有記住帳號（見上）。
+        - **「用畫面看得出來焦點在哪」** —— 三種都試過都不行：ID 欄空不空
+          （暗像素只差 1.5 倍）、游標在哪一格閃（`PrintWindow` 抓不到游標）、
+          直接問記憶體（客戶端記住的帳號本來就在堆積上，分不開）。詳見 [INP-026]。
+        - **「打字要用視窗訊息才不搶前景」** —— 那條會掉字又慢（[INP-025]）。
+        """
+        known = self._remembered_focus()
+        if known is not None and not self._typed_once:
+            self._type_fast(hwnd, known)
+            return True
+        return self._type_by_probing(hwnd)
+
+    @staticmethod
+    def _remembered_focus() -> bool | None:
+        """上次查出來的「焦點預設在哪一格」。True＝密碼欄、None＝還沒查過。"""
+        from ro_toolbox.config.settings import current_settings
+
+        return current_settings().login_focus_password
+
+    def _learn_focus(self, focus_password: bool) -> None:
+        """把查出來的答案記下來，下次就能走快路。"""
+        from ro_toolbox.config.settings import current_settings, save_settings
+
+        settings = current_settings()
+        if settings.login_focus_password is focus_password:
+            return
+        settings.login_focus_password = focus_password
+        try:
+            save_settings(settings)
+        except Exception as exc:  # noqa: BLE001 - 存不了不該讓登入失敗
+            log.warning("記不住「焦點在哪一格」：%s", exc)
+
+    def _type_fast(self, hwnd: int, focus_password: bool) -> None:
+        """**快路**：一個子行程、不清空、不掃記憶體（1~2 秒）。
+
+        用得起的前提是「焦點預設在哪一格」已經查過（`_remembered_focus`）——
+        那是客戶端的性質（存檔勾了沒），不會每次不一樣。
+
+        ⚠ **不清空是刻意的**：Tab 進去的時候那一格的內容是**選取狀態**，
+        打字就整個取代掉（實測）。而清空要送 24+24 個按鍵，那是一次爆量，
+        客戶端的訊息迴圈跟不上就掉訊息（[INP-024]）——又慢又危險。
+
+        猜錯也不會安靜地錯：送出後的 `0x0064` 明文帳號會抓到，
+        那時候整輪重來會走**慢路**（重新查一次並改掉記住的答案）。
+        """
+        user, password = self._account.username, self._account.password
+        first, second = (password, user) if focus_password else (user, password)
+        gap = input_helper.pause(_STEP_GAP)
+        self._step("焦點在" + ("密碼欄" if focus_password else "帳號欄")
+                   + "（上次查出來的）—— 直接打")
+        self._type(hwnd, [
+            input_helper.focus(), input_helper.ime_off(),
+            *self._type_actions(first), gap,
+            *self._tab_actions(), gap,
+            *self._type_actions(second), gap,
+            *self._submit_actions(),
+        ])
+        self._typed_once = True
+
+    def _type_by_probing(self, hwnd: int) -> bool:
+        """**慢路**：把焦點在哪一格**查出來**（5~6 秒），順便記起來。
+
+        ① 兩格都清乾淨 ② 帳號打進「現在這一格」 ③ 問記憶體找不找得到。
+        ①不能省：客戶端**記住的**帳號本來就躺在堆積上，跟「我們剛打進去的」
+        分不開 —— 先清乾淨，那份就不見了（[INP-026]）。
         """
         user, password = self._account.username, self._account.password
         clear = self._clear_actions()
         tab = self._tab_actions()
+        gap = input_helper.pause(_STEP_GAP)
 
-        # ① **兩格都清乾淨。** 這一步是後面那個判斷的前提：清完之後，
-        #    記憶體裡再出現我們的帳號，就**一定是我們剛剛打進去的**
-        #    （客戶端記住的那份已經被清掉了）。
         self._type(hwnd, [input_helper.focus(), input_helper.ime_off(),
-                          *clear, *tab, input_helper.pause(_STEP_GAP), *clear])
-        # ② 先把帳號打進**現在這一格**（不管它是哪一格）。
+                          *clear, *tab, gap, *clear])
         self._type(hwnd, [input_helper.focus(), *self._type_actions(user)])
         self._typed_once = True
-        # ③ 問記憶體：找得到帳號 ⇒ 剛剛那一格就是**帳號欄**（[MEM-032] 的不對稱：
-        #    打進帳號欄的字在堆積上找得到，打進密碼欄的找不到）。
         if self._field_has(user):
             self._step("焦點在帳號欄（記憶體確認過）—— Tab 過去打密碼")
-            self._type(hwnd, [input_helper.focus(), *tab,
-                              input_helper.pause(_STEP_GAP),
+            self._learn_focus(False)
+            self._type(hwnd, [input_helper.focus(), *tab, gap,
                               *self._type_actions(password)])
         else:
-            # 剛剛那一格是**密碼欄**（使用者說的規則：客戶端記住帳號時就是這樣）。
-            # 帳號誤打進密碼欄了 —— 清掉，Tab 到帳號欄打帳號，再 Tab 回來打密碼。
             self._step("焦點在密碼欄（帳號沒出現在堆積上）—— 換過去重打")
-            self._type(hwnd, [input_helper.focus(), *clear, *tab,
-                              input_helper.pause(_STEP_GAP),
+            self._learn_focus(True)
+            self._type(hwnd, [input_helper.focus(), *clear, *tab, gap,
                               *self._type_actions(user)])
             self._verify_account(hwnd)
-            self._type(hwnd, [input_helper.focus(), *tab,
-                              input_helper.pause(_STEP_GAP),
+            self._type(hwnd, [input_helper.focus(), *tab, gap,
                               *self._type_actions(password)])
         self._type(hwnd, [input_helper.key(_VK_RETURN)])
         return True
@@ -993,7 +1117,7 @@ class AutoLogin:
         實機踩過：OTP 打不進去 → 客戶端跳「不是6位認證碼」→ 接下來 10 次
         重試全部落空，而日誌只寫「還沒換伺服器，再送一次」。
         """
-        return [input_helper.key(_VK_RETURN), input_helper.pause(_STEP_GAP)]
+        return [*AutoLogin._submit_actions(), input_helper.pause(_STEP_GAP)]
 
     def _dismiss_error(self, hwnd: int) -> None:
         """關掉「帳密錯誤」對話框。按一次 Enter 就回到登入畫面（使用者實測）。
@@ -1118,8 +1242,8 @@ class AutoLogin:
         if not seen:
             self._step("伺服器沒有要求二次密碼（這個帳號沒設定）")
             return True
-        if state == login_packets.PIN_STATE_OK:
-            self._step("伺服器說這個帳號不需要二次密碼")
+        if state in (login_packets.PIN_STATE_OK, login_packets.PIN_STATE_NOT_USED):
+            self._step(f"伺服器說這個帳號不需要二次密碼（狀態 {state}）")
             return True
         if state == login_packets.PIN_STATE_ASK:
             self._step(
@@ -1337,28 +1461,49 @@ class AutoLogin:
             return False
 
         self._step(f"選角游標現在在第 {here} 格，要移到第 {slot} 格")
-        for _ in range(_SELECT_MOVE_LIMIT):
+        started = time.monotonic()
+        give_up = started + _SELECT_MOVE_TIMEOUT
+        presses = 0
+        while presses < _SELECT_MOVE_LIMIT:
             if here == slot:
                 return True
+            if time.monotonic() >= give_up:
+                break
             key = _VK_RIGHT if here < slot else _VK_LEFT
             self._type(hwnd, [input_helper.key(key)])
-            time.sleep(_SELECT_KEY_PAUSE)
-            moved = screen.index()
-            if moved is None or moved == here:
-                # 按了卻沒動：畫面不在選角、或那個方向到底了。
-                reason = (
-                    f"選角游標卡在第 {here} 格，移不到第 {slot} 格 —— 停手"
-                )
-                self.progress.stopped_at_character = reason
-                self._step(reason)
-                return False
-            here = moved
+            presses += 1
+            moved = self._index_after(screen, here)
+            if moved is not None:
+                here = moved
         if here == slot:
             return True
-        reason = f"按了 {_SELECT_MOVE_LIMIT} 下還沒移到第 {slot} 格（停在第 {here} 格）"
+        reason = (
+            f"選角游標卡在第 {here} 格，移不到第 {slot} 格"
+            f"（按了 {presses} 下、等了 {time.monotonic() - started:.0f} 秒都沒動）"
+            " —— 這個畫面已經沒救了，關掉重登"
+        )
         self.progress.stopped_at_character = reason
+        # ⚠ **這要算「登入失敗」，不是「停在選角」。**
+        #   實機踩過（2026-08-31）：客戶端跑到「創立角色」對話框裡
+        #   （游標停在空格上，前面某一下 Enter 把它打開了），那個框
+        #   **鍵盤關不掉**（Esc 跳的是「是否同意終止」），方向鍵一律無效。
+        #   從那裡沒有任何按鍵能回到選角畫面 —— 唯一的出路是關掉重開，
+        #   而那是回連那一層的工作，所以這裡要老實報失敗（`ok=False`），
+        #   不能報成「登入成功、只是停在選角」（那樣沒有人會去重開）。
+        self.progress.fail("選角", reason)
         self._step(reason)
         return False
+
+    @staticmethod
+    def _index_after(screen, was: int) -> int | None:
+        """按完之後等游標離開 `was`。沒動就回 None（那一下被吃掉了）。"""
+        deadline = time.monotonic() + _SELECT_MOVE_WAIT
+        while time.monotonic() < deadline:
+            now = screen.index()
+            if now is not None and now != was:
+                return now
+            time.sleep(_SELECT_KEY_PAUSE)
+        return None
 
     def _wait_name_written(self, screen, wanted: str) -> bool:
         """按下 Enter 之後，客戶端會把選到的名字寫進記憶體。核對它。
@@ -1653,9 +1798,21 @@ class AutoLogin:
                 # 登入成功、跳到 Google OTP 了，記憶體那份卻回一個完全不相干的
                 # 舊帳號 `s9318888`，於是被判成「打到別的欄位」→ 翻面重打 →
                 # 把帳號打進 OTP 的認證號碼欄 → 無限重試到逾時。
+                # ⚠⚠ **只有封包能拿來翻面。** `0x0064` 是真的送出去的那串位元組
+                #   （[PKT-046]）；記憶體那份會有**上一次登入的殘留**（[PKT-083]）。
+                #   實機踩過（2026-08-31）：封包還沒擷取到，退回去問記憶體，
+                #   讀到一個**完全不相干的舊帳號** `s9318888`，於是把本來正確的
+                #   順序翻掉、整輪重來 —— 這正是「拿模稜兩可的訊號去觸發修正動作」
+                #   會犯的錯（[INP-015] 的教訓）。
+                #   讀不到封包＝**不知道**，不知道就不要動任何東西。
                 sent_now = self._sent_account()
                 if sent_now is None:
-                    sent_now = input_helper.submitted_account(self._pid)
+                    guess = input_helper.submitted_account(self._pid)
+                    if guess is not None and guess != self._account.username:
+                        log.info(
+                            "還沒擷取到 0x0064；記憶體說送出的帳號是 %r"
+                            "（可能是上一次的殘留）—— 不拿它做決定", guess,
+                        )
                 elif (guess := input_helper.submitted_account(self._pid)) not in (
                     None, sent_now
                 ):
@@ -1815,7 +1972,7 @@ class AutoLogin:
         #   就多一次被 GameGuard 整批擋掉的機會）。
         actions = [input_helper.key_foreground(_VK_UP) for _ in range(_SERVER_LIST_TOP)]
         actions += [input_helper.key_foreground(_VK_DOWN) for _ in range(index)]
-        actions.append(input_helper.key(_VK_RETURN))
+        actions += self._submit_actions()
         self._step(f"選伺服器：先到頂再往下 {index} 次（{wanted}）")
         return actions
 
@@ -1844,7 +2001,19 @@ class AutoLogin:
                 "請到帳號頁掃一次 QR code（或貼上密鑰）再試。",
             )
             return False
+        # ★ **先等伺服器開口要 OTP**（`0x0A73`）。看到它才代表認證碼那一格
+        #   已經存在 —— 以前是帳密一送出就開始盲打，第 1 次幾乎都掉黑洞。
+        #   擷取漏掉的話照樣往下（下面每一次都會自己確認有沒有送出去）。
+        # 這一等**最多只花整段預算的三分之一**：它是加分項，不是成敗依據，
+        # 不能把重試的時間吃光（沒看到就往下打，下面每一次都會自己確認）。
+        prompt_wait = min(_OTP_PROMPT_TIMEOUT, max(0.0, deadline - time.monotonic()) / 3)
+        if self._wait_packet(OP_OTP_REQUIRED, prompt_wait):
+            self._step("伺服器要 OTP 了 —— 認證碼那一格已經開好")
+        else:
+            self._step("沒看到伺服器要 OTP 的封包（擷取可能漏掉）—— 照樣往下打")
         attempt = 0
+        submitted = 0
+        passed = False
         while time.monotonic() < deadline:
             # 視窗**每一輪現查**（客戶端會換視窗，見 `_window`）。
             hwnd = self._window() or hwnd
@@ -1859,6 +2028,13 @@ class AutoLogin:
                     "不再重試，交給自動回連關掉重開。",
                 )
                 return False
+            if passed:
+                # ⚠ 認證碼**已經過了**（伺服器清單到了），缺的只是「選哪一台」。
+                #   這時候再打一次 OTP 是把六碼打進伺服器選單裡 —— 只補按鍵。
+                self._step("認證碼已經過了，重送一次選伺服器的按鍵")
+                if self._pick_server_and_wait(hwnd):
+                    return True
+                continue
             left = self._remaining(secret)
             if left < _OTP_MIN_SECONDS:
                 # 等下一組。等的是**碼的有效期**（可以精確算出來的東西），
@@ -1893,18 +2069,17 @@ class AutoLogin:
             actions += list(self._dismiss_error_actions() if attempt > 1 else [])
             actions += [
                 *self._type_actions(code),
-                input_helper.key(_VK_RETURN),
+                *self._submit_actions(),
             ]
+            mark = len(self._packets)
+            # ⚠ **封包只有在擷取真的活著的時候才准當判斷依據。**
+            #   Npcap 沒裝／raw socket 被擋的機器上一包都收不到，
+            #   那時候「沒看到 0x0A74」不代表沒送出去 —— 拿它當關卡會把
+            #   整個 OTP 關死。有收過封包才用它加速，沒有就退回舊訊號
+            #   （客戶端有沒有換台）。
+            watching = bool(self._packets)
             try:
                 self._type(hwnd, actions)
-                # OTP 過了之後客戶端會跳出伺服器選單 —— 順手把它選掉。
-                # ⚠ **只在第一次送**。每次重試都補送的話，OTP 沒過時那些方向鍵
-                # 和 Enter 會打進 OTP 畫面，把狀態弄亂 —— 實測會讓後面每一次
-                # 都失敗（送了 9 次都沒過）。沒指定伺服器時這裡什麼都不會送。
-                if attempt == 1:
-                    picks = self._pick_server_actions()
-                    if picks:
-                        self._type(hwnd, picks)
             except input_helper.InputHelperError as exc:
                 # ⚠ 這裡以前只記 DEBUG 就 continue —— DEBUG 沒開的話**完全看不到**，
                 # 外面看到的是「0.4 秒送一次、送了 145 次」的鬼打牆，
@@ -1918,25 +2093,72 @@ class AutoLogin:
                 time.sleep(_OTP_STEP_TIMEOUT)
                 continue
 
-            # 過了的訊號：客戶端**換到下一台伺服器**（角色伺服器）。
-            # 那是實際發生的事，不必等封包 —— 這一段的連線是後來才建立的，
-            # 封包擷取常常整段漏掉（實測抓到 0 個）。
-            moved = self._wait_connection(_OTP_STEP_TIMEOUT, exclude=self._login_server)
-            if moved is not None:
-                from ro_toolbox.services import servers
+            accepted = False
+            if watching:
+                # ★ **打完先確認客戶端真的送出去了**（`0x0A74` 是它自己送的）。
+                #   沒送出去 ＝ 那六碼掉黑洞，跟「碼不對」是完全不同的失敗：
+                #   立刻用**同一組還沒過期的碼**重打，不要空等一整輪。
+                if not self._seen_since(OP_OTP, mark, _OTP_SENT_TIMEOUT):
+                    self._step(
+                        f"第 {attempt} 次打的字沒送出去（客戶端沒送 0x0A74）—— 立刻重打"
+                    )
+                    continue
+                submitted += 1
+                # ★ 伺服器收下的訊號：`0x0B60`（登入成功＋伺服器清單）。
+                accepted = self._seen_since(
+                    login_packets.OP_LOGIN_ACCEPTED, mark, _OTP_ACCEPT_TIMEOUT
+                )
+                if accepted:
+                    self._step("伺服器收下認證碼了（伺服器清單到了）")
+                elif submitted < 2:
+                    self._step("伺服器還沒收下這組認證碼 —— 再送一次")
+                    continue
+                else:
+                    # 送出去兩次都沒看到回應：多半是**擷取漏掉**那一包，
+                    # 而不是碼不對（碼不對客戶端會跳錯誤框，下一輪會關掉它）。
+                    # 照舊往下試一次選伺服器 —— 成敗仍然看「有沒有換台」。
+                    self._step("沒看到伺服器的回應（擷取可能漏掉）—— 照樣試著選伺服器")
 
-                self.server_name = servers.name_for_ip(moved[0])
-                where = self.server_name or f"{moved[0]}（認不出是哪一台）"
-                self._step(f"OTP 過了 —— 進到 {where}")
+            passed = passed or accepted
+            if self._pick_server_and_wait(hwnd):
                 return True
-            self._step("還沒換伺服器，再送一次 OTP")
+            self._step("還沒換伺服器" + ("，重按一次" if passed else "，再送一次 OTP"))
 
         self.progress.fail(
             "等登入結果",
             f"送了 {attempt} 次 OTP，客戶端都沒有換到下一台伺服器。"
-            "驗證碼可能不對（本機時間偏移過大時就會這樣）。",
+            + ("認證碼伺服器收下了，是伺服器選單那幾下沒生效。"
+               if passed else
+               "驗證碼可能不對（本機時間偏移過大時就會這樣）。"),
         )
         return False
+
+    def _pick_server_and_wait(self, hwnd: int) -> bool:
+        """送「選哪一台」的按鍵，然後等客戶端**真的換台**。
+
+        ⚠ **只在認證碼真的送出去之後才准呼叫。** 以前是「第 1 次打完就補送」，
+        而第 1 次幾乎都掉黑洞（那六碼根本沒進去）—— 那幾個方向鍵和 Enter
+        就直接打進 OTP 畫面，把狀態弄亂，後面每一次都失敗。
+        """
+        picks = self._pick_server_actions()
+        if picks:
+            try:
+                self._type(hwnd, picks)
+            except input_helper.InputHelperError as exc:
+                self._step(f"選伺服器的按鍵送不進去：{exc}")
+                return False
+        # 過了的訊號：客戶端**換到下一台伺服器**（角色伺服器）。
+        # 那是實際發生的事，不必等封包 —— 這一段的連線是後來才建立的，
+        # 封包擷取常常整段漏掉（實測抓到 0 個）。
+        moved = self._wait_connection(_OTP_STEP_TIMEOUT, exclude=self._login_server)
+        if moved is None:
+            return False
+        from ro_toolbox.services import servers
+
+        self.server_name = servers.name_for_ip(moved[0])
+        where = self.server_name or f"{moved[0]}（認不出是哪一台）"
+        self._step(f"OTP 過了 —— 進到 {where}")
+        return True
 
     # ---- 小工具 -----------------------------------------------------
 
@@ -1967,6 +2189,24 @@ class AutoLogin:
                 self._step(f"還在等遊戲視窗…（{time.monotonic() - started:.0f} 秒）")
             time.sleep(_POLL)
         return None
+
+    def _seen_since(self, opcode: int, mark: int, timeout: float) -> bool:
+        """`mark` 之後有沒有出現這個 opcode。等到逾時就回 False。
+
+        跟 `_wait_packet` 的差別：這支用**呼叫端給的位置**當起點，
+        所以同一包不會被別人先消費掉 —— 用來確認「我剛剛那一下有沒有生效」。
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            for packet in self._packets[mark:]:
+                if packet.opcode == opcode:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            if self._game_gone():
+                log.warning("等封包 0x%04X 時發現遊戲已經關掉了，不再等", opcode)
+                return False
+            time.sleep(0.05)
 
     def _wait_packet(self, opcode: int, timeout: float) -> bool:
         """等某個 opcode 出現，**依序消費、不跳號**。
