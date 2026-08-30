@@ -21,10 +21,15 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 
 #: 子行程回報「做完幾個動作」用的開頭。**重試安不安全全靠它。**
 #: 見 `input_helper.send()`：只有「做完 0 個」才准換一個子行程重送。
 DONE_PREFIX = "DONE "
+
+#: 連按同一個鍵時，兩下之間的間隔（秒）。**這是節流，不是等待。**
+#: 實機：一次灌 24 個 Backspace，客戶端只吃到 4 個。
+_KEY_GAP = 0.02
 
 #: 切輸入法用的 Win32 常數。
 _WM_IME_CONTROL = 0x0283
@@ -121,6 +126,16 @@ def perform(hwnd: int, actions: list[dict], on_look=None) -> int:
             elif "click" in action:
                 x, y = action["click"]
                 game_input.click_foreground(hwnd, int(x), int(y))
+            elif "pause" in action:
+                # ⚠ 這**不是**「睡一下等它穩定」，是**節流**：客戶端自己的訊息
+                #   迴圈跟不上就會掉字（`input.type_background` 的註解量過：
+                #   間隔 0.01 秒時 `s26016041` 會變成 `s26011034`）。
+                #   清空那 48 個按鍵是一次爆量，緊接著的第一個字必掉 ——
+                #   實機看到 ID 欄的 `PWaa1234` 變成 `Waa1234`。
+                time.sleep(min(2.0, max(0.0, float(action["pause"]))))
+            elif "click_msg" in action:
+                rx, ry = action["click_msg"]
+                game_input.click_message(hwnd, float(rx), float(ry))
             elif "text" in action:
                 game_input.type_background(hwnd, action["text"])
             elif "text_fg" in action:
@@ -130,10 +145,19 @@ def perform(hwnd: int, actions: list[dict], on_look=None) -> int:
                     game_input.press_foreground(int(action["key_fg"]))
             elif "key" in action:
                 char = action.get("char")
-                for _ in range(int(action.get("times", 1))):
+                # ⚠ **連按之間一定要留間隔。** 客戶端自己的訊息迴圈跟不上就
+                #   會掉訊息，而且掉得很難看：實機把 24 個 Backspace 一次灌進去，
+                #   欄位裡的 `s26016041` 只被刪掉 4 個字變成 `s2601`，
+                #   接著打的 6 個字**一個都沒進去**。
+                #   （同一條理由已經寫在 `input.type_background` 的註解裡。）
+                gap = float(action.get("gap", _KEY_GAP))
+                times = int(action.get("times", 1))
+                for i in range(times):
                     game_input.press_background(
                         hwnd, int(action["key"]), None if char is None else int(char)
                     )
+                    if gap and i + 1 < times:
+                        time.sleep(gap)
             else:
                 print(f"看不懂的動作：{action!r}", file=sys.stderr)
                 print(f"{DONE_PREFIX}{done}")

@@ -187,6 +187,31 @@ def press_background(hwnd: int, key: int, char: int | None = None) -> None:
     _post(hwnd, win32con.WM_KEYUP, key, 0)
 
 
+def click_message(hwnd: int, ratio_x: float, ratio_y: float) -> None:
+    """用**視窗訊息**點視窗裡的某一點（背景有效，不搶前景）。
+
+    ## 為什麼需要它（2026-08-30）
+
+    登入畫面的焦點**不一定在哪一格**：程式碼原本假設「客戶端記住帳號時焦點
+    在密碼欄」，實機打出來卻是密碼跑進 ID 欄（使用者：「第二個還會相反」）。
+    與其猜，不如**直接點那一格** —— 點完就確定焦點在哪裡。
+
+    用視窗訊息而不是 `SendInput`：`SendInput` 打的是「當下的前景視窗」，
+    使用者只要在登入那幾秒點了別的視窗，字就跑掉了（實機看到 ID 欄只剩一個字）。
+    視窗訊息是**指名**送給那個 hwnd 的，使用者照樣可以用電腦。
+
+    ⚠ 座標是**客戶區比例**。呼叫端必須先確認畫面真的是登入畫面
+    （`game_screen.detect()` 比對過縮圖才算數）—— 點在沒有輸入框的地方是無害的，
+    但點到「結束」就把遊戲關掉了。
+    """
+    if not available():
+        raise InputError("缺少 pywin32，無法送輸入。")
+    point = client_position(hwnd, ratio_x, ratio_y)
+    _post(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, point)
+    time.sleep(0.02)
+    _post(hwnd, win32con.WM_LBUTTONUP, 0, point)
+
+
 def press_enter_background(hwnd: int) -> None:
     press_background(hwnd, win32con.VK_RETURN, 13)
 

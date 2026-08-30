@@ -246,8 +246,8 @@ def test_it_does_not_type_while_the_eula_is_still_up(monkeypatch, wired):
     """
     calls: list[str] = []
     monkeypatch.setattr(
-        AutoLogin, "_credential_actions",
-        lambda self, hwnd: calls.append("typed") or [],
+        AutoLogin, "_type_credentials",
+        lambda self, hwnd: calls.append("typed") or True,
     )
     monkeypatch.setattr(auto_login, "_INPUT_TIMEOUT", 0.8)
     monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
@@ -960,6 +960,15 @@ def test_another_accounts_login_packet_is_ignored(fast):
 # 的唯一依據，等於把整條登入押在沒有反覆驗證過的前提上。
 
 
+def _capture_sends(monkeypatch):
+    """把每一次 `_type()` 送出去的動作清單收下來。"""
+    sent: list[list[dict]] = []
+    monkeypatch.setattr(
+        AutoLogin, "_type", lambda self, hwnd, actions: sent.append(list(actions))
+    )
+    return sent
+
+
 def _bot(monkeypatch, findable=()):
     """做一個 AutoLogin，並決定「哪些字串在堆積上找得到」（只影響觀察用的日誌）。"""
     bot = AutoLogin(_account(), 4242)
@@ -970,12 +979,16 @@ def _bot(monkeypatch, findable=()):
     return bot
 
 
-def test_it_assumes_the_password_box_and_says_so(monkeypatch, wired):
-    """客戶端記住帳號時焦點就在密碼欄（使用者實測，實務上幾乎永遠如此）。"""
+def test_it_assumes_the_account_box_and_says_so(monkeypatch, wired):
+    """預設「焦點在帳號欄」—— 2026-08-30 實機量到的（抓圖看兩格的內容）。
+
+    ⚠ 舊版預設是密碼欄（依使用者更早的回報）。猜錯不會卡死：送出後的
+    閉環驗證（`0x0064` 的明文帳號）會翻面重打，兩次之內一定對上。
+    """
     bot = _bot(monkeypatch)
     bot._decide_focus(0x1234)
-    assert bot._tab_first is True
-    assert any("假設焦點在密碼欄" in step for step in bot.progress.steps)
+    assert bot._tab_first is False
+    assert any("先按 Tab 再打帳號" in step for step in bot.progress.steps)
 
 
 def test_nothing_extra_is_ever_typed_into_the_boxes(monkeypatch, wired):
@@ -983,13 +996,11 @@ def test_nothing_extra_is_ever_typed_into_the_boxes(monkeypatch, wired):
 
     現在**只准打帳號與密碼**，不准打任何使用者看得見卻不屬於他的字。
     """
-    bot = _bot(monkeypatch)
-    typed = [
-        action["text_fg"]
-        for action in bot._credential_actions(0x1234)
-        if "text_fg" in action
-    ]
-    assert typed == ["pw", "demo01"], typed
+    bot = _bot(monkeypatch, findable=("demo01",))
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    typed = [a["text"] for batch in sent for a in batch if "text" in a]
+    assert typed == ["demo01", "pw"], typed
 
 
 def test_the_focus_guess_is_made_once_not_every_attempt(monkeypatch, wired):
@@ -1012,18 +1023,23 @@ def test_the_field_after_tab_is_always_cleared(monkeypatch, wired):
     我們對「Tab 過去是哪一格」根本沒有把握 —— 那只是預設假設。
     省下 2.7 秒 vs 一次打錯送出（錯誤框＋整輪重打 ≈ 25 秒），完全不對稱。
     """
-    bot = _bot(monkeypatch)
-    actions = bot._credential_actions(0x1234)
-    # 清空是 Home/Delete/End/Backspace 四個視窗訊息動作，兩格各一組。
-    assert len([a for a in actions if a.get("key") == 0x24]) == 2, actions
+    bot = _bot(monkeypatch, findable=("demo01",))
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)          # 第一次：欄位內容是選取狀態，不清
+    assert not [a for b in sent for a in b if a.get("key") == 0x24], "第一次不該清"
+    sent.clear()
+    bot._type_credentials(0x1234)          # 重打：裡面是我們自己的字，要清
+    assert [a for b in sent for a in b if a.get("key") == 0x24], "重打一定要清"
 
 
 def test_a_retry_always_clears_because_our_own_text_is_still_there(monkeypatch, wired):
     """重試時欄位裡是上一輪我們自己打的字 —— 一定要清。"""
-    bot = _bot(monkeypatch)
-    bot._credential_actions(0x1234)
-    again = bot._credential_actions(0x1234)
-    assert len([a for a in again if a.get("key") == 0x24]) == 2, "重試時兩格都要清"
+    bot = _bot(monkeypatch, findable=("demo01",))
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    sent.clear()
+    bot._type_credentials(0x1234)
+    assert len([a for b in sent for a in b if a.get("key") == 0x24]) == 2, "重試時兩格都要清"
 
 
 def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
@@ -1033,7 +1049,9 @@ def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
     `KEYDOWN+KEYUP`（無 CHAR）**不會送出**，而且失敗時毫無錯誤訊息。
     """
     bot = _bot(monkeypatch)
-    enter = bot._credential_actions(0x1234)[-1]
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    enter = sent[-1][-1]
     assert enter["key"] == 0x0D, enter
     assert enter["char"] == 0x0D, "Enter 一定要帶字元碼"
 
@@ -1107,7 +1125,10 @@ def test_every_foreground_action_has_a_focus_before_it(monkeypatch, wired):
     所以這裡改成檢查**動作清單本身的形狀**。
     """
     bot = _bot(monkeypatch)
-    _assert_focus_before_foreground(bot._credential_actions(0x1234))
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    for batch in sent:
+        _assert_focus_before_foreground(batch)
 
 
 def test_the_whole_thing_goes_in_one_subprocess(monkeypatch, wired):
@@ -1122,11 +1143,12 @@ def test_the_whole_thing_goes_in_one_subprocess(monkeypatch, wired):
     拆六批的代價才是致命的：GameGuard 會**隨機整批擋掉一個子行程的輸入**
     （打包版 40~70%），六批要連過六關 —— 使用者實機打了 22 次、73 秒。
     """
-    bot = _bot(monkeypatch)
-    actions = bot._credential_actions(0x1234)
-    kinds = {k for a in actions for k in a}
-    assert {"key", "text_fg", "key_fg", "focus"} <= kinds, kinds
-    assert actions[-1]["key"] == 0x0D, "最後一定是 Enter"
+    bot = _bot(monkeypatch, findable=("demo01",))
+    sent = _capture_sends(monkeypatch)
+    bot._type_credentials(0x1234)
+    kinds = {k for batch in sent for a in batch for k in a}
+    assert {"ime_off", "text", "key_fg", "key"} <= kinds, kinds
+    assert sent[-1][-1]["key"] == 0x0D, "最後一定是 Enter"
 
 
 # ---- 遊戲不在了就馬上停，不要做無意義的重試與等待 -----------------------

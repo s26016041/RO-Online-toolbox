@@ -86,6 +86,24 @@ def text(value: str) -> dict:
     return {"text": value}
 
 
+def pause(seconds: float) -> dict:
+    """讓子行程停一下下。**這是節流，不是「等它穩定」。**
+
+    清空欄位那 48 個按鍵是一次爆量，客戶端的訊息迴圈跟不上，
+    緊接著的第一個字會被吃掉（實機：`PWaa1234` 進到欄位變成 `Waa1234`）。
+    """
+    return {"pause": float(seconds)}
+
+
+def click_message(ratio_x: float, ratio_y: float) -> dict:
+    """用**視窗訊息**點視窗裡的某一點（背景有效，不搶前景）。
+
+    給「點某一格輸入框」用 —— 點完焦點就確定在哪一格，不必猜
+    （見 `input.click_message`）。座標是**客戶區比例**。
+    """
+    return {"click_msg": [float(ratio_x), float(ratio_y)]}
+
+
 def look() -> dict:
     """看一眼畫面：**現在在哪一關** ＋ 合約書的「同意」按鈕在哪。
 

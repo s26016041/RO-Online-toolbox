@@ -120,6 +120,10 @@ _PACKET_TIMEOUT = 25.0
 _CREDENTIAL_TIMEOUT = 8.0
 #: 反覆「打字→讀記憶體確認」的放棄上限。**逾時只是放棄的上限，
 #: 不是成功的依據** —— 成功一律以「記憶體裡讀到那串字」為準。
+#: 按完 Tab 之後停多久再打字。**這是節流不是等待**：Tab 走的是
+#: `SendInput`（視窗訊息的 Tab 不生效，實測），客戶端還在處理那一下時
+#: 緊接著送的第一個字會被吃掉（實機：`PWaa1234` 只進去 `Waa1234`）。
+_TAB_SETTLE = 0.2
 #: 從開始按同意到帳密送出去的上限。
 #:
 #: ⚠ 要撐得夠久。實測：**合約書的「同意」要等客戶端載完才真的按得動**，
@@ -661,14 +665,22 @@ class AutoLogin:
         ]
 
     def _type_actions(self, text: str) -> list[dict]:
-        """打一段字。**用真的按鍵（Unicode），不用視窗訊息。**
+        """打一段字。**走視窗訊息（`WM_CHAR`），指名送給遊戲視窗。**
 
-        使用者的輸入法停在中文時，`WM_CHAR` 送進去的**英文字母會被吃掉**
-        （數字照過）—— 密碼 `s26011034` 進到欄位變成 `26011034`，
-        送出去伺服器回「帳密錯誤」。`KEYEVENTF_UNICODE` 直接把字元碼塞進
-        輸入串流，**完全不經過 IME**。
+        ## 為什麼從 `SendInput` 改回視窗訊息（2026-08-30，[INP-024]）
+
+        `SendInput` 打的是「**當下的前景視窗**」，不是我們指定的那個。
+        使用者只要在登入那幾秒點了別的視窗，字就跑掉了 —— 實機看到 ID 欄
+        只剩一個字母，而工具完全沒有錯誤訊息（它以為自己送出去了）。
+        視窗訊息是指名給那個 hwnd 的，**使用者照樣可以用電腦**。
+
+        ⚠ **前提是先把輸入法關掉**（`ime_off`，見 `_type_credentials`）。
+        當初改用 `SendInput` 的理由是「使用者的輸入法停在中文時，`WM_CHAR`
+        送進去的英文字母會被吃掉（數字照過）」——那是真的，實機重現了
+        （`s26016041` 變成 `26016041`）；但關掉 IME 之後整串都進得去。
+        原本的 `ime_off()` 寫好了卻**從來沒有人叫**，所以那個坑一直在。
         """
-        return [input_helper.focus(), input_helper.text_foreground(text)]
+        return [input_helper.text(text)]
 
     def _tab_actions(self) -> list[dict]:
         """換行。**Tab 要送真的按鍵**（用視窗訊息送的 Tab 不生效，實測）。
@@ -703,54 +715,78 @@ class AutoLogin:
         """
         if self._tab_first is not None:
             return
-        self._tab_first = True
-        self._step("假設焦點在密碼欄（客戶端記住帳號時就是這樣）；"
+        self._tab_first = False
+        self._step("先按 Tab 再打帳號（Tab 之後的第一格是 ID，2026-08-30 實機量到）；"
                    "打錯的話送出後的驗證會翻面重打")
 
-    def _credential_actions(self, hwnd: int) -> list[dict]:
-        """組出整組輸入動作，**一個子行程一口氣做完**（含最後那個 Enter）。
+    def _field_has(self, text: str) -> bool:
+        """這串字現在**在客戶端的欄位緩衝裡**嗎（讀記憶體，不看畫面）。
 
-        順序由 `self._tab_first` 決定（`_decide_focus` 的**預設假設**），都只需要一次 Tab：
+        [MEM-032] 的不對稱：打進**帳號欄**的字在堆積上找得到，
+        打進密碼欄的找不到。所以「找得到我們的帳號」＝**帳號確實進了帳號欄**，
+        那是個**正面**訊號，可以拿來當「這一步做好了」的依據。
 
-            焦點在密碼欄：打密碼 → Tab 到帳號欄 → 清空 → 打帳號
-            焦點在帳號欄：打帳號 → Tab 到密碼欄 → 清空 → 打密碼
-
-        ## 為什麼**一批**（2026-08-30 改的，以前是六批）
-
-        以前拆六批，理由寫在 [INP-009]：「同一個行程送過 `SendInput` 之後，
-        它後續的視窗訊息會被封鎖」。**那條實測後不成立**（[INP-022]）——
-        在登入畫面上照同樣的順序 `PostMessage → SendInput → PostMessage`
-        混著送，一個行程整包做完：venv python 子行程 8/8 全過、
-        打包版 exe 6/8（那 2 次是被整批擋掉，跟混不混無關）。
-        而且真的把假帳密打進去抓圖驗過：ID 欄與密碼欄都對。
-
-        **拆六批的代價是致命的**：GameGuard 會**隨機把整個子行程的輸入擋掉**
-        （打包版被擋率 40~70%，[INP-022]），六批就要連中六次；
-        使用者實機因此打了 **22 次、73 秒**才送出去一次。
-        合成一批之後只擲一次骰子，而且 `input_helper.send()` 會在
-        「一個動作都沒做」時換一個子行程重送。
-
-        ⚠ v0.2.5 那次合併失敗（[INP-013]）**同時**改了兩件事：清空改走
-        `SendInput` ＋ 合併。這次**只合併，清空照舊走視窗訊息**，
-        而且是量過才改的。
+        ⚠ 只准用正面方向。「找不到」同時代表「真的沒進去」與「讀不到」，
+        拿它去觸發修正動作會把本來對的弄壞（[INP-015] 踩過兩次）——
+        這裡「找不到」只會讓我們**再打一次**（重打前會先清空，是冪等的）。
         """
+        try:
+            return bool(input_helper.field_addresses(self._pid, text))
+        except Exception as exc:  # noqa: BLE001 - 讀不到就當作「不知道」
+            log.debug("查欄位落點失敗：%s", exc)
+            return False
+
+    def _type_credentials(self, hwnd: int) -> bool:
+        """把帳號密碼打進去並送出。**順序是量出來的，不是猜的**（[INP-024]）。
+
+        使用者的要求原話：「輸入帳密正確要一次完美輸入，所以基本上要知道
+        你在帳號還是密碼然後輸入了啥」。2026-08-30 用假帳密在真的登入畫面上
+        一種一種試、每次抓圖看兩格的內容，才把這條順序定下來：
+
+            Tab → 打帳號 → Tab → 打密碼      ID 欄 `IDTEST11`、密碼欄 8 個星號，
+                                             2.1 秒，一次到位
+
+        沿路推翻的三個前提（每一個都害過一次登入）：
+
+        1. **「焦點一開始在某一格」** —— 兩格**都沒有焦點**。直接打字整串掉進
+           黑洞（欄位空的、記憶體也搜不到），所以要先按一次 Tab。
+           舊版在猜「帳號欄還是密碼欄」，那個問題本身就是錯的。
+        2. **「打字要用 `SendInput`」** —— 那是打給**前景視窗**的，使用者
+           在登入那幾秒點了別的視窗，字就跑掉了（實機看到 ID 欄只剩一個字母）。
+           改用 `WM_CHAR` 指名送給遊戲視窗，**使用者照樣可以用電腦**。
+           前提是先關輸入法（見下）。
+        3. **「欄位要先清空」** —— 剛到登入畫面時欄位是空的（或內容被選取，
+           打字就取代）。硬清的代價很實際：24+24 個按鍵是一次爆量，
+           客戶端的訊息迴圈跟不上就掉訊息（實機：`s26016041` 只被刪掉 4 個字
+           變成 `s2601`，接著打的字一個都沒進去）。只有重打那幾輪才清。
+
+        回 True 代表「該送的都送了」；打對格了沒由送出後的閉環驗證
+        （`0x0064` 的明文帳號）做最後把關。
+        """
+        # ★ **先按一次 Tab。** 登入畫面剛出現時**兩格都沒有焦點** ——
+        #   實機驗過：直接打字整串掉進黑洞（欄位空的、記憶體也搜不到），
+        #   按一次 Tab 之後焦點落在 ID 欄，字就一個不漏地進去。
+        #   這也是為什麼舊版要猜「焦點在帳號還是密碼」—— 前提本來就是錯的。
+        tab = [*self._tab_actions(), input_helper.pause(_TAB_SETTLE)]
+        # 輸入法自己一批送：關 IME 之後緊接著的那一串會被吃掉（實機重現）。
+        self._type(hwnd, [input_helper.ime_off()])
+        # ⚠ **第一次不要清空。** 剛到登入畫面時欄位是空的（或內容被選取），
+        #   打字就取代掉了。硬清的代價很實際：24+24 個按鍵是一次爆量，
+        #   客戶端的訊息迴圈跟不上就掉訊息（實機：`s26016041` 只被刪掉 4 個字
+        #   變成 `s2601`，接著打的字一個都沒進去）。重打那幾輪才非清不可。
+        clear = self._clear_actions() if self._typed_once else []
+        # Tab 之後的第一格是 ID（實機量到）。萬一某台機器的 tab 順序相反，
+        # 送出後的閉環驗證（`0x0064` 的明文帳號）會把這個順序翻面，兩次之內對上。
         self._decide_focus(hwnd)
-        if self._tab_first:
-            first, second = self._account.password, self._account.username
-        else:
-            first, second = self._account.username, self._account.password
-        actions = [
-            # 第一格一定要清：重試時裡面是上一輪打的字。
-            *self._clear_actions(),
-            *self._type_actions(first),
-            *self._tab_actions(),
-        ]
-        if self._needs_clear_after_tab():
-            actions += self._clear_actions()
-        actions += self._type_actions(second)
-        actions.append(input_helper.key(_VK_RETURN))   # Enter 走視窗訊息
+        pair = ((self._account.password, self._account.username) if self._tab_first
+                else (self._account.username, self._account.password))
+        for value in pair:
+            self._type(hwnd, [*tab, *clear, *self._type_actions(value)])
         self._typed_once = True
-        return actions
+        # 純觀察，只寫日誌不做決定（見 `_note_field_placement`）。
+        self._note_field_placement()
+        self._type(hwnd, [input_helper.key(_VK_RETURN)])
+        return True
 
     def _note_field_placement(self) -> None:
         """把「帳號／密碼現在在不在堆積上」記進日誌。**只觀察，不做任何決定。**
@@ -784,34 +820,6 @@ class AutoLogin:
             f"（觀察）送出前：帳號在堆積上{'找得到' if user_at else '找不到'}、"
             f"密碼{'找得到' if pw_at else '找不到'}"
         )
-
-    def _needs_clear_after_tab(self) -> bool:
-        """Tab 過去那一格要不要先清空。**答案永遠是要。**
-
-        ⚠ 這裡試過一次最佳化又收回來，理由值得記住。
-
-        使用者實測的規則是對的：剛進登入畫面時有焦點的那一格是空的，
-        而客戶端只把記住的帳號預填在**帳號欄**。照這個規則，
-        「焦點在帳號欄 → Tab 過去的密碼欄是空的 → 不用清」應該成立，
-        而且可以省掉一個子行程（打包後就是 2.7 秒，[INP-013]）。
-
-        **但那個推論有兩個洞**：
-
-        1. **我們對「Tab 過去是哪一格」根本沒有把握** —— 那只是預設假設
-           （見 `_decide_focus`）。假設錯的時候「不用清」就會讓舊值留著，
-           直接送出去。
-        2. 登入畫面上有「**存檔**」選項，客戶端不見得只記帳號 ——
-           「密碼欄一定是空的」本來就不是我們驗過的事實。
-
-        使用者實測回報：「輸入完密碼移動到帳號應該要刪除帳號再打入真帳號，
-        可是他沒刪除舊帳，ENTER 導致錯誤。雖然最後還是成功但不該有那個錯誤。」
-
-        **代價完全不對稱**：省下 2.7 秒 vs 一次打錯送出（伺服器拒絕、跳錯誤框、
-        關掉、翻面、整輪重打 ≈ 25 秒）。所以一律清。
-
-        （第一格照樣要清：重試時裡面是上一輪我們自己打的字。）
-        """
-        return True
 
     def _connection_lost(self) -> bool:
         """這次登入是不是已經死了（客戶端一條伺服器連線都沒有）？
@@ -1482,11 +1490,7 @@ class AutoLogin:
                 # ★ **整組一個子行程做完**（清空→打字→Tab→清空→打字→Enter）。
                 #   拆成六個子行程的話，GameGuard 隨機擋掉的機率要連過六關 ——
                 #   使用者實機因此打了 22 次、73 秒（[INP-022]）。
-                self._type(hwnd, self._credential_actions(hwnd))
-                # 純觀察，只寫日誌不做決定（見 `_note_field_placement`）。
-                # 移到送出**之後**：它要掃整個記憶體，夾在打字與 Enter 中間
-                # 每一輪都白等四五秒。
-                self._note_field_placement()
+                self._type_credentials(hwnd)
             except input_helper.InputHelperError as exc:
                 # ⚠ 這一句以前是 `log.debug` —— 等於沒有。使用者的日誌只有
                 #   「按同意、輸入帳號密碼並送出（第 N 次）」一行一行往下，
