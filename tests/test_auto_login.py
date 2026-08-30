@@ -988,7 +988,7 @@ def test_it_assumes_the_account_box_and_says_so(monkeypatch, wired):
     bot = _bot(monkeypatch)
     bot._decide_focus(0x1234)
     assert bot._tab_first is False
-    assert any("先按 Tab 再打帳號" in step for step in bot.progress.steps)
+    assert any("先打帳號再 Tab 到密碼" in step for step in bot.progress.steps)
 
 
 def test_nothing_extra_is_ever_typed_into_the_boxes(monkeypatch, wired):
@@ -999,7 +999,7 @@ def test_nothing_extra_is_ever_typed_into_the_boxes(monkeypatch, wired):
     bot = _bot(monkeypatch, findable=("demo01",))
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
-    typed = [a["text"] for batch in sent for a in batch if "text" in a]
+    typed = [a["text_fg"] for batch in sent for a in batch if "text_fg" in a]
     assert typed == ["demo01", "pw"], typed
 
 
@@ -1147,11 +1147,12 @@ def test_the_whole_thing_goes_in_one_subprocess(monkeypatch, wired):
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
     kinds = {k for batch in sent for a in batch for k in a}
-    assert {"ime_off", "text", "key"} <= kinds, kinds
-    # ★ **一個前景動作都不准有。** `focus`／`text_fg`／`key_fg` 都要前景，
-    #   而使用者只要在登入那幾秒用電腦，那一下就失敗（實機日誌：「搶不到前景，
-    #   不敢打字」）—— 失敗在整批中間，字就打到別格去，那就是「會打反」。
-    assert not ({"focus", "text_fg", "key_fg"} & kinds), kinds
+    # ⚠ 前景 `SendInput`（`text_fg`／`key_fg`）打的是「當下的前景視窗」，
+    #   所以**同一批的開頭一定要有 `focus()`**，而且要在打字之前 ——
+    #   搶不到前景就整批失敗，寧可不做也不要打進使用者正在用的視窗。
+    assert {"focus", "ime_off", "text_fg", "key_fg"} <= kinds, kinds
+    order = [k for a in sent[0] for k in a]
+    assert order.index("focus") < order.index("text_fg"), sent[0]
     assert sent[-1][-1]["key"] == 0x0D, "最後一定是 Enter"
 
 
@@ -1453,14 +1454,11 @@ def test_the_otp_is_typed_the_same_way_as_the_credentials(monkeypatch, wired):
     monkeypatch.setattr(AutoLogin, "_pick_server_actions", lambda self: [])
     bot._login_server = ("1.2.3.4", 6900)
     bot._send_otp(0x1234)
-    first = next(b for b in sent if any("text" in a for a in b))
-    order = [a.get("key", "text" if "text" in a else None) for a in first]
-    assert order.index(0x09) < order.index("text"), f"Tab 要在打字之前：{first}"
+    first = next(b for b in sent if any("text_fg" in a for a in b))
+    order = [k for a in first for k in a]
+    assert order.index("focus") < order.index("text_fg"), f"要先搶前景：{first}"
     assert any("ime_off" in a for b in sent for a in b), "要先關輸入法"
     assert not any(a.get("key") == 0x2E for b in sent for a in b), "不該清空（會灌爆客戶端）"
-    # ★ OTP 也不准要前景 —— 同一個理由（見 `_tab_actions`）。
-    assert not any("key_fg" in a or "focus" in a or "text_fg" in a
-                   for b in sent for a in b), "OTP 也不該要前景"
 
 
 def test_the_account_is_verified_and_retyped_when_it_did_not_land(monkeypatch, wired):
@@ -1484,7 +1482,7 @@ def test_the_account_is_verified_and_retyped_when_it_did_not_land(monkeypatch, w
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
     retypes = [b for b in sent
-               if any(a.get("text") == "demo01" for a in b)
+               if any(a.get("text_fg") == "demo01" for a in b)
                and any(a.get("key") == 0x08 for a in b)]     # 清空＋重打
     assert len(retypes) == 2, f"該補打兩次：{sent}"
     assert any("帳號沒完整進到欄位裡" in s for s in bot.progress.steps), bot.progress.steps

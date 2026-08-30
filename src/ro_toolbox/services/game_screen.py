@@ -676,6 +676,15 @@ def _spread(image: QImage) -> float:
         return 0.0
 
 
+def _brightness(image: QImage) -> float:
+    """畫面的平均亮度。算不出來回 255（當作「亮的」，不要因此擋住流程）。"""
+    try:
+        return float(_gray_array(image).mean())
+    except Exception as exc:  # noqa: BLE001 - 只是輔助判斷
+        log.debug("算不出畫面亮度：%s", exc)
+        return 255.0
+
+
 def image_note(image: QImage) -> str:
     """一句話描述這張畫面（尺寸＋平均亮度）。
 
@@ -703,6 +712,9 @@ class ScreenReport:
     #: 「同意」按鈕的**螢幕**座標；認不出來是 None。
     agree: tuple[int, int] | None
     note: str
+    #: 畫面的平均亮度。**很暗＝客戶端還在載，什麼都還沒畫出來** ——
+    #: 那時候打字是白打（實機：亮度 14 的時候打了 25 秒，合約書其實還沒出來）。
+    brightness: float = 255.0
 
 
 def screen_report(hwnd: int) -> ScreenReport:
@@ -744,6 +756,7 @@ def screen_report(hwnd: int) -> ScreenReport:
             "遊戲多半在全螢幕模式，請改成視窗模式再試"))
 
     stage = detect(image)
+    bright = _brightness(image)
     # 判定的**依據**也要印出來：認錯畫面時，這兩個數字是唯一看得出
     # 「差多少才算數」的東西（門檻見 `_EULA_TOLERANCE` / `_MATCH_TOLERANCE`）。
     note += (f"；判定 {stage.value}"
@@ -753,15 +766,15 @@ def screen_report(hwnd: int) -> ScreenReport:
     match = find_agree_match(image, dpi)
     if match is None:
         return ScreenReport(stage, None, f"{note}；同意按鈕比都比不了"
-                                         "（樣板載不到或畫面比樣板還小）")
+                                         "（樣板載不到或畫面比樣板還小）", bright)
     if not match.accepted:
-        return ScreenReport(stage, None, f"{note}；{match.describe()}")
+        return ScreenReport(stage, None, f"{note}；{match.describe()}", bright)
     try:
         left, top, _right, _bottom = _window_rect(hwnd)
     except ScreenError as exc:
-        return ScreenReport(stage, None, f"{note}；{exc}")
+        return ScreenReport(stage, None, f"{note}；{exc}", bright)
     return ScreenReport(stage, (left + match.x, top + match.y),
-                        f"{note}；{match.describe()}")
+                        f"{note}；{match.describe()}", bright)
 
 
 def agree_button_position(

@@ -246,6 +246,8 @@ _SEND_TRIES = 6
 _AGREE_PREFIX = "AGREE "
 #: 子行程回報「畫面現在停在哪一關」時用的開頭（值是 `Stage` 的名字）。
 _STAGE_PREFIX = "STAGE "
+#: 子行程回報畫面平均亮度時用的開頭。很暗＝客戶端還在載。
+_BRIGHT_PREFIX = "BRIGHT "
 #: 子行程回報「為什麼找到／為什麼沒找到」時用的開頭。
 #:
 #: ⚠ 這一行不是裝飾。找按鈕跑在子行程裡（[INP-009]），它的 `log` **不會**
@@ -360,9 +362,10 @@ def look_at_screen(hwnd: int):
         output = _run([look()], hwnd)
     except InputHelperError as exc:
         log.info("看畫面的子行程失敗：%s", exc)
-        return ScreenReport(Stage.UNKNOWN, None, f"子行程失敗：{exc}")
+        return ScreenReport(Stage.UNKNOWN, None, f"子行程失敗：{exc}", 255.0)
     spot: tuple[int, ...] | None = None
     stage = Stage.UNKNOWN
+    bright = 255.0
     note = ""
     for line in (output or "").splitlines():
         if line.startswith(_AGREE_NOTE):
@@ -370,6 +373,11 @@ def look_at_screen(hwnd: int):
         elif line.startswith(_STAGE_PREFIX):
             name = line[len(_STAGE_PREFIX):].strip()
             stage = getattr(Stage, name, Stage.UNKNOWN)
+        elif line.startswith(_BRIGHT_PREFIX):
+            try:
+                bright = float(line[len(_BRIGHT_PREFIX):])
+            except ValueError:
+                bright = 255.0
         elif line.startswith(_AGREE_PREFIX):
             try:
                 spot = tuple(int(v) for v in line[len(_AGREE_PREFIX):].split())
@@ -380,7 +388,7 @@ def look_at_screen(hwnd: int):
     # 別人的機器上這一句是唯一查得到的東西。
     log.info("子行程看畫面：%s、同意按鈕 %s（%s）",
              stage.value, found or "找不到", note or "沒有說明")
-    return ScreenReport(stage, found, note or "沒有說明")
+    return ScreenReport(stage, found, note or "沒有說明", bright)
 
 
 # ---- 子行程這一側 -----------------------------------------------------------
@@ -400,6 +408,7 @@ def _report_screen(hwnd: int) -> None:
         print(f"{_AGREE_NOTE}看畫面失敗（略過）：{exc}")
         return
     print(f"{_STAGE_PREFIX}{report.stage.name}")
+    print(f"{_BRIGHT_PREFIX}{report.brightness:.1f}")
     print(f"{_AGREE_NOTE}{report.note}")
     if report.agree is not None:
         print(f"{_AGREE_PREFIX}{report.agree[0]} {report.agree[1]}")

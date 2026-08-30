@@ -120,12 +120,14 @@ _PACKET_TIMEOUT = 25.0
 _CREDENTIAL_TIMEOUT = 8.0
 #: 反覆「打字→讀記憶體確認」的放棄上限。**逾時只是放棄的上限，
 #: 不是成功的依據** —— 成功一律以「記憶體裡讀到那串字」為準。
+#: 畫面平均亮度低於這個值就當作「客戶端還在載」——那時候做什麼都是白做。
+#: 實機：亮度 14 的時候打了 25 秒，合約書其實還沒出來。
+_DARK_SCREEN = 40.0
+#: 每一步之間的間隔（秒）。對照組 ROZeroLoginer 用 0.5，實測 0.15 就夠，
+#: 而使用者的要求是**越快越好**（登入會占用他的畫面）。
+_STEP_GAP = 0.15
 #: 帳號沒完整打進欄位時，最多清掉重打幾次（同一格，冪等）。
 _FIELD_TRIES = 3
-#: 按完 Tab 之後停多久再打字。**這是節流不是等待**：Tab 走的是
-#: `SendInput`（視窗訊息的 Tab 不生效，實測），客戶端還在處理那一下時
-#: 緊接著送的第一個字會被吃掉（實機：`PWaa1234` 只進去 `Waa1234`）。
-_TAB_SETTLE = 0.2
 #: 從開始按同意到帳密送出去的上限。
 #:
 #: ⚠ 要撐得夠久。實測：**合約書的「同意」要等客戶端載完才真的按得動**，
@@ -576,6 +578,11 @@ class AutoLogin:
             #   設定裡也存了一個錯的比例）。
             #   ⚠ 看過合約書就**不能**從這裡走：那是「他按掉了」的正常轉場，
             #     要留給下面「合約書消失時游標在那裡」那個訊號去學。
+            # ⚠ **畫面還全黑就不准學。** 使用者實際踩過：客戶端還在載入時
+            #   他點了一下，工具把那一塊**背景圖**學成了「同意按鈕」，
+            #   之後每次都很有自信地在 (882,1172) 找到它（每像素差 4.9）。
+            if shot is not None and game_screen._brightness(shot) < _DARK_SCREEN:
+                continue
             if stage is game_screen.Stage.LOGIN and not seen_eula:
                 self._step("合約書已經不在了（畫面：登入畫面）—— 不用你按，這次不學")
                 return False
@@ -667,50 +674,37 @@ class AutoLogin:
         ]
 
     def _type_actions(self, text: str) -> list[dict]:
-        """打一段字。**走視窗訊息（`WM_CHAR`），指名送給遊戲視窗。**
+        """打一段字。**前景 `SendInput`（Unicode），整串一次送。**
 
-        ## 為什麼從 `SendInput` 改回視窗訊息（2026-08-30，[INP-024]）
+        ## 為什麼繞了一圈又回到前景（2026-08-31）
 
-        `SendInput` 打的是「**當下的前景視窗**」，不是我們指定的那個。
-        使用者只要在登入那幾秒點了別的視窗，字就跑掉了 —— 實機看到 ID 欄
-        只剩一個字母，而工具完全沒有錯誤訊息（它以為自己送出去了）。
-        視窗訊息是指名給那個 hwnd 的，**使用者照樣可以用電腦**。
+        2026-08-30 曾經改成 `WM_CHAR`（視窗訊息、不搶前景），想讓使用者
+        登入時還能用電腦。實機的結論是**不行**：客戶端的訊息迴圈忙起來就掉字，
+        而且**常常掉第一個** —— 使用者的帳號長 `s26016041` 這樣
+        （一個英文字母＋八個數字），掉第一個看起來就像「英文被吃掉」。
+        他自己把輸入法切成英數再測，證實「不是被輸入法吃掉，是壓根沒打出來」。
 
-        ⚠ **前提是先把輸入法關掉**（`ime_off`，見 `_type_credentials`）。
-        當初改用 `SendInput` 的理由是「使用者的輸入法停在中文時，`WM_CHAR`
-        送進去的英文字母會被吃掉（數字照過）」——那是真的，實機重現了
-        （`s26016041` 變成 `26016041`）；但關掉 IME 之後整串都進得去。
-        原本的 `ime_off()` 寫好了卻**從來沒有人叫**，所以那個坑一直在。
+        改回前景之後同一台機器實測：`q26016041` **整串進去、0.9 秒**
+        （視窗訊息那版要 4.5 秒還會掉字）。使用者的要求是
+        「**自動登入會占用畫面，所以我需要速度非常快**」—— 前景這條路才快。
+
+        參考 ROZeroLoginer（使用者指定的對照組）也是這一條：
+        `SendInput` ＋ `KEYEVENTF_UNICODE`，整串一次送。
+
+        ⚠ 送到哪裡取決於誰是前景，所以**同一批的開頭一定要有 `focus()`**
+        （`_type_credentials` 會放）。搶不到前景就整批失敗，寧可不做也不要
+        打進使用者正在用的視窗。
         """
-        return [input_helper.text(text)]
+        return [input_helper.text_foreground(text)]
 
     def _tab_actions(self) -> list[dict]:
-        """換到下一格。**走視窗訊息，不搶前景**（[INP-024]）。
+        """換到下一格（前景 `SendInput`）。
 
-        ## 「視窗訊息的 Tab 不生效」是**少帶了那個字元碼**
-
-        舊註解寫著「Tab 要送真的按鍵，視窗訊息送的不生效（實測）」，
-        所以這一支一直是 `focus()` ＋ `SendInput`。2026-08-30 重測才發現
-        差別不在通道，而在 **`WM_CHAR(9)`**：
-
-            KEYDOWN + KEYUP（無 CHAR）      → **不換格**（舊測就是這樣測的）
-            KEYDOWN + CHAR(9) + KEYUP      → **換格** ★
-
-        跟 Enter 一模一樣的坑（[INP-010]：Enter 少帶 `WM_CHAR(13)` 就不送出）。
-        `input_helper.key()` 本來就會替 Tab／Enter 補上字元碼，用它就對了。
-
-        ## 為什麼非改不可
-
-        `SendInput` 要**前景**。使用者實機日誌：
-
-            第 1 個子行程整批被擋掉（一個動作都沒送出）：
-            搶不到前景，不敢打字（會打進別的視窗）
-
-        使用者只要在登入那幾秒用電腦，這一下就失敗；而它失敗在整批的中間，
-        後面的字就打到別格去 —— 那就是他說的「**會打反**」。
-        改成視窗訊息之後**整段帳密都不需要前景**，他可以照常用電腦。
+        ⚠ 視窗訊息的 Tab **帶上 `WM_CHAR(9)` 其實也會換格**（2026-08-30 量到，
+        舊註解說「不生效」是因為少帶那個字元碼）。但整段既然已經是前景輸入了，
+        就用同一條通道，不要兩種混著 —— 混著送反而多一種會壞的方式。
         """
-        return [input_helper.key(_VK_TAB)]
+        return [input_helper.key_foreground(_VK_TAB)]
 
     def _decide_focus(self, hwnd: int) -> None:
         """決定 `self._tab_first`（要不要先打密碼）。只在第一次做。
@@ -739,7 +733,7 @@ class AutoLogin:
         if self._tab_first is not None:
             return
         self._tab_first = False
-        self._step("先按 Tab 再打帳號（Tab 之後的第一格是 ID，2026-08-30 實機量到）；"
+        self._step("先打帳號再 Tab 到密碼（2026-08-31 實機量到的順序）；"
                    "打錯的話送出後的驗證會翻面重打")
 
     def _field_has(self, text: str) -> bool:
@@ -786,31 +780,26 @@ class AutoLogin:
         回 True 代表「該送的都送了」；打對格了沒由送出後的閉環驗證
         （`0x0064` 的明文帳號）做最後把關。
         """
-        # ★ **先按一次 Tab。** 登入畫面剛出現時**兩格都沒有焦點** ——
-        #   實機驗過：直接打字整串掉進黑洞（欄位空的、記憶體也搜不到），
-        #   按一次 Tab 之後焦點落在 ID 欄，字就一個不漏地進去。
-        #   這也是為什麼舊版要猜「焦點在帳號還是密碼」—— 前提本來就是錯的。
-        tab = [*self._tab_actions(), input_helper.pause(_TAB_SETTLE)]
-        # 輸入法自己一批送：關 IME 之後緊接著的那一串會被吃掉（實機重現）。
-        self._type(hwnd, [input_helper.ime_off()])
-        # ⚠ **第一次不要清空。** 剛到登入畫面時欄位是空的（或內容被選取），
-        #   打字就取代掉了。硬清的代價很實際：24+24 個按鍵是一次爆量，
-        #   客戶端的訊息迴圈跟不上就掉訊息（實機：`s26016041` 只被刪掉 4 個字
-        #   變成 `s2601`，接著打的字一個都沒進去）。重打那幾輪才非清不可。
-        clear = self._clear_actions() if self._typed_once else []
-        # Tab 之後的第一格是 ID（實機量到）。萬一某台機器的 tab 順序相反，
-        # 送出後的閉環驗證（`0x0064` 的明文帳號）會把這個順序翻面，兩次之內對上。
+        # ★ **整組一個子行程、一口氣送完**（使用者要求：登入會占用畫面，
+        #   所以要**快**）。實機 0.9 秒打完兩格。
+        #   ⚠ 開頭一定要 `focus()`：前景 `SendInput` 打的是「當下的前景視窗」，
+        #     搶不到就整批失敗（寧可不做，也不要打進使用者正在用的視窗）。
         self._decide_focus(hwnd)
         pair = ((self._account.password, self._account.username) if self._tab_first
                 else (self._account.username, self._account.password))
-        for value in pair:
-            self._type(hwnd, [*tab, *clear, *self._type_actions(value)])
-            if value == self._account.username:
-                # ★ **打完帳號當場回頭確認**（讀記憶體，不看畫面）。
-                self._verify_account(hwnd)
+        gap = input_helper.pause(_STEP_GAP)
+        clear = self._clear_actions() if self._typed_once else []
+        actions = [input_helper.focus(), input_helper.ime_off()]
+        actions += [*clear, *self._type_actions(pair[0]), gap]
+        actions += [*self._tab_actions(), gap]
+        actions += [*clear, *self._type_actions(pair[1]), gap]
+        self._type(hwnd, actions)
         self._typed_once = True
-        # 純觀察，只寫日誌不做決定（見 `_note_field_placement`）。
-        self._note_field_placement()
+        # ★ 打完**當場回頭確認帳號整串進去了**（讀記憶體，不看畫面）。
+        self._verify_account(hwnd)
+        # ⚠ 這裡以前還多做一次「純觀察」的記憶體掃描（`_note_field_placement`），
+        #   每一輪多花 2~4 秒。`_verify_account()` 已經看過同一件事而且會修，
+        #   使用者的要求是**越快越好**（登入會占用他的畫面），所以拿掉。
         self._type(hwnd, [input_helper.key(_VK_RETURN)])
         return True
 
@@ -843,7 +832,7 @@ class AutoLogin:
                     self._step(f"帳號補打成功（第 {attempt} 次，記憶體確認過）")
                 return True
             self._step(f"帳號沒完整進到欄位裡（第 {attempt} 次）—— 清掉重打同一格")
-            self._type(hwnd, [*self._clear_actions(),
+            self._type(hwnd, [input_helper.focus(), *self._clear_actions(),
                               *self._type_actions(self._account.username)])
         self._step("帳號重打幾次都確認不到 —— 照樣送出去，讓封包驗證收尾")
         return False
@@ -978,7 +967,7 @@ class AutoLogin:
         實機踩過：OTP 打不進去 → 客戶端跳「不是6位認證碼」→ 接下來 10 次
         重試全部落空，而日誌只寫「還沒換伺服器，再送一次」。
         """
-        return [input_helper.key(_VK_RETURN), input_helper.pause(_TAB_SETTLE)]
+        return [input_helper.key(_VK_RETURN), input_helper.pause(_STEP_GAP)]
 
     def _dismiss_error(self, hwnd: int) -> None:
         """關掉「帳密錯誤」對話框。按一次 Enter 就回到登入畫面（使用者實測）。
@@ -1537,6 +1526,16 @@ class AutoLogin:
                 deadline += time.monotonic() - waited
                 continue
 
+            if screen.brightness < _DARK_SCREEN:
+                # ★ 畫面幾乎全黑＝**客戶端還在載，什麼都還沒畫出來**。
+                #   打字是白打，點同意也是點空氣 —— 使用者實機因此在黑畫面上
+                #   耗了 25 秒（亮度 14），合約書其實那時候還沒出來。
+                #   什麼都不要做，回頭再看一眼就好。
+                if time.monotonic() >= deadline:
+                    self._give_up_on_credentials(hwnd, attempt, stage)
+                    return False
+                continue
+
             if stage is not Stage.LOGIN:
                 # 合約書、或還認不出來的畫面 —— 先把同意按掉。
                 # ⚠ **認出是登入畫面就不要點。** 那一下不是無害的：使用者實機
@@ -1825,15 +1824,13 @@ class AutoLogin:
             # ⚠ **不要清空。** 那 48 個按鍵是一次爆量，客戶端的訊息迴圈跟不上
             #   就掉訊息（[INP-024]）。Tab 進去的時候那一格是空的／被選取，
             #   打字就取代掉了；真的有殘留時，錯誤框那條路也會重來一次。
-            actions = list(self._dismiss_error_actions() if attempt > 1 else [])
+            actions = [input_helper.focus(), input_helper.ime_off()]
+            actions += list(self._dismiss_error_actions() if attempt > 1 else [])
             actions += [
-                *self._tab_actions(),
-                input_helper.pause(_TAB_SETTLE),
                 *self._type_actions(code),
                 input_helper.key(_VK_RETURN),
             ]
             try:
-                self._type(hwnd, [input_helper.ime_off()])
                 self._type(hwnd, actions)
                 # OTP 過了之後客戶端會跳出伺服器選單 —— 順手把它選掉。
                 # ⚠ **只在第一次送**。每次重試都補送的話，OTP 沒過時那些方向鍵
