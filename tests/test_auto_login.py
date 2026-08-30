@@ -246,8 +246,8 @@ def test_it_does_not_type_while_the_eula_is_still_up(monkeypatch, wired):
     """
     calls: list[str] = []
     monkeypatch.setattr(
-        AutoLogin, "_credential_batches",
-        lambda self, hwnd: calls.append("typed") or [[], []],
+        AutoLogin, "_credential_actions",
+        lambda self, hwnd: calls.append("typed") or [],
     )
     monkeypatch.setattr(auto_login, "_INPUT_TIMEOUT", 0.8)
     monkeypatch.setattr(auto_login, "find_server", lambda pid: None)
@@ -986,8 +986,7 @@ def test_nothing_extra_is_ever_typed_into_the_boxes(monkeypatch, wired):
     bot = _bot(monkeypatch)
     typed = [
         action["text_fg"]
-        for batch in bot._credential_batches(0x1234)
-        for action in batch
+        for action in bot._credential_actions(0x1234)
         if "text_fg" in action
     ]
     assert typed == ["pw", "demo01"], typed
@@ -1014,17 +1013,17 @@ def test_the_field_after_tab_is_always_cleared(monkeypatch, wired):
     省下 2.7 秒 vs 一次打錯送出（錯誤框＋整輪重打 ≈ 25 秒），完全不對稱。
     """
     bot = _bot(monkeypatch)
-    batches = bot._credential_batches(0x1234)
-    assert len(batches) == 6, [len(b) for b in batches]
-    assert all("key" in a for a in batches[3]), batches[3]
+    actions = bot._credential_actions(0x1234)
+    # 清空是 Home/Delete/End/Backspace 四個視窗訊息動作，兩格各一組。
+    assert len([a for a in actions if a.get("key") == 0x24]) == 2, actions
 
 
 def test_a_retry_always_clears_because_our_own_text_is_still_there(monkeypatch, wired):
     """重試時欄位裡是上一輪我們自己打的字 —— 一定要清。"""
     bot = _bot(monkeypatch)
-    bot._credential_batches(0x1234)
-    again = bot._credential_batches(0x1234)
-    assert len(again) == 6, "重試時兩格都要清"
+    bot._credential_actions(0x1234)
+    again = bot._credential_actions(0x1234)
+    assert len([a for a in again if a.get("key") == 0x24]) == 2, "重試時兩格都要清"
 
 
 def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
@@ -1034,9 +1033,9 @@ def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
     `KEYDOWN+KEYUP`（無 CHAR）**不會送出**，而且失敗時毫無錯誤訊息。
     """
     bot = _bot(monkeypatch)
-    enter = bot._credential_batches(0x1234)[-1]
-    assert len(enter) == 1 and enter[0]["key"] == 0x0D, enter
-    assert enter[0]["char"] == 0x0D, "Enter 一定要帶字元碼"
+    enter = bot._credential_actions(0x1234)[-1]
+    assert enter["key"] == 0x0D, enter
+    assert enter["char"] == 0x0D, "Enter 一定要帶字元碼"
 
 
 # ---- 送出前只**觀察**，不做決定 -----------------------------------------
@@ -1108,27 +1107,26 @@ def test_every_foreground_action_has_a_focus_before_it(monkeypatch, wired):
     所以這裡改成檢查**動作清單本身的形狀**。
     """
     bot = _bot(monkeypatch)
-    for batch in bot._credential_batches(0x1234):
-        _assert_focus_before_foreground(batch)
+    _assert_focus_before_foreground(bot._credential_actions(0x1234))
 
 
-def test_no_window_message_after_a_key_in_the_same_batch(monkeypatch, wired):
-    """[INP-009]：同一個行程送過 `SendInput` 之後，它的**視窗訊息會被封鎖**。
+def test_the_whole_thing_goes_in_one_subprocess(monkeypatch, wired):
+    """★ 整組帳密**一個子行程做完**，視窗訊息與按鍵混著送。
 
-    所以一批裡面只要出現過前景按鍵／打字，後面就不准再有視窗訊息動作 ——
-    要換一個乾淨的子行程。這條規則就是「為什麼帳密要分成好幾批」的全部理由。
+    ⚠⚠ 這一條跟舊版相反。舊版照 [INP-009]「送過 SendInput 之後視窗訊息會被
+    封鎖」拆成六批 —— **那條 2026-08-30 實測不成立**（[INP-022]）：
+    在登入畫面上照同樣順序 `PostMessage → SendInput → PostMessage` 混著送，
+    一個行程整包做完，python 子行程 8/8 全過、打包版 exe 6/8
+    （那兩次是整批被擋，跟混不混無關），而且抓圖驗過兩格都打對。
 
-    ⚠ v0.2.5 為了省子行程把清空也改成按鍵、六批併成兩批，自動登入整個爛掉
-    （實跑 11 次，欄位都填對了但 Enter 一次都沒送出去）。已還原。
+    拆六批的代價才是致命的：GameGuard 會**隨機整批擋掉一個子行程的輸入**
+    （打包版 40~70%），六批要連過六關 —— 使用者實機打了 22 次、73 秒。
     """
     bot = _bot(monkeypatch)
-    for batch in bot._credential_batches(0x1234):
-        seen_key = False
-        for action in batch:
-            if "text_fg" in action or "key_fg" in action:
-                seen_key = True
-            if "text" in action or "key" in action:
-                assert not seen_key, f"按鍵之後又送視窗訊息：{batch}"
+    actions = bot._credential_actions(0x1234)
+    kinds = {k for a in actions for k in a}
+    assert {"key", "text_fg", "key_fg", "focus"} <= kinds, kinds
+    assert actions[-1]["key"] == 0x0D, "最後一定是 Enter"
 
 
 # ---- 遊戲不在了就馬上停，不要做無意義的重試與等待 -----------------------

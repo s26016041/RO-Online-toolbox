@@ -646,7 +646,12 @@ class AutoLogin:
         但**客戶端一次都沒有連上伺服器** —— 最後那個 Enter 送不出去，
         `submitted_account()` 全程是 None。改回來就好了。
         機制沒有查清楚，但結論很清楚：**這條路驗過會動，不要為了省時間去動它。**
-        真正該省的是子行程的啟動成本（[INP-013]），不是送法。
+
+        ⚠ 2026-08-30 補充：v0.2.5 那次**同時**改了兩件事（清空改成按鍵 ＋
+        六批併成一批），失敗只能歸給其中一件。現在已經量清楚了 ——
+        **「合併」是好的**（[INP-022]：混著送實測 8/8，而且每多一個子行程
+        就多一次被 GameGuard 整批擋掉的機會），**「清空改成按鍵」沒有平反**，
+        照舊走視窗訊息。
         """
         return [
             input_helper.key(_VK_HOME),
@@ -702,43 +707,50 @@ class AutoLogin:
         self._step("假設焦點在密碼欄（客戶端記住帳號時就是這樣）；"
                    "打錯的話送出後的驗證會翻面重打")
 
-    def _credential_batches(self, hwnd: int) -> list[list[dict]]:
-        """組出整組輸入動作，**一批一個子行程**。
+    def _credential_actions(self, hwnd: int) -> list[dict]:
+        """組出整組輸入動作，**一個子行程一口氣做完**（含最後那個 Enter）。
 
         順序由 `self._tab_first` 決定（`_decide_focus` 的**預設假設**），都只需要一次 Tab：
 
             焦點在密碼欄：打密碼 → Tab 到帳號欄 → 清空 → 打帳號
             焦點在帳號欄：打帳號 → Tab 到密碼欄 → 清空 → 打密碼
 
-        ## 為什麼要分成六批
+        ## 為什麼**一批**（2026-08-30 改的，以前是六批）
 
-        Tab 與文字要送真的按鍵（`SendInput`），清空與 Enter 走視窗訊息，
-        而**同一個行程送過 `SendInput` 之後，它後續的視窗訊息會被封鎖**
-        （[INP-009]）。所以每種通道各自一個乾淨的子行程。
+        以前拆六批，理由寫在 [INP-009]：「同一個行程送過 `SendInput` 之後，
+        它後續的視窗訊息會被封鎖」。**那條實測後不成立**（[INP-022]）——
+        在登入畫面上照同樣的順序 `PostMessage → SendInput → PostMessage`
+        混著送，一個行程整包做完：venv python 子行程 8/8 全過、
+        打包版 exe 6/8（那 2 次是被整批擋掉，跟混不混無關）。
+        而且真的把假帳密打進去抓圖驗過：ID 欄與密碼欄都對。
 
-        ⚠⚠ **不要為了少開子行程去合併。** v0.2.5 把清空也改成按鍵、六批併成
-        兩批，結果自動登入**整個爛掉**（實跑 11 次，合約書過了、欄位也填對了，
-        但客戶端一次都沒連上伺服器 —— 見 `_clear_actions`）。
-        打包後每批要 2.7 秒是真的很痛，但**答案是讓子行程變便宜（[INP-013]），
-        不是改送法**。
+        **拆六批的代價是致命的**：GameGuard 會**隨機把整個子行程的輸入擋掉**
+        （打包版被擋率 40~70%，[INP-022]），六批就要連中六次；
+        使用者實機因此打了 **22 次、73 秒**才送出去一次。
+        合成一批之後只擲一次骰子，而且 `input_helper.send()` 會在
+        「一個動作都沒做」時換一個子行程重送。
+
+        ⚠ v0.2.5 那次合併失敗（[INP-013]）**同時**改了兩件事：清空改走
+        `SendInput` ＋ 合併。這次**只合併，清空照舊走視窗訊息**，
+        而且是量過才改的。
         """
         self._decide_focus(hwnd)
         if self._tab_first:
             first, second = self._account.password, self._account.username
         else:
             first, second = self._account.username, self._account.password
-        batches = [
-            # 第一格一定要清：探針剛剛就打在這裡（重試時則是上一輪打的）。
-            self._clear_actions(),
-            self._type_actions(first),
-            self._tab_actions(),
+        actions = [
+            # 第一格一定要清：重試時裡面是上一輪打的字。
+            *self._clear_actions(),
+            *self._type_actions(first),
+            *self._tab_actions(),
         ]
         if self._needs_clear_after_tab():
-            batches.append(self._clear_actions())
-        batches.append(self._type_actions(second))
-        batches.append([input_helper.key(_VK_RETURN)])  # Enter 走視窗訊息
+            actions += self._clear_actions()
+        actions += self._type_actions(second)
+        actions.append(input_helper.key(_VK_RETURN))   # Enter 走視窗訊息
         self._typed_once = True
-        return batches
+        return actions
 
     def _note_field_placement(self) -> None:
         """把「帳號／密碼現在在不在堆積上」記進日誌。**只觀察，不做任何決定。**
@@ -1467,13 +1479,14 @@ class AutoLogin:
             attempt += 1
             self._step(f"畫面：{stage.value} —— 輸入帳號密碼並送出（第 {attempt} 次）")
             try:
-                # Enter 單獨留到最後，中間插一次**純觀察**的記錄
-                # （只寫日誌，不做決定 —— 見 `_note_field_placement`）。
-                *typing, enter = self._credential_batches(hwnd)
-                for batch in typing:
-                    self._type(hwnd, batch)
+                # ★ **整組一個子行程做完**（清空→打字→Tab→清空→打字→Enter）。
+                #   拆成六個子行程的話，GameGuard 隨機擋掉的機率要連過六關 ——
+                #   使用者實機因此打了 22 次、73 秒（[INP-022]）。
+                self._type(hwnd, self._credential_actions(hwnd))
+                # 純觀察，只寫日誌不做決定（見 `_note_field_placement`）。
+                # 移到送出**之後**：它要掃整個記憶體，夾在打字與 Enter 中間
+                # 每一輪都白等四五秒。
                 self._note_field_placement()
-                self._type(hwnd, enter)
             except input_helper.InputHelperError as exc:
                 # ⚠ 這一句以前是 `log.debug` —— 等於沒有。使用者的日誌只有
                 #   「按同意、輸入帳號密碼並送出（第 N 次）」一行一行往下，
@@ -1631,7 +1644,7 @@ class AutoLogin:
                 return packet.payload[4:28].split(bytes(1))[0].decode("ascii", "replace")
         return None
 
-    def _pick_server_actions(self) -> list[list[dict]]:
+    def _pick_server_actions(self) -> list[dict]:
         """選伺服器要送的按鍵。設定裡沒指定就不動（用客戶端記住的那台）。
 
         ## 為什麼只能用鍵盤
@@ -1660,11 +1673,13 @@ class AutoLogin:
             self._step(f"設定裡的伺服器「{wanted}」不在清單中，不動選單")
             return []
 
-        batches = [[input_helper.key_foreground(_VK_UP)] for _ in range(_SERVER_LIST_TOP)]
-        batches += [[input_helper.key_foreground(_VK_DOWN)] for _ in range(index)]
-        batches.append([input_helper.key(_VK_RETURN)])
+        # ⚠ 一個子行程送完（[INP-022]：混著送沒問題，而且每多開一個子行程
+        #   就多一次被 GameGuard 整批擋掉的機會）。
+        actions = [input_helper.key_foreground(_VK_UP) for _ in range(_SERVER_LIST_TOP)]
+        actions += [input_helper.key_foreground(_VK_DOWN) for _ in range(index)]
+        actions.append(input_helper.key(_VK_RETURN))
         self._step(f"選伺服器：先到頂再往下 {index} 次（{wanted}）")
-        return batches
+        return actions
 
     def _send_otp(self, hwnd: int) -> bool:
         """算 OTP 並送出。**每次重算**，不能用先前算好的。
@@ -1729,23 +1744,25 @@ class AutoLogin:
             # 不清的話重試時第二組 6 碼會接在第一組後面變成 12 碼，必然失敗 ——
             # 而且看起來就像「OTP 不對」，完全誤導。
             #
-            # 文字走真的按鍵（Unicode，繞過輸入法），清空與 Enter 走視窗訊息；
-            # 兩種通道要分批，同一個行程混用會被封鎖（[INP-009]）。
-            batches = [
-                self._clear_actions(),
-                self._type_actions(code),
-                [input_helper.key(_VK_RETURN)],
+            # 文字走真的按鍵（Unicode，繞過輸入法），清空與 Enter 走視窗訊息。
+            # ⚠ 兩種通道**可以在同一個子行程裡混著送**（[INP-022] 實測；
+            #   舊版照 [INP-009] 拆三批，等於讓 GameGuard 多擋兩次機會 ——
+            #   使用者實機的 OTP 就是這樣連 5 次一個都沒送進去）。
+            actions = [
+                *self._clear_actions(),
+                *self._type_actions(code),
+                input_helper.key(_VK_RETURN),
             ]
             try:
-                for batch in batches:
-                    self._type(hwnd, batch)
+                self._type(hwnd, actions)
                 # OTP 過了之後客戶端會跳出伺服器選單 —— 順手把它選掉。
                 # ⚠ **只在第一次送**。每次重試都補送的話，OTP 沒過時那些方向鍵
                 # 和 Enter 會打進 OTP 畫面，把狀態弄亂 —— 實測會讓後面每一次
                 # 都失敗（送了 9 次都沒過）。沒指定伺服器時這裡什麼都不會送。
                 if attempt == 1:
-                    for batch in self._pick_server_actions():
-                        self._type(hwnd, batch)
+                    picks = self._pick_server_actions()
+                    if picks:
+                        self._type(hwnd, picks)
             except input_helper.InputHelperError as exc:
                 # ⚠ 這裡以前只記 DEBUG 就 continue —— DEBUG 沒開的話**完全看不到**，
                 # 外面看到的是「0.4 秒送一次、送了 145 次」的鬼打牆，

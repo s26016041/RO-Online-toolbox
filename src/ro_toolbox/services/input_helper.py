@@ -53,6 +53,15 @@ _TIMEOUT = 20.0
 class InputHelperError(RuntimeError):
     """輸入送不出去。訊息是要直接給使用者看的。"""
 
+    def __init__(self, message: str, done: int | None = None) -> None:
+        super().__init__(message)
+        #: 子行程在失敗前**做完了幾個動作**。
+        #:
+        #: `0` 代表整批一個都沒送出去 —— 那時候換一個子行程重送是**安全的**
+        #: （不會重複打字）。`None` 代表問不出來（子行程根本沒回報），
+        #: 那就當作「不知道做到哪」，不准重送。
+        self.done = done
+
 
 # ---- 動作 -------------------------------------------------------------------
 #
@@ -163,6 +172,19 @@ def _environment() -> dict[str, str]:
     return env
 
 
+#: 子行程回報「做完幾個動作」用的開頭。**重試安不安全全靠它。**
+_DONE_PREFIX = "DONE "
+
+#: 一批輸入最多換幾個子行程重送。見 `send()`。
+#:
+#: 實機量到的擋掉率（2026-08-30，同一個視窗、同一時間交錯 A/B 各 10 次）：
+#:
+#:     打包版 exe 子行程   PostMessage 6 成功 / 4 失敗、SendInput 3 / 7
+#:     venv python 子行程  PostMessage 10 / 0、        SendInput 10 / 0
+#:
+#: 每換一個子行程就是重擲一次骰子，擋掉率抓 0.5 的話 6 次還失敗是 1.6%。
+_SEND_TRIES = 6
+
 #: 子行程回報找到的按鈕座標時用的開頭。
 _AGREE_PREFIX = "AGREE "
 #: 子行程回報「畫面現在停在哪一關」時用的開頭（值是 `Stage` 的名字）。
@@ -175,13 +197,38 @@ _STAGE_PREFIX = "STAGE "
 _AGREE_NOTE = "AGREENOTE "
 
 
-def send(hwnd: int, actions: list[dict]) -> None:
+def send(hwnd: int, actions: list[dict], tries: int = _SEND_TRIES) -> None:
     """開一個子行程，照順序把動作送進遊戲。失敗丟 `InputHelperError`。
 
     ⚠ 回傳只代表「子行程說它送出去了」，**不代表遊戲收下了**。
     收沒收下要看封包（CLAUDE.md：等訊號，不等時間）。
+
+    ## 整批被擋掉就換一個子行程再送（2026-08-30）
+
+    實機量到：**GameGuard 會隨機把整個子行程的輸入擋掉**，而且是
+    「這個行程能不能送」一次決定 —— 能送的行程連送 20 次都進得去
+    （8 回裡 7 回整包成功），被擋的行程第一個動作就失敗。
+    打包版 exe 的子行程被擋掉的機率高到 40~70%（同一時間交錯比對，
+    venv python 的子行程 20/20 全過），所以**換一個子行程重送就是重擲骰子**。
+
+    ⚠ **只有「一個動作都沒做」才准重送。** 做到一半才被擋的話，
+    前面幾個動作已經生效了（欄位裡已經有字），整批重來會變成打兩次 ——
+    那時候寧可讓呼叫端整輪重來（它會先清空欄位）。
+    子行程回報的 `DONE n` 就是為了這個。
     """
-    _run(actions, hwnd)
+    last: InputHelperError | None = None
+    for attempt in range(1, max(1, tries) + 1):
+        try:
+            _run(actions, hwnd)
+            return
+        except InputHelperError as exc:
+            last = exc
+            if exc.done != 0 or attempt >= tries:
+                raise
+            log.info("第 %d 個子行程整批被擋掉（一個動作都沒送出）—— 換一個再送：%s",
+                     attempt, exc)
+    if last is not None:                     # pragma: no cover - 迴圈一定會 return/raise
+        raise last
 
 
 def _run(actions: list[dict], hwnd: int) -> str:
@@ -222,10 +269,23 @@ def _run(actions: list[dict], hwnd: int) -> str:
             pass
 
     if done.returncode != 0:
-        lines = (done.stderr or done.stdout or "").strip().splitlines()
+        lines = [line for line in (done.stderr or "").strip().splitlines()
+                 if not line.startswith(_DONE_PREFIX)]
+        lines = lines or (done.stdout or "").strip().splitlines()
         detail = lines[-1] if lines else f"結束碼 {done.returncode}"
-        raise InputHelperError(f"輸入沒送出去：{detail}")
+        raise InputHelperError(f"輸入沒送出去：{detail}", _actions_done(done.stdout))
     return done.stdout or ""
+
+
+def _actions_done(output: str | None) -> int | None:
+    """子行程說它做完幾個動作。問不出來回 None（＝不知道，不准重送）。"""
+    for line in reversed((output or "").splitlines()):
+        if line.startswith(_DONE_PREFIX):
+            try:
+                return int(line[len(_DONE_PREFIX):].strip())
+            except ValueError:
+                return None
+    return None
 
 
 def look_at_screen(hwnd: int):
@@ -360,11 +420,16 @@ def run_helper(argv: list[str]) -> int:
 
     # ⚠ 一定要在碰任何視窗 API 之前宣告，否則座標會差一個縮放倍率（[INP-002]）。
     game_input.ensure_dpi_aware()
+    # ★ **做完幾個動作要回報。** GameGuard 會整批擋掉一個子行程的輸入
+    #   （見 `send()`），主行程要靠這個數字判斷「重送安不安全」——
+    #   0 個代表什麼都沒發生，重送不會打兩次。
+    done = 0
     try:
         for action in actions:
             if "focus" in action:
                 if not game_input.focus_window(hwnd, 2.0):
                     print("搶不到前景，不敢打字（會打進別的視窗）", file=sys.stderr)
+                    print(f"{_DONE_PREFIX}{done}")
                     return 1
             elif "ime_off" in action:
                 _switch_ime_off(hwnd)
@@ -388,10 +453,14 @@ def run_helper(argv: list[str]) -> int:
                     )
             else:
                 print(f"看不懂的動作：{action!r}", file=sys.stderr)
+                print(f"{_DONE_PREFIX}{done}")
                 return 2
+            done += 1
     except game_input.InputError as exc:
         print(str(exc), file=sys.stderr)
+        print(f"{_DONE_PREFIX}{done}")
         return 1
+    print(f"{_DONE_PREFIX}{done}")
     return 0
 
 
