@@ -272,7 +272,98 @@ def _closest(places, full, core, only=None):
     return index, score, margin
 
 
-def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]:
+def _is_exit(place: str) -> bool:
+    return any(word in place for word in EXIT_OPTIONS)
+
+
+def _assign(places: dict[int, str], names: list[tuple[str, str]]) -> dict[int, tuple[int, float]]:
+    """把**選項**跟**目的地**配對（一對一）。回 {目的地序號: (選項編號, 分數)}。
+
+    貪婪法：全場最像的那一對先配走，兩邊都劃掉，再找下一對。
+    最後**剛好各剩一個**的話就把它們配起來（分數記 0，代表是排除法配的）——
+    譯名完全不同時（`gef_fild10` 我們叫「獸人村」、選單寫「吉芬野外」）
+    就是靠這一步。
+    """
+    pairs = []
+    for option, place in places.items():
+        for index, (full, core) in enumerate(names):
+            score = _similarity(place, full, core)
+            if score > 0:
+                pairs.append((score, option, index))
+    pairs.sort(reverse=True)
+
+    used_options: set[int] = set()
+    used_names: set[int] = set()
+    out: dict[int, tuple[int, float]] = {}
+    for score, option, index in pairs:
+        if option in used_options or index in used_names:
+            continue
+        used_options.add(option)
+        used_names.add(index)
+        out[index] = (option, score)
+
+    left_options = [o for o in places if o not in used_options]
+    left_names = [n for n in range(len(names)) if n not in used_names]
+    if len(left_options) == 1 and len(left_names) == 1:
+        out[left_names[0]] = (left_options[0], 0.0)
+    return out
+
+
+def pick_against(
+    options: list[str], display_name: str, others: list[str]
+) -> tuple[int | None, str]:
+    """知道這隻 NPC **還通往哪些地方**時，用「配對」挑選項。
+
+    ## 為什麼這比「像不像」可靠得多
+
+    導航資料（`navi_link_tw.lub`）記得每一隻 NPC 通往哪些地圖 ——
+    實機查得到：普隆德拉那隻卡普拉 @(146,89) 通往
+    `alberta / gef_fild10 / geffen / izlude / morocc / payon / prt_mk`。
+
+    所以問題不是「這個選項像不像我要去的地方」（門檻訂高會漏、訂低會亂點），
+    而是「**這幾個選項分別在講哪一個目的地**」—— 候選是有限的、互相又不像，
+    配出來的答案穩定得多，而且**剩下的那一個可以用排除法認出來**。
+
+    使用者的話：「常常會不知道這個地圖傳到哪，但我們卻是知道他可以傳到
+    我們要去哪張地圖」——就是這件事。
+
+    ## 什麼時候才敢用配出來的答案
+
+    - 我們那一格自己就夠像（`_FUZZY_MIN`）→ 直接用。
+    - 自己不像，但**其他目的地每一個都配得很有把握** → 排除法，剩下的就是我們的。
+    - 其他的也配不好 → 回 None，讓呼叫端停手。**分不出來就不賭。**
+    """
+    names = [(_squash(display_name), _squash(core_name(display_name)))]
+    names += [(_squash(name), _squash(core_name(name))) for name in others]
+    places = {
+        index: place_of(opt) for index, opt in enumerate(options, start=1)
+        if place_of(opt) and not _is_exit(place_of(opt))
+    }
+    if not places:
+        return None, ""
+
+    assigned = _assign(places, names)
+    mine = assigned.get(0)
+    if mine is None:
+        return None, ""
+    option, score = mine
+    if score >= _FUZZY_MIN:
+        return option, (
+            f"第 {option} 項「{options[option - 1]}」配到「{names[0][1]}」"
+            f"（{score:.0%}；這隻 NPC 通往的 {len(names)} 個地方我們查得到）"
+        )
+    rivals = [assigned.get(i) for i in range(1, len(names))]
+    if rivals and all(hit is not None and hit[1] >= _FUZZY_MIN for hit in rivals):
+        return option, (
+            f"第 {option} 項「{options[option - 1]}」是**排除法**選的："
+            f"這隻 NPC 的另外 {len(rivals)} 個目的地都對到別的選項了，只剩它"
+        )
+    return None, ""
+
+
+def pick_option(
+    options: list[str], display_name: str, others: list[str] | None = None
+) -> tuple[int | None, str]:
     """挑出通往 `display_name` 的選項。回 (編號從 1 開始, 說明)。
 
     **剛好一個對得上才回編號**；0 個或 2 個以上回 None —— 分不出來就不賭
@@ -290,11 +381,14 @@ def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]
     prontera 是**我們的比較長**（主名還黏著「首都」），alberta 是**選單的比較長**。
     所以先試精確相等，再試「誰包含誰」。
 
-    ## 三層，一層比一層寬
+    ## 四層，一層比一層寬
 
         ① 完全相同   place == 我們的全名或主名
         ② 包含       誰包含誰都算
-        ③ **最像的** difflib 相似度（使用者要求：「遊戲給的跟我們要的中文
+        ③ **比賽**   知道這隻 NPC 還通往哪些地方時：這個選項在講**哪一個**
+                     目的地？候選有限又互相不像，比「像不像」可靠（見
+                     `pick_against`；`others` 從 `npc_links_on_map` 來）
+        ④ **最像的** difflib 相似度（使用者要求：「遊戲給的跟我們要的中文
                      不同，那就選最像的」）
 
     ③ 是 2026-08-31 加的。實機回報：「自動尋路跟 NPC 說話常常會不知道
@@ -333,7 +427,14 @@ def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]
                 )
             return None, f"「{core}」對到 {len(hits)} 個選項，分不出來：{options}"
 
-    # ★ 都對不上才用**相似度**：遊戲寫的中文跟我們表裡的不一樣時（改版換譯名、
+    # ★ 知道這隻 NPC 還通往哪些地方的話，先用「比賽」——那比「像不像」可靠：
+    #   候選是有限的，而且互相都不像（見 `pick_against`）。
+    if others:
+        index, why = pick_against(options, display_name, others)
+        if index is not None:
+            return index, why
+
+    # ★ 最後才用**相似度**：遊戲寫的中文跟我們表裡的不一樣時（改版換譯名、
     #   多／少一個字），照字面比會整個落空 —— 使用者的要求是「那就選最像的」。
     best = _closest(places, full, core)
     if best is not None:
@@ -412,11 +513,16 @@ class NpcTalk:
     TIMEOUT = 15.0
 
     def __init__(self, gid: int, want: str, npc: str = "",
-                 sole: bool = False, now=None) -> None:
+                 sole: bool = False, now=None,
+                 others: list[str] | None = None) -> None:
         import time as _time
 
         self._gid = gid
         self._want = want
+        #: 這隻 NPC **還通往哪些地方**（中文名，來自 `navi_link` 導航資料）。
+        #: 有這份清單就能用「配對」而不是「像不像」來挑選項，還能用排除法 ——
+        #: 見 `pick_against`。查不到就是空的，那時候只剩字面比對。
+        self._others = list(others or [])
         #: 這隻 NPC 在我們的資料裡**只通往一個地方** —— 那它的選單如果沒有
         #: 地名，多半是「確定嗎」。只有這種情況才准點確認選項。
         self._sole = sole
@@ -473,7 +579,7 @@ class NpcTalk:
             self._on_menu(got[1])
 
     def _on_menu(self, options: list[str]) -> None:
-        index, why = pick_option(options, self._want)
+        index, why = pick_option(options, self._want, self._others)
         if index is None:
             # 這一層沒有目的地：可能是多層選單的第一層（卡普拉那種）。
             # **只准點白名單裡的選項**，而且只准剛好一個對上。

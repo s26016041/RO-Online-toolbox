@@ -621,3 +621,74 @@ def test_two_characters_in_common_is_not_similar_enough():
     assert nd._overlap("里希塔連", "企業之都里希塔樂鎮") == 0.75   # 共同三個字
     assert nd._overlap("天津町", "天津港口城市") == 0             # 只有兩個字
     assert nd._overlap("克魔", "克魔島嶼樂園") == 0               # 只有兩個字
+
+
+# ---- 第三層：知道這隻 NPC 還通往哪裡，就用「配對」而不是「像不像」-------
+#
+# 導航資料（navi_link）記得每隻 NPC 通往哪些地圖。候選有限又互相不像，
+# 配出來的答案比訂一個相似度門檻穩定得多，而且**剩下的可以用排除法認出來**。
+
+_KAFRA_MENU = [
+    "依斯魯得島 -> 600 z", "吉芬 -> 1200 z", "斐揚 -> 1200 z",
+    "夢羅克 -> 1200 z", "艾爾貝塔 -> 1800 z", "吉芬野外 -> 1200 z",
+    "普隆德拉練功場 -> 0 z", "結束",
+]
+#: 普隆德拉那隻卡普拉 @(146,89) 在導航資料裡通往的七個地方（實機查得到）。
+_KAFRA_DESTS = [
+    "港都 艾爾貝塔", "獸人村", "魔法之都 吉芬", "衛星都市 依斯魯得島",
+    "沙漠之都 夢羅克", "山岳之都 斐揚", "普隆德拉市集",
+]
+
+
+def _others(want):
+    return [name for name in _KAFRA_DESTS if name != want]
+
+
+def test_a_renamed_place_is_matched_against_the_known_destinations():
+    """★ 我們叫「普隆德拉市集」、選單寫「普隆德拉練功場」—— 配得起來。
+
+    ⚠ 這一項如果只跟「普隆德拉市集」比字面，會輸給選單裡其他也含「普隆德拉」
+    的東西；但跟**七個已知目的地一起比**，它明顯是在講這一個。
+    """
+    index, why = nd.pick_option(_KAFRA_MENU, "普隆德拉市集", _others("普隆德拉市集"))
+    assert index == 7, why
+
+
+def test_the_last_one_is_found_by_elimination():
+    """★★ 排除法：我們叫「獸人村」，選單寫「吉芬野外」—— 字面上完全不像。
+
+    但另外六個目的地都各自配到一個選項了，只剩第 6 項沒人認領 ——
+    那它必然就是我們的。這是**只有知道目的地清單才做得到**的判斷，
+    也是使用者說的「我們卻是知道他可以傳到我們要去哪張地圖」。
+    """
+    index, why = nd.pick_option(_KAFRA_MENU, "獸人村", _others("獸人村"))
+    assert index == 6, why
+    assert "排除法" in why, why
+
+
+def test_the_exact_ones_still_win_first():
+    """有一模一樣的選項時還是走第一層，不必勞駕配對。"""
+    for want, expect in (("魔法之都 吉芬", 2), ("港都 艾爾貝塔", 5),
+                         ("山岳之都 斐揚", 3), ("沙漠之都 夢羅克", 4)):
+        index, why = nd.pick_option(_KAFRA_MENU, want, _others(want))
+        assert index == expect, why
+        assert "完全相同" in why, why
+
+
+def test_elimination_needs_every_other_destination_to_be_confident():
+    """⛔ 別的目的地沒有一個對得上時，不准拿「剩下那個」當答案。
+
+    那不是排除法，那是猜 —— 選單根本不是這隻 NPC 的傳送清單也會長這樣。
+    """
+    index, why = nd.pick_option(
+        ["記憶點", "倉庫服務", "查詢其他資訊", "結束"], "獸人村", _others("獸人村")
+    )
+    assert index is None, why
+
+
+def test_the_exit_option_is_never_picked_by_elimination():
+    """⛔ 「結束」永遠不准被排除法選中 —— 選了等於自己把對話關掉。"""
+    index, why = nd.pick_option(
+        ["依斯魯得島 -> 600 z", "結束"], "獸人村", ["衛星都市 依斯魯得島"]
+    )
+    assert index is None, why

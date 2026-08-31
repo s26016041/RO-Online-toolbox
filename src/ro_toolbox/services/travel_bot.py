@@ -681,11 +681,22 @@ class TravelBot:
                 link for link in npc_links_on_map(hop.from_map)
                 if (link[0], link[1]) == (hop.x, hop.y)
             ]
+            # ★ 把這隻 NPC **還通往哪些地方**一起交給對話狀態機。
+            #   選項文字跟我們的地圖名不見得一樣，但候選是有限的 ——
+            #   配對比「像不像」可靠，而且剩下的那個可以用排除法認出來
+            #   （實測：`gef_fild10` 我們叫「獸人村」、選單寫「吉芬野外」，
+            #   只有排除法選得出來）。
+            others = sorted({
+                map_display_name(link[2]) for link in here
+                if link[2] and link[2] != hop.to_map
+            })
             self._talk = npc_dialog.NpcTalk(
-                self._npc_gid, want, npc=hop.npc, sole=len(here) == 1
+                self._npc_gid, want, npc=hop.npc, sole=len(here) == 1,
+                others=others,
             )
             self._said_waiting = False
-            log.info("「%s」在資料裡有 %d 個目的地", hop.npc, len(here))
+            log.info("「%s」在資料裡有 %d 個目的地%s", hop.npc, len(here),
+                     ("（另外通往：" + "、".join(others) + "）") if others else "")
             log.info("開始跟「%s」(GID %s) 對話，想去 %s",
                      hop.npc, self._npc_gid, want)
         talk = self._talk
