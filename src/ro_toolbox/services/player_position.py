@@ -519,13 +519,30 @@ class PlayerPosition:
         # 走路中才需要路徑陣列。⚠ 剛傳過來還沒走的角色這裡是 0，
         #   所以**不能**拿它當存活旗標（第一版就是這樣一換圖就全滅）。
         begin, end = struct.unpack_from("<II", buf, OFF_PATH_BEGIN)
-        if begin == 0 or end < begin:
+        if end < begin:
             return None
+        if begin == 0:
+            # ⚠⚠ **剛被傳過來、一步都還沒走**：路徑陣列還沒配置（`begin` 是 0），
+            #   但 `index` 已經是 0（不是 -1），於是舊版把整個元件判成「不是本人」。
+            #   後果：傳送完一直「找不到移動元件」，自動打怪／尋路只好拿進圖座標
+            #   每 0.3 秒推一步去逼它出現 —— 使用者實測回報：
+            #   「每次用了傳送都會一直找不到位置在那邊一直嘗試，可是肯定已經有
+            #   位置了，因為地圖下面那個座標已經是正確的」。
+            #
+            #   客戶端確實知道自己在哪：沒有路徑就是**沒在走**，那 `dest` 就是
+            #   目前這一格（跟 `index < 0` 那條同一個道理）。
+            #   ⚠ 這不會放寬「認錯人」的風險：`gid == aid`、`state`、`dest` 範圍
+            #   三關都還在，真的有好幾個過關時 `_closest()` 會拿**伺服器剛給的
+            #   進圖座標**當參考挑出本人。
+            return dest_x, dest_y
         span = end - begin
         if span % PATH_STRIDE or span // PATH_STRIDE > MAX_PATH_NODES:
             return None
         if index >= span // PATH_STRIDE:
-            return None                    # 索引超出陣列＝解錯了，不要硬讀
+            # 索引超出陣列＝解錯了，不要硬讀。
+            # ⚠ **不要**在這裡退回 dest：那是「沒量過就放寬」。真的走完的元件
+            #   長什麼樣還沒實機看過，而  配一節點的路徑明顯是垃圾。
+            return None
         node = self._scanner.read_region(begin + index * PATH_STRIDE, 8)
         if node is None or len(node) < 8:
             return None

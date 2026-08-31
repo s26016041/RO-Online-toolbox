@@ -28,6 +28,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ro_toolbox.services import hop_blocklist
 from ro_toolbox.services.gamedata import (
     npc_links_on_map,
     warp_landings_on,
@@ -142,6 +143,47 @@ class Hop:
     def key(self) -> tuple[str, int, int]:
         """黑名單用的身分（存身分不存位置：地圖＋傳點座標，不是路線第幾段）。"""
         return self.from_map, self.x, self.y
+
+
+def describe_route(start_map: str, route: list[Hop]) -> str:
+    """把路線寫成人看得懂的中文。地圖名與 NPC 名都用中文。
+
+    使用者指定（2026-08-31）：「自動尋路的時候需要跳出一個視窗告訴我我們的
+    路徑，用中文地圖名字和中文 NPC 名字，告訴我要從哪張圖到哪張圖、
+    NPC 要傳到哪張圖等等」。
+
+    ⚠ 地圖名查不到就退回**內部名**（`mjolnir_07`），不要留白 ——
+    留白的話使用者看不出是哪一段，而那正是他要這個視窗的原因。
+    """
+    from ro_toolbox.services.gamedata import map_display_name
+
+    # ⚠ **中文名不見得唯一**： 與  兩張都叫
+    #   「妙勒妙勒尼山脈南區」（遊戲自己就這樣取）。整條路線上撞名的話，
+    #   兩段看起來會一模一樣 —— 那正好是使用者想從這個視窗看懂的東西。
+    #   撞名時把內部名補在後面。
+    maps = [start_map] + [hop.to_map for hop in route]
+    names: dict[str, str] = {}
+    for name in maps:
+        names.setdefault(name, map_display_name(name) or name)
+    clashes = {
+        shown for shown in names.values()
+        if sum(1 for value in names.values() if value == shown) > 1
+    }
+
+    def label(name: str) -> str:
+        shown = names.get(name) or map_display_name(name) or name
+        return f"{shown}（{name}）" if shown in clashes else shown
+
+    if not route:
+        return f"已經在「{label(start_map)}」了，只剩最後一段路要走。"
+    lines = [f"從「{label(start_map)}」到「{label(route[-1].to_map)}」，"
+             f"要換 {len(route)} 張圖："]
+    here = start_map
+    for step, hop in enumerate(route, start=1):
+        how = f"找「{hop.npc}」傳送" if hop.npc else f"走傳點 ({hop.x},{hop.y})"
+        lines.append(f"　{step}. {label(here)} —— {how} → 「{label(hop.to_map)}」")
+        here = hop.to_map
+    return "\n".join(lines)
 
 
 def plan_route(
@@ -330,7 +372,12 @@ class Traveler:
         walker: Walker,
         now: Callable[[], float],
         terrain_loader: Callable[[str], MapTerrain] = load_terrain,
+        character: str = "",
     ) -> None:
+        #: 誰在走。學到的「這段 NPC 傳送我用不了」是**跟著角色**存的 ——
+        #: 前置條件每個角色不一樣（伊甸園入會、結婚…），見
+        #: `services/hop_blocklist.py`。
+        self._character = character
         self._walker = walker
         self._now = now
         self._load = terrain_loader
@@ -422,6 +469,13 @@ class Traveler:
         self._route = []
         self._route_map = ""
         self._avoid.clear()
+        # ★ 以前踩過、確定走不通的 NPC 傳送直接跳過（使用者：「有前置才能
+        #   使用的 NPC 傳送也要記得把有它的路徑刪除」）。**一趟一趟重讀**，
+        #   使用者解掉前置之後把紀錄清掉就會立刻生效。
+        learned = hop_blocklist.blocked(self._character)
+        if learned:
+            self._avoid |= learned
+            log.info("跳過 %d 段學過走不通的 NPC 傳送", len(learned))
         self._replans = 0
         self._stale_since = 0.0
         self._hops.clear()
@@ -1114,6 +1168,18 @@ class Traveler:
         )
         return "waiting"
 
+    def set_character(self, name: str) -> None:
+        """誰在走。學到的「這段 NPC 傳送我用不了」是**跟著角色**存的。
+
+        ⚠ 名字是**讀到之後**才知道的（建 Traveler 的時候還沒登入／還沒讀到
+        角色狀態），所以這裡是 setter 不是建構參數。換人就把已經帶進來的
+        封鎖段丟掉重來 —— 別的角色的前置跟我無關。
+        """
+        if not name or name == self._character:
+            return
+        self._character = name
+        self._avoid |= hop_blocklist.blocked(name)
+
     def npc_impassable(self) -> bool:
         """跟 NPC 講不通（看不懂選單）—— 把這一段當走不過去，改走別條路。
 
@@ -1127,6 +1193,9 @@ class Traveler:
         hop = self._npc_wait
         if hop is None:
             return False
+        # ⚠ 先記帳再改路線：這一段**確定過不去**（多半是有前置條件的傳送）。
+        #   踩滿 `NEEDED_FAILURES` 次才會真的封起來 —— 一次可能只是意外。
+        hop_blocklist.remember(self._character, hop, "跟 NPC 講不通")
         keep_route = list(self._route)
         keep_map = self._route_map
         self._npc_wait = None

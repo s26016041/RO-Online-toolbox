@@ -375,6 +375,9 @@ def test_travel_bot_logs_the_traveler_progress(caplog):
         def __init__(self, stop) -> None:
             self._stop = stop
 
+        def set_character(self, _name):
+            pass
+
         def update(self, *_args):
             self._stop.set()   # 只跑一拍
             return "walking"
@@ -1182,3 +1185,45 @@ def test_with_no_other_route_we_still_wait_for_the_user(monkeypatch):
     assert t.npc_impassable() is False
     assert t.npc_hop is hop, "還是停在他面前等人"
     assert hop.key not in t._avoid, "沒改走別條就不要把它記成走不通"
+
+
+# ---- 出發前先把走法講清楚（使用者 2026-08-31 指定）------------------------
+
+
+def test_the_route_is_described_in_chinese():
+    """★ 使用者：「需要跳出一個視窗告訴我我們的路徑，用中文地圖名字和中文
+    NPC 名字，告訴我要從哪張圖到哪張圖、NPC 要傳到哪張圖」。"""
+    from ro_toolbox.services.travel import Hop, describe_route
+
+    text = describe_route("izlude", [
+        Hop("izlude", 128, 148, "geffen", 120, 39, npc="卡普拉職員", npc_id=117),
+        Hop("geffen", 119, 213, "gef_fild04", 187, 42),
+    ])
+    assert "衛星都市 依斯魯得島" in text
+    assert "魔法之都 吉芬" in text
+    assert "卡普拉職員" in text, "NPC 的中文名要寫出來"
+    assert "走傳點 (119,213)" in text, "走傳點那種也要說清楚是哪一格"
+    assert "要換 2 張圖" in text
+
+
+def test_two_maps_with_the_same_chinese_name_are_told_apart():
+    """⚠ `mjolnir_06` 與 `mjolnir_07` 兩張都叫「妙勒妙勒尼山脈南區」。
+
+    撞名的話兩段看起來一模一樣 —— 那正好是使用者想從這個視窗看懂的東西。
+    """
+    from ro_toolbox.services.travel import Hop, describe_route
+
+    text = describe_route("mjolnir_06", [
+        Hop("mjolnir_06", 382, 377, "mjolnir_07", 19, 377),
+    ])
+    assert "mjolnir_06" in text and "mjolnir_07" in text
+
+
+def test_an_unknown_map_falls_back_to_the_internal_name():
+    """查不到中文名就寫內部名 —— **不准留白**，留白就看不出是哪一段。"""
+    from ro_toolbox.services.travel import Hop, describe_route
+
+    text = describe_route("no_such_map", [
+        Hop("no_such_map", 1, 1, "also_missing", 2, 2),
+    ])
+    assert "no_such_map" in text and "also_missing" in text

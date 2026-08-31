@@ -279,6 +279,8 @@ class CharacterCard(QWidget):
         #: 這一趟的「到了」通知跳過沒有。bot 停下來時還會再回報一次同一份
         #: stats（arrived 仍是 True），沒有這道閘門會跳兩次。
         self._travel_notified = False
+        #: 這一趟的路線視窗跳過了沒有（見 `_apply_travel_stats`）。
+        self._route_shown = False
         #: 死亡通知跳過沒有。bot 停下來時還會再回報一次同一份 stats
         #: （died 仍是 True），沒有這道閘門會連跳兩個框。
         self._death_notified = False
@@ -669,6 +671,15 @@ class CharacterCard(QWidget):
         兩邊都記的症狀是同一句話印兩次（實測：「前往 依斯魯得島　前往 izlude」）。
         介面上唯一的表現是：bot 停了，按鈕就彈起來。"""
         self._notify_death(stats)
+        route = getattr(stats, "route_text", "")
+        if route and not self._route_shown:
+            # ★ 出發前先把**走法**攤開給人看（使用者 2026-08-31 指定：
+            #   「需要跳出一個視窗告訴我我們的路徑，用中文地圖名字和中文
+            #   NPC 名字，告訴我要從哪張圖到哪張圖、NPC 要傳到哪張圖」）。
+            #   一趟只跳一次 —— 中途每換一張圖都會重算路線，每次都跳是騷擾。
+            self._route_shown = True
+            who = self.character or "角色"
+            show_notice(f"自動尋路：{who} 的走法", route)
         if getattr(stats, "arrived", False) and not self._travel_notified:
             # 到了要**跳到螢幕最前面**講一聲：趕路動輒幾十秒，人早就切回遊戲
             # 或去做別的事了，只寫在日誌等於沒講。
@@ -698,6 +709,7 @@ class CharacterCard(QWidget):
             self._travel_paused = False
         if busy:
             self._travel_notified = False  # 新的一趟，抵達通知重新算
+            self._route_shown = False      # 路線視窗也是一趟一次
 
     # ---- 自動補水 ---------------------------------------------------
 

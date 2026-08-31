@@ -159,3 +159,62 @@ def test_the_lost_position_warning_is_said_once_not_every_tick(monkeypatch, capl
             bot._stats.note = "別的訊息"     # 模擬 `_nudge` 插話
     said = [r for r in caplog.records if "讀不到角色座標" in r.getMessage()]
     assert len(said) == 1, f"只准講一次，實際 {len(said)} 次"
+
+
+def test_an_unrecognised_npc_reroutes_before_asking_for_help(monkeypatch):
+    """★ 認不出那隻 NPC 就**先改走別條**，不要叫人來。
+
+    使用者的規矩：不要叫使用者持續配合（半夜掛機的人不在電腦前）。
+    實測回報：「跟自動尋路遇到新 NPC 常常會卡住」—— 舊版搖完視野還是
+    認不出來就直接停下來等人 10 分鐘。
+    """
+    from ro_toolbox.services import travel_bot as mod
+    from ro_toolbox.services.travel import Hop
+
+    bot = mod.TravelBot(pid=0)
+    hop = Hop("izlude", 128, 148, "geffen", 120, 39, npc="卡普拉職員", npc_id=117)
+    asked = []
+    rerouted = []
+
+    class _Traveler:
+        npc_hop = hop
+
+        def npc_impassable(self):
+            rerouted.append(True)
+            return True
+
+    bot._traveler = _Traveler()
+    bot._npc_gid = None
+    bot._shake_round = mod._SHAKE_ROUNDS          # 搖過了還是認不出來
+    bot._shake = None
+    monkeypatch.setattr(bot, "_ask_for_help", lambda h: asked.append(h))
+
+    bot._run_dialog()
+
+    assert rerouted == [True], "要先試著改走別條"
+    assert asked == [], "不准直接叫人來"
+
+
+def test_it_still_asks_when_there_is_really_no_other_way(monkeypatch):
+    """⛔ 反面：真的沒有別條路時，維持「停下來等人」—— 那時候等人還有救。"""
+    from ro_toolbox.services import travel_bot as mod
+    from ro_toolbox.services.travel import Hop
+
+    bot = mod.TravelBot(pid=0)
+    hop = Hop("izlu2dun", 108, 27, "izlude", 128, 148, npc="船員", npc_id=700)
+    asked = []
+
+    class _Traveler:
+        npc_hop = hop
+
+        def npc_impassable(self):
+            return False               # 沒有別條路
+
+    bot._traveler = _Traveler()
+    bot._npc_gid = None
+    bot._shake_round = mod._SHAKE_ROUNDS
+    bot._shake = None
+    monkeypatch.setattr(bot, "_ask_for_help", lambda h: asked.append(h))
+
+    bot._run_dialog()
+    assert asked == [hop]

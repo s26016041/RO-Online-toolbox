@@ -30,7 +30,12 @@ from ro_toolbox.services import cast_lock, mapdata, npc_dialog
 from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import map_display_name, npc_links_on_map
 from ro_toolbox.services.navigation import NavigationReader
-from ro_toolbox.services.travel import START_SNAP, Traveler, nearest_walkable
+from ro_toolbox.services.travel import (
+    START_SNAP,
+    Traveler,
+    describe_route,
+    nearest_walkable,
+)
 from ro_toolbox.services.walker import MAX_STEP, Walker
 
 log = logging.getLogger(__name__)
@@ -100,6 +105,10 @@ class TravelStats:
     paused: bool = False
     #: 角色死了。跟一般的失敗分開報 —— 介面要跳「按確定才消失」的通知窗。
     died: bool = False
+    #: 這一趟的路線（中文，多行）。**只在第一次算好時填一次** ——
+    #: 中途每換一張圖都會重算，每次都跳視窗會變成騷擾（使用者要的是
+    #: 「出發前告訴我要怎麼走」）。見 `services/travel.describe_route`。
+    route_text: str = ""
 
 
 class TravelBot:
@@ -483,6 +492,9 @@ class TravelBot:
                 continue
 
             self._stats.here = status.map_name
+            # ⚠ 學到的「這段 NPC 傳送我用不了」是**跟著角色**存的
+            #   （前置條件每個角色不一樣），所以讀到名字就交給 Traveler。
+            self._traveler.set_character(getattr(status, "name", "") or "")
             if self._paused.is_set():
                 self._hold()
                 continue
@@ -493,6 +505,7 @@ class TravelBot:
                 # 對話走不完（看不懂選單、沒回應）就退回「等你手動做」。
                 self._run_dialog()
             self._stats.hops_left = len(self._traveler.route)
+            self._describe_route_once(status.map_name)
             # ⚠ 這裡要走 `_note()`，不能直接指派：`Traveler` 一路算出來的狀態
             # （正在計算路線、還要換幾張圖、踩傳點、等座標更新…）本來只寫進
             # `stats.note`，而 `stats.note` 只有介面在看 —— 介面又刻意不顯示它。
@@ -670,6 +683,15 @@ class TravelBot:
                 # 兩輪都不行才跳警告叫人 —— 能自己做的不要麻煩使用者。
                 if self._shake_round < _SHAKE_ROUNDS or self._shake is not None:
                     self._shake_view(hop)
+                elif self._traveler.npc_impassable():
+                    # ★ 認不出他就**先改走別條**，不要叫人來。使用者的規矩：
+                    #   不要叫使用者持續配合（半夜掛機的人根本不在電腦前）。
+                    #   實測回報：「跟自動尋路遇到新 NPC 常常會卡住」——
+                    #   舊版搖完視野還是認不出來就直接停下來等人 10 分鐘。
+                    #   `npc_impassable()` 找不到別條路時會回 False，
+                    #   那時候才維持「停下來等人」——那種情況等人至少還有救。
+                    log.warning("認不出「%s」，改走別條路", hop.npc)
+                    self._dialog_dead = key
                 else:
                     self._ask_for_help(hop)
                 return
@@ -977,6 +999,23 @@ class TravelBot:
         所以要把**答案本身**記下來，不是記「回來再去問遊戲」。
         """
         return self._destination
+
+    def _describe_route_once(self, map_name: str) -> None:
+        """第一次算好路線時，把**中文的走法**寫進 stats 給介面跳視窗。
+
+        使用者指定（2026-08-31）：「自動尋路的時候需要跳出一個視窗告訴我
+        我們的路徑，用中文地圖名字和中文 NPC 名字」。
+
+        ⚠ **只填一次**：中途每換一張圖都會重算路線，每次都跳視窗是騷擾。
+        他要的是「出發前先讓我知道要怎麼走」。
+        """
+        if self._stats.route_text:
+            return
+        route = self._traveler.route
+        if not route and not map_name:
+            return
+        self._stats.route_text = describe_route(map_name, route)
+        log.info("這一趟的走法：%s", self._stats.route_text.replace(chr(10), " ｜ "))
 
     def _note(self, text: str, level: int = logging.INFO) -> None:
         """提示字一律進**執行日誌**，不放介面（使用者指定）。

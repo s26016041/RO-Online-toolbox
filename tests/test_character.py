@@ -761,3 +761,24 @@ def test_changing_map_throws_the_component_address_away(monkeypatch):
     assert dropped == []
     reader.read()          # 換到 izlude_in
     assert dropped == [1]
+
+
+def test_just_warped_with_no_path_yet_reads_the_destination():
+    """★★ 剛被傳過來、一步都還沒走：路徑陣列還沒配置（`begin` 是 0），
+    但 `index` 已經是 0（不是 -1）—— 那是**站著**，不是「解不出來」。
+
+    舊版在這裡回 None，於是傳送完一直「找不到移動元件」，自動打怪／尋路只好
+    拿進圖座標每 0.3 秒推一步去逼它出現。使用者實測回報：
+    「每次用了傳送都會一直找不到位置在那邊一直嘗試，可是肯定已經有位置了，
+    因為地圖下面那個座標已經是正確的」—— 客戶端知道，是我們擋掉的。
+    """
+    pos, _mem = _position_at(0x5000, dest=(65, 99), path=(), index=0, state=1)
+    assert pos.read() == (65, 99)
+
+
+def test_a_recycled_component_with_no_path_is_still_rejected():
+    """⛔ 放寬的只有「沒有路徑」這一項 —— 其他關卡照樣擋。"""
+    pos, _mem = _position_at(0x5000, dest=(65, 99), path=(), index=0, state=0)
+    assert pos.read() is None, "state=0 是被回收的殘留元件"
+    pos, _mem = _position_at(0x5000, dest=(999, 999), path=(), index=0, state=1)
+    assert pos.read() is None, "座標超出範圍照樣不收"
