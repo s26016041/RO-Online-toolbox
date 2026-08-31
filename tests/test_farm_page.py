@@ -2016,3 +2016,61 @@ def test_the_buff_status_row_is_gone(qtbot):
     assert not hasattr(card, "buff_label"), "撞名的那個標籤要一起清掉"
     card.set_buff_note("幫隊友放「天使之賜福」")
     assert card.buff_note_label.text() == "幫隊友放「天使之賜福」"
+
+
+# ---- 同一個視窗換了角色（使用者 2026-09-01 實機）--------------------------
+#
+# 使用者：「有時候喝水會被換掉變成其他藥水或沒有選」。
+# `card.character` 只在 attach 那一刻設過一次 —— 登出換一隻進來時，卡片還記著
+# 上一隻的名字，而背包已經是新角色的。存檔就寫到舊角色頭上了。
+
+
+def _status(name):
+    return type("S", (), {
+        "name": name, "map_name": "prontera", "hp": 100, "max_hp": 100,
+        "hp_percent": 100.0, "sp": 10, "max_sp": 10, "sp_percent": 100.0,
+        "base_level": 1, "job_level": 1, "base_exp": 0, "job_exp": 0,
+        "base_exp_next": 1, "job_exp_next": 1, "base_percent": 0.0,
+        "job_percent": 0.0, "base_maxed": False, "job_maxed": False,
+        "has_exp": False, "weight": 0, "max_weight": 100, "aid": 1,
+    })()
+
+
+def test_the_same_window_swapping_characters_is_reattached(qtbot, monkeypatch):
+    """★ 換人要**整張卡重接** —— 不然新角色的設定會存到舊角色頭上。"""
+    page = _page(qtbot, monkeypatch)
+    card = _wired_card(page, qtbot, who="白狐")
+    card.character = "白狐"
+    removed = []
+    monkeypatch.setattr(page, "_remove", lambda pid, why: removed.append((pid, why)))
+
+    # 第一拍：看到新名字，先記著不動（可能只是記憶體殘渣）
+    assert page._changed_character(1234, card, _status("狐狐狸")) is False
+    assert removed == [], "一拍就拆掉的話，一次雜訊就收攤了"
+
+    # 第二拍：還是同一個新名字 —— 這才動手
+    assert page._changed_character(1234, card, _status("狐狐狸")) is True
+    assert removed and removed[0][0] == 1234
+    assert page._retry_at[1234] == 0.0, "要馬上重接，不要等冷卻"
+
+
+def test_a_one_off_garbage_name_does_not_tear_the_card_down(qtbot, monkeypatch):
+    """⛔ 名字讀到殘渣一拍就恢復 —— 不准因此把正在掛機的角色收攤。"""
+    page = _page(qtbot, monkeypatch)
+    card = _wired_card(page, qtbot, who="白狐")
+    card.character = "白狐"
+    removed = []
+    monkeypatch.setattr(page, "_remove", lambda pid, why: removed.append((pid, why)))
+
+    assert page._changed_character(1234, card, _status("���亂碼")) is False
+    assert page._changed_character(1234, card, _status("白狐")) is False
+    assert removed == []
+    assert 1234 not in page._renamed, "回復正常就把記著的清掉"
+
+
+def test_the_same_character_is_left_alone(qtbot, monkeypatch):
+    """沒換人就什麼都不做。"""
+    page = _page(qtbot, monkeypatch)
+    card = _wired_card(page, qtbot, who="白狐")
+    card.character = "白狐"
+    assert page._changed_character(1234, card, _status("白狐")) is False

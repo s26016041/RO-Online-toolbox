@@ -1260,6 +1260,9 @@ class FarmPage(BasePage):
         self._no_snapshot_said: set = set()
         #: 帳號頁裡沒有設定、**救不了**的角色。講一次就不要再碰。
         self._no_account: set = set()
+        #: PID → 剛剛讀到的**新名字**（同一個 PID 換人的確認用，見
+        #: `_changed_character`）。連續兩拍都是同一個新名字才動手。
+        self._renamed: dict = {}
         #: 每個角色上一句等待訊息（倒數每秒都會變一次，同一句只印一次）。
         self._said_wait: dict = {}
         #: 角色 → 他上次連線正常時住在哪個 PID。**閃退偵測靠它** ——
@@ -2616,11 +2619,47 @@ class FarmPage(BasePage):
                 continue
 
             self._failures[pid] = 0
+            if self._changed_character(pid, card, status):
+                continue
             card.update_status(status)
             card.set_exp_gain(self._exp_gain_text(pid, status))
             index = self.tabs.indexOf(card)
             if index >= 0 and status.name and self.tabs.tabText(index) != status.name:
                 self.tabs.setTabText(index, status.name)
+
+    def _changed_character(self, pid, card, status) -> bool:  # noqa: ANN001
+        """同一個 PID 換人了嗎？是的話整張卡重接。回 True 代表這一拍別再往下做。
+
+        ## 為什麼一定要處理
+
+        `card.character` **只在 attach 那一刻設過一次**，之後就沒人更新
+        （舊版連分頁標題都會跟著改名，卻獨獨留著這個欄位）。所以登出換一隻
+        角色、或回連之後選了別隻進來時，卡片還記著**上一隻的名字**，而畫面上
+        的背包已經是**新角色的**。
+
+        接下來 `_save_potion()` 會把新角色的下拉內容**存到舊角色名下** ——
+        舊角色的補水設定就變成別人的道具，或者直接變成「未選擇」。
+        使用者實測回報：「有時候喝水會被換掉變成其他藥水或沒有選」。
+
+        ## 為什麼要連續兩拍才動手
+
+        名字是從記憶體讀的，換圖／剛進遊戲那一瞬間可能讀到殘渣（[MEM-035]）。
+        一拍就拆掉整張卡的話，一次雜訊就會把正在掛機的角色收攤。
+        """
+        name = (status.name or "").strip()
+        if not name or not card.character or name == card.character:
+            self._renamed.pop(pid, None)
+            return False
+        if self._renamed.get(pid) != name:
+            self._renamed[pid] = name      # 第一次看到，先記著，下一拍再確認
+            return False
+        self._renamed.pop(pid, None)
+        log.warning("PID %s 換人了：「%s」→「%s」—— 整張卡重接，"
+                    "免得把新角色的設定存到舊角色頭上",
+                    pid, card.character, name)
+        self._remove(pid, "同一個視窗換了角色")
+        self._retry_at[pid] = 0.0          # 下一拍就重接，不要等冷卻
+        return True
 
     # ---- 收尾 -------------------------------------------------------
 
