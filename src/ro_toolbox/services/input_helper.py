@@ -163,9 +163,15 @@ def text_foreground(value: str) -> dict:
     return {"text_fg": value}
 
 
-def key_foreground(virtual_key: int, times: int = 1) -> dict:
-    """對前景視窗按一個功能鍵幾次（`SendInput`）。"""
-    return {"key_fg": int(virtual_key), "times": int(times)}
+def key_foreground(virtual_key: int, times: int = 1, shift: bool = False) -> dict:
+    """對前景視窗按一個功能鍵幾次（`SendInput`）。
+
+    `shift=True`＝壓著 Shift 按（Shift+Tab 是焦點往**回**一格）。
+    """
+    action = {"key_fg": int(virtual_key), "times": int(times)}
+    if shift:
+        action["shift"] = True
+    return action
 
 
 def key(virtual_key: int, times: int = 1) -> dict:

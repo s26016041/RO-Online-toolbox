@@ -47,8 +47,7 @@ def _clean_settings(monkeypatch):
     """每一條測試都從「什麼都沒記過」的設定開始。
 
     ⚠ `AppSettings` 是模組層級的單例，測試之間會互相污染 ——
-    `login_focus_password`（焦點在哪一格）被前一條測試寫進去之後，
-    後面那條就會走**快路**，測到的完全是另一件事（實際踩過）。
+    前一條測試寫進去的東西會讓後面那條測到完全不同的行為（實際踩過）。
     """
     from ro_toolbox.config import settings as settings_module
 
@@ -1049,24 +1048,12 @@ def _capture_sends(monkeypatch):
     return sent
 
 
-def _forget_focus(monkeypatch):
-    """讓這個測試走「查焦點」的慢路（設定裡沒有記過答案）。"""
-    from ro_toolbox.config import settings as settings_module
-
-    monkeypatch.setattr(settings_module, "_current", settings_module.AppSettings())
-    monkeypatch.setattr(AutoLogin, "_learn_focus", lambda self, v: None)
-
-
 def _bot(monkeypatch, findable=()):
     """做一個 AutoLogin，並決定「哪些字串在堆積上找得到」。
 
-    ⚠ 順便把「焦點在哪一格」的記憶清掉 —— 這些測試驗的是**查出來**那條路
-    （慢路）。設定裡記過答案的話會走快路，測到的就是別的東西。
+    焦點在哪一格**每一次都現查**（快取已經被實機推翻並移除，見
+    `_type_credentials` 的說明），所以這裡不必再清什麼設定。
     """
-    from ro_toolbox.config import settings as settings_module
-
-    monkeypatch.setattr(settings_module, "_current", settings_module.AppSettings())
-    monkeypatch.setattr(settings_module, "save_settings", lambda s: None)
     bot = AutoLogin(_account(), 4242)
     monkeypatch.setattr(
         auto_login.input_helper, "field_addresses",
@@ -1075,81 +1062,79 @@ def _bot(monkeypatch, findable=()):
     return bot
 
 
-def test_it_assumes_the_account_box_and_says_so(monkeypatch, wired):
-    """預設「焦點在帳號欄」—— 2026-08-30 實機量到的（抓圖看兩格的內容）。
-
-    ⚠ 舊版預設是密碼欄（依使用者更早的回報）。猜錯不會卡死：送出後的
-    閉環驗證（`0x0064` 的明文帳號）會翻面重打，兩次之內一定對上。
-    """
-    bot = _bot(monkeypatch)
-    bot._decide_focus(0x1234)
-    assert bot._tab_first is False
-    assert any("先打帳號再 Tab 到密碼" in step for step in bot.progress.steps)
-
-
 def test_nothing_extra_is_ever_typed_into_the_boxes(monkeypatch, wired):
     """⚠ 使用者實測：「還會莫名打出一些字然後自己刪掉」——那是探針。
 
     現在**只准打帳號與密碼**，不准打任何使用者看得見卻不屬於他的字。
     """
-    bot = _bot(monkeypatch, findable=("demo01",))
+    # 打之前找不到帳號 → 直接拿帳號當記號，畫面上不會出現多餘的字。
+    seen = {"n": 0}
+
+    def only_after_typing(pid, text):
+        seen["n"] += 1
+        return [0x1825] if seen["n"] > 1 else []      # 第一次（打之前）找不到
+
+    bot = _bot(monkeypatch)
+    monkeypatch.setattr(
+        auto_login.input_helper, "field_addresses", only_after_typing)
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
     typed = [a["text_fg"] for batch in sent for a in batch if "text_fg" in a]
     assert typed == ["demo01", "pw"], typed
 
 
-def test_the_focus_guess_is_made_once_not_every_attempt(monkeypatch, wired):
-    """重試時的翻面由送出後的閉環驗證負責，不要每輪重猜。"""
-    bot = _bot(monkeypatch)
-    bot._tab_first = False
-    bot._decide_focus(0x1234)
-    assert bot._tab_first is False, "已經有結論就不准再猜"
-
-
 # ---- Tab 過去那一格一律清空 ---------------------------------------------
 
 
-def test_the_field_after_tab_is_always_cleared(monkeypatch, wired):
-    """⚠ 試過「Tab 過去是空的密碼欄就不用清」，**收回來了**。
+def test_every_box_is_entered_by_tab_so_the_old_value_is_replaced(monkeypatch, wired):
+    """★ **每一格都是 Tab 進去之後才打字** —— 舊值才會被整個取代掉。
 
-    使用者實測：「輸入完密碼移動到帳號應該要刪除帳號再打入真帳號，
-    可是他沒刪除舊帳，ENTER 導致錯誤。」
+    2026-08-31 抓圖量到：登入框的 Tab 只有兩站（帳號 ↔ 密碼），而且 Tab 進去
+    的那一格內容是**選取狀態** —— 打 `BBBBBB` 就把客戶端記著的 `ss26011034`
+    整串換掉了。所以不需要清空，也就不需要那 48 個 `PostMessage` 按鍵
+    （它會被 GameGuard 整批擋掉，實機連續失敗 23 次、耗掉 196 秒）。
 
-    我們對「Tab 過去是哪一格」根本沒有把握 —— 那只是預設假設。
-    省下 2.7 秒 vs 一次打錯送出（錯誤框＋整輪重打 ≈ 25 秒），完全不對稱。
+    這一條釘住：**打字前面一定有 Tab**，不然打的字會接在客戶端記著的舊值後面
+    （使用者實測過：「他沒刪除舊帳，ENTER 導致錯誤」）。
     """
     bot = _bot(monkeypatch, findable=("demo01",))
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
-    # ★ 現在是**開頭就把兩格都清乾淨**（Home 是清空那組的第一個動作）——
-    #   那是「打進去之後用記憶體判斷焦點在哪一格」的前提：清完之後，
-    #   記憶體裡再出現我們的帳號，就一定是剛剛打進去的那一份。
-    assert len([a for b in sent for a in b if a.get("key") == 0x24]) >= 2, sent
+    for batch in sent:
+        keys = [k for a in batch for k in (("TAB",) if a.get("key_fg") == 0x09
+                                           else ("TEXT",) if "text_fg" in a else ())]
+        for i, kind in enumerate(keys):
+            if kind == "TEXT":
+                assert "TAB" in keys[:i], f"打字前面沒有 Tab：{batch}"
 
 
-def test_a_retry_always_clears_because_our_own_text_is_still_there(monkeypatch, wired):
-    """重試時欄位裡是上一輪我們自己打的字 —— 一定要清。"""
+def test_no_window_messages_are_used_while_logging_in(monkeypatch, wired):
+    """★ 登入全程**只用前景 `SendInput`**，一個視窗訊息都不准送。
+
+    `PostMessage` 會被 GameGuard 整批擋掉（[INP-023]）。清空欄位是最後一個
+    還在用它的動作，實機因此連續失敗 23 次、耗掉 196 秒才逾時（2026-08-31）。
+    改用「Tab 出去再 Tab 回來，內容自動選取」取代之後就沒有這個關卡了。
+    """
     bot = _bot(monkeypatch, findable=("demo01",))
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
-    sent.clear()
-    bot._type_credentials(0x1234)
-    assert len([a for b in sent for a in b if a.get("key") == 0x24]) == 2, "重試時兩格都要清"
+    background = [a for b in sent for a in b if "key" in a or "text" in a]
+    assert not background, f"登入不准用視窗訊息：{background}"
 
 
-def test_only_the_enter_still_goes_through_window_messages(monkeypatch, wired):
-    """Enter **維持視窗訊息**，不准改成按鍵。
+def test_the_enter_goes_the_same_way_as_the_typing(monkeypatch, wired):
+    """★ 送出的 Enter 要走**前景**，跟打字同一條佇列（[INP-027]）。
 
-    [INP-010] 實測過它很挑：`KEYDOWN+CHAR+KEYUP` 會送出、
-    `KEYDOWN+KEYUP`（無 CHAR）**不會送出**，而且失敗時毫無錯誤訊息。
+    ⚠ 舊版這裡是 `PostMessage` 的視窗訊息（[INP-010]：它很挑，要帶字元碼）。
+    混著送的代價實機量到了：兩條佇列沒有先後保證，Enter 會排在字前面被處理，
+    客戶端就拿**空欄位**去送 —— OTP 第 1 次因此每一場都失敗。
     """
     bot = _bot(monkeypatch)
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
     enter = sent[-1][-1]
-    assert enter["key"] == 0x0D, enter
-    assert enter["char"] == 0x0D, "Enter 一定要帶字元碼"
+    assert enter["key_fg"] == 0x0D, enter
+    assert "focus" in {k for a in sent[-1] for k in a}, sent[-1]
 
 
 # ---- 送出前只**觀察**，不做決定 -----------------------------------------
@@ -1164,9 +1149,7 @@ def test_the_observation_never_changes_anything(monkeypatch, wired):
     """只寫日誌，不回傳決定、不改狀態 —— 這是這一支存在的全部理由。"""
     for findable in ((), ("demo01",), ("pw",), ("demo01", "pw")):
         bot = _bot(monkeypatch, findable)
-        bot._tab_first = True
         assert bot._note_field_placement() is None
-        assert bot._tab_first is True, "觀察不准改任何決定"
 
 
 def test_the_observation_records_what_it_saw(monkeypatch, wired):
@@ -1252,7 +1235,7 @@ def test_the_whole_thing_goes_in_one_subprocess(monkeypatch, wired):
             order = [k for a in batch for k in a]
             assert "focus" in order, batch
             assert order.index("focus") == 0, batch
-    assert sent[-1][-1]["key"] == 0x0D, "最後一定是 Enter"
+    assert sent[-1][-1]["key_fg"] == 0x0D, "最後一定是 Enter（前景，[INP-027]）"
 
 
 # ---- 遊戲不在了就馬上停，不要做無意義的重試與等待 -----------------------
@@ -1568,21 +1551,21 @@ def test_the_account_is_verified_and_retyped_when_it_did_not_land(monkeypatch, w
     帳號長 `s26016041` 這樣（一個英文字母＋八個數字）時，掉第一個字
     看起來完全像「英文被吃掉」。所以不要再想「怎麼送才不會掉」，送完就確認。
     """
-    found = {"n": 0}
+    bot = AutoLogin(_account(), 4242)
+    sent = _capture_sends(monkeypatch)
 
+    # ⚠ 用「補打過幾次」當條件，不要用「問過幾次」—— `_field_has` 是**輪詢**的
+    #   （打完到寫進堆積之間有落差），同一次確認會問很多遍。
     def flaky(pid, text):
         if text != "demo01":
             return []
-        found["n"] += 1
-        return [0x1825] if found["n"] > 2 else []      # 前兩次沒進去
+        return [0x1825] if len(sent) >= 2 else []      # 前兩次沒進去
 
     monkeypatch.setattr(auto_login.input_helper, "field_addresses", flaky)
-    bot = AutoLogin(_account(), 4242)
-    sent = _capture_sends(monkeypatch)
-    bot._type_credentials(0x1234)
+    bot._verify_account(0x1234)
     retypes = [b for b in sent
                if any(a.get("text_fg") == "demo01" for a in b)
-               and any(a.get("key") == 0x08 for a in b)]     # 清空＋重打
+               and len([a for a in b if a.get("key_fg") == 0x09]) == 2]  # Tab 出去再回來
     assert len(retypes) == 2, f"該補打兩次：{sent}"
     assert any("帳號沒完整進到欄位裡" in s for s in bot.progress.steps), bot.progress.steps
 
@@ -1597,7 +1580,7 @@ def test_it_gives_up_repairing_instead_of_looping_forever(monkeypatch, wired):
     bot = AutoLogin(_account(), 4242)
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
-    assert sent[-1][-1]["key"] == 0x0D, "最後還是要送出去"
+    assert sent[-1][-1]["key_fg"] == 0x0D, "最後還是要送出去"
     assert any("照樣送出去" in s for s in bot.progress.steps), bot.progress.steps
 
 
@@ -1666,7 +1649,9 @@ def test_but_it_still_types_blind_on_a_screen_it_never_recognises(monkeypatch, w
 
 
 def _typed_order(sent):
-    """把送出去的動作攤平成「打了什麼字、按了幾次 Tab」的順序。"""
+    """把送出去的動作攤平成「打了什麼字、往哪個方向 Tab」的順序。
+
+    """
     out = []
     for batch in sent:
         for a in batch:
@@ -1680,19 +1665,32 @@ def _typed_order(sent):
 def test_it_finds_out_which_box_has_focus_instead_of_guessing(monkeypatch, wired):
     """★ 焦點在哪一格是**問出來的**，不是猜的（使用者：不能有出錯機會）。
 
-    先把兩格都清乾淨（這樣記憶體裡再出現我們的帳號，就一定是剛打進去的），
+    先把現在這一格清乾淨（這樣記憶體裡再出現我們的帳號，就一定是剛打進去的），
     打帳號進去，再問記憶體 —— 找得到就是帳號欄。
+
+    ⚠ 猜對的時候只開**兩個**子行程（使用者：「一直在那切換焦距要很久」）。
     """
-    bot = _bot(monkeypatch, findable=("demo01",))       # 打進去就找得到＝帳號欄
+    # 打**之前**找不到、打完找得到 ＝ 剛打進去的那一格就是帳號欄。
+    seen = {"n": 0}
+    monkeypatch.setattr(
+        auto_login.input_helper, "field_addresses",
+        lambda pid, text: (seen.__setitem__("n", seen["n"] + 1)
+                           or ([0x1825] if seen["n"] > 1 else [])),
+    )
+    bot = AutoLogin(_account(), 4242)
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
     assert _typed_order(sent) == ["TAB", "demo01", "TAB", "pw"], _typed_order(sent)
+    assert len(sent) == 2, f"猜對時只該開兩個子行程：{len(sent)} 批"
+    assert not any("key" in a for b in sent for a in b), "不准用視窗訊息"
     assert any("焦點在帳號欄" in s for s in bot.progress.steps), bot.progress.steps
 
 
 def test_when_the_focus_was_the_password_box_it_moves_over_and_retypes(monkeypatch, wired):
     """★ 反面：客戶端記住帳號時焦點在**密碼欄**（使用者實測的規則）——
-    帳號會誤打進密碼欄，要清掉、換過去重打，而不是就這樣送出去。"""
+    帳號會誤打進密碼欄，要清掉、**Shift+Tab 回帳號欄**重打。
+
+    """
     bot = _bot(monkeypatch, findable=())                # 怎麼打都找不到＝不是帳號欄
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
@@ -1703,45 +1701,52 @@ def test_when_the_focus_was_the_password_box_it_moves_over_and_retypes(monkeypat
     assert any("焦點在密碼欄" in s for s in bot.progress.steps), bot.progress.steps
 
 
-def test_the_answer_is_remembered_so_the_next_login_is_fast(monkeypatch, wired):
-    """★ 查到「焦點在哪一格」之後要**記起來** —— 那是客戶端的性質，不會變。
+def test_the_focus_is_probed_every_single_time(monkeypatch, wired):
+    """★ **每一次都要現查**焦點在哪一格 —— 不准記住上次的答案。
 
-    使用者：「非常完美但速度超慢，可以很快速嗎？畢竟要占用使用者的畫面」。
-    查一次要 5~6 秒（兩次清空＋一次記憶體掃描），記起來之後走快路 1~2 秒。
+    2026-08-31 實機推翻了「那是客戶端的固定性質」這個前提：使用者一次登入
+    三個帳號，第一個查出「焦點在帳號欄」，第二個照抄就打錯了 ——
+    因為第一個登入成功之後客戶端變成「有記住帳號」，焦點跟著移到密碼欄，
+    結果帳號欄原封不動地把它記著的舊帳號 `s9318888` 送了出去。
+
+    這一條釘住：不管設定裡有什麼，都要**清空兩格 ＋ 掃記憶體**。
     """
     from ro_toolbox.config import settings as settings_module
 
-    bot = _bot(monkeypatch, findable=())          # 找不到＝焦點在密碼欄
-    saved = {}
-    # ⚠ 要在 `_bot()` **之後**才換掉 `save_settings` —— 它自己也會換一個假的。
-    monkeypatch.setattr(settings_module, "save_settings", lambda s: saved.update(v=s))
-    _capture_sends(monkeypatch)
-    bot._type_credentials(0x1234)
-    assert settings_module.current_settings().login_focus_password is True
-    assert saved, "查到答案要存起來"
-
-
-def test_the_fast_path_skips_the_clearing_and_the_memory_scan(monkeypatch, wired):
-    """記過答案就走快路：**一個子行程、不清空、不掃記憶體**。"""
-    from ro_toolbox.config import settings as settings_module
-
     monkeypatch.setattr(
-        settings_module, "_current",
-        settings_module.AppSettings(login_focus_password=True),
+        settings_module, "_current", settings_module.AppSettings(),
     )
     scans = []
-    monkeypatch.setattr(auto_login.input_helper, "field_addresses",
-                        lambda pid, t: scans.append(t) or [])
+    monkeypatch.setattr(
+        auto_login.input_helper, "field_addresses",
+        lambda pid, t: scans.append(t) or [0x18254788],
+    )
     bot = AutoLogin(_account(), 4242)
     sent = _capture_sends(monkeypatch)
     bot._type_credentials(0x1234)
-    assert len(sent) == 1, f"快路只該送一批：{sent}"
-    assert not [a for b in sent for a in b if a.get("key") == 0x24], "快路不清空"
-    assert not scans, "快路不掃記憶體"
-    assert _typed_order(sent) == ["pw", "TAB", "demo01"], _typed_order(sent)
+
+    assert scans, "每一次都要掃記憶體確認打進哪一格"
     # ⚠ 送出的 Enter 要跟打字**同一條路**（前景 SendInput）——
     #   混著背景 PostMessage 的話兩條佇列沒有先後保證，Enter 會排到字前面。
     assert sent[-1][-1]["key_fg"] == 0x0D, "最後要送出去，而且要走前景"
+
+
+def test_a_wrong_submitted_account_gives_up_instead_of_retyping(monkeypatch, wired):
+    """★ 送出去的帳號不是我們的 → **關掉重開**，不准原地重打。
+
+    實機踩過（2026-08-31）：客戶端把它記著的舊帳號送了出去，舊版當場翻面
+    重打 —— 但那時候畫面已經不是登入框了，接下來 60 秒判定「不確定」、
+    `PostMessage` 一路失敗，最後跳出「請你手動按一次同意」而畫面上根本
+    沒有合約書。使用者訂的規則就是這種情況：失敗就關掉重開。
+    """
+    bot = _bot(monkeypatch, findable=("demo01",))
+    monkeypatch.setattr(AutoLogin, "_type", lambda self, hwnd, actions: None)
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: ("1.2.3.4", 6900))
+    bot._packets = [FakePacket(0x0064, _login_payload("s9318888"))]
+
+    assert bot._send_credentials(0x1234) is False
+    assert bot.progress.failed_at == "輸入帳號密碼", bot.progress.failed_at
+    assert "關掉重開" in bot.progress.detail, bot.progress.detail
 
 
 def test_pin_state_7_means_the_account_has_no_pin(monkeypatch, wired):

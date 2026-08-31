@@ -155,6 +155,12 @@ class _RefreshCharactersWorker(Worker):
             self.done.emit("；".join(parts))
 
 
+#: 一個帳號最多開幾次遊戲。第一次沒登進去就**關掉重開**再試一次 ——
+#: 客戶端的狀態（記不記得帳號、焦點在哪一格、卡在哪個對話框）重開就乾淨了。
+#: 三次還不成就報失敗，不要無限重開（那是使用者說的「無意義等待」）。
+_LOGIN_TRIES = 3
+
+
 class _BatchLoginWorker(Worker):
     """在背景把勾選的帳號**一個一個**登入。
 
@@ -203,16 +209,40 @@ class _BatchLoginWorker(Worker):
                 self.account_done.emit(account.name, True, "已經在跑，跳過")
                 continue
 
-            self.step.emit(f"開始登入「{account.name}」")
-            try:
-                pid = game_launcher.launch_game_directly(self._paths)
-            except game_launcher.LaunchError as exc:
-                failed.append(account.name)
-                self.account_done.emit(account.name, False, f"開遊戲失敗：{exc}")
-                continue
+            progress = None
+            for attempt in range(1, _LOGIN_TRIES + 1):
+                if self.should_stop:
+                    break
+                self.step.emit(
+                    f"開始登入「{account.name}」"
+                    + (f"（第 {attempt} 次）" if attempt > 1 else "")
+                )
+                try:
+                    pid = game_launcher.launch_game_directly(self._paths)
+                except game_launcher.LaunchError as exc:
+                    self.step.emit(f"開遊戲失敗：{exc}")
+                    progress = None
+                    break
 
-            bot = AutoLogin(account, pid, self.step.emit)
-            progress = bot.run()
+                bot = AutoLogin(account, pid, self.step.emit)
+                progress = bot.run()
+                if progress.ok or attempt >= _LOGIN_TRIES:
+                    break
+                # ⚠ **失敗就關掉重開，不要在壞掉的畫面上繼續試。**
+                #   使用者訂的規則（2026-08-31）：「如果沒有成功連線那就是
+                #   官方問題，就直接關閉重開遊戲登入」。實機踩過：帳密打到
+                #   別的欄位之後客戶端已經送出去了，畫面回不到登入框，
+                #   舊版在那裡重打了 60 秒，最後跳出「請你手動按一次同意」。
+                #   留著那個半死的客戶端還會擋住下一次（多開判定、封包混淆）。
+                self.step.emit(
+                    f"「{account.name}」沒登進去（{progress.summary}）—— 關掉重開再試一次"
+                )
+                game_census.close(pid)
+
+            if progress is None:
+                failed.append(account.name)
+                self.account_done.emit(account.name, False, "開遊戲失敗")
+                continue
             if bot.password_blob and bot.password_blob != account.password_blob:
                 # ⚠ **每次都覆蓋**。這串是密碼轉出來的，改了遊戲密碼舊的就過期；
                 # 靠這裡自動換新，使用者不必知道有這回事（見 login_client 檔頭）。

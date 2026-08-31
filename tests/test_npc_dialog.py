@@ -566,3 +566,58 @@ def test_a_close_before_the_menu_is_still_answered():
     talk = _talk_to()
     talk.feed(nd.ZC_CLOSE_DIALOG, (143).to_bytes(4, "little"))
     assert talk.next_packet() == nd.build_close(143)
+
+
+# ---- 第三層：遊戲寫的中文跟我們的不一樣時，挑最像的 ---------------------
+#
+# 使用者回報（2026-08-31）：「自動尋路跟 NPC 說話常常會不知道這個地圖傳到哪，
+# 但我們卻是知道他可以傳到我們要去哪張地圖……可以用模糊搜尋，
+# 遊戲給的跟我們要的中文不同那就選最像的。」
+
+
+def test_a_translation_that_differs_by_one_character_still_matches():
+    """★ 譯名差一兩個字也要挑得出來（完全相同、包含都落空的情況）。"""
+    index, why = nd.pick_option(
+        ["哎喲提雅 -> 500 z", "莫斯科 -> 500 z"], "哎喲泰雅"
+    )
+    assert index == 1, why
+    assert "最像" in why, why
+
+
+def test_a_long_prefix_in_our_name_does_not_break_the_match():
+    """★ 我們的名字黏著一長串前綴時，要比「共同片段」而不是整串。
+
+    `企業之都里希塔樂鎮` vs 選單的 `里希塔連`：整串比只有 43%（比不過門檻），
+    但共同片段 `里希塔` 占短的那個 75% —— 那才看得出是同一個地方。
+    """
+    index, why = nd.pick_option(
+        ["里希塔連 -> 1200 z", "毀葛 -> 1200 z"], "企業之都里希塔樂鎮"
+    )
+    assert index == 1, why
+
+
+def test_nothing_like_it_is_still_refused():
+    """⛔ **不像就是不像** —— 模糊比對不是「總之挑一個」。
+
+    點錯的代價是真的：把人傳到別的島，還花掉他的錢。
+    """
+    index, why = nd.pick_option(
+        ["普隆德拉 -> 120 z", "吉芬 -> 120 z"], "港都 艾爾貝塔"
+    )
+    assert index is None, why
+    assert "沒有夠像" in why, why
+
+
+def test_two_equally_similar_options_are_refused():
+    """⛔ 兩個一樣像 → 分不出來，停手。"""
+    index, why = nd.pick_option(
+        ["拉赫爾東 -> 1200 z", "拉赫爾西 -> 1200 z"], "拉赫爾"
+    )
+    assert index is None, why
+
+
+def test_two_characters_in_common_is_not_similar_enough():
+    """⛔ 中文兩個字撞在一起太容易，不算像。"""
+    assert nd._overlap("里希塔連", "企業之都里希塔樂鎮") == 0.75   # 共同三個字
+    assert nd._overlap("天津町", "天津港口城市") == 0             # 只有兩個字
+    assert nd._overlap("克魔", "克魔島嶼樂園") == 0               # 只有兩個字

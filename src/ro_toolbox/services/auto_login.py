@@ -157,8 +157,20 @@ _DARK_SCREEN = 40.0
 #: 每一步之間的間隔（秒）。對照組 ROZeroLoginer 用 0.5，實測 0.15 就夠，
 #: 而使用者的要求是**越快越好**（登入會占用他的畫面）。
 _STEP_GAP = 0.15
-#: 帳號沒完整打進欄位時，最多清掉重打幾次（同一格，冪等）。
+#: 帳號沒完整打進欄位時，最多整格重打幾次（冪等，不會把對的弄壞）。
 _FIELD_TRIES = 3
+#: 探焦點用的記號。**只在客戶端本來就記著我們的帳號時才會用到** ——
+#: 那時候「帳號在不在堆積上」分不出是我們剛打的還是它本來就有的。
+#: 選一串不可能跟任何帳號撞名、也不會被誤認成中文的字。
+_PROBE_MARKER = "ZQ7X4K"
+#: 連續幾次「輸入送不進去」就當場放棄整場登入。
+#:
+#: ⚠ 使用者的規則（2026-08-31）：「登入失敗基本上是卡登，這時就要馬上關閉
+#: 遊戲重開」。實機踩過：`PostMessage` 被擋之後**連續失敗 23 次、耗掉 196 秒**
+#: 才逾時 —— 那 3 分鐘完全是浪費（客戶端不會自己好起來），而且期間一直
+#: 占著使用者的畫面。連續這麼多次都送不進去 ＝ 這個客戶端已經沒救了，
+#: 要交給上層關掉重開（`_BatchLoginWorker` 會重來一次）。
+_INPUT_DEAD_TRIES = 5
 #: 從開始按同意到帳密送出去的上限。
 #:
 #: ⚠ 要撐得夠久。實測：**合約書的「同意」要等客戶端載完才真的按得動**，
@@ -209,14 +221,10 @@ _LOGIN_LOST_SEC = 4.0
 
 
 
-_VK_HOME, _VK_DELETE = 0x24, 0x2E
-_VK_END, _VK_BACKSPACE = 0x23, 0x08
 _VK_TAB, _VK_RETURN = 0x09, 0x0D
 _VK_UP, _VK_DOWN = 0x26, 0x28
 #: 選伺服器前先按幾次「上」保證回到第一項（清單只有兩台，按 5 次綽綽有餘）。
 _SERVER_LIST_TOP = 5
-#: 清空欄位要按幾次。RO 的帳號欄最多 23 字，按 32 次一定夠。
-_CLEAR_KEYS = 24
 
 
 def _process_alive(pid: int) -> bool:
@@ -314,7 +322,6 @@ class AutoLogin:
         self.learned_character: str = ""
         # 這一輪要不要先按一次 Tab（＝焦點在密碼欄）。
         # 一開始用記憶體判斷，判斷不出來就先假設不用；**送出去發現打反就翻面**。
-        self._tab_first: bool | None = None
         #: 已經打過一輪了嗎。重試時欄位裡有上一輪的字，一定要清空。
         self._typed_once = False
         #: 連線是什麼時候不見的（0 = 還在）。見 `_connection_lost`。
@@ -719,30 +726,24 @@ class AutoLogin:
             log.debug("存不了畫面：%s", exc)
             return None
 
-    def _clear_actions(self) -> list[dict]:
-        """把目前這一格清乾淨，**兩個方向都清**。
+    def _retype_actions(self, text: str) -> list[dict]:
+        """把**現在這一格**整格換成 `text`。
 
-        客戶端會記住上次的帳號，直接打字是接在後面；而且 `Home`+`Delete` 不夠
-        （那個欄位不見得吃 Home），要再補 `End`+`Backspace`。
+        做法是 `Tab` 出去再 `Tab` 回來 —— 回來的時候那一格的內容是**選取狀態**，
+        打字就整個取代掉（2026-08-31 抓圖量到：登入框的 Tab 只有兩站，
+        Tab 進去打 `BBBBBB`，客戶端記著的 `ss26011034` 直接被換掉）。
 
-        ⚠⚠ **走視窗訊息，不要改成真的按鍵。** v0.2.5 為了少開子行程把它改成
-        `key_foreground`，結果自動登入**整個爛掉**：實跑 11 次，合約書明明過了
-        （畫面判定＝登入畫面）、欄位也填對了（ID 欄看得到帳號、密碼欄 9 個星號），
-        但**客戶端一次都沒有連上伺服器** —— 最後那個 Enter 送不出去，
-        `submitted_account()` 全程是 None。改回來就好了。
-        機制沒有查清楚，但結論很清楚：**這條路驗過會動，不要為了省時間去動它。**
-
-        ⚠ 2026-08-30 補充：v0.2.5 那次**同時**改了兩件事（清空改成按鍵 ＋
-        六批併成一批），失敗只能歸給其中一件。現在已經量清楚了 ——
-        **「合併」是好的**（[INP-022]：混著送實測 8/8，而且每多一個子行程
-        就多一次被 GameGuard 整批擋掉的機會），**「清空改成按鍵」沒有平反**，
-        照舊走視窗訊息。
+        ⚠⚠ **這取代了舊的 `_clear_actions`（Home＋Delete×24＋End＋Backspace×24）。**
+        那 48 個按鍵走的是 `PostMessage`，而 `PostMessage` 會被 GameGuard
+        整批擋掉（[INP-023]）—— 它是登入這一段最後一個還在用視窗訊息的動作，
+        實機因此連續失敗 23 次、耗掉 196 秒（2026-08-31）。
+        用 Tab 取代之後**登入全程只剩前景 `SendInput`**，沒有那個關卡了，
+        而且少送 48 個按鍵，也少了「一次爆量客戶端跟不上」的掉字風險。
         """
         return [
-            input_helper.key(_VK_HOME),
-            input_helper.key(_VK_DELETE, _CLEAR_KEYS),
-            input_helper.key(_VK_END),
-            input_helper.key(_VK_BACKSPACE, _CLEAR_KEYS),
+            *self._tab_actions(), input_helper.pause(_STEP_GAP),
+            *self._tab_actions(), input_helper.pause(_STEP_GAP),
+            *self._type_actions(text),
         ]
 
     def _type_actions(self, text: str) -> list[dict]:
@@ -794,36 +795,6 @@ class AutoLogin:
         """
         return [input_helper.key_foreground(_VK_RETURN)]
 
-    def _decide_focus(self, hwnd: int) -> None:
-        """決定 `self._tab_first`（要不要先打密碼）。只在第一次做。
-
-        ## 現在的做法：**用預設假設，不做任何探測**
-
-        使用者實測的規則：客戶端記住帳號時焦點落在**密碼欄**，
-        沒記住時落在帳號欄。實務上幾乎永遠是前者，所以預設「先打密碼」。
-        猜錯不會卡死：送出後有閉環驗證（`submitted_account()` 與擷取到的
-        `0x0064` 明文帳號），錯了就翻面重打。
-
-        ## ⛔⛔ 試過兩種「量出來」的做法，**兩種都讓事情變糟，都已移除**
-
-        1. **讀「上次送出的帳號」那塊靜態緩衝** —— [MEM-032] 明寫它**送出後才有值**，
-           所以兩種情況讀到的都是空的，等於沒在判斷（本條目上半段）。
-        2. **打探針進去再搜記憶體**（`ZQ7X4K` / `VM3H8T`）——
-           想法是靠 [MEM-032] 的不對稱「帳號欄的字找得到、密碼欄的搜不到」。
-           但使用者實測回報 **「剛開始在密碼時，還會莫名打出一些字然後自己刪掉」**
-           ——那就是探針，它會出現在使用者眼前；而且判斷結果照樣會錯
-           （「他都會相反一次」）。
-
-        **教訓**：那條不對稱是在**一次**特定量測下成立的，拿它當「判斷焦點」
-        的唯一依據，等於把整條登入押在一個沒有反覆驗證過的前提上。
-        現在只拿它**記錄觀察**（見 `_note_field_placement`），不拿它做決定。
-        """
-        if self._tab_first is not None:
-            return
-        self._tab_first = False
-        self._step("先打帳號再 Tab 到密碼（2026-08-31 實機量到的順序）；"
-                   "打錯的話送出後的驗證會翻面重打")
-
     def _field_has(self, text: str) -> bool:
         """這串字現在**在客戶端的欄位緩衝裡**嗎（讀記憶體，不看畫面）。
 
@@ -835,6 +806,11 @@ class AutoLogin:
         拿它去觸發修正動作會把本來對的弄壞（[INP-015] 踩過兩次）——
         這裡「找不到」只會讓我們**再打一次**（重打前會先清空，是冪等的）。
         """
+        # ⚠⚠ **只讀一次，不准改成輪詢。** [MEM-032] 的不對稱是「**打完馬上讀**」
+        #   量出來的：那一瞬間帳號欄的字找得到、密碼欄的找不到。
+        #   2026-08-31 試過等 1.5 秒、找到就回 —— 結果**兩格都找得到**，
+        #   判斷完全失效（實機：三個帳號全部回報「焦點在帳號欄」，
+        #   其中一個把客戶端記著的舊帳號送了出去）。等越久，鑑別力越低。
         try:
             return bool(input_helper.field_addresses(self._pid, text))
         except Exception as exc:  # noqa: BLE001 - 讀不到就當作「不知道」
@@ -844,113 +820,95 @@ class AutoLogin:
     def _type_credentials(self, hwnd: int) -> bool:
         """把帳號密碼打進去並送出。**焦點在哪一格是查出來的，不是猜的。**
 
-        ## 兩條路（使用者要「不能出錯」，也要「快」）
+        ## 每一次都**查**。⛔ 「記住上次的答案走快路」已被實機推翻，別再加回來
 
-            快路 `_type_fast`      1~2 秒　一個子行程、不清空、不掃記憶體
-            慢路 `_type_by_probing` 5~6 秒　清乾淨 → 打進去 → 問記憶體
+        舊版把查出來的答案存進 `AppSettings.login_focus_password`，理由是
+        「焦點在哪一格是那台客戶端的性質（存檔勾了沒），不會每次不一樣」。
 
-        走哪一條看**上次查到的答案**（`AppSettings.login_focus_password`）：
-        沒查過就走慢路查一次並記起來，之後都走快路。
+        **那是錯的。** 2026-08-31 使用者一次登入三個帳號，實機日誌：
 
-        ## 為什麼「上次的答案」可以信
+            06:57:54  第一個帳號　焦點在帳號欄（記憶體確認過）   ← 查出來的
+            06:58:13  第二個帳號　焦點在帳號欄（上次查出來的）   ← 快路照抄
+            06:58:15  送出去的帳號是 's9318888'，不是我們的
 
-        使用者實測的規則：**客戶端記住帳號時焦點在密碼欄**，沒記住時在帳號欄。
-        那是**那台客戶端的性質**（存檔勾了沒），不會每次登入不一樣。
+        `s9318888` 是**客戶端自己記著的舊帳號**。第一個帳號登入成功之後，
+        客戶端就變成「有記住帳號」，焦點跟著移到**密碼欄** —— 我們打的字
+        全落在密碼欄那一側，帳號欄原封不動，把它記著的舊帳號送了出去
+        （快路又刻意不清空，那個舊值才有機會被送出去）。
 
-        而且猜錯不會安靜地錯：送出後的閉環驗證（`0x0064` 的明文帳號）會抓到，
-        整輪重來時就走慢路重查、順便把記住的答案改掉。
+        也就是說：**這個屬性會在同一台客戶端上、同一批登入之間改變。**
+        快取它＝拿上一個帳號的結論去賭下一個帳號。所以現在**每一次都查**
+        （多花 4~5 秒，整場約 33 秒）。
 
         ## 沿路推翻過的東西（別再走一次）
 
-        - **「焦點固定在某一格」** —— 不是。看客戶端有沒有記住帳號（見上）。
+        - **「焦點固定在某一格」** —— 不是。看客戶端有沒有記住帳號。
+        - **「那是客戶端的固定性質，可以記起來」** —— 也不是，見上面那段日誌。
         - **「用畫面看得出來焦點在哪」** —— 三種都試過都不行：ID 欄空不空
           （暗像素只差 1.5 倍）、游標在哪一格閃（`PrintWindow` 抓不到游標）、
           直接問記憶體（客戶端記住的帳號本來就在堆積上，分不開）。詳見 [INP-026]。
         - **「打字要用視窗訊息才不搶前景」** —— 那條會掉字又慢（[INP-025]）。
         """
-        known = self._remembered_focus()
-        if known is not None and not self._typed_once:
-            self._type_fast(hwnd, known)
-            return True
         return self._type_by_probing(hwnd)
 
-    @staticmethod
-    def _remembered_focus() -> bool | None:
-        """上次查出來的「焦點預設在哪一格」。True＝密碼欄、None＝還沒查過。"""
-        from ro_toolbox.config.settings import current_settings
-
-        return current_settings().login_focus_password
-
-    def _learn_focus(self, focus_password: bool) -> None:
-        """把查出來的答案記下來，下次就能走快路。"""
-        from ro_toolbox.config.settings import current_settings, save_settings
-
-        settings = current_settings()
-        if settings.login_focus_password is focus_password:
-            return
-        settings.login_focus_password = focus_password
-        try:
-            save_settings(settings)
-        except Exception as exc:  # noqa: BLE001 - 存不了不該讓登入失敗
-            log.warning("記不住「焦點在哪一格」：%s", exc)
-
-    def _type_fast(self, hwnd: int, focus_password: bool) -> None:
-        """**快路**：一個子行程、不清空、不掃記憶體（1~2 秒）。
-
-        用得起的前提是「焦點預設在哪一格」已經查過（`_remembered_focus`）——
-        那是客戶端的性質（存檔勾了沒），不會每次不一樣。
-
-        ⚠ **不清空是刻意的**：Tab 進去的時候那一格的內容是**選取狀態**，
-        打字就整個取代掉（實測）。而清空要送 24+24 個按鍵，那是一次爆量，
-        客戶端的訊息迴圈跟不上就掉訊息（[INP-024]）——又慢又危險。
-
-        猜錯也不會安靜地錯：送出後的 `0x0064` 明文帳號會抓到，
-        那時候整輪重來會走**慢路**（重新查一次並改掉記住的答案）。
-        """
-        user, password = self._account.username, self._account.password
-        first, second = (password, user) if focus_password else (user, password)
-        gap = input_helper.pause(_STEP_GAP)
-        self._step("焦點在" + ("密碼欄" if focus_password else "帳號欄")
-                   + "（上次查出來的）—— 直接打")
-        self._type(hwnd, [
-            input_helper.focus(), input_helper.ime_off(),
-            *self._type_actions(first), gap,
-            *self._tab_actions(), gap,
-            *self._type_actions(second), gap,
-            *self._submit_actions(),
-        ])
-        self._typed_once = True
-
     def _type_by_probing(self, hwnd: int) -> bool:
-        """**慢路**：把焦點在哪一格**查出來**（5~6 秒），順便記起來。
+        """把焦點在哪一格**查出來**再打。猜錯的代價太大，這一步不能省。
 
-        ① 兩格都清乾淨 ② 帳號打進「現在這一格」 ③ 問記憶體找不找得到。
-        ①不能省：客戶端**記住的**帳號本來就躺在堆積上，跟「我們剛打進去的」
-        分不開 —— 先清乾淨，那份就不見了（[INP-026]）。
+        ## 量出來的兩件事（2026-08-31 抓圖，見 [INP-029]）
+
+        1. **登入框的 Tab 只有兩站**：帳號欄 ↔ 密碼欄（`存檔` 那顆不在循環裡）。
+        2. **Tab 進去的那一格內容是選取狀態**，打字直接整格取代 ——
+           所以不需要清空，客戶端記著的舊帳號會被蓋掉。
+
+        ## 形狀
+
+            ① Tab 一次 → 把記號打進「另一格」        （一個子行程）
+            ② 問記憶體：那串在不在堆積上？           （[MEM-032] 的不對稱）
+                 在  → 那一格是帳號欄
+                 不在 → 那一格是密碼欄
+            ③ 照答案把帳號密碼放進正確的格子並送出   （一個子行程）
+
+        ## 記號用哪一串
+
+        通常直接用**帳號本身**當記號（使用者看到的就是他的帳號，沒有雜訊）。
+        但如果打之前帳號就已經在堆積上（客戶端記著它），那「找得到」就分不出
+        是我們剛打的還是它本來就有的 —— 這時候才改用一串固定記號。
         """
         user, password = self._account.username, self._account.password
-        clear = self._clear_actions()
         tab = self._tab_actions()
         gap = input_helper.pause(_STEP_GAP)
 
-        self._type(hwnd, [input_helper.focus(), input_helper.ime_off(),
-                          *clear, *tab, gap, *clear])
-        self._type(hwnd, [input_helper.focus(), *self._type_actions(user)])
-        self._typed_once = True
+        # ⚠ 打之前先問一次：帳號本身能不能當記號。
+        marker = user
         if self._field_has(user):
+            marker = _PROBE_MARKER
+            self._step("客戶端本來就記著這個帳號 —— 改用記號探焦點")
+
+        # ① Tab 到另一格（內容會被選起來），把記號整格打進去。
+        self._type(hwnd, [input_helper.focus(), input_helper.ime_off(),
+                          *tab, gap, *self._type_actions(marker)])
+        self._typed_once = True
+
+        # ② 問記憶體（**打完馬上問**，見 `_field_has`）。
+        if self._field_has(marker):
             self._step("焦點在帳號欄（記憶體確認過）—— Tab 過去打密碼")
-            self._learn_focus(False)
-            self._type(hwnd, [input_helper.focus(), *tab, gap,
-                              *self._type_actions(password)])
-        else:
-            self._step("焦點在密碼欄（帳號沒出現在堆積上）—— 換過去重打")
-            self._learn_focus(True)
-            self._type(hwnd, [input_helper.focus(), *clear, *tab, gap,
-                              *self._type_actions(user)])
-            self._verify_account(hwnd)
-            self._type(hwnd, [input_helper.focus(), *tab, gap,
-                              *self._type_actions(password)])
-        self._type(hwnd, [input_helper.key(_VK_RETURN)])
+            actions = [input_helper.focus()]
+            if marker != user:
+                actions += self._retype_actions(user)
+                actions.append(gap)
+            actions += [*tab, gap, *self._type_actions(password), gap,
+                        *self._submit_actions()]
+            self._type(hwnd, actions)
+            return True
+
+        self._step("焦點在密碼欄（記號沒出現在堆積上）—— Tab 過去打帳號")
+        self._type(hwnd, [input_helper.focus(), *tab, gap,
+                          *self._type_actions(user)])
+        # 帳號是這一輪的關鍵，補打確認過再往下（[INP-024]：客戶端會掉字）。
+        self._verify_account(hwnd)
+        self._type(hwnd, [input_helper.focus(), *tab, gap,
+                          *self._type_actions(password), gap,
+                          *self._submit_actions()])
         return True
 
     def _verify_account(self, hwnd: int) -> bool:
@@ -981,9 +939,9 @@ class AutoLogin:
                 if attempt > 1:
                     self._step(f"帳號補打成功（第 {attempt} 次，記憶體確認過）")
                 return True
-            self._step(f"帳號沒完整進到欄位裡（第 {attempt} 次）—— 清掉重打同一格")
-            self._type(hwnd, [input_helper.focus(), *self._clear_actions(),
-                              *self._type_actions(self._account.username)])
+            self._step(f"帳號沒完整進到欄位裡（第 {attempt} 次）—— 整格重打")
+            self._type(hwnd, [input_helper.focus(),
+                              *self._retype_actions(self._account.username)])
         self._step("帳號重打幾次都確認不到 —— 照樣送出去，讓封包驗證收尾")
         return False
 
@@ -1126,7 +1084,7 @@ class AutoLogin:
         沒事亂按只會多送一次錯的帳密、再多跳一個框。
         """
         try:
-            self._type(hwnd, [input_helper.key(_VK_RETURN)])
+            self._type(hwnd, [input_helper.focus(), *self._submit_actions()])
         except input_helper.InputHelperError as exc:
             log.debug("關錯誤框失敗：%s", exc)
 
@@ -1680,6 +1638,7 @@ class AutoLogin:
         deadline = started + _INPUT_TIMEOUT
 
         attempt = 0          # **真的打字**的次數（按同意的那幾輪不算）
+        dead = 0             # 連續幾次「輸入送不進去」（見 _INPUT_DEAD_TRIES）
         asked = False
         stage = Stage.UNKNOWN
         while True:
@@ -1778,12 +1737,23 @@ class AutoLogin:
                 self._step(f"第 {attempt} 次沒送進去（畫面：{stage.value}）：{exc}")
                 if self._stop_if_gone(hwnd, "輸入帳號密碼"):
                     return False
+                dead += 1
+                if dead >= _INPUT_DEAD_TRIES:
+                    # 連續這麼多次都送不進去＝這個客戶端已經沒救了。
+                    # 等滿逾時沒有意義（實機：23 次、196 秒），交給上層重開。
+                    self.progress.fail(
+                        "輸入帳號密碼",
+                        f"連續 {dead} 次都送不進去（畫面：{stage.value}）：{exc} "
+                        "—— 客戶端沒反應，關掉重開比較快。",
+                    )
+                    return False
                 if time.monotonic() >= deadline:
                     self.progress.fail(
                         "輸入帳號密碼",
                         f"送不進視窗訊息（畫面：{stage.value}）：{exc}")
                     return False
                 continue
+            dead = 0
             server = self._wait_connection(_CREDENTIAL_TIMEOUT)
             if server is not None:
                 # ⚠ 「連上了」**不等於帳密正確** —— 錯的帳密照樣會先連上，
@@ -1824,36 +1794,26 @@ class AutoLogin:
                         guess, sent_now,
                     )
                 if sent_now is not None and sent_now != self._account.username:
-                    self._step(
-                        f"送出去的帳號是 {sent_now!r}，不是我們的 —— 打到別的欄位了，重來"
+                    # ⚠⚠ **不准原地重打。** 客戶端已經把帳密送出去了 ——
+                    #   畫面早就不是登入框（伺服器接著跳 OTP 或「帳密錯誤」），
+                    #   在那裡打字就是對著認不出來的畫面亂打。
+                    #
+                    #   實機踩過（2026-08-31，使用者一次登入三個帳號）：
+                    #   第二個帳號送出了客戶端記著的舊帳號 `s9318888`，舊版當場
+                    #   翻面重打 —— 接下來 60 秒畫面一直判定「不確定」、
+                    #   `PostMessage` 一路失敗，最後跳出「請你手動按一次同意」，
+                    #   而畫面上根本沒有合約書。那個帳號就卡死在那裡。
+                    #
+                    #   使用者訂的規則就是針對這種情況：**失敗就關掉重開**。
+                    #   重開之後客戶端狀態乾淨，而下一輪會**重新查**焦點在哪一格
+                    #   （快取已移除），不會再犯同一個錯。
+                    self.progress.fail(
+                        "輸入帳號密碼",
+                        f"送出去的帳號是 {sent_now!r}，不是 "
+                        f"{self._account.username!r} —— 字打到別的欄位去了。"
+                        "客戶端已經送出去、畫面回不到登入框，要關掉重開。",
                     )
-                    # ⚠ **重試之前一定要先關掉錯誤框。**
-                    # 帳密被拒絕時客戶端會跳「帳密錯誤」，那個框會**擋住輸入** ——
-                    # 不關掉的話後面每一次重試都是在對著它打字，永遠不會成功
-                    # （踩過：連續十幾次全部落空）。
-                    # 使用者實測：按一次 Enter 就回到登入畫面。
-                    self._dismiss_error(hwnd)
-                    # ⚠ **把假設翻面。** 兩格事前分不出來，唯一確定的依據就是
-                    # 送出之後客戶端記下的「送出去的帳號」。既然這次打反了，
-                    # 下一次就換另一邊 —— 兩次之內一定對上。
-                    # （早期版本每次都重新猜同一個答案，於是無限重複同樣的錯。）
-                    self._tab_first = not self._tab_first
-                    self._step(
-                        f"下一次改成先打{'帳號' if not self._tab_first else '密碼'}"
-                    )
-                    # ⚠ **把假設翻面。** 兩格在記憶體裡長得一模一樣，沒有標籤
-                    # 可以事先分辨；唯一確定的依據就是送出之後客戶端記下的
-                    # 「送出去的帳號」。既然這次打反了，下次就換另一邊 ——
-                    # 兩次之內一定對上。
-                    # （早期版本每次都重新猜同一個答案，於是無限重複同樣的錯。）
-                    if time.monotonic() >= deadline:
-                        self.progress.fail(
-                            "輸入帳號密碼",
-                            f"最後一次送出去的帳號是 {sent_now!r}，"
-                            f"不是 {self._account.username!r} —— 字一直打到別的欄位。",
-                        )
-                        return False
-                    continue
+                    return False
                 self._login_server = server
                 self._step(f"客戶端連上了 {server[0]}:{server[1]} —— 帳密送出去了")
                 # ⚠ 用 WARNING：預設 log_level 就是 WARNING，前面每一步的 INFO

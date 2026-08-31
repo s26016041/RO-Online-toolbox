@@ -142,7 +142,9 @@ def perform(hwnd: int, actions: list[dict], on_look=None) -> int:
                 game_input.type_foreground(action["text_fg"])
             elif "key_fg" in action:
                 for _ in range(int(action.get("times", 1))):
-                    game_input.press_foreground(int(action["key_fg"]))
+                    game_input.press_foreground(
+                        int(action["key_fg"]), bool(action.get("shift", False))
+                    )
             elif "key" in action:
                 char = action.get("char")
                 # ⚠ **連按之間一定要留間隔。** 客戶端自己的訊息迴圈跟不上就

@@ -285,6 +285,10 @@ def _send(*inputs: _Input) -> None:
         )
 
 
+#: Shift 的虛擬鍵碼。Shift+Tab ＝ 焦點往**回**一格。
+_VK_SHIFT = 0x10
+
+
 def _key_event(code: int, unicode_char: bool, key_up: bool) -> _Input:
     flags = (_KEYEVENTF_UNICODE if unicode_char else 0) | (
         _KEYEVENTF_KEYUP if key_up else 0
@@ -318,17 +322,28 @@ def type_foreground(text: str) -> None:
     _send(*events)
 
 
-def press_foreground(virtual_key: int) -> None:
+def press_foreground(virtual_key: int, shift: bool = False) -> None:
     """對前景視窗按一個功能鍵（Enter、Tab、Home、Delete…）。
 
     功能鍵沒有對應的 Unicode 字元，所以走虛擬鍵碼。
+
+    `shift=True` 會把 Shift 壓著再按（Shift+Tab ＝ 焦點往**回**一格）。
+    登入框從密碼欄往前 Tab 不會回到帳號欄（實機：字打到別的地方去了，
+    客戶端把它自己記著的舊帳號送了出去），要往回走才行。
     """
     if not available():
         raise InputError("缺少 pywin32，無法送輸入。")
-    _send(
+    events = [
         _key_event(virtual_key, unicode_char=False, key_up=False),
         _key_event(virtual_key, unicode_char=False, key_up=True),
-    )
+    ]
+    if shift:
+        events = [
+            _key_event(_VK_SHIFT, unicode_char=False, key_up=False),
+            *events,
+            _key_event(_VK_SHIFT, unicode_char=False, key_up=True),
+        ]
+    _send(*events)
 
 
 def focus_window(hwnd: int, settle: float = 0.7) -> bool:

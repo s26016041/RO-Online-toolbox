@@ -341,10 +341,23 @@ def login_once(argv: list[str]) -> int:
     if problem:
         say(f"遊戲路徑有問題：{problem}")
         return 2
-    pid = game_launcher.launch_game_directly(paths)
+    # ⚠ 跟 UI 那條路**同一個規則**：登入沒成就關掉重開再試
+    #   （使用者：「登入失敗基本上是卡登，這時就要馬上關閉遊戲重開」）。
+    #   驗收工具要跟真實行為一致，不然量到的成功率是假的。
+    from ro_toolbox.services import game_census
+    from ro_toolbox.ui.pages.account_page import _LOGIN_TRIES
+
     say(f"[--login] 報告寫到 {report}")
-    say(f"[--login] 開了遊戲 PID {pid}，帳號「{account.name}」")
-    progress = AutoLogin(account, pid, lambda text: say(f"[--login] {text}")).run()
+    progress = None
+    for attempt in range(1, _LOGIN_TRIES + 1):
+        pid = game_launcher.launch_game_directly(paths)
+        say(f"[--login] 開了遊戲 PID {pid}，帳號「{account.name}」"
+            + (f"（第 {attempt} 次）" if attempt > 1 else ""))
+        progress = AutoLogin(account, pid, lambda text: say(f"[--login] {text}")).run()
+        if progress.ok or attempt >= _LOGIN_TRIES:
+            break
+        say(f"[--login] 沒登進去（{progress.summary}）—— 關掉重開再試一次")
+        game_census.close(pid)
     say(f"[--login] {'成功' if progress.ok else '失敗'}：{progress.summary}")
     if progress.stopped_at_character:
         say(f"[--login] 停在選角：{progress.stopped_at_character}")

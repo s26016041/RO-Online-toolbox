@@ -203,6 +203,75 @@ def place_of(option: str) -> str:
     return _squash(_PRICE_TAIL.sub("", option.split("->")[0]))
 
 
+#: 相似度至少要這麼像才敢點。低於這個就當成「選單裡沒有這個地方」。
+#:
+#: ⚠ 這是**最後一道**手段（完全相同、包含都試過了）。使用者的要求：
+#: 「遊戲給的跟我們要的中文不同，那就選最像的」。但點錯的代價是真的
+#: （傳到別的島、花掉他的錢），所以還要求跟第二名拉開差距 —— 兩個都像
+#: 就是分不出來，寧可停手。
+_FUZZY_MIN = 0.5
+#: 最像的要比第二像的多這麼多，才算「分得出來」。
+_FUZZY_MARGIN = 0.15
+
+
+def _overlap(a: str, b: str) -> float:
+    """最長共同片段占**比較短那個**的比例（0~1）。
+
+    為什麼需要它：我們表裡的中文名常常黏著一長串前綴
+    （），而選單只寫地名（）。
+    整串比的話分母被前綴稀釋（0.43，比不過門檻），
+    但「共同片段  占短的那個 3/4」就看得出它們在講同一個地方。
+
+    ⚠ 兩個字以下不算 —— 中文兩個字撞在一起太容易，那不叫像。
+    """
+    from difflib import SequenceMatcher
+
+    if not a or not b:
+        return 0.0
+    match = SequenceMatcher(None, a, b).find_longest_match(0, len(a), 0, len(b))
+    if match.size < 3:
+        return 0.0
+    return match.size / min(len(a), len(b))
+
+
+def _similarity(place: str, full: str, core: str) -> float:
+    """選項地名跟目的地中文名有多像（0~1）。取所有比法裡最像的那個。
+
+    -  的字元比對：錯一兩個字仍然很像，完全不同的地名分數很低
+      （實測「普隆德拉」vs「艾爾貝塔」= 0.0）。
+    - ：我們的名字黏著前綴時，整串比會被稀釋（見上）。
+    """
+    from difflib import SequenceMatcher
+
+    return max(
+        SequenceMatcher(None, place, full).ratio(),
+        SequenceMatcher(None, place, core).ratio(),
+        _overlap(place, full),
+        _overlap(place, core),
+    )
+
+
+def _closest(places, full, core, only=None):
+    """最像的那個選項。回 (編號從 1 開始, 相似度, 跟第二名的差距)。
+
+    不夠像、或跟第二名差不多像，一律回 None —— **分不出來就不賭**。
+    """
+    scored = [
+        (index, _similarity(place, full, core))
+        for index, place in enumerate(places, start=1)
+        if place and (only is None or index in only)
+    ]
+    if not scored:
+        return None
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    index, score = scored[0]
+    runner_up = scored[1][1] if len(scored) > 1 else 0.0
+    margin = score - runner_up
+    if score < _FUZZY_MIN or margin < _FUZZY_MARGIN:
+        return None
+    return index, score, margin
+
+
 def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]:
     """挑出通往 `display_name` 的選項。回 (編號從 1 開始, 說明)。
 
@@ -219,8 +288,23 @@ def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]
     | alberta | `港都 艾爾貝塔` | `艾爾貝塔 港口-> 500金幣` |
 
     prontera 是**我們的比較長**（主名還黏著「首都」），alberta 是**選單的比較長**。
-    所以先試精確相等，再試「誰包含誰」——但**兩層都要求剛好一個**，
-    對到兩個就停手（例如選單同時有「吉芬」跟「吉芬地城」那種）。
+    所以先試精確相等，再試「誰包含誰」。
+
+    ## 三層，一層比一層寬
+
+        ① 完全相同   place == 我們的全名或主名
+        ② 包含       誰包含誰都算
+        ③ **最像的** difflib 相似度（使用者要求：「遊戲給的跟我們要的中文
+                     不同，那就選最像的」）
+
+    ③ 是 2026-08-31 加的。實機回報：「自動尋路跟 NPC 說話常常會不知道
+    這個地圖傳到哪，但我們卻知道他可以傳到我們要去的地圖」—— 就是①②
+    都落空的情況（譯名差一兩個字）。
+
+    ⚠ 每一層都要求**分得出來**：①②要剛好一個（對到多個時用相似度在那幾個
+    之中挑，差距夠大才算），③要夠像（`_FUZZY_MIN`）而且跟第二名拉開
+    （`_FUZZY_MARGIN`）。兩個都像就是分不出來，停手 —— 點錯是把人傳到
+    別的島、還花掉他的錢。
     """
     full = _squash(display_name)
     core = _squash(core_name(display_name))
@@ -237,8 +321,28 @@ def pick_option(options: list[str], display_name: str) -> tuple[int | None, str]
         if len(hits) == 1:
             return hits[0], f"第 {hits[0]} 項「{options[hits[0] - 1]}」{how}於「{core}」"
         if len(hits) > 1:
+            # 對到好幾個（例如選單同時有「吉芬」與「吉芬地城」）——
+            # 用相似度在**這幾個之中**挑，差距夠大才算數。
+            best = _closest(places, full, core, only=hits)
+            if best is not None:
+                index, score, margin = best
+                return index, (
+                    f"第 {index} 項「{options[index - 1]}」{how}於「{core}」，"
+                    f"而且是 {len(hits)} 個裡最像的（{score:.0%}，"
+                    f"比第二名多 {margin:.0%}）"
+                )
             return None, f"「{core}」對到 {len(hits)} 個選項，分不出來：{options}"
-    return None, f"選單裡沒有「{core}」：{options}"
+
+    # ★ 都對不上才用**相似度**：遊戲寫的中文跟我們表裡的不一樣時（改版換譯名、
+    #   多／少一個字），照字面比會整個落空 —— 使用者的要求是「那就選最像的」。
+    best = _closest(places, full, core)
+    if best is not None:
+        index, score, margin = best
+        return index, (
+            f"第 {index} 項「{options[index - 1]}」跟「{core}」最像"
+            f"（{score:.0%}，比第二名多 {margin:.0%}）"
+        )
+    return None, f"選單裡沒有「{core}」，也沒有夠像的：{options}"
 
 
 def pick_submenu(options: list[str]) -> tuple[int | None, str]:
