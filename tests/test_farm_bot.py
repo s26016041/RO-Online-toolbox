@@ -12,6 +12,8 @@ FarmBot 只有 start() 才會碰遊戲，建構子不會，所以可以直接測
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 
 from ro_toolbox.core.ro_packet import RoPacket
@@ -930,3 +932,85 @@ def test_the_wake_up_is_fast_enough_to_not_look_dead():
 
     assert mod._STALE_POS_SEC <= 1.0, "按下去到動起來不能超過一秒級"
     assert mod._STALE_POS_SEC > 0, "還是要擋一下單次讀取失敗的抖動"
+
+
+# ---- 卡住只重來，不關掉自動打怪 -----------------------------------------
+#
+# 使用者訂的規則（2026-08-31）：「自動戰鬥只有死掉會關閉，或者回程補給會
+# 暫時關閉」。實機日誌：
+#     16:40:45 太靠近傳點，先走開（往 153,20）
+#     16:41:30 ⚠ 角色 45 秒毫無進展（正在脫離傳點禁區…），已停止
+# 使用者掛了一整晚，回來看到的就是「它自己關掉了」。
+
+
+def _frozen_bot(monkeypatch, clock):
+    """做一個「HP 正常、但四十五秒毫無進展」的 bot。"""
+    from ro_toolbox.services import farm_bot as mod
+
+    bot = _warp_bot()
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock["now"])
+
+    class _Reader:
+        position_live = True
+
+        def read(self):
+            return SimpleNamespace(hp=1000, max_hp=1000, map_name="prontera")
+
+        def read_position(self):
+            return (200, 200)          # 永遠不動
+
+    bot._reader = _Reader()
+    return bot
+
+
+def test_being_stuck_does_not_switch_the_farming_off(monkeypatch):
+    """★ 卡住 45 秒 → **清狀態重來**，`running` 不准被關掉。"""
+    from ro_toolbox.services import farm_bot as mod
+
+    clock = {"now": 9000.0}
+    bot = _frozen_bot(monkeypatch, clock)
+    bot._stats.running = True
+    bot._escape_goal = (203, 200)
+
+    assert bot._alive(clock["now"]) is True          # 第一拍：記下起點
+    clock["now"] += mod._FROZEN_SEC + 1
+    assert bot._alive(clock["now"]) is True, "卡住不是關掉自動打怪的理由"
+
+    assert bot._stats.running is True
+    assert bot._escape_goal is None, "卡住的目標要丟掉"
+    assert bot._is_bad_goal((203, 200)), "走不到的那一格要記起來，別再挑它"
+    assert bot._stuck == 1
+    assert "沒進展" in bot._stats.note, bot._stats.note
+
+
+def test_dying_still_switches_the_farming_off(monkeypatch):
+    """⛔ 反面：**死掉**照樣要關 —— 使用者指定「死了就跳通知窗＋關掉」。"""
+    clock = {"now": 9000.0}
+    bot = _frozen_bot(monkeypatch, clock)
+    bot._stats.running = True
+    bot._reader.read = lambda: SimpleNamespace(hp=0, max_hp=1000, map_name="prontera")
+
+    assert bot._alive(clock["now"]) is False
+    assert bot._stats.running is False
+    assert bot._stats.died is True
+
+
+def test_stale_coordinates_drop_the_escape_state(monkeypatch):
+    """★ 座標不是即時的時候，「正在脫離傳點」要放掉。
+
+    `_wake_position()` 回 False 會讓整拍跳過，`_escape_warp()` 根本不會被叫到
+    —— 它裡面「12 秒走不到就換方向」的出口等於不存在，`_escape_goal` 就
+    永遠留著，`_doing()` 也一直說在脫離。實機就是這樣被判成卡住的。
+    """
+    bot = _warp_bot()
+    bot._escape_goal = (203, 200)
+
+    class _Stale:
+        position_live = False
+
+        def read_position(self):
+            return (200, 200)
+
+    bot._reader = _Stale()
+    assert bot._wake_position(1000.0, (200, 200)) is False
+    assert bot._escape_goal is None

@@ -309,6 +309,8 @@ class FarmBot:
         self._escape_since = 0.0
         #: 座標從什麼時候開始「不是即時的」（0 = 現在是即時的）。
         self._stale_since = 0.0
+        #: 卡住重來過幾次（見 `_unstick`）。只拿來寫日誌，不當停止條件。
+        self._stuck = 0
         #: 上次為了「把移動元件逼出來」推的那一步是什麼時候。
         self._woke_at = 0.0
         self._resync_at = 0.0
@@ -745,14 +747,49 @@ class FarmBot:
             self._progress = progress
             self._progress_at = now
         elif now - self._progress_at > _FROZEN_SEC:
-            # ⚠ **要講在做什麼**：只說「毫無進展」的話，事後從日誌完全看不出
-            # 是打怪打不到、走位走不動、還是卡在傳點禁區出不來
-            # （細節都在 DEBUG，使用者手上的檔案只有 INFO）。
-            self._fail(
-                f"⚠ 角色 {_FROZEN_SEC:.0f} 秒毫無進展（{self._doing()}），已停止"
-            )
-            return False
+            # ⚠⚠ **卡住不是收工的理由。** 使用者訂的規則（2026-08-31）：
+            #   「自動戰鬥只有死掉會關閉，或者回程補給會暫時關閉」。
+            #   舊版在這裡 `_fail()` 把自動打怪關掉 —— 實機日誌：
+            #
+            #       16:40:45 太靠近傳點，先走開（往 153,20）
+            #       16:41:30 ⚠ 角色 45 秒毫無進展（正在脫離傳點禁區…），已停止
+            #
+            #   使用者掛了一整晚，回來看到的就是「它自己關掉了」。
+            #   卡住是**要處理的狀況**：清掉狀態重來，並且大聲留紀錄。
+            self._unstick(now)
         return True
+
+    def _unstick(self, now: float) -> None:
+        """卡住了：把當下的目標全部作廢、重新開始。**不關掉自動打怪。**
+
+        會做的事都是「把錯的假設丟掉」：
+
+        - 走不到的脫離目標／漫遊目標記進 `_bad_goals`（下次不要再挑它）
+        - 鎖定的怪、走路佇列、座標喚醒的節流通通歸零
+
+        ⚠ 這裡**不碰** `_traveler`（被傳走時走回原圖那條）——那條自己有
+        重新規劃的機制，從外面清掉反而會讓它重來一次已經走過的路。
+        """
+        self._stuck += 1
+        doing = self._doing()
+        for goal in (self._escape_goal, self._roam_goal):
+            if goal is not None:
+                self._bad_goals.append((goal, now + _BAD_GOAL_SEC))
+        self._escape_goal = None
+        self._roam_goal = None
+        self._aim = None
+        self._walker.clear()
+        self._stale_since = 0.0
+        self._woke_at = 0.0
+        self._progress_at = now
+        # ⚠ WARNING 級：使用者手上的預設層級就是 WARNING，這一行必須看得到
+        #   （[ENV-...]：INFO 在他的日誌裡一行都不會出現）。
+        log.warning("[自動打怪] 卡住了（%s）—— 清掉狀態重來，第 %d 次",
+                    doing, self._stuck)
+        self._note(
+            f"⚠ {_FROZEN_SEC:.0f} 秒沒進展（{doing}）—— 換個目標重來"
+            f"（第 {self._stuck} 次，**沒有**關掉自動打怪）"
+        )
 
     def _doing(self) -> str:
         """卡住的時候在做什麼 —— 給日誌看的一句話。"""
@@ -1313,6 +1350,13 @@ class FarmBot:
         if reader is None or reader.position_live:
             self._stale_since = 0.0
             return True
+        # ⚠⚠ **座標不是即時的時候，先把「正在脫離傳點」那件事放掉。**
+        #   這一支回 False 會讓整拍 `continue`，`_escape_warp()` 根本不會被叫到
+        #   —— 它裡面那個「12 秒走不到就換方向」的出口等於不存在，
+        #   `_escape_goal` 就永遠留在那裡。實機踩過（2026-08-31）：
+        #   `_doing()` 一路回報「正在脫離傳點禁區（往 (153, 20)）」，
+        #   45 秒後被當成卡住。座標回來之後本來就要重算，留著沒有意義。
+        self._escape_goal = None
         if not self._stale_since:
             self._stale_since = now
             return False

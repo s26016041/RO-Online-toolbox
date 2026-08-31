@@ -51,11 +51,16 @@ def test_a_frozen_entry_position_does_not_look_like_being_stuck():
 
 
 def test_really_stuck_is_still_caught_without_a_live_position():
-    """連移動都不送了 —— 那才是真的卡住，照樣要抓到。"""
+    """連移動都不送了 —— 那才是真的卡住，照樣要抓到。
+
+    ⚠ 「抓到」＝**清狀態重來並留紀錄**，不是關掉自動打怪
+    （使用者訂的規則：只有死掉才准關，見 GAMEDATA [DAT-050]）。
+    """
     bot = _bot(live=False)
     assert bot._alive(1000.0)
-    assert not bot._alive(1000.0 + 46.0)
-    assert "毫無進展" in bot.stats.note
+    assert bot._alive(1000.0 + 46.0), "卡住不是關掉自動打怪的理由"
+    assert bot._stuck == 1, "但要算進去、留紀錄"
+    assert "沒進展" in bot.stats.note
 
 
 def test_a_live_position_still_uses_the_coordinates():
@@ -64,7 +69,9 @@ def test_a_live_position_still_uses_the_coordinates():
     assert bot._alive(1000.0)
     bot._link.reader.pos = (20, 377)
     assert bot._alive(1000.0 + 46.0), "位置變了就是有在動"
-    assert not bot._alive(1000.0 + 100.0), "位置又不動了就該抓到"
+    assert bot._stuck == 0, "有在動就不算卡住"
+    assert bot._alive(1000.0 + 100.0)
+    assert bot._stuck == 1, "位置又不動了就該抓到"
 
 
 def test_missing_component_is_said_once_not_every_tick(caplog):
