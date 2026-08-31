@@ -492,9 +492,6 @@ class TravelBot:
                 continue
 
             self._stats.here = status.map_name
-            # ⚠ 學到的「這段 NPC 傳送我用不了」是**跟著角色**存的
-            #   （前置條件每個角色不一樣），所以讀到名字就交給 Traveler。
-            self._traveler.set_character(getattr(status, "name", "") or "")
             if self._paused.is_set():
                 self._hold()
                 continue

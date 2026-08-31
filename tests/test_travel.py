@@ -375,9 +375,6 @@ def test_travel_bot_logs_the_traveler_progress(caplog):
         def __init__(self, stop) -> None:
             self._stop = stop
 
-        def set_character(self, _name):
-            pass
-
         def update(self, *_args):
             self._stop.set()   # 只跑一拍
             return "walking"
@@ -1227,3 +1224,30 @@ def test_an_unknown_map_falls_back_to_the_internal_name():
         Hop("no_such_map", 1, 1, "also_missing", 2, 2),
     ])
     assert "no_such_map" in text and "also_missing" in text
+
+
+# ---- 有前置的傳送直接濾掉（使用者 2026-08-31 指定）------------------------
+
+
+def test_gated_npc_warps_are_never_planned():
+    """★ 使用者：「不可以猜，也不能學習。伊甸園入會、結婚…這不就是箝制嗎，
+    我們直接濾掉就好」。
+
+    導航資料**沒有「有沒有前置」這個欄位**，排進路線角色就會走到 NPC 面前
+    卡住（對話根本不會給你傳送的選項）。
+    """
+    from ro_toolbox.services import travel as mod
+
+    assert "moc_para01" in mod.GATED_MAPS, "伊甸園總部要先入會"
+    assert "jawaii" in mod.GATED_MAPS, "加維要結婚"
+    for map_name in ("prontera", "izlude", "geffen", "alberta"):
+        dests = {row[2] for row in mod._npc_links(map_name)}
+        assert not (dests & mod.GATED_MAPS), f"{map_name} 還排得到有前置的地圖"
+
+
+def test_the_ordinary_npc_warps_are_still_there():
+    """⛔ 反面：不准把好好的 NPC 傳送一起濾掉。"""
+    from ro_toolbox.services import travel as mod
+
+    dests = {row[2] for row in mod._npc_links("izlude")}
+    assert "alberta" in dests, "船員通往艾爾貝塔，那條是好的"

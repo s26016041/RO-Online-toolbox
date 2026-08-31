@@ -28,7 +28,6 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ro_toolbox.services import hop_blocklist
 from ro_toolbox.services.gamedata import (
     npc_links_on_map,
     warp_landings_on,
@@ -186,6 +185,33 @@ def describe_route(start_map: str, route: list[Hop]) -> str:
     return "\n".join(lines)
 
 
+#: **有前置條件才進得去的地圖** —— 這些的 NPC 傳送一律不排進路線。
+#:
+#: 使用者訂的（2026-08-31）：「不可以猜，也不能學習。伊甸園入會、結婚…
+#: 這不就是箝制嗎，我們直接濾掉就好」。
+#:
+#: ⚠ 導航資料（`navi_link_tw.lub`）**沒有「有沒有前置」這個欄位** ——
+#: 它只說「這隻 NPC 通往哪張圖」。排進路線的話角色會走到他面前然後卡住
+#: （對話根本不會給你傳送的選項）。
+#:
+#: ⛔ **這張表只准放使用者確認過的**。不准從名字猜、不准「看起來像任務地圖」
+#: 就加進來 —— 加錯的代價是把一條**本來走得通**的路默默砍掉，
+#: 而使用者只會看到「怎麼繞遠路」。要新增就先問人。
+#:
+#: 目前的內容（使用者指名的兩種箝制）：
+#:   moc_para01  伊甸園總部 —— 要先加入伊甸園
+#:   jawaii      加維 —— 要結婚
+GATED_MAPS = frozenset({"moc_para01", "jawaii"})
+
+
+def _npc_links(map_name: str):
+    """這張圖上要跟 NPC 講話的連結，**濾掉有前置的那些**（`GATED_MAPS`）。"""
+    return [
+        row for row in npc_links_on_map(map_name)
+        if row[2] not in GATED_MAPS
+    ]
+
+
 def plan_route(
     start_map: str,
     goal_map: str,
@@ -216,7 +242,7 @@ def plan_route(
         current = queue.popleft()
         links = [(x, y, d, dx, dy, "", 0) for x, y, d, dx, dy in warps_on_map(current)]
         if allow_npc:
-            links += list(npc_links_on_map(current))
+            links += list(_npc_links(current))
         for x, y, dest, dx, dy, who, who_id in links:
             if dest in seen or (current, x, y) in avoid:
                 continue
@@ -256,7 +282,7 @@ def nearest_map_with(
         current = queue.popleft()
         links = [(x, y, d, dx, dy, "", 0) for x, y, d, dx, dy in warps_on_map(current)]
         if allow_npc:
-            links += list(npc_links_on_map(current))
+            links += list(_npc_links(current))
         for x, y, dest, dx, dy, who, who_id in links:
             if dest in seen or (current, x, y) in avoid:
                 continue
@@ -287,7 +313,7 @@ def why_no_route(start_map: str, goal_map: str) -> tuple[str, int, int, str, str
     while queue and len(seen) < 4000:
         current = queue.popleft()
         walk = [(x, y, d, dx, dy, "", 0) for x, y, d, dx, dy in warps_on_map(current)]
-        for x, y, dest, dx, dy, who, _id in walk + list(npc_links_on_map(current)):
+        for x, y, dest, dx, dy, who, _id in walk + list(_npc_links(current)):
             if dest in seen:
                 continue
             gate = (current, x, y, dest, who) if who else None
@@ -372,12 +398,7 @@ class Traveler:
         walker: Walker,
         now: Callable[[], float],
         terrain_loader: Callable[[str], MapTerrain] = load_terrain,
-        character: str = "",
     ) -> None:
-        #: 誰在走。學到的「這段 NPC 傳送我用不了」是**跟著角色**存的 ——
-        #: 前置條件每個角色不一樣（伊甸園入會、結婚…），見
-        #: `services/hop_blocklist.py`。
-        self._character = character
         self._walker = walker
         self._now = now
         self._load = terrain_loader
@@ -469,13 +490,6 @@ class Traveler:
         self._route = []
         self._route_map = ""
         self._avoid.clear()
-        # ★ 以前踩過、確定走不通的 NPC 傳送直接跳過（使用者：「有前置才能
-        #   使用的 NPC 傳送也要記得把有它的路徑刪除」）。**一趟一趟重讀**，
-        #   使用者解掉前置之後把紀錄清掉就會立刻生效。
-        learned = hop_blocklist.blocked(self._character)
-        if learned:
-            self._avoid |= learned
-            log.info("跳過 %d 段學過走不通的 NPC 傳送", len(learned))
         self._replans = 0
         self._stale_since = 0.0
         self._hops.clear()
@@ -1168,18 +1182,6 @@ class Traveler:
         )
         return "waiting"
 
-    def set_character(self, name: str) -> None:
-        """誰在走。學到的「這段 NPC 傳送我用不了」是**跟著角色**存的。
-
-        ⚠ 名字是**讀到之後**才知道的（建 Traveler 的時候還沒登入／還沒讀到
-        角色狀態），所以這裡是 setter 不是建構參數。換人就把已經帶進來的
-        封鎖段丟掉重來 —— 別的角色的前置跟我無關。
-        """
-        if not name or name == self._character:
-            return
-        self._character = name
-        self._avoid |= hop_blocklist.blocked(name)
-
     def npc_impassable(self) -> bool:
         """跟 NPC 講不通（看不懂選單）—— 把這一段當走不過去，改走別條路。
 
@@ -1193,9 +1195,6 @@ class Traveler:
         hop = self._npc_wait
         if hop is None:
             return False
-        # ⚠ 先記帳再改路線：這一段**確定過不去**（多半是有前置條件的傳送）。
-        #   踩滿 `NEEDED_FAILURES` 次才會真的封起來 —— 一次可能只是意外。
-        hop_blocklist.remember(self._character, hop, "跟 NPC 講不通")
         keep_route = list(self._route)
         keep_map = self._route_map
         self._npc_wait = None

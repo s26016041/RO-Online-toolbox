@@ -453,14 +453,23 @@ def test_a_sole_destination_npc_can_be_confirmed():
     assert talk.done is True and talk.failed is False
 
 
-def test_the_same_menu_is_refused_when_the_npc_has_several_destinations():
-    """⚠ 有好幾個目的地卻跳「確定嗎」—— 代表我們看漏了什麼，停手。"""
+def test_the_only_safe_option_is_pressed_even_without_a_place_name():
+    """★ 沒有地名可比、又只剩一個能安全點的選項 —— **按下去**。
+
+    ⚠ 這一條跟舊版相反（舊版：有好幾個目的地卻跳「確定嗎」就停手）。
+    使用者 2026-08-31 訂的：「如果沒有更好辦法，我覺得當沒有選擇就無腦按
+    確定、下一步、離開之類的；當有選擇就選最像的」。
+
+    停下來的代價是角色站在 NPC 面前**整晚不動**；按下去最壞的情況是多繞一段路
+    （走錯了 `Traveler` 會重新規劃）。使用者選了後者。
+    ⛔ 煞車還在：記憶點／倉庫／手推車／離開一律不點（見 `NEVER_PICK`）。
+    """
     talk = nd.NpcTalk(BOAT_GID, "衛星都市 依斯魯得島", npc="船員",
                       sole=False, now=Clock())
     _drain(talk)
     talk.feed(nd.ZC_MENU_LIST, _menu(BOAT_GID, "使用", "結束"))
-    assert _drain(talk) == []
-    assert talk.failed is True
+    assert [p.hex() for p in _drain(talk)] == ["b8005b00000001"]
+    assert talk.failed is False
 
 
 def test_confirm_never_picks_the_way_out():
@@ -692,3 +701,38 @@ def test_the_exit_option_is_never_picked_by_elimination():
         ["依斯魯得島 -> 600 z", "結束"], "獸人村", ["衛星都市 依斯魯得島"]
     )
     assert index is None, why
+
+
+# ---- 最後一招：安全選項裡挑最像的（使用者 2026-08-31 指定）----------------
+
+
+def test_the_dangerous_options_are_never_picked():
+    """⛔ 「記憶點」會**改掉玩家的存檔點**、倉庫與手推車**要錢**。
+
+    不管多像都不點 —— 這是「選最像的」那條退路唯一的煞車。
+    """
+    kafra = ["記憶點", "倉庫服務", "手推車服務", "查詢其他資訊", "結束"]
+    index, why = nd.pick_anything(kafra, "記憶之都")
+    assert index is None or nd.place_of(kafra[index - 1]) == "查詢其他資訊", why
+    for danger in ("記憶點", "倉庫服務", "手推車服務"):
+        assert danger not in [kafra[i - 1] for i in ([index] if index else [])]
+
+
+def test_the_only_safe_option_wins_without_a_place_name():
+    """沒有地名可比、又只剩一個能安全點的 —— 那個就是它。"""
+    index, why = nd.pick_anything(["使用", "結束"], "衛星都市 依斯魯得島")
+    assert index == 1, why
+
+
+def test_two_equally_likely_options_are_still_refused():
+    """⛔ 兩個一樣像就是分不出來 —— 退路也不准亂賭。"""
+    index, why = nd.pick_anything(
+        ["拉赫爾東 -> 100 z", "拉赫爾西 -> 100 z"], "拉赫爾"
+    )
+    assert index is None, why
+
+
+def test_nothing_safe_to_press_is_refused():
+    """全部都是不准點的 → 停手。"""
+    index, _why = nd.pick_anything(["記憶點", "倉庫服務", "結束"], "隨便")
+    assert index is None

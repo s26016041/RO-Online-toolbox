@@ -87,6 +87,17 @@ SUBMENU_OPTIONS = ("傳送服務",)
 #: ⛔ `結束`／`取消` 永遠不准進來。
 CONFIRM_OPTIONS = ("使用", "回去")
 
+#: ⛔ **絕對不准點的選項**（點下去會花錢或改掉玩家的存檔點）。
+#:
+#: 這是「選最像的」那條退路唯一的煞車。使用者要的是「有選擇就選最像的」，
+#: 但「最像的」在完全沒有地名的選單上可能是任何東西 —— 卡普拉第一層長這樣：
+#:
+#:     記憶點 : 倉庫服務 : 傳送服務 : 手推車服務 : 查詢其他資訊 : 結束
+#:
+#: 「記憶點」會**改掉玩家的重生點**、倉庫與手推車**要錢**。那三個不管多像
+#: 都不點；剩下的才拿去比。
+NEVER_PICK = ("記憶點", "倉庫", "手推車")
+
 #: 「離開對話」的選項。⛔ **永遠不准選** —— 選了等於自己把對話關掉還以為成功了。
 #: 也是「排除法」的依據：只通一個地方、而且**只剩一個不是離開的選項**時，
 #: 那個必然就是「做這件事」，不必每遇到一個新的確認詞就回來加白名單。
@@ -446,6 +457,51 @@ def pick_option(
     return None, f"選單裡沒有「{core}」，也沒有夠像的：{options}"
 
 
+def pick_anything(options: list[str], display_name: str) -> tuple[int | None, str]:
+    """**最後一招**：白名單都沒中時，在「安全的選項」裡挑最像目的地的那個。
+
+    使用者訂的（2026-08-31）：「當有選擇就選最像的」。
+
+    ## 為什麼可以放寬到這裡
+
+    前面三層（完全相同／包含／配對）都是**要求分得出來**才動手，分不出來就停。
+    停下來的代價是角色站在 NPC 面前整晚不動 —— 使用者的規矩是
+    「不要叫使用者持續配合」，所以最後給一條退路。
+
+    ## 煞車還在
+
+    - `NEVER_PICK` 裡的一律不點（記憶點會改存檔點、倉庫／手推車要錢）。
+    - `EXIT_OPTIONS` 一律不點（點了等於自己把對話關掉還以為成功了）。
+    - 剩下**剛好一個**就選它；好幾個就挑最像的，而且要**比第二名明顯**
+      （沿用 `_FUZZY_MARGIN`）—— 兩個一樣像就是分不出來，那時候還是停。
+    """
+    safe = [
+        (index, place_of(opt))
+        for index, opt in enumerate(options, start=1)
+        if place_of(opt)
+        and not _is_exit(place_of(opt))
+        and not any(word in _squash(opt) for word in NEVER_PICK)
+    ]
+    if not safe:
+        return None, "沒有可以安全點下去的選項"
+    if len(safe) == 1:
+        index = safe[0][0]
+        return index, f"第 {index} 項「{options[index - 1]}」是唯一能安全點的選項"
+    full = _squash(display_name)
+    core = _squash(core_name(display_name))
+    scored = sorted(
+        ((index, _similarity(place, full, core)) for index, place in safe),
+        key=lambda pair: pair[1], reverse=True,
+    )
+    index, score = scored[0]
+    if score - scored[1][1] < _FUZZY_MARGIN:
+        return None, f"「{core}」跟好幾個選項一樣像，分不出來：{options}"
+    return index, (
+        f"第 {index} 項「{options[index - 1]}」是安全選項裡最像「{core}」的"
+        f"（{score:.0%}）"
+    )
+
+
 def pick_submenu(options: list[str]) -> tuple[int | None, str]:
     """這一層沒有目的地時，挑一個「往下一層」的選項。回 (編號從 1 開始, 說明)。
 
@@ -603,9 +659,22 @@ class NpcTalk:
                     self.done = True
                     return
                 sub_why = f"{sub_why}；{ok_why}"
-            # ⛔ 分不出來就**不准賭**：猜錯是把人傳到別的島、或花掉他的錢。
+            # ★ 最後一招：在**安全的選項**裡挑最像的（使用者：「當有選擇就選
+            #   最像的」）。停下來的代價是角色站在 NPC 面前整晚不動。
+            #   ⛔ 記憶點／倉庫／手推車／離開一律不點，見 `pick_anything`。
+            index, any_why = pick_anything(options, self._want)
+            if index is not None:
+                self.cost = cost_of(options[index - 1])
+                self.note = f"跟「{self._npc}」對話：{any_why}"
+                log.info("%s", self.note)
+                self._push(build_choose(self._gid, index))
+                return
+            # ⛔ 連最像的都分不出來就**不准賭**：猜錯是把人傳到別的島、
+            #   或花掉他的錢。
             self.failed = True
-            self.note = f"⚠ 看不懂 NPC 的選單，沒有動作：{why}；{sub_why}"
+            self.note = (
+                f"⚠ 看不懂 NPC 的選單，沒有動作：{why}；{sub_why}；{any_why}"
+            )
             log.warning("%s", self.note)
             return
         # 付錢是這趟路本來就要的花費，不是警告 —— 講清楚「找誰、去哪、多少」就好。
