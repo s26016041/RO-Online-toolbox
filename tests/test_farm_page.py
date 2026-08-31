@@ -1880,3 +1880,83 @@ def test_nothing_is_restarted_while_the_character_is_not_logged_in(qtbot, monkey
     page._watch_potion_alive()
     assert page._potions[1234].running is False, "沒登入就不要動"
     assert card.auto_potion.isChecked() is True, "但勾勾照樣留著"
+
+
+# ---- 連線回來就把自動打怪接回去（使用者 2026-08-31 指定）-------------------
+#
+# 使用者：「連線斷掉回來要自動戰鬥開著而不是關閉」。
+# 斷線那一刻 FarmBot 一定要停（不停就是對著死掉的連線一直送封包，[PKT-082]），
+# 但停掉之後**沒有人負責開回去** —— 掛一整晚，回來角色站在原地。
+
+
+def _farm_alive_card(page, qtbot, monkeypatch, *, map_name="mjolnir_07"):
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.setattr(mod, "FarmBot", _ResumeFarmBot)
+    monkeypatch.setattr(mod, "find_server", lambda _pid: ("1.2.3.4", 10000))
+    card = _wired_card(page, qtbot)
+    card.auto_hunt.setChecked(True)                 # 使用者要掛機
+    page._farm_map[1234] = "mjolnir_07"
+
+    class _Reader:
+        def read(self):
+            return type("S", (), {
+                "hp": 1000, "map_name": map_name, "has_exp": False,
+                "base_exp": 0, "job_exp": 0,
+            })()
+
+    page._readers[1234] = _Reader()
+    return card
+
+
+def test_the_farming_comes_back_when_the_link_does(qtbot, monkeypatch):
+    """★ 斷線→回來：**自己把自動打怪接回去**，不用人在電腦前面。"""
+    page = _page(qtbot, monkeypatch)
+    card = _farm_alive_card(page, qtbot, monkeypatch)
+    page._bots[1234].stats.running = False          # 斷線時 bot 自己停了
+    page._set_auto_hunt(1234, False, keep_intent=True)
+    assert page._wants_farm(1234) is True, "意圖要留著"
+
+    page._farm_retry.clear()
+    page._watch_farm_alive()
+
+    assert card.auto_hunt.isChecked() is True
+    assert page._bots[1234].stats.running is True
+
+
+def test_it_does_not_start_farming_in_town(qtbot, monkeypatch):
+    """⛔ 回連之後人在存檔點（城裡）—— 那時候要走回去，不是原地開打。
+
+    在城裡開打只會空轉，而「先走回去、到了再開打」是另一條路
+    （`_resume_farm` / `_watch_travel_resumes`）。
+    """
+    page = _page(qtbot, monkeypatch)
+    card = _farm_alive_card(page, qtbot, monkeypatch, map_name="prontera")
+    page._set_auto_hunt(1234, False, keep_intent=True)
+    page._farm_retry.clear()
+    page._watch_farm_alive()
+    assert card.auto_hunt.isChecked() is False
+
+
+def test_it_waits_for_the_link_instead_of_spinning(qtbot, monkeypatch):
+    """⛔ 還沒連上就重開只會每秒噴一行定位失敗（跟自動補水同一個坑）。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot, monkeypatch)
+    card = _farm_alive_card(page, qtbot, monkeypatch)
+    page._set_auto_hunt(1234, False, keep_intent=True)
+    monkeypatch.setattr(mod, "find_server", lambda _pid: None)   # 連線還沒回來
+    page._farm_retry.clear()
+    page._watch_farm_alive()
+    assert card.auto_hunt.isChecked() is False
+
+
+def test_it_keeps_its_hands_off_a_supply_run(qtbot, monkeypatch):
+    """⛔ 補給途中不碰 —— 那條路自己會在補完之後接回去。"""
+    page = _page(qtbot, monkeypatch)
+    card = _farm_alive_card(page, qtbot, monkeypatch)
+    page._set_auto_hunt(1234, False, keep_intent=True)
+    page._restocks[1234] = object()
+    page._farm_retry.clear()
+    page._watch_farm_alive()
+    assert card.auto_hunt.isChecked() is False

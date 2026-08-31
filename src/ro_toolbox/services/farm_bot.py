@@ -948,8 +948,13 @@ class FarmBot:
             # 使用者實測回報「中間有障礙物比如樹，他會卡住不繞過去」。
             # 繞得過去的照樣繞（`_approach` 走的是 A*，本來就會繞開障礙）；
             # 這裡處理的是**真的繞不過去**那一種。
-            if not self._approach(pos, mob.pos):
-                self._give_up_target(aim, now, "繞不過去")
+            #
+            # ⚠⚠ 理由由 `_approach()` 給 —— 它分得出「真的過不去」「牠在傳點
+            # 禁區裡」「已經走到最近那一格了」。舊版一律寫「繞不過去」，
+            # 連「剛好走到了」也算進去（見 `_approach` 的說明）。
+            why = self._approach(pos, mob.pos)
+            if why is not None:
+                self._give_up_target(aim, now, why)
             return
         # 貼到了：直線 _ATTACK_RANGE 格內，而且中間乾淨
         self._walker.clear()
@@ -1065,18 +1070,46 @@ class FarmBot:
         self._aim = None
         self._note(f"打到空氣（座標過時），換下一隻｜共 {self._stats.missed} 次")
 
-    def _approach(self, pos: tuple[int, int], goal: tuple[int, int]) -> bool:
-        """走到怪**旁邊**的可走格。回傳 True = 還在路上。"""
+    def _approach(self, pos: tuple[int, int], goal: tuple[int, int]) -> str | None:
+        """走到怪**旁邊**的可走格。
+
+        回 `None` ＝ 沒問題（還在路上，或這一段已經走完了）；
+        回字串 ＝ 放棄這一隻的**理由**，呼叫端拿去寫日誌。
+
+        ## ⚠ 為什麼不是 True/False
+
+        舊版是 `return self._walker.update(pos) == "walking"`，於是
+        `"arrived"`（走到那一格了）與 `"idle"`（沒路可走＝已經站在目標上）
+        通通被當成失敗，呼叫端一律報「繞不過去」並把那隻怪**列入 30 秒黑名單**。
+
+        使用者實測回報：「繞路有問題，常常會說繞不過去害我卡住」——
+        真正在發生的事是**我們剛好走到了**，然後就把牠丟掉了。
+        `_plan_path()` 在「起點就是終點」時回空 list，`if not path` 也踩同一個坑。
+
+        現在把「走完了」當成正常：下一拍會用新的距離重新判斷，多半直接開打。
+        真的過不去的三種情況各有各的說法，日誌看得出是哪一種。
+        """
         target = self._beside(goal, pos)
         if target is None:
-            return False
+            return "牠站的地方四周都不能走"
+        if target == pos:
+            # 已經站在最靠近牠的那一格了，還被判定打不到 —— 再走也沒有用
+            # （多半是牠站在不可走的格上，直線過不去）。
+            return "站到最近的那一格了還是打不到"
+        if target in self._warp_zone:
+            # 過去要踩進傳點禁區 —— 那是**不去**，不是走不到。
+            return "牠在傳點禁區裡"
         current = self._walker.goal
         if current is None or max(abs(current[0] - target[0]), abs(current[1] - target[1])) > 2:
             path = self._plan_path(pos, target)
-            if not path:
-                return False
-            self._walker.set_path(path, avoid=self._warp_zone)
-        return self._walker.update(pos) == "walking"
+            if path is None:
+                return "繞不過去"
+            if path:
+                self._walker.set_path(path, avoid=self._warp_zone)
+        state = self._walker.update(pos)
+        if state in ("walking", "arrived", "idle"):
+            return None
+        return "走到一半被擋住"
 
     def _beside(self, goal: tuple[int, int], pos: tuple[int, int]) -> tuple[int, int] | None:
         """挑一個緊鄰怪、離我最近的可走格（怪站的那格也算）。"""

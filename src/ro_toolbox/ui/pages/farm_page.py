@@ -88,6 +88,14 @@ _READ_INTERVAL_MS = 1000  # 多久更新一次數值
 #: 所以勾勾一律留著，bot 停掉就重新開一個 —— 退避只是為了沒登入時
 #: 不要每秒重試。
 _POTION_RETRY_SEC = 5.0
+
+#: 自動打怪停掉之後，多久檢查一次「該不該把它接回去」。
+#:
+#: ⚠ 使用者指定（2026-08-31）：「**連線斷掉回來要自動戰鬥開著而不是關閉**」。
+#: 斷線那一刻 `FarmBot` 會自己停（不停的話就是對著死掉的連線一直送封包，
+#: [PKT-082]），但連線回來之後**沒有人把它開回去** —— 使用者掛一整晚，
+#: 回來看到角色站在原地。退避是為了「還沒連上」時不要每秒重開一個 bot。
+_FARM_RETRY_SEC = 5.0
 _RETRY_AFTER_SEC = 10.0  # 定位失敗後隔多久重試（多半是還沒登入）
 #: 回連之後，最多等這麼久讓新遊戲的分頁長出來。
 #:
@@ -1192,6 +1200,8 @@ class FarmPage(BasePage):
         self._auto_restock: set[int] = set()
         #: 自動補水下次可以重開的時刻（見 `_watch_potion_alive`）。
         self._potion_retry: dict[int, float] = {}
+        #: 自動打怪下次可以接回去的時刻（見 `_watch_farm_alive`）。
+        self._farm_retry: dict[int, float] = {}
         #: **使用者要這隻角色掛機**（存角色名，不存 PID —— 重連之後 PID 會變）。
         #:
         #: ⚠⚠ 這是**意圖**，不是「現在有沒有在跑」。中間有一大堆東西會暫時
@@ -1282,6 +1292,7 @@ class FarmPage(BasePage):
         self._read_timer.timeout.connect(self._watch_overweight)
         self._read_timer.timeout.connect(self._watch_supply_runs)
         self._read_timer.timeout.connect(self._watch_potion_alive)
+        self._read_timer.timeout.connect(self._watch_farm_alive)
         self._read_timer.timeout.connect(self._watch_travel_resumes)
         #: 定期重掃技能。**不能放在每秒的計時器裡** —— 掃一趟 2 秒，
         #: 每秒掃一次會把整頁拖垮（[MEM-043] 就是這樣被 bag.as_dict 拖慢的）。
@@ -2288,6 +2299,59 @@ class FarmPage(BasePage):
                 self._potions.pop(pid, None)
                 bot.stop()
             self._toggle_potion(pid, True)
+
+    def _watch_farm_alive(self) -> None:
+        """要掛機的角色**連線回來就把自動打怪接回去**。
+
+        使用者指定（2026-08-31）：「連線斷掉回來要自動戰鬥開著而不是關閉」。
+
+        ## 為什麼需要這一支
+
+        斷線的那一刻 `FarmBot` 一定要停 —— 不停就是對著死掉的連線一直送封包
+        （[PKT-082]：一小時 5,185 行錯誤，從頭到尾沒有人喊停）。但**停掉之後
+        沒有人負責開回去**：`_watch_travel_resumes()` 只管「走回練功地圖那一趟」
+        走完的情況，連線只是閃斷、角色還站在原地的那種它看不到。
+        使用者掛一整晚，回來就是角色站在原地。
+
+        ## 只在「確定可以打」的時候才接回去
+
+        - 連線要真的回來了（`find_server`）—— 沒登入就重開只會每 5 秒噴一行
+          定位失敗（跟 `_watch_potion_alive` 同一個坑）。
+        - **人要在練功地圖上**。回連之後角色在存檔點（城裡），那時候要走的是
+          「先回去、到了再開打」那條路（`_resume_farm`），在城裡開打只會空轉。
+        - 補給、趕路、負重待處理的中途一律不碰 —— 那些流程結束時自己會接回去。
+        """
+        now = time.monotonic()
+        for pid in list(self._cards):
+            if not self._wants_farm(pid):
+                continue                       # 使用者本來就沒有要掛機
+            bot = self._bots.get(pid)
+            if bot is not None and bot.stats.running:
+                continue
+            if (pid in self._restocks or pid in self._supply_pending
+                    or pid in self._overweight_pending or pid in self._resume_farm
+                    or pid in self._arrived_pending):
+                continue                       # 補給／回程那幾條自己會接回去
+            traveler = self._travelers.get(pid)
+            if traveler is not None and traveler.running:
+                continue                       # 正在趕路
+            if now < self._farm_retry.get(pid, 0.0):
+                continue
+            self._farm_retry[pid] = now + _FARM_RETRY_SEC
+            if find_server(pid) is None:
+                continue                       # 連線還沒回來
+            wanted_map = self._farm_map.get(pid, "")
+            reader = self._readers.get(pid)
+            status = reader.read() if reader is not None else None
+            if status is None:
+                continue                       # 讀不到狀態就不亂開
+            if status.hp <= 0:
+                continue                       # 死著就別開（死亡本來就會清意圖）
+            if wanted_map and status.map_name and status.map_name != wanted_map:
+                continue                       # 不在練功地圖上 —— 交給回程那條
+            who = self._names.get(pid) or f"PID {pid}"
+            log.warning("「%s」連線回來了，自動打怪接回去", who)
+            self._set_auto_hunt(pid, True, keep_intent=True)
 
     def _watch_supply_runs(self) -> None:
         """沒水自己回城了 → **接著去補給，補完走回練功點**（使用者指定）。
