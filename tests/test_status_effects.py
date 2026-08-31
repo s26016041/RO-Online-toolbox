@@ -201,15 +201,17 @@ def test_reads_correctly_across_the_wrap():
 # ---- 顯示 ---------------------------------------------------------------
 
 
-@pytest.mark.parametrize("remaining,expected", [
-    (None, "加速術"),
-    (5_400, "加速術 5s"),
-    (61_200, "加速術 1:01"),
-    (210_000, "加速術 3:30"),
-])
-def test_describe(remaining, expected):
+@pytest.mark.parametrize("remaining", [None, 5_400, 61_200, 210_000])
+def test_describe_shows_the_name_only(remaining):
+    """★ 畫面上**只放名字**，不放剩餘秒數（使用者 2026-08-31 指定）。
+
+    那一行每秒都在跳（`5s` → `4s` → …），一排 buff 就是一整條在閃。
+    ⚠ 剩餘時間**沒有不讀** —— `remaining_ms` 照樣有值，補 buff 那條要用它
+    決定要不要重放；只是不畫出來。
+    """
     row = ActiveStatus(efst=12, name="加速術", remaining_ms=remaining, total_ms=None)
-    assert row.describe() == expected
+    assert row.describe() == "加速術"
+    assert row.remaining_ms == remaining, "資料不准跟著顯示一起砍掉"
 
 
 # ---- 特徵本身 -----------------------------------------------------------

@@ -820,6 +820,18 @@ class CharacterCard(QWidget):
                 (item_id, amount) for _slot, (item_id, amount) in sorted(rows.items())
                 if wants(item_id)
             ]
+            # ⚠⚠ **選著的道具暫時不在背包裡，也要留在清單上。**
+            #   喝完了、補給途中、背包還沒讀完 —— 這三種都會讓它從背包消失，
+            #   舊版就把選擇洗成「未選擇」，接著任何一次存檔（改門檻、切勾勾）
+            #   都會把 `None` 寫回設定檔。使用者實測回報：
+            #   「白狐喝水的藥水跟回程使用物品怎麼一直不見沒紀錄」——
+            #   回程道具（蝴蝶之翼）用完就不見，正是這條。
+            #   放一個「× 0」進去，選擇就不會被背包的內容洗掉。
+            chosen = combo.currentData()
+            if chosen is None:
+                chosen = self._want_item[key]
+            if chosen is not None and chosen not in {w[0] for w in wanted}:
+                wanted.append((chosen, 0))
             current = [
                 (combo.itemData(i), combo.itemData(i, Qt.ItemDataRole.UserRole + 1))
                 for i in range(1, combo.count())
@@ -831,9 +843,7 @@ class CharacterCard(QWidget):
                 continue
             if combo.view().isVisible():
                 continue  # 使用者正在挑，別把清單抽掉
-            keep = combo.currentData()
-            if keep is None:
-                keep = self._want_item[key]      # 還原存檔時選的那個
+            keep = chosen                        # 現在選的、或還原存檔時選的
             combo.blockSignals(True)
             combo.clear()
             combo.addItem("未選擇", None)
@@ -887,15 +897,25 @@ class CharacterCard(QWidget):
         from ro_toolbox.services.potion_store import PotionSaved
 
         return PotionSaved(
-            hp_item=self.hp_item.currentData(),
+            hp_item=self._picked("hp", self.hp_item),
             hp_percent=self.hp_threshold.value(),
-            sp_item=self.sp_item.currentData(),
+            sp_item=self._picked("sp", self.sp_item),
             sp_percent=self.sp_threshold.value(),
             enabled=self.auto_potion.isChecked(),
             go_home=self.go_home.isChecked(),
-            home_item=self.home_item.currentData(),
+            home_item=self._picked("home", self.home_item),
             travel_dest=self.chosen_destination(),
         )
+
+    def _picked(self, key: str, combo: QComboBox) -> int | None:
+        """使用者選的是哪個道具。**下拉是空的時候要回還原存檔時那個。**
+
+        ⚠ 背包是非同步讀的，分頁剛長出來的那幾秒下拉裡什麼都沒有 ——
+        那時候 `currentData()` 是 None，直接拿去存就是**把設定洗掉**。
+        使用者實測回報「藥水跟回程使用物品一直不見沒紀錄」就是這個。
+        `_want_item` 記的是「還原了但還選不起來」的那個，它才是使用者的意思。
+        """
+        return combo.currentData() or self._want_item.get(key)
 
     def potion_config(self) -> PotionConfig:
         return PotionConfig(

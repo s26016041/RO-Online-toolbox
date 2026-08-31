@@ -96,12 +96,15 @@ class ActiveStatus:
         return self.total_ms is None
 
     def describe(self) -> str:
-        if self.remaining_ms is None:
-            return self.name
-        seconds = self.remaining_ms // 1000
-        if seconds >= 60:
-            return f"{self.name} {seconds // 60}:{seconds % 60:02d}"
-        return f"{self.name} {seconds}s"
+        """介面上要顯示的字 —— **只有名字，不帶剩餘秒數**。
+
+        ⚠ 使用者指定（2026-08-31）：「BUFF 狀態剩下幾秒文字不需要顯示出來」。
+        那一行每秒都在跳（`5s` → `4s` → …），一排 buff 就是一整條在閃，
+        看不出重點。剩餘時間**照樣讀、照樣存**在 `remaining_ms` 裡 ——
+        補 buff 那條靠它決定要不要重放（見 `services/buffs.py`），
+        只是不畫在畫面上。
+        """
+        return self.name
 
 
 class StatusEffects:

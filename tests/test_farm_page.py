@@ -1960,3 +1960,45 @@ def test_it_keeps_its_hands_off_a_supply_run(qtbot, monkeypatch):
     page._farm_retry.clear()
     page._watch_farm_alive()
     assert card.auto_hunt.isChecked() is False
+
+
+# ---- 選著的道具不准被背包洗掉（使用者 2026-08-31 實機）--------------------
+#
+# 使用者：「白狐喝水的藥水跟回程使用物品怎麼一直不見沒紀錄」。
+# 回程道具（蝴蝶之翼）用完就從背包消失 → 下拉重建時選擇掉回「未選擇」→
+# 下一次存檔把 None 寫回設定檔。藥水補給途中也一樣。
+
+
+def test_a_potion_that_ran_out_keeps_its_place_in_the_list(qtbot):
+    """★ 選著的道具**暫時不在背包裡**也要留在清單上（顯示 × 0）。"""
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    card = make_card(qtbot)
+    card.set_slots({6: (501, 30), 7: (601, 2)})
+    card.apply_saved_potion(PotionSaved(hp_item=501, home_item=601, hp_percent=50))
+    assert card.hp_item.currentData() == 501
+    assert card.home_item.currentData() == 601
+
+    card.set_slots({6: (501, 30)})            # 蝴蝶之翼用完了
+    assert card.home_item.currentData() == 601, "選擇不准被背包洗掉"
+    assert card.saved_potion().home_item == 601, "更不准存成 None"
+
+
+def test_saving_before_the_bag_arrives_keeps_the_restored_choice(qtbot):
+    """★ 背包還沒讀到就存檔 —— 要存**還原回來的那個**，不是空的。
+
+    分頁剛長出來的那幾秒下拉裡什麼都沒有，`currentData()` 是 None。
+    這時候只要有任何一次存檔（改門檻、切勾勾），設定就被洗掉了。
+    """
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    card = make_card(qtbot)
+    card.apply_saved_potion(
+        PotionSaved(hp_item=501, home_item=601, hp_percent=55, go_home=True)
+    )
+    assert card.hp_item.currentData() is None, "下拉的確是空的"
+
+    saved = card.saved_potion()
+    assert saved.hp_item == 501, "存的要是使用者選的那個"
+    assert saved.home_item == 601
+    assert saved.hp_percent == 55
