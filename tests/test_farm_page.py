@@ -2002,3 +2002,17 @@ def test_saving_before_the_bag_arrives_keeps_the_restored_choice(qtbot):
     assert saved.hp_item == 501, "存的要是使用者選的那個"
     assert saved.home_item == 601
     assert saved.hp_percent == 55
+
+
+def test_the_buff_status_row_is_gone(qtbot):
+    """★ 卡片上不准再有「狀態：加速術 5s…」那一條（使用者 2026-08-31 指定）。
+
+    ⚠ 順帶釘住那個安靜的 bug：以前狀態列跟自動補助技能的提示**同名**
+    （`buff_label` 被指派兩次），後建的把前面那個蓋掉 ——
+    狀態列從頭到尾是空的，而兩個功能在搶同一個標籤。
+    """
+    card = make_card(qtbot)
+    assert not hasattr(card, "set_buffs"), "顯示狀態的那支已經沒有人要了"
+    assert not hasattr(card, "buff_label"), "撞名的那個標籤要一起清掉"
+    card.set_buff_note("幫隊友放「天使之賜福」")
+    assert card.buff_note_label.text() == "幫隊友放「天使之賜福」"

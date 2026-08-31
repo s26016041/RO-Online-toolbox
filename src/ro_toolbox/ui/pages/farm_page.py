@@ -393,13 +393,14 @@ class CharacterCard(QWidget):
         self.exp_label.setObjectName("pageSubtitle")
         layout.addWidget(self.exp_label)
 
-        # 身上有什麼狀態（buff／debuff）。讀不到與「沒有 buff」要看得出差別，
-        # 不然功能壞掉會長得跟「剛好沒 buff」一模一樣（見 set_buffs）。
-        self.buff_label = QLabel("")
-        self.buff_label.setObjectName("pageSubtitle")
-        self.buff_label.setWordWrap(True)
-        layout.addWidget(self.buff_label)
-
+        # ⛔ 這裡本來有一條「狀態：加速術 5s　天使之障壁 1:20…」。
+        #    **拿掉了**（使用者 2026-08-31 指定：「不要出現那狀態列，
+        #    顯示狀態文字沒用」）。身上的狀態照樣讀 —— 補 buff 那條靠它決定
+        #    要不要重放（`services/buffs.py`）—— 只是不畫在卡片上。
+        #
+        # ⚠ 順帶修掉一個安靜的 bug：這個 `buff_label` 跟下面自動補助技能
+        #    那個**同名**，後建的會把它蓋掉，於是這一條從頭到尾都是空的，
+        #    而兩個功能在搶同一個標籤。下面那個已經改名 `buff_note_label`。
         self._overweight_notified = False
         self._note_text = "定位中…"
         self._last_alert = ""
@@ -421,10 +422,12 @@ class CharacterCard(QWidget):
         self.skills = SkillPanel()
         self.skills.changed.connect(self.skills_changed)
         layout.addWidget(self.skills)
-        self.buff_label = QLabel("")
-        self.buff_label.setObjectName("pageSubtitle")
-        self.buff_label.setVisible(False)
-        layout.addWidget(self.buff_label)
+        #: 自動補助技能在做什麼（「幫隊友放…」）。跟身上的狀態清單無關 ——
+        #: 那條已經拿掉了，見上面 `_overweight_notified` 前面那段說明。
+        self.buff_note_label = QLabel("")
+        self.buff_note_label.setObjectName("pageSubtitle")
+        self.buff_note_label.setVisible(False)
+        layout.addWidget(self.buff_note_label)
 
         self.buff_stats.connect(self._apply_buff_stats)
         self.restock_stats.connect(self._apply_restock_stats)
@@ -956,8 +959,8 @@ class CharacterCard(QWidget):
             self.set_note(stats.note)
 
     def set_buff_note(self, text: str) -> None:
-        self.buff_label.setText(text)
-        self.buff_label.setVisible(bool(text))
+        self.buff_note_label.setText(text)
+        self.buff_note_label.setVisible(bool(text))
 
     def _apply_buff_stats(self, stats) -> None:  # noqa: ANN001 - BuffStats
         """自動補助技能的近況。
@@ -1078,20 +1081,6 @@ class CharacterCard(QWidget):
         bar.setValue(int(percent))
         # 遊戲畫面只給到小數一位且無條件捨去，這裡多給一位看得出有沒有在動
         label.setText(f"{exp:,} / {need:,}　{percent:.2f}%")
-
-    def set_buffs(self, rows) -> None:
-        """身上的狀態那一行。
-
-        三種情形要分得出來（CLAUDE.md：安靜地做錯事一律當 bug）：
-        `None` = 問不出來、`[]` = 確定身上沒東西、有內容 = 列出來。
-        """
-        if rows is None:
-            self.buff_label.setText("狀態：讀不到（定位失敗或內容不可信）")
-            return
-        if not rows:
-            self.buff_label.setText("狀態：無")
-            return
-        self.buff_label.setText("狀態：" + "　".join(row.describe() for row in rows))
 
     def set_exp_gain(self, text: str) -> None:
         self.exp_label.setText(text)
@@ -2617,7 +2606,6 @@ class FarmPage(BasePage):
             self._failures[pid] = 0
             card.update_status(status)
             card.set_exp_gain(self._exp_gain_text(pid, status))
-            card.set_buffs(reader.status_effects())
             index = self.tabs.indexOf(card)
             if index >= 0 and status.name and self.tabs.tabText(index) != status.name:
                 self.tabs.setTabText(index, status.name)

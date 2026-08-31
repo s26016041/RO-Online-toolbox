@@ -199,19 +199,18 @@ def test_reads_correctly_across_the_wrap():
 
 
 # ---- 顯示 ---------------------------------------------------------------
+#
+# ⛔ 卡片上那條「狀態：…」**已經拿掉了**（使用者 2026-08-31 指定：
+#    「不要出現那狀態列，顯示狀態文字沒用」），連帶 `describe()` 也刪了。
+#    ⚠ 資料沒有跟著砍：`remaining_ms` 照樣讀 —— 補 buff 那條靠它決定
+#    要不要重放。下面這條就是在釘「顯示砍掉、資料留著」。
 
 
 @pytest.mark.parametrize("remaining", [None, 5_400, 61_200, 210_000])
-def test_describe_shows_the_name_only(remaining):
-    """★ 畫面上**只放名字**，不放剩餘秒數（使用者 2026-08-31 指定）。
-
-    那一行每秒都在跳（`5s` → `4s` → …），一排 buff 就是一整條在閃。
-    ⚠ 剩餘時間**沒有不讀** —— `remaining_ms` 照樣有值，補 buff 那條要用它
-    決定要不要重放；只是不畫出來。
-    """
+def test_the_remaining_time_is_still_read_even_though_it_is_not_shown(remaining):
     row = ActiveStatus(efst=12, name="加速術", remaining_ms=remaining, total_ms=None)
-    assert row.describe() == "加速術"
     assert row.remaining_ms == remaining, "資料不准跟著顯示一起砍掉"
+    assert not hasattr(row, "describe"), "顯示用的那支已經沒有人要了"
 
 
 # ---- 特徵本身 -----------------------------------------------------------
