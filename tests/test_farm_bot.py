@@ -289,12 +289,12 @@ def test_giving_up_is_check_hit_s_job_not_the_resend_gate(monkeypatch):
     assert bot._stats.missed == 1
 
 
-# ---- 黑名單會被「又看到它」推翻 --------------------------------------------
+# ---- 「打到空氣」的黑名單只被**新座標**推翻 --------------------------------
 
 
-def test_a_fresh_sighting_lifts_the_miss_blacklist(monkeypatch):
-    """拉黑多半是因為座標過時打到空氣。之後又收到那隻怪的實體封包，
-    就代表它真的還在、而且我們拿到新座標了 —— 那比黑名單可信。
+def test_a_new_position_lifts_the_miss_blacklist(monkeypatch):
+    """拉黑的理由是「我們手上的座標過時了」，所以推翻它的證據只有一個：
+    **座標真的變了**。
 
     不放行的話，附近幾隻怪一被拉黑，畫面上明明有怪、程式卻說「附近沒怪」，
     而且要等 20 秒（使用者實際回報）。
@@ -309,16 +309,43 @@ def test_a_fresh_sighting_lifts_the_miss_blacklist(monkeypatch):
         None if 777 in (skip or set()) else mob
     ))
 
-    # 打到空氣 → 拉黑
+    # 打到空氣 → 拉黑，並記下「我們以為牠在哪」
     bot._skip[777] = T0 + 20
     bot._skip_at[777] = T0
-    mob.seen_at = T0 - 1
+    bot._miss_pos[777] = (5, 5)
     assert bot._pick_target((0, 0)) is None, "剛拉黑就該跳過"
 
-    # 又收到它的實體封包（比拉黑那一刻新）→ 黑名單失效
-    mob.seen_at = T0 + 1
+    # 拿到新座標了 → 黑名單失效
+    mob.x, mob.y = 6, 5
     assert bot._pick_target((0, 0)) is mob
     assert 777 not in bot._skip, "放行之後要把黑名單清掉，不然下一拍又被擋"
+
+
+def test_the_same_stale_position_does_not_lift_the_blacklist(monkeypatch):
+    """⚠⚠ 這是「每 3 秒重打同一隻空氣」的修法（[MEM-058]）。
+
+    舊條件是「之後又看到牠」（`seen_at` 比拉黑那一刻新）—— 那在封包時代
+    成立，但記憶體變成主來源之後 `sync_from_memory` **每一拍**都會更新
+    `seen_at`，等於「下一拍就解除黑名單」：鎖定 → 打空氣 → 解除 → 再鎖定
+    同一隻，實機日誌 08:31:31／34／37 連續三次。
+    座標沒變就代表我們手上的還是同一份錯資料，再打一次還是空氣。
+    """
+    from ro_toolbox.services.world import Monster
+
+    bot = FarmBot(1234)
+    mob = Monster(gid=777, class_id=1002, x=5, y=5)
+    monkeypatch.setattr(bot._world, "monsters", lambda: [mob])
+    monkeypatch.setattr(bot._world, "get", lambda gid: mob if gid == 777 else None)
+    monkeypatch.setattr(bot._world, "nearest", lambda _pos, skip=None: (
+        None if 777 in (skip or set()) else mob
+    ))
+    bot._skip[777] = T0 + 20
+    bot._skip_at[777] = T0
+    bot._miss_pos[777] = (5, 5)
+
+    for _ in range(5):
+        mob.seen_at = T0 + 99      # 記憶體每一拍都「又看到牠」
+        assert bot._pick_target((0, 0)) is None, "座標沒變就還是同一份錯資料"
 
 
 def test_blacklist_still_holds_without_a_new_sighting(monkeypatch):

@@ -171,7 +171,8 @@ class TravelBot:
         #: 擷取、忘掉路線），暫停是站在原地什麼都不做，連線與路線都留著。
         self._paused = threading.Event()
         self._holding = False    # 暫停的那句話講過了沒（免得每拍洗版）
-        self._walker = Walker(self._send_move)
+        # `moving` 見 farm_bot 同一行的說明：不要在角色還在走的時候重送。
+        self._walker = Walker(self._send_move, moving=self._client_moving)
         self._traveler = Traveler(self._walker, time.monotonic)
         self._resync_at = 0.0
         #: 伺服器最近一次在 0x0087 裡說「你在這裡」。換圖後記憶體座標會過期，
@@ -984,6 +985,16 @@ class TravelBot:
 
     def _send_move(self, x: int, y: int) -> None:
         self._send(build_move(x, y))
+
+    def _client_moving(self) -> bool | None:
+        """客戶端認為角色現在正在走嗎？讀不到回 None（**不等於站著**）。
+
+        給 `Walker` 判斷「這一段到底是被打斷了，還是只是我取樣得比較慢」。
+        見 `services/player_position.py` 的 `moving()`。
+        """
+        reader = self._reader
+        return reader.position_moving() if reader is not None else None
+
 
     def _cleanup(self) -> None:
         self._link.close()

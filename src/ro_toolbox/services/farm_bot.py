@@ -279,12 +279,24 @@ class FarmBot:
         self._stats = FarmStats()
         self._loot: dict[int, int] = {}  # 物品 ID -> 撿取次數
         self._loot_lock = threading.Lock()
-        self._walker = Walker(self._send_move)
+        # ⚠ `moving` 讓走路那一支問得到「客戶端認為我還在走嗎」—— 沒有它就只能
+        #   靠計時器猜，走得慢一點（或那一拍做的事比較多）就會被誤判成停住而重送，
+        #   症狀就是「走路一卡一卡」。見 `walker.Walker.update`。
+        self._walker = Walker(self._send_move, moving=self._client_moving)
         self._aim: _Aim | None = None
         self._skip: dict[int, float] = {}  # 打不到的目標 → 黑名單到期時間
-        #: gid → 被列入黑名單的時間。用來判斷「之後有沒有再看到它」——
-        #: 收到更新的實體封包就是**它還在那裡的證據**，那比我們的黑名單可信。
+        #: gid → 被列入黑名單的時間。診斷與過期用。
         self._skip_at: dict[int, float] = {}
+        #: gid → 「打到空氣」那一刻我們**以為**牠在哪（座標未知則 None）。
+        #:
+        #: ⚠⚠ 只有這一種黑名單可以被推翻，而且推翻的條件是**座標真的變了**。
+        #: 以前的條件是「之後又看到牠」（`seen_at` 比拉黑的時間新），
+        #: 那在封包時代成立 —— 收到新的實體封包確實是新證據。但記憶體變成
+        #: 主來源之後，`sync_from_memory` **每一拍**都會更新 `seen_at`，
+        #: 於是這條規則等於「下一拍就解除黑名單」：鎖定 → 打空氣 → 解除 →
+        #: 再鎖定同一隻，每 3 秒循環一次（實機日誌 08:31:31/34/37 連三次）。
+        #: 座標沒變就代表我們手上的還是同一份錯資料，再打一次還是空氣。
+        self._miss_pos: dict[int, tuple[int, int] | None] = {}
         #: 跑進傳點範圍而收手的怪 → 冷卻到期時間。
         #:
         #: ⚠ **故意跟 `_skip` 分開**：`_skip` 有一條「再看到牠就取消黑名單」的
@@ -719,6 +731,7 @@ class FarmBot:
             self._aim = None
             self._skip.clear()
             self._skip_at.clear()
+            self._miss_pos.clear()
             self._warp_skip.clear()
             self._bad_goals.clear()
             self._loot_since.clear()
@@ -833,6 +846,7 @@ class FarmBot:
         for gid in [g for g, until in self._skip.items() if now > until]:
             del self._skip[gid]
             self._skip_at.pop(gid, None)
+            self._miss_pos.pop(gid, None)
         for gid in [g for g, until in self._warp_skip.items() if now > until]:
             del self._warp_skip[gid]
         with self._dmg_lock:
@@ -907,15 +921,17 @@ class FarmBot:
         MVP 與草一律跳過（`is_farmable`）：它們跟一般怪一樣打得動、也會掉東西，
         但草是浪費時間、MVP 是送死。**菁英怪不算 MVP，照打。**
         """
-        # ⚠ **黑名單被新的目擊推翻。** 拉黑多半是因為座標過時打到空氣；
-        # 之後又收到那隻怪的實體封包，就代表它真的還在，而且我們拿到新座標了。
+        # ⚠ **「打到空氣」的黑名單被新座標推翻。** 那種拉黑的理由是「我們手上的
+        # 座標過時了」，所以推翻它的證據只有一個：**座標真的變了**。
         # 不放行的話，附近幾隻怪一被拉黑，畫面上明明有怪、程式卻說「附近沒怪」
-        # 而且要等 20 秒（使用者實際回報）。
-        for gid, at in list(self._skip_at.items()):
+        # 而且要等 20 秒（使用者實際回報）；放行條件太鬆則會每 3 秒重打同一隻空氣
+        # （見 `_miss_pos` 的說明）。
+        for gid, where in list(self._miss_pos.items()):
             mob = self._world.get(gid)
-            if mob is not None and mob.seen_at > at:
+            if mob is not None and mob.pos is not None and mob.pos != where:
                 self._skip.pop(gid, None)
                 self._skip_at.pop(gid, None)
+                self._miss_pos.pop(gid, None)
         skip = set(self._skip) | set(self._warp_skip)
         skip.update(m.gid for m in self._world.monsters() if not is_farmable(m.class_id))
         # ⚠ **站在傳點那一片裡的怪一律不打**（`warpzone.NO_FIGHT`，比走路禁區大）。
@@ -1203,6 +1219,9 @@ class FarmBot:
         if self._world.was_killed(aim.gid):
             return  # 已經死了，交給 _update_aim 記擊殺
         self._stats.missed += 1
+        # ⚠ 先把「我們以為牠在哪」記下來，再 forget —— 順序反了就記到 None，
+        # 那條黑名單就永遠解不開了。
+        self._miss_pos[aim.gid] = self._pos_of(aim.gid)
         self._world.forget(aim.gid)
         self._skip[aim.gid] = now + _MISS_SKIP_SEC
         self._skip_at[aim.gid] = now
@@ -1294,6 +1313,8 @@ class FarmBot:
 
         reachable = []
         for item in self._world.ground_items():
+            if item.pos is None:
+                continue  # 座標解不出來就沒得走過去（`_grab_nearby` 已經照撿了）
             distance = max(abs(item.x - pos[0]), abs(item.y - pos[1]))
             started = self._loot_since.setdefault(item.entity_id, now)
             if now - started > _LOOT_TIMEOUT or distance > _LOOT_WALK_MAX:
@@ -1727,6 +1748,16 @@ class FarmBot:
 
     def _send_move(self, x: int, y: int) -> None:
         self._send(build_move(x, y))
+
+    def _client_moving(self) -> bool | None:
+        """客戶端認為角色現在正在走嗎？讀不到回 None（**不等於站著**）。
+
+        給 `Walker` 判斷「這一段到底是被打斷了，還是只是我取樣得比較慢」。
+        見 `services/player_position.py` 的 `moving()`。
+        """
+        reader = self._reader
+        return reader.position_moving() if reader is not None else None
+
 
     def _send(self, data: bytes) -> bool:
         """送封包。失敗代表 socket 已經失效（多半是換頻道），下一拍會重綁。

@@ -111,9 +111,13 @@ class Walker:
         self,
         send_move: Callable[[int, int], None],
         now: Callable[[], float] = time.monotonic,
+        moving: Callable[[], bool | None] | None = None,
     ) -> None:
         self._send_move = send_move
         self._now = now
+        #: 「客戶端認為角色現在正在走嗎」。回 None＝問不出來，那就當沒有這條線索。
+        #: 見 `update()` 裡的重送那一段。
+        self._moving = moving or (lambda: None)
         self._path: list[tuple[int, int]] = []
         self._index = 0
         self._target: tuple[int, int] | None = None
@@ -231,6 +235,19 @@ class Walker:
 
         # 停住了。**先假設是被打斷，把同一段再送一次**（被怪打是最常見的原因，
         # 伺服器不會吭聲）；重送用完而且還是不動，才當這條路真的走不成。
+        #
+        # ⚠⚠ **但客戶端說「我正在走」的時候不要重送。** 這裡的「停住」是
+        # 「兩次取樣讀到同一格」—— 主迴圈一拍 0.2 秒起跳、還要加上那一拍的
+        # 工作時間，所以走得慢一點、或剛好卡在斜走那一步，就會誤判成停住。
+        # 重送等於叫伺服器**從現在這一格重新規劃**，角色會頓一下再走，
+        # 症狀就是使用者回報的「走路一卡一卡」。
+        #
+        # 客戶端的走路狀態是收到 `0x0087` 之後才寫的（見 `player_position`），
+        # 所以它說在走就是真的在走；被怪打斷時它會變回站著，重送照樣會發生。
+        # 問不出來（None）就退回原本的計時器判斷 —— 那是安全的那一邊。
+        if self._target is not None and now - self._pos_at > RESEND_SEC \
+                and self._moving() is True:
+            self._pos_at = now          # 還在走，這一段不算停住
         if self._target is not None and now - self._pos_at > RESEND_SEC:
             if self._resends >= MAX_RESEND and now - self._pos_at > STUCK_SEC:
                 self.clear()

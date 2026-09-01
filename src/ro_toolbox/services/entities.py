@@ -1,15 +1,31 @@
-"""從遊戲自己的記憶體讀「附近有哪些怪」—— 比封包可靠得多。
+"""從遊戲自己的記憶體讀「附近有哪些怪、牠們站在哪」。
 
-**這是輔助來源，不是主來源。** 誠實的 A/B（70 秒、189 次取樣，30 格以內）：
-**記憶體平均 0.16 隻、封包平均 0.40 隻**；兩邊都看到 29 次、只有記憶體看到 1 次、
-只有封包看到 46 次。也就是說它偶爾能補到封包漏收的那一隻，但整體涵蓋率**輸給封包**，
-原因是還沒找到實體清單、只能靠特徵掃描，而掃描要輪過整份記憶體才會涵蓋到。
-（一開始量到「記憶體是封包的 7 倍」是錯的：那次沒開地圖與可走格過濾、
-視野放到 40 格，多出來的都是假陽性。）
+**這是主來源。** 誠實的 A/B（2026-09-01、狐狐狸 @ mjolnir_07、60 秒 177 拍、
+用伺服器封包當對照，30 格以內）：
 
-怎麼找到的（[MEM-014]）：以前只有 GID 一個錨點，光靠「值像座標」會被尋路陣列、
-路徑緩衝、UTF-16 路徑字串大量誤中（[MEM-010]）。[PKT-029] 解出 class ID 之後，
-用「同一塊記憶體同時有 GID 和 class ID」兩個獨立條件，候選從 96 個直接縮到 1 個。
+    封包                      1.44 隻
+    記憶體（**修好之前**）      0.44 隻   ← 三個欄位都解錯，見下
+    記憶體（修好）             1.72 隻   ← 兩邊都有 1.24、只有記憶體 0.48、只有封包 0.20
+
+同一份樣本裡「同一隻怪的座標差幾格」：
+**整數格 `+0x5C/+0x60` 中位 0 格**、舊版用的 float `+0x120/+0x124` **中位 181 格**。
+
+## 修好之前錯在哪（[MEM-058]，三個都是「欄位意義猜錯」）
+
+1. **座標讀錯欄位**：`+0x120/+0x124` 是移動的插值座標，
+   **從沒走過路的怪那裡是 (0,0)** —— 而 (0,0) 過不了可走格驗證，
+   所以整批被丟掉。真正的「現在站哪」是 `+0x5C/+0x60`（走路中則是路徑節點），
+   `player_position.py` 早就量過並寫在文件裡了。
+2. **`-0x24` 當存活旗標**：它在活著的怪身上會閃爍。實機量到就站在角色旁邊
+   2 格的野豬 `-0x24 == 0`。（角色自己身上會閃爍這件事也早就寫在
+   `player_position.py` 了。）
+3. **`+0x110` 當「繪圖物件指標」**：那是**路徑陣列 begin**，
+   沒走過路的怪一律是 0 —— 站著不動的怪（噬人花那種完全不會動的更是）
+   100% 被擋掉。使用者回報的「明明有怪卻說沒怪」「走不到怪那邊」就是這條。
+
+現在改用**動作 tick `+0x134`**判斷「還在不在世界上」：活的實體它一直在更新，
+被丟掉的實體它就停住（實機殘留物 tickΔ 5 秒~9 分鐘，活的在 ±0.5 秒內）。
+版面與門檻的完整出處見 `services/actor.py`。
 
 **全程唯讀**（ReadProcessMemory），不寫、不注入，GameGuard 看不到。
 """
@@ -17,45 +33,42 @@
 from __future__ import annotations
 
 import logging
-import struct
 import threading
 import time
 
 import numpy as np
 
+from ro_toolbox.services import actor
+from ro_toolbox.services.actor import ActorView
 from ro_toolbox.services.gamedata import mob_names, mobs_on_map
 from ro_toolbox.services.mapdata import MapTerrain
 from ro_toolbox.services.memory_scan import MemoryScanner
 
 log = logging.getLogger(__name__)
 
-# 結構偏移（相對 GID 欄位）。屬 CLAUDE.md 允許寫死的「結構偏移」類別，
-# 出處與驗證方式見 GAMEDATA [MEM-014]：GID exact-match → class ID 對得上 →
-# 座標對得上 → 追蹤 12 秒與封包一致 45 次、不一致 0 次。
-OFF_CLASS = -0x04   # int32 怪種編號
-OFF_ALIVE = -0x24   # int32 存活旗標：活著是 1，死掉的瞬間變 0
-OFF_RENDER = 0x110  # 繪圖物件指標：死掉時被清成 0（畫面上就是這樣消失的）
-OFF_X = 0x120       # float32 格座標 x
-OFF_Y = 0x124       # float32 格座標 y
-_SPAN = OFF_Y + 4   # 一筆要讀到的最遠位元組
-_HEAD = -OFF_ALIVE  # 要往前讀多少（存活旗標在 GID 前面）
-
 _MAX_GID = 0x7FFF_FFFF
 _FULL_RESCAN_SEC = 5.0  # 冷區段輪掃一輪結束後，至少隔這麼久才重新輪一次
-_SWEEP_CHUNK = 120  # 每次多掃幾個冷區段（把 1.5 秒的全掃攤平成每拍幾十毫秒）
+_SWEEP_CHUNK = 60  # 每次多掃幾個冷區段（把全掃攤平成每拍幾十毫秒）
 _MIN_REGION = 0x1000
-#: 讀「一隻已知的怪」要抓多少位元組：從存活旗標（GID-0x24）一路到 y（GID+0x124）。
-_ONE_START = OFF_ALIVE               # 相對 GID 的起點（負的）
-_ONE_SIZE = -OFF_ALIVE + OFF_Y + 4   # 0x24 + 0x128 = 0x14C
-#: 緩衝內的欄位位置（相對 `_ONE_START`）
-_B_ALIVE = 0
-_B_CLASS = -OFF_ALIVE + OFF_CLASS
-_B_GID = -OFF_ALIVE
-_B_RENDER = -OFF_ALIVE + OFF_RENDER
-_B_X = -OFF_ALIVE + OFF_X
-_B_Y = -OFF_ALIVE + OFF_Y
-#: 背景發現執行緒兩輪之間睡多久。掃描本身就會花時間，這只是別把 CPU 佔滿。
-_DISCOVER_IDLE = 0.05
+#: 背景發現執行緒兩輪之間睡多久。掃描本身就會花時間，這只是別把 CPU 佔滿 ——
+#: 佔滿的代價是主迴圈那一拍變慢，走路看起來就一卡一卡。
+_DISCOVER_IDLE = 0.08
+#: 掃描階段的視野放寬幾格。掃描用的是「移動終點」（省一次讀取），
+#: 走路中的怪終點會比現在位置遠一點，不放寬就會在牠跑過來的路上漏掉牠。
+#: 真正的視野判斷在 `read_known()`，那裡用的是精確位置。
+_SCAN_SLACK = 10
+
+# ---- 以 class 欄位為錨的 dword 索引（class 在 GID-0x04，所以 GID 在 +1）----
+_D_GID = 1
+_D_VTABLE = _D_GID + actor.VTABLE // 4
+_D_STATE = _D_GID + actor.STATE // 4
+_D_DEST_X = _D_GID + actor.DEST_X // 4
+_D_DEST_Y = _D_GID + actor.DEST_Y // 4
+_D_TICK = _D_GID + actor.TICK // 4
+#: 掃描時 class 欄位前面要留多少 dword 讀得到（vtable 在最前面）
+_HEAD_DWORDS = actor.HEAD // 4
+#: class 欄位後面要留多少 dword 讀得到
+_TAIL_DWORDS = _D_TICK + 2
 
 
 class MemoryEntity:
@@ -82,17 +95,20 @@ class EntityScanner:
     """掃遊戲記憶體找附近的怪。
 
     每一筆都要同時通過驗證才算數（少一道就退掉，寧可漏看也不要打空氣）：
-      1. **存活旗標 `-0x24` == 1，且繪圖指標 `+0x110` 不是 0**
-         —— 死掉的怪結構會留在記憶體裡沒被回收，但這兩個欄位會被清掉。
-         實測 70 秒：已確認死亡的實體被掃到 65 次，其中 **60 次兩個旗標都已清空**，
-         剩下 5 次都發生在死亡當下那一瞬間（客戶端還沒處理完）。
-      2. class ID 在**這張地圖的出沒表**裡（[DAT-016]）
-      3. GID 在合理範圍
-      4. 座標是有限浮點、落在地圖範圍內、且**站在 .gat 的可走格上**
-      5. 離角色不超過 view（超出視野的不可能是現在看得到的怪）
+
+      1. **vtable 落在 Ragexe.exe 的模組映像內** —— 實體物件的第一個欄位。
+         列舉不到模組時（GameGuard 偶爾會擋，[MEM-031]）這一關自動略過，
+         其餘四關照常，屬安全退化。
+      2. **動作 tick `+0x134` 還在更新**（`actor.FRESH_MS` 內）——
+         這是「還在世界上」唯一可靠的訊號，取代舊版那兩個猜錯的旗標。
+      3. class ID 在**這張地圖的出沒表**裡（[DAT-016]）
+      4. GID 在合理範圍
+      5. **座標**（`+0x5C/+0x60`，走路中讀路徑節點）落在地圖內、
+         而且站在 .gat 的可走格上
+      6. 離角色不超過 view（超出視野的不可能是現在看得到的怪）
 
     每次掃「曾經掃到過怪」的熱區段（實測 4 ms），再加掃一小段冷區段慢慢輪完
-    整份記憶體 —— 一次掃全部要 1.5 秒，直接做會讓 bot 每隔幾秒定格一下。
+    整份記憶體 —— 一次掃全部要 0.5~1.5 秒，直接做會讓 bot 每隔幾秒定格一下。
     """
 
     def __init__(
@@ -112,6 +128,8 @@ class EntityScanner:
         self._sweep_index = 0
         self._last_full = 0.0
         self._lut, self.map_filtered = self._build_lut(map_name, extra_classes)
+        #: 模組映像範圍（vtable 驗證用）。None = 列舉不到，那一關略過。
+        self._module: tuple[int, int] | None = None
         #: 診斷用：最近一次掃描花多少秒、掃了幾個區段
         self.last_cost = 0.0
         self.last_regions = 0
@@ -150,60 +168,86 @@ class EntityScanner:
         except OSError as exc:
             log.warning("開啟行程記憶體失敗：%s", exc)
             return False
+        self._module = self._main_image()
         return True
+
+    def _main_image(self) -> tuple[int, int] | None:
+        """主程式映像的範圍。查不到回 None —— vtable 那一關就略過（安全退化）。"""
+        try:
+            base = self._scanner.main_module_base()
+            if base:
+                for module in self._scanner.list_modules():
+                    if module.base == base and module.size:
+                        return base, base + module.size
+        except (RuntimeError, OSError) as exc:  # noqa: BLE001 - 查不到不是錯誤
+            log.debug("列舉模組失敗（vtable 驗證停用）：%s", exc)
+        log.info("列舉不到主程式映像，實體驗證少一道 vtable（其餘照常）")
+        return None
 
     # ---- 快路徑：只讀已知位址 ---------------------------------------
 
-    def read_one(self, addr: int, me: tuple[int, int]) -> MemoryEntity | None:
-        """從**已知位址**直接讀一隻怪。驗不過（死了／走遠了／位址失效）回 None。
+    def read_actor(self, addr: int, now_tick: int | None = None) -> MemoryEntity | None:
+        """從**已知位址**直接讀一隻怪，**不看距離**。驗不過回 None。
 
-        只讀 0x14C bytes，不掃記憶體 —— 這才是每一拍該做的事。
-        驗證條件與掃描那條路完全一樣（存活旗標、繪圖指標、class 在表裡、
-        座標有限且在地圖內、站在可走格），所以不會因為走快路徑而放寬標準。
+        驗證條件與掃描那條路完全一樣（vtable、動作 tick、class 在表裡、
+        座標有效且站在可走格），所以不會因為走快路徑而放寬標準。
+        距離由呼叫端決定 —— 走出視野的怪位址還是好的，不該因此忘掉它
+        （忘掉就要等背景輪掃好幾秒才找得回來）。
         """
-        raw = self._scanner.read_region(addr + _ONE_START, _ONE_SIZE)
-        if raw is None or len(raw) < _ONE_SIZE:
+        view = ActorView.read(self._scanner, addr)
+        if view is None:
             return None
-        buf = bytes(raw)
-        alive, = struct.unpack_from("<I", buf, _B_ALIVE)
-        render, = struct.unpack_from("<I", buf, _B_RENDER)
-        gid, = struct.unpack_from("<I", buf, _B_GID)
-        class_id, = struct.unpack_from("<I", buf, _B_CLASS)
-        x, = struct.unpack_from("<f", buf, _B_X)
-        y, = struct.unpack_from("<f", buf, _B_Y)
-        if alive != 1 or render == 0:
-            return None                      # 死掉的結構還在，但這兩個欄位會被清掉
+        if self._module is not None and not (
+            self._module[0] <= view.vtable < self._module[1]
+        ):
+            return None                      # 這塊記憶體已經不是實體物件了
+        gid = view.gid
+        class_id = view.class_id
         if not (0 < gid < _MAX_GID) or not (0 < class_id < 65536):
             return None
         if not self._lut[class_id]:
             return None
-        if not (x == x and y == y):           # NaN
+        if not view.fresh(now_tick):
+            return None                      # 動作 tick 停了＝已經不在世界上
+        cell = view.cell(self._scanner)
+        if cell is None:
             return None
-        cell_x, cell_y = int(round(x)), int(round(y))
+        cell_x, cell_y = cell
         if not (0 < cell_x < self._terrain.width and 0 < cell_y < self._terrain.height):
             return None
-        if max(abs(cell_x - me[0]), abs(cell_y - me[1])) > self._view:
-            return None                      # 走出視野了
         if not self._terrain.is_walkable(cell_x, cell_y):
             return None
-        return MemoryEntity(gid, class_id, x, y, addr)
+        return MemoryEntity(gid, class_id, cell_x, cell_y, addr)
+
+    def read_one(self, addr: int, me: tuple[int, int]) -> MemoryEntity | None:
+        """`read_actor()` 再加一道「還在視野內」。"""
+        entity = self.read_actor(addr)
+        if entity is None:
+            return None
+        if max(abs(entity.x - me[0]), abs(entity.y - me[1])) > self._view:
+            return None
+        return entity
 
     def read_known(self, me: tuple[int, int]) -> list[MemoryEntity]:
         """讀所有記著的怪，回傳還活著、還在視野內的那些。**很便宜。**
 
-        讀不到的就從清單移除 —— 牠死了、走遠了，或那塊記憶體被回收了。
-        新的怪由背景的 `start_discovery()` 補進來。
+        ⚠ **走出視野不等於忘掉牠**：位址還是好的，牠走回來的下一拍就又看得到。
+        只有「讀不到／GID 換人／動作 tick 停了／座標驗不過」才從清單移除 ——
+        那才是真的「那塊記憶體不再是牠」。舊版一律移除，於是怪一走遠就要
+        等背景輪掃好幾秒才找得回來。
         """
         with self._known_lock:
             known = dict(self._known)
+        now_tick = actor.now_tick()
         out: list[MemoryEntity] = []
         dead: list[int] = []
         for gid, addr in known.items():
-            entity = self.read_one(addr, me)
+            entity = self.read_actor(addr, now_tick)
             if entity is None or entity.gid != gid:
                 dead.append(gid)             # gid 對不上＝那塊記憶體換人住了
                 continue
-            out.append(entity)
+            if max(abs(entity.x - me[0]), abs(entity.y - me[1])) <= self._view:
+                out.append(entity)
         if dead:
             with self._known_lock:
                 for gid in dead:
@@ -215,7 +259,7 @@ class EntityScanner:
     def start_discovery(self, position) -> None:  # noqa: ANN001 - 回目前座標的函式
         """在背景持續掃描記憶體找**新的**怪，把位址記起來。
 
-        掃一輪整份記憶體要 1.5 秒級，放在主迴圈裡會讓 bot 每拍卡住 ——
+        掃一輪整份記憶體要 0.5~1.5 秒，放在主迴圈裡會讓 bot 每拍卡住 ——
         所以搬到背景執行緒。主迴圈只走 `read_known()`（只讀已知位址）。
         """
         if self._thread is not None:
@@ -268,15 +312,19 @@ class EntityScanner:
         """回傳目前記憶體裡、角色附近的怪。失敗回空清單（安全退化）。
 
         每次只掃「熱區段」（實測 4 ms），另外**每次多掃一小段冷區段**把整份
-        記憶體慢慢輪過一遍 —— 一次掃全部要 1.5 秒，直接做會讓 bot 定格。
+        記憶體慢慢輪過一遍 —— 一次掃全部要 0.5~1.5 秒，直接做會讓 bot 定格。
+
+        ⚠ 這條路是**為了發現位址**，座標用的是「移動終點」（少讀一次路徑節點）。
+        精確位置一律由 `read_known()` 回答。
         """
         start = self._now()
         regions = list(self._hot) + self._next_sweep_slice()
+        now_tick = actor.now_tick()
 
         found: dict[int, MemoryEntity] = {}
         hot: set[tuple[int, int]] = set(self._hot)
         for base, size in regions:
-            entities = self._scan_region(base, size, me)
+            entities = self._scan_region(base, size, me, now_tick)
             if entities:
                 hot.add((base, size))
             for entity in entities:
@@ -311,27 +359,27 @@ class EntityScanner:
     def _dist(entity: MemoryEntity, me: tuple[int, int]) -> int:
         return max(abs(entity.x - me[0]), abs(entity.y - me[1]))
 
-    def _scan_region(self, base: int, size: int, me: tuple[int, int]) -> list[MemoryEntity]:
+    def _scan_region(
+        self, base: int, size: int, me: tuple[int, int], now_tick: int
+    ) -> list[MemoryEntity]:
         if size < _MIN_REGION:
             return []
         buf = self._scanner.read_region(base, size)
         if buf is None:
             return []
         count = len(buf) // 4
-        if count * 4 < _SPAN + 16:
+        if count < _HEAD_DWORDS + _TAIL_DWORDS + 4:
             return []
         words = np.frombuffer(buf, dtype=np.uint32, count=count)
-        floats = words.view(np.float32)
 
-        # class ID 欄位在 GID-0x4，所以先找 class 再往後算。
-        # 開頭留 _HEAD 是因為存活旗標在 GID 前面，讀得到才判斷得了。
-        head = _HEAD // 4
-        stop = count - _SPAN // 4 - 2
-        if stop <= head:
+        # class ID 欄位在 GID-0x4，所以先找 class 再往前後算。
+        # 開頭留 _HEAD_DWORDS 是因為 vtable 在 GID-0x110，讀得到才驗得了。
+        stop = count - _TAIL_DWORDS
+        if stop <= _HEAD_DWORDS:
             return []
         classes = words[:stop]
         candidate = classes < 65536
-        candidate[:head] = False
+        candidate[:_HEAD_DWORDS] = False
         if not candidate.any():
             return []
         candidate &= self._lut[np.where(candidate, classes, 0)]
@@ -339,34 +387,35 @@ class EntityScanner:
         if not len(index):
             return []
 
-        gid = words[index + 1]
-        alive = words[index + 1 + OFF_ALIVE // 4]
-        render = words[index + 1 + OFF_RENDER // 4]
-        x = floats[index + (OFF_X - OFF_CLASS) // 4]
-        y = floats[index + (OFF_Y - OFF_CLASS) // 4]
-        with np.errstate(invalid="ignore"):
-            ok = (
-                (alive == 1)      # 死掉的結構還在，但旗標會被清掉
-                & (render != 0)   # 沒有繪圖物件＝畫面上已經不存在
-                & (gid > 0)
-                & (gid < _MAX_GID)
-                & np.isfinite(x)
-                & np.isfinite(y)
-                & (x > 0)
-                & (x < self._terrain.width)
-                & (y > 0)
-                & (y < self._terrain.height)
-                & (np.abs(x - me[0]) <= self._view)
-                & (np.abs(y - me[1]) <= self._view)
-            )
+        gid = words[index + _D_GID]
+        dest_x = words[index + _D_DEST_X].astype(np.int32)
+        dest_y = words[index + _D_DEST_Y].astype(np.int32)
+        # tick 差用無號算再折回有號 —— 走路中的實體 tick 是未來的值（差是負的）。
+        age = (np.uint32(now_tick) - words[index + _D_TICK]).astype(np.int64)
+        age = np.where(age > 0x7FFF_FFFF, age - 0x1_0000_0000, age)
+        reach = self._view + _SCAN_SLACK
+        ok = (
+            (gid > 0)
+            & (gid < _MAX_GID)
+            & (age < actor.FRESH_MS)          # 動作 tick 停了＝已經不在世界上
+            & (dest_x > 0)
+            & (dest_x < self._terrain.width)
+            & (dest_y > 0)
+            & (dest_y < self._terrain.height)
+            & (np.abs(dest_x - me[0]) <= reach)
+            & (np.abs(dest_y - me[1]) <= reach)
+        )
+        if self._module is not None:
+            vtable = words[index + _D_VTABLE]
+            ok &= (vtable >= self._module[0]) & (vtable < self._module[1])
         out: list[MemoryEntity] = []
         for k in np.nonzero(ok)[0]:
-            cell_x, cell_y = int(round(float(x[k]))), int(round(float(y[k])))
+            cell_x, cell_y = int(dest_x[k]), int(dest_y[k])
             if not self._terrain.is_walkable(cell_x, cell_y):
                 continue  # 怪不會站在不可走的格子上 —— 擋掉剩下的垃圾值
             i = int(index[k])
             out.append(
-                MemoryEntity(int(gid[k]), int(classes[i]), float(x[k]), float(y[k]),
+                MemoryEntity(int(gid[k]), int(classes[i]), cell_x, cell_y,
                              base + i * 4 + 4)
             )
         return out

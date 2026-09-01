@@ -383,6 +383,14 @@ class CharacterReader:
         """座標定位成功了嗎？沒有的話走路類功能要停用，不要空轉。"""
         return self._position.located
 
+    def position_moving(self) -> bool | None:
+        """客戶端認為角色現在正在走嗎？讀不到回 None（**不等於站著**）。
+
+        給走路那一支用：角色還在走的時候不必重送移動封包
+        （見 `PlayerPosition.moving()`）。
+        """
+        return self._position.moving()
+
     def read_position(self) -> tuple[int, int] | None:
         """讀角色的格座標 (x, y)。驗不過回 None —— **絕不回殘留值**。
 

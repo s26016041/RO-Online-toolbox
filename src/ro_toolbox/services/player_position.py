@@ -116,6 +116,7 @@ import time
 
 import numpy as np
 
+from ro_toolbox.services import actor
 from ro_toolbox.services.aob import locate_global
 from ro_toolbox.services.mapdata import GatError, has_terrain, load_terrain
 from ro_toolbox.services.memory_scan import MemoryScanner
@@ -130,29 +131,24 @@ log = logging.getLogger(__name__)
 
 # ---- 移動元件的結構偏移 ---------------------------------------------------
 #
-# 屬 CLAUDE.md 允許寫死的「結構偏移」類別（同一個結構內部的欄位距離，
-# 大更新才會壞）。出處：2026-08-28 實機，先用 `GID == AID` 找到結構，
-# 再一邊送移動封包一邊 30 Hz 取樣整塊結構，看哪些 dword 在走路途中變化。
-OFF_STATE = 0x38        # u32 狀態：站著 1、走路 2、被回收 0
-OFF_DEST_X = 0x5C       # i32 移動終點 x（沒在走＝目前格）
-OFF_DEST_Y = 0x60       # i32 移動終點 y
-OFF_PATH_BEGIN = 0x110  # 路徑陣列 begin（⚠ 沒走過路時是 0，不能當存活旗標）
-OFF_PATH_END = 0x114    # 路徑陣列 end（begin/end/cap 的標準 vector 版面）
-OFF_PATH_INDEX = 0x12C  # i32 目前走到第幾個節點，-1 = 沒在走
-PATH_STRIDE = 0x10      # 一個路徑節點的大小，前 8 bytes 是 (i32 x, i32 y)
+# ⚠⚠ **定義在 `services/actor.py`，這裡只是取用。** 角色與怪共用同一套版面，
+# 以前兩邊各寫一份，結果 `entities.py` 把 `+0x110` 當成「繪圖物件指標」、
+# 把 `+0x120` 的 float 當成「現在站哪」—— 兩條這個檔早就寫著是錯的，
+# 但沒有任何東西會發現（[MEM-058]）。要改偏移請改 `actor.py`。
+OFF_STATE = actor.STATE            # u32 狀態：站著 1、走路 2、被回收 0
+OFF_DEST_X = actor.DEST_X          # i32 移動終點 x（沒在走＝目前格）
+OFF_DEST_Y = actor.DEST_Y          # i32 移動終點 y
+OFF_PATH_BEGIN = actor.PATH_BEGIN  # 路徑陣列 begin（⚠ 沒走過路時是 0）
+OFF_PATH_END = actor.PATH_END      # 路徑陣列 end（標準 vector 版面）
+OFF_PATH_INDEX = actor.PATH_INDEX  # i32 目前走到第幾個節點，-1 = 沒在走
+PATH_STRIDE = actor.PATH_STRIDE    # 一個路徑節點的大小，前 8 bytes 是 (i32 x, i32 y)
 
 #: 讀一次要抓多少 bytes：從 GID 一路到路徑索引。
 SPAN = OFF_PATH_INDEX + 4
 
-#: 狀態欄位的合理範圍。實測只看過 1（站著）與 2（走路）；
-#: 放寬到 8 是留給還沒看過的狀態（坐下、死亡…），但**不能無上限** ——
-#: 堆積垃圾的這個位置常常是指標或很大的數字。
-MAX_STATE = 8
-#: RO 沒有超過 512x512 的地圖；0 是地圖邊界（任何圖上都不可走）。
-#: ⚠ (0,0) 一定要擋掉 —— [MEM-039] 就是被 (0,0) 通過驗證害的。
-MAX_CELL = 512
-#: 路徑不可能有這麼多節點（單次移動上限 17 格）。用來擋「指標像陣列但其實是垃圾」。
-MAX_PATH_NODES = 256
+MAX_STATE = actor.MAX_STATE
+MAX_CELL = actor.MAX_CELL
+MAX_PATH_NODES = actor.MAX_PATH_NODES
 #: 一直找不到元件多久之後要大聲抱怨一次。
 #:
 #: ⚠ 這是**改版時唯一的警報**：結構偏移壞掉的話元件永遠驗不過，
@@ -428,6 +424,33 @@ class PlayerPosition:
             self._note_missing()
             return entry
         return None
+
+    def moving(self) -> bool | None:
+        """客戶端認為角色**現在正在走**嗎？讀不到回 None。
+
+        ⚠ 呼叫端不可以把 None 當成「站著」。這個值的用途是「不要在角色
+        明明還在走的時候重送移動封包」（見 `services/walker.py`）——
+        讀不到就退回原本的計時器判斷，那是安全的那一邊。
+
+        為什麼可信：`+0x38`／路徑索引是**伺服器確認 `0x0087` 之後**才寫的
+        （見本檔開頭的實機驗證），所以「客戶端說在走」代表這一段真的被接受了；
+        被怪打斷時客戶端會停下來，這裡就會變成 False，重送照樣會發生。
+        """
+        if self._addr is None:
+            return None
+        raw = self._scanner.read_region(self._addr, SPAN)
+        if raw is None or len(raw) < SPAN:
+            return None
+        buf = bytes(raw)
+        gid, = struct.unpack_from("<I", buf, 0)
+        if gid != self._aid:
+            return None
+        state, = struct.unpack_from("<I", buf, OFF_STATE)
+        if not (0 < state <= MAX_STATE):
+            return None
+        index, = struct.unpack_from("<i", buf, OFF_PATH_INDEX)
+        begin, = struct.unpack_from("<I", buf, OFF_PATH_BEGIN)
+        return index >= 0 and begin != 0
 
     def _note_missing(self) -> None:
         """一直沒有元件 → 講一次話。改版把結構偏移弄壞時這是唯一的警報。"""

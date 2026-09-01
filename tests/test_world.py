@@ -336,3 +336,40 @@ def test_kill_confirmation_still_works_right_after_the_kill(monkeypatch):
     feed(world, VANISH_DEAD)
     clock[0] += mod.KILL_PROTECT_SEC - 0.5
     assert world.was_killed(GID), "保護期內一定要還認得出剛剛那次擊殺"
+
+
+# ---- 座標以記憶體為準（[MEM-058]，使用者要求）--------------------------------
+
+
+def test_memory_position_wins_over_a_move_packet():
+    """`0x09FD` 帶的是**終點**，怪還在半路上；記憶體讀到的是牠現在那一格。
+
+    兩個來源打架時要聽記憶體的 —— 不然走過去打的是牠等一下才會到的位置。
+    """
+    world = WorldTracker(map_size=MAP)
+    world.sync_from_memory([_Ent(GID, x=100, y=100)])
+    feed(world, MOVE)
+    assert world.get(GID).pos == (100, 100), "封包不准蓋掉剛讀到的記憶體座標"
+
+
+def test_packet_position_is_used_once_memory_goes_quiet():
+    """記憶體看不到牠了（超過 MEMORY_TRUST_SEC）就換封包說了算 ——
+    有個舊一點的座標，還是比完全沒有座標好。"""
+    from ro_toolbox.services import world as mod
+
+    world = WorldTracker(map_size=MAP)
+    world.sync_from_memory([_Ent(GID, x=100, y=100)])
+    world.get(GID).mem_at -= mod.MEMORY_TRUST_SEC + 1
+    feed(world, MOVE)
+    assert world.get(GID).pos != (100, 100)
+
+
+def test_memory_only_deletes_what_memory_has_seen():
+    """⚠ 背景掃描要輪過整份記憶體才會發現新配置的實體（幾秒），這段期間
+    封包已經看到牠了 —— 這時候刪掉牠等於「因為我還沒找到，所以牠不存在」。"""
+    world = WorldTracker(map_size=MAP)
+    feed(world, STAND)
+    here = world.get(GID).pos
+    for _ in range(10):
+        world.sync_from_memory([], pos=here, view=30, strikes=3)
+    assert world.is_present(GID), "記憶體沒看過牠，就不該由記憶體判牠死刑"

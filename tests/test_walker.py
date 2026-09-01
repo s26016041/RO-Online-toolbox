@@ -305,3 +305,51 @@ def test_the_step_is_short_enough_for_diagonal_moves():
     from ro_toolbox.services import walker as mod
 
     assert mod.MAX_STEP <= 10
+
+
+# ---- 客戶端說「我還在走」的時候不要重送 --------------------------------------
+
+
+def test_no_resend_while_the_client_says_it_is_still_walking():
+    """⚠ 這是「走路一卡一卡」的修法（[MEM-058]）。
+
+    「停住了」的判斷是「兩次取樣讀到同一格」，而主迴圈一拍 0.2 秒起跳、
+    還要加上那一拍的工作時間 —— 走得慢一點或剛好卡在斜走那一步就會誤判。
+    重送等於叫伺服器從現在這一格重新規劃，角色會頓一下再走。
+
+    客戶端的走路狀態是收到 `0x0087` 之後才寫的，所以它說在走就是真的在走。
+    """
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock, moving=lambda: True)
+    walker.set_path(straight_path(40))
+    walker.update((10, 50))
+    walker.note_move_ack(fake.sent[-1])
+
+    for _ in range(MAX_RESEND + 3):
+        fake.now += RESEND_SEC + 0.05
+        assert walker.update((10, 50)) == "walking"
+    assert walker.resent == 0, "客戶端說還在走，就不該重送"
+
+
+def test_resend_still_happens_when_the_client_says_it_stopped():
+    """被怪打斷時客戶端會變回站著 —— 那條救援路徑一定要留著。"""
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock, moving=lambda: False)
+    walker.set_path(straight_path(40))
+    walker.update((10, 50))
+    walker.note_move_ack(fake.sent[-1])
+    fake.now += RESEND_SEC + 0.05
+    assert walker.update((10, 50)) == "walking"
+    assert walker.resent == 1
+
+
+def test_unknown_moving_state_falls_back_to_the_timer():
+    """問不出來（None）不等於站著，也不等於在走 —— 退回原本的計時器判斷。"""
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock, moving=lambda: None)
+    walker.set_path(straight_path(40))
+    walker.update((10, 50))
+    walker.note_move_ack(fake.sent[-1])
+    fake.now += RESEND_SEC + 0.05
+    walker.update((10, 50))
+    assert walker.resent == 1

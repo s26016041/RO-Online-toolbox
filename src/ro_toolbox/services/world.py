@@ -63,6 +63,18 @@ _MAX_MAP_SIDE = 512  # RO 地圖邊長上限，沒載到地形時用來擋離譜
 #:
 #: 保護這幾秒是為了「剛送出的那次擊殺確認」不被同一拍的殘留封包蓋掉。
 KILL_PROTECT_SEC = 8.0
+#: 記憶體給過座標之後，這麼久之內**封包不准覆蓋它**。
+#:
+#: ⚠⚠ 為什麼要有這條：`0x09FD`（移動中的實體）帶的是「牠要走去哪」，
+#: 那是**未來**的格子 —— 牠實際還在半路上。記憶體讀到的是客戶端當下算出來的
+#: 那一格。實機同一份 60 秒樣本（177 拍、以伺服器封包為對照）：
+#: 記憶體整數格與封包終點的差**中位 0 格、最大 4 格**，差的那幾格全是
+#: 「封包說終點、記憶體說現在」。兩個來源打架時要聽記憶體的
+#: （使用者要求：「不要看官方封包，完全看我們記憶體」）。
+#:
+#: 只保護這麼短是因為記憶體每一拍（0.2 秒）都會更新；超過就代表這隻怪
+#: 記憶體那邊已經看不到了，那時封包給的座標比沒有座標好。
+MEMORY_TRUST_SEC = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +93,7 @@ class GroundItem:
 
 @dataclass(slots=True)
 class Monster:
-    """視野內的一隻怪。座標會隨移動封包更新；沒解到座標的一律 None。"""
+    """視野內的一隻怪。座標優先來自記憶體，其次才是封包。"""
 
     gid: int
     class_id: int | None = None
@@ -90,6 +102,8 @@ class Monster:
     seen_at: float = field(default_factory=time.monotonic)
     hit_at: float = 0.0  # 最後一次「有人打到它」的時間 —— 證明它真的在
     hp: int | None = None  # 0x0A36 給的剩餘 HP（0~某上限）
+    #: 記憶體最後一次給這隻座標的時間（0 = 從來沒有）。見 `MEMORY_TRUST_SEC`。
+    mem_at: float = 0.0
 
     @property
     def pos(self) -> tuple[int, int] | None:
@@ -201,8 +215,13 @@ class WorldTracker:
         if mob is None:
             self._monsters[gid] = Monster(gid, class_id, x, y)
         else:
-            mob.class_id, mob.x, mob.y = class_id, x, y
-            mob.seen_at = time.monotonic()
+            now = time.monotonic()
+            mob.class_id = class_id
+            # ⚠ 記憶體剛給過座標就不要用封包蓋掉（見 `MEMORY_TRUST_SEC`）：
+            # 移動封包帶的是**終點**，怪還在半路上。
+            if now - mob.mem_at >= MEMORY_TRUST_SEC:
+                mob.x, mob.y = x, y
+            mob.seen_at = now
         self._gone_gids.discard(gid)
 
     def _take_vanish(self, raw: bytes, i: int) -> None:
@@ -231,8 +250,12 @@ class WorldTracker:
         y = int.from_bytes(raw[i + 8 : i + 10], "little")
         if not self._in_map(x, y):
             return
-        mob.x, mob.y = x, y
-        mob.seen_at = time.monotonic()
+        now = time.monotonic()
+        # 「停下來」帶的是純 uint16 定點座標，是封包裡最準的一筆；
+        # 但記憶體更即時，所以一樣讓記憶體優先（見 `MEMORY_TRUST_SEC`）。
+        if now - mob.mem_at >= MEMORY_TRUST_SEC:
+            mob.x, mob.y = x, y
+        mob.seen_at = now
 
     def _take_mob_hp(self, raw: bytes, i: int) -> None:
         """怪物 HP 變動 = 有人正在打它，也就證明它真的在那裡。"""
@@ -350,12 +373,12 @@ class WorldTracker:
                 self._killed_gids.pop(entity.gid, None)
                 mob = self._monsters.get(entity.gid)
                 if mob is None:
-                    self._monsters[entity.gid] = Monster(
-                        entity.gid, entity.class_id, entity.x, entity.y
-                    )
+                    mob = Monster(entity.gid, entity.class_id, entity.x, entity.y)
+                    self._monsters[entity.gid] = mob
                 else:
                     mob.class_id, mob.x, mob.y = entity.class_id, entity.x, entity.y
                     mob.seen_at = now
+                mob.mem_at = now      # 這一拍記憶體看過牠了 → 封包不准蓋掉座標
                 self._gone_gids.discard(entity.gid)
                 self._absent.pop(entity.gid, None)
 
@@ -363,6 +386,12 @@ class WorldTracker:
                 return 0
             for gid, mob in list(self._monsters.items()):
                 if gid in seen:
+                    continue
+                if not mob.mem_at:
+                    # ⚠ **記憶體只能收回自己講過的話。** 背景掃描要輪過整份記憶體
+                    # 才會發現新配置的實體（幾秒），這段期間封包已經看到牠了 ——
+                    # 這時候刪掉牠等於「因為我還沒找到，所以牠不存在」。
+                    # 沒有座標的幽靈由 `forget_far()` 與 `0x0080` 負責。
                     continue
                 distance = mob.distance_from(pos)
                 if distance is None or distance > view:
