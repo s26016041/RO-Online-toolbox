@@ -184,6 +184,26 @@ _LOOT_TIMEOUT = 8.0  # 撿不到就放棄這一個，別卡住
 #: 怪打我之後多久內還算「正在打我」。太長會去追已經跑掉的怪。
 _AGGRO_SEC = 12.0
 _FROZEN_SEC = 45.0  # 完全沒進展（沒移動、沒擊殺、沒撿到）這麼久就停下來喊人
+#: 漫遊／走去撿東西的時候，「該在走卻沒動」超過這麼久就當這條路走不成。
+#:
+#: ⚠⚠ **為什麼不能只靠 `Walker` 說「走不成」。** 2026-09-01 實機：兩隻分身
+#: 一小時內安靜地站著 30 次、每次 45 秒 —— 日誌從頭到尾一行都沒有，
+#: 只有保護機制那句「45 秒沒進展」。原因是 `Walker.update()` 一路回報
+#: `walking`（客戶端的走路旗標卡在「正在走」），而 `_roam()` 看到 walking
+#: 就 `return` —— 沒有人送封包、沒有人重新規劃、也沒有人抱怨。
+#:
+#: 走路那一支已經補上信任上限（`walker.MOVING_TRUST_SEC`），但**呼叫端不能
+#: 把自己的健康完全託付給下一層**：這裡自己看一個讀得到的訊號（座標有沒有變），
+#: 不管下面回報什麼。
+#:
+#: 四秒是量出來的：實機取樣（`tools/probe_walk_freeze.py`）裡「座標沒變」的
+#: 區間中位數 **0.12 秒**、p99 **2.1~3.6 秒**，7 分鐘內超過 4 秒的只有 7 段，
+#: 其中 3 段就是那個 45 秒的卡死。門檻壓在 p99 之上、災難之下。
+#:
+#: ⚠ 只在「本來就該移動」的時候算數 —— 交戰中站著打、讓路給詠唱、
+#: 打死之後停下來撿東西都是**故意**站著，那些時候要把時鐘往前推
+#: （見 `_stand_still()`），不然會把正常行為誤判成卡住。
+_STALL_SEC = 4.0
 #: 多久撈一次 TCP 表看「連線有沒有換掉」。**只管連線，不管地圖** ——
 #: 地圖名是一次記憶體讀取，每一拍都看得起，而且非看不可（見 `_keep_in_sync`）。
 _RESYNC_SEC = 2.0
@@ -346,6 +366,11 @@ class FarmBot:
         self._stale_since = 0.0
         #: 卡住重來過幾次（見 `_unstick`）。只拿來寫日誌，不當停止條件。
         self._stuck = 0
+        #: 最後一次「角色動了，或**故意**站著」的時刻。見 `_STALL_SEC`。
+        #: 0 = 還沒開始（第一次讀到座標時才起算）。
+        self._moved_at = 0.0
+        #: 上一次讀到的座標（拿來判斷「動了沒」）。
+        self._was_at: tuple[int, int] | None = None
         #: 上次為了「把移動元件逼出來」推的那一步是什麼時候。
         self._woke_at = 0.0
         self._resync_at = 0.0
@@ -567,9 +592,11 @@ class FarmBot:
             # 讓路只是**這一拍不動**，不是等待：`held()` 有到期時間，
             # 補 buff 那條收到上身就馬上放行（見 `services/cast_lock.py`）。
             if cast_lock.held(self._pid):
+                self._stand_still(now)   # 讓路是**故意**站著，不是卡住
                 self._stop.wait(_TICK)
                 continue
             pos = self._reader.read_position() if self._reader else None
+            self._note_moved(now, pos)
             if pos is not None:
                 # 被傳走時要回推「踩到哪裡出事」，所以隨手記著最近幾拍的位置。
                 # ⚠ 記的時候就把**當下的地圖**綁上去，事後才分得出哪幾點可信。
@@ -579,6 +606,7 @@ class FarmBot:
             # **一定要排在 `_escape_warp` 前面**：剛落地時人就站在回程傳點旁邊，
             # 脫離邏輯會把我們往外拉，正好跟「走回去」互相打架。
             if self._traveler is not None:
+                self._stand_still(now)   # 走回原圖那條有自己的逾時，同上
                 self._go_home(now, pos)
                 self._emit()
                 self._stop.wait(_TICK)
@@ -618,6 +646,8 @@ class FarmBot:
             # ⚠ 站在傳點禁區裡的話，這一拍只做一件事：走出去。
             # 不是停下來 —— 叫你別靠近傳點，不是叫你關掉自動戰鬥。
             if self._escape_warp(pos):
+                # 脫離自己有 `_ESCAPE_GIVE_UP_SEC` 那道出口，不歸這裡的停滯偵測管
+                self._stand_still(now)
                 self._emit()
                 self._stop.wait(_TICK)
                 continue
@@ -629,9 +659,13 @@ class FarmBot:
             self._stats.walk_rejected = self._walker.rejected
 
             # 再來：打怪 > 走過去撿遠一點的掉落 > 漫遊找怪
+            # ⚠ 前兩條（交戰中、撿東西的停頓）**站著是應該的** ——
+            #   要把「該在走卻沒動」的時鐘往前推，見 `_STALL_SEC`。
             if self._aim is not None:
+                self._stand_still(now)
                 self._fight(now, pos)
             elif now < self._loot_until:
+                self._stand_still(now)
                 self._walker.clear()  # 剛打死，停一下讓它撿完再走
             elif not self._collect(now, pos):
                 self._roam(now, pos)
@@ -812,6 +846,21 @@ class FarmBot:
         for goal in (self._escape_goal, self._roam_goal):
             if goal is not None:
                 self._bad_goals.append((goal, now + _BAD_GOAL_SEC))
+        # ⚠ WARNING 級：使用者手上的預設層級就是 WARNING，這一行必須看得到
+        #   （[ENV-...]：INFO 在他的日誌裡一行都不會出現）。
+        # ⚠⚠ **把當下的狀態一起印出來，而且要在清掉之前印。**
+        #   2026-09-01 實機一小時卡了 30 次，45 秒裡日誌一行都沒有 ——
+        #   只知道「在漫遊」，不知道是客戶端說在走、伺服器不收、還是路算不出來，
+        #   三種的修法完全不同（見 `_STALL_SEC`）。多印這一行幾乎免費：
+        #   45 秒才一次。
+        log.warning(
+            "[自動打怪] 卡住了（%s）—— 清掉狀態重來，第 %d 次"
+            "｜位置 %s（即時=%s，%.1f 秒沒動）｜附近 %d 隻怪｜%s",
+            doing, self._stuck, self._was_at,
+            self._reader.position_live if self._reader is not None else None,
+            (now - self._moved_at) if self._moved_at else -1.0,
+            self._stats.monsters_near, self._walker.debug_state(now),
+        )
         self._escape_goal = None
         self._roam_goal = None
         self._aim = None
@@ -819,14 +868,30 @@ class FarmBot:
         self._stale_since = 0.0
         self._woke_at = 0.0
         self._progress_at = now
-        # ⚠ WARNING 級：使用者手上的預設層級就是 WARNING，這一行必須看得到
-        #   （[ENV-...]：INFO 在他的日誌裡一行都不會出現）。
-        log.warning("[自動打怪] 卡住了（%s）—— 清掉狀態重來，第 %d 次",
-                    doing, self._stuck)
+        self._stand_still(now)
         self._note(
             f"⚠ {_FROZEN_SEC:.0f} 秒沒進展（{doing}）—— 換個目標重來"
             f"（第 {self._stuck} 次，**沒有**關掉自動打怪）"
         )
+
+    def _note_moved(self, now: float, pos: tuple[int, int] | None) -> None:
+        """角色動了沒。**這是唯一沒被任何旗標污染的進度證據**（見 `_STALL_SEC`）。"""
+        if pos is None:
+            return
+        if pos != self._was_at or not self._moved_at:
+            self._was_at = pos
+            self._moved_at = now
+
+    def _stand_still(self, now: float) -> None:
+        """這一拍**故意**站著（交戰、讓路詠唱、撿東西的停頓）—— 不算沒進展。"""
+        self._moved_at = now
+
+    def _stalled(self, now: float) -> float:
+        """「該在走卻沒動」多久了。0 = 沒有（剛動過，或還沒起算）。"""
+        if not self._moved_at:
+            return 0.0
+        held = now - self._moved_at
+        return held if held > _STALL_SEC else 0.0
 
     def _doing(self) -> str:
         """卡住的時候在做什麼 —— 給日誌看的一句話。"""
@@ -1332,8 +1397,12 @@ class FarmBot:
                 self._world.forget_item(item.entity_id)
                 return False
             self._walker.set_path(path, avoid=self._warp_zone)
-        if self._walker.update(pos) == "blocked":
+        # ⚠ 走不成、或「該在走卻沒動」（見 `_STALL_SEC`）都算撿不到 ——
+        #   不放掉的話這一支每拍都回 True，漫遊永遠輪不到，人就站在那裡。
+        if self._walker.update(pos) == "blocked" or self._stalled(now):
             self._world.forget_item(item.entity_id)
+            self._walker.clear()
+            self._stand_still(now)
         return True
 
     def _pick_up(self, item) -> None:  # noqa: ANN001 - GroundItem
@@ -1358,8 +1427,21 @@ class FarmBot:
         if self._terrain is None or pos is None:
             return
         state = self._walker.update(pos)
-        if state == "walking":
+        stalled = self._stalled(now)
+        if state == "walking" and not stalled:
             return
+        if state == "walking":
+            # ⚠⚠ 走路那一支說「還在走」，但**座標好幾秒沒變過**。
+            # 以讀得到的訊號為準（CLAUDE.md：做→讀→確認），當成這條路走不成。
+            # 這裡要**大聲**：它是安靜站著 45 秒那件事唯一的線索。
+            log.warning(
+                "[自動打怪] 漫遊 %.1f 秒沒有前進（往 %s，走路狀態說還在走）"
+                "—— 換一條路｜%s",
+                stalled, self._roam_goal, self._walker.debug_state(now),
+            )
+            self._walker.clear()
+            self._stand_still(now)      # 重新起算，不然下一拍又報一次
+            state = "blocked"
         if state == "arrived":
             self._roam_goal = None  # 到了，換下一個遠點
         elif state == "blocked":

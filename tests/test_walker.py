@@ -11,6 +11,7 @@ from ro_toolbox.services.walker import (
     LOOKAHEAD,
     MAX_RESEND,
     MAX_STEP,
+    MOVING_TRUST_SEC,
     RESEND_SEC,
     STUCK_SEC,
     Walker,
@@ -325,10 +326,38 @@ def test_no_resend_while_the_client_says_it_is_still_walking():
     walker.update((10, 50))
     walker.note_move_ack(fake.sent[-1])
 
-    for _ in range(MAX_RESEND + 3):
-        fake.now += RESEND_SEC + 0.05
+    while fake.now < 100.0 + MOVING_TRUST_SEC - RESEND_SEC:
+        fake.now += RESEND_SEC + 0.01
         assert walker.update((10, 50)) == "walking"
     assert walker.resent == 0, "客戶端說還在走，就不該重送"
+
+
+def test_the_client_saying_it_walks_only_buys_a_bounded_amount_of_time():
+    """★ 客戶端說「我在走」**不能無限期壓過「停住了」**（2026-09-01 實機）。
+
+    舊版沒有上限：只要 `moving()` 一直回 True，`Walker` 就永遠回 walking ——
+    不重送、不判 blocked。`farm_bot._roam()` 看到 walking 就 return，
+    於是機器人安靜地站著，一行日誌都沒有，直到 45 秒的保護把它踢醒
+    （一小時 30 次）。座標**真的動了**才算進度，旗標只能擋短暫的誤判。
+    """
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock, moving=lambda: True)
+    walker.set_path(straight_path(40))
+    walker.update((10, 50))
+    walker.note_move_ack(fake.sent[-1])
+
+    outcome = "walking"
+    for _ in range(200):                       # 上限一到就該自己救自己
+        fake.now += RESEND_SEC + 0.01
+        outcome = walker.update((10, 50))
+        if outcome == "blocked":
+            break
+    assert outcome == "blocked", "客戶端說在走也不能永遠不判定走不成"
+    assert walker.resent >= 1, "上限一到就要開始重送搶救"
+    held = fake.now - 100.0
+    assert held <= MOVING_TRUST_SEC + STUCK_SEC + RESEND_SEC * (MAX_RESEND + 2), (
+        f"從停住到放棄花了 {held:.1f} 秒，太久了"
+    )
 
 
 def test_resend_still_happens_when_the_client_says_it_stopped():

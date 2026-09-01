@@ -68,6 +68,23 @@ MAX_RESEND = 6
 #: ⚠ 重送用完**而且**停超過這個時間才判定 blocked ——
 #: 「被打斷」與「真的被擋住」的差別就是重送有沒有救回來。
 STUCK_SEC = 2.0
+#: 客戶端說「我正在走」最多能壓過「停住了」多久。
+#:
+#: ⚠⚠ **這是上限，不是信任票。** 第一版沒有上限：只要 `moving()` 回 True 就
+#: 一路把「停住」的計時器往後推 —— 於是客戶端只要在「正在走」的狀態裡卡住，
+#: `Walker` 就**永遠**回報 walking：不重送、不判 blocked、也不再送下一段，
+#: 呼叫端（`farm_bot._roam`）看到 walking 就直接 return，整個機器人安靜地
+#: 站著，一行日誌都沒有，直到 45 秒的保護把它踢醒（2026-09-01 實機一小時 30 次）。
+#:
+#: 這正是 CLAUDE.md 那條「逾時只能當放棄的上限，不能當成功的依據」——
+#: 客戶端的旗標可以用來**壓下誤判**，但不可以拿來證明「事情正在進行」。
+#: 座標真的動了才是進行中的證據；旗標只在剛停住的那一小段裡有發言權。
+#:
+#: 值取 2 秒，有實機分佈撐著（`tools/probe_walk_freeze.py`，2026-09-01，
+#: 兩隻分身各取樣 3342 筆／7 分鐘）：**「座標沒變」的區間中位數 0.12 秒、
+#: p90 0.25 秒、p99 2.1~3.6 秒**，而卡死的那幾段是 45 秒。
+#: 2 秒落在正常抖動的十倍以上、又遠低於災難，兩邊都不沾。
+MOVING_TRUST_SEC = 2.0
 #: 偏離路徑超過幾格就當這條路走不成，重新規劃。
 OFF_PATH = 5
 
@@ -126,6 +143,10 @@ class Walker:
         self._step = MAX_STEP
         self._pos: tuple[int, int] | None = None
         self._pos_at = 0.0
+        #: 位置**真的變了**的最後時刻。⚠ 跟 `_pos_at` 分開：`_pos_at` 會被
+        #: 「客戶端說我在走」往後推，這個不會 —— 它是唯一沒被任何旗標污染的
+        #: 進度證據，`MOVING_TRUST_SEC` 的上限就靠它算。
+        self._moved_at = 0.0
         self._resends = 0      # 這一次「停住」已經重送幾次
         self._resent_at = 0.0
         #: 這一段路不准經過的格子（自動打怪拿它擋傳點）。見 `_clear_line`。
@@ -198,6 +219,30 @@ class Walker:
         self._acked = True
         self._resends = 0
 
+    def debug_state(self, now: float | None = None) -> str:
+        """現在的內部狀態，寫成一行。**只給日誌看。**
+
+        卡住的時候光看「呼叫端在做什麼」分不出是哪一種壞法（客戶端說在走、
+        伺服器不收、還是路算不出來），而那三種的修法完全不同。這一行把
+        分辨得出來的欄位一次攤開，下一次再卡住就不必再猜（2026-09-01 那次
+        45 秒裡日誌一行都沒有，只能靠推理）。
+        """
+        now = self._now() if now is None else now
+        try:
+            moving = self._moving()
+        except Exception as exc:  # noqa: BLE001
+            # ⚠ 這一行只是要寫進日誌。**診斷絕不能反過來炸掉呼叫端** ——
+            #   自動打怪那條執行緒死掉的樣子跟斷線一模一樣（[DAT-059]），
+            #   為了一行 log 賠掉整個功能是最糟的交換。
+            moving = f"問不到（{exc.__class__.__name__}）"
+        return (
+            f"目標={self._target} 已確認={self._acked} 步幅={self._step} "
+            f"路徑剩={max(0, len(self._path) - self._index)} "
+            f"停住={now - self._pos_at:.1f}s 真的沒動={now - self._moved_at:.1f}s "
+            f"重送={self._resends} 客戶端在走={moving} "
+            f"累計 送出={self.sent} 被拒={self.rejected} 重送={self.resent}"
+        )
+
     def update(self, pos: tuple[int, int]) -> str:
         if not self._path:
             return "idle"
@@ -206,6 +251,7 @@ class Walker:
         if pos != self._pos:
             self._pos = pos
             self._pos_at = now
+            self._moved_at = now
             self._resends = 0   # 動了就是接回去了，重送次數重新起算
 
         index = self._progress(pos)
@@ -245,8 +291,13 @@ class Walker:
         # 客戶端的走路狀態是收到 `0x0087` 之後才寫的（見 `player_position`），
         # 所以它說在走就是真的在走；被怪打斷時它會變回站著，重送照樣會發生。
         # 問不出來（None）就退回原本的計時器判斷 —— 那是安全的那一邊。
-        if self._target is not None and now - self._pos_at > RESEND_SEC \
-                and self._moving() is True:
+        #
+        # ⚠⚠ **但只信 `MOVING_TRUST_SEC` 秒。** 座標從上次真的變到現在已經
+        # 超過那個上限的話，不管客戶端說什麼都當成停住 —— 「它說在走」跟
+        # 「它真的在前進」是兩件事，而只有後者算進度（見 `MOVING_TRUST_SEC`）。
+        if (self._target is not None and now - self._pos_at > RESEND_SEC
+                and now - self._moved_at <= MOVING_TRUST_SEC
+                and self._moving() is True):
             self._pos_at = now          # 還在走，這一段不算停住
         if self._target is not None and now - self._pos_at > RESEND_SEC:
             if self._resends >= MAX_RESEND and now - self._pos_at > STUCK_SEC:

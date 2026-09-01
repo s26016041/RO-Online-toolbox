@@ -1168,6 +1168,9 @@ def _frozen_bot(monkeypatch, clock):
         def read_position(self):
             return (200, 200)          # 永遠不動
 
+        def position_moving(self):
+            return True                # 客戶端說「我正在走」，人卻沒動
+
     bot._reader = _Reader()
     return bot
 
@@ -1223,3 +1226,81 @@ def test_stale_coordinates_drop_the_escape_state(monkeypatch):
     bot._reader = _Stale()
     assert bot._wake_position(1000.0, (200, 200)) is False
     assert bot._escape_goal is None
+
+
+# ---- 客戶端的走路旗標卡住 → 機器人安靜地站 45 秒（2026-09-01 實機）----------
+
+
+def _walking_forever_bot(clock: dict) -> tuple[FarmBot, list]:
+    """做一個「客戶端一直說我在走、角色卻一步都不動」的機器人。
+
+    這不是想像出來的情境：`tools/probe_walk_freeze.py` 對兩隻分身取樣 7 分鐘，
+    抓到 **6 次**「座標 45 秒不變、`position_moving()` 100% 都是 True、
+    移動終點只變了一次」—— 也就是我們送的那一步伺服器收了、人卻沒走，
+    然後客戶端的路徑索引就停在 0 不動。
+    """
+    from ro_toolbox.services.walker import Walker
+
+    bot = bot_with_map()
+    bot._reader = SimpleNamespace(
+        position_live=True,
+        position_moving=lambda: True,          # ⚠ 永遠說「我正在走」
+        read_position=lambda: (200, 200),
+        read=lambda: SimpleNamespace(hp=100, max_hp=100, map_name="test"),
+    )
+    sent: list[tuple[int, int]] = []
+
+    def send(x: int, y: int) -> None:
+        sent.append((x, y))
+        bot._walker.note_move_ack((x, y))      # 伺服器每次都接受（實機就是這樣）
+
+    bot._walker = Walker(send, now=lambda: clock["now"], moving=bot._client_moving)
+    return bot, sent
+
+
+def test_a_stuck_client_walk_flag_cannot_freeze_the_roaming():
+    """★ 這顆就是「卡住卡超久」：45 秒裡日誌一行都沒有、封包一個也沒送。
+
+    舊版的鏈條是：客戶端旗標卡在「正在走」→ `Walker` 不重送也不判 blocked、
+    永遠回 walking → `_roam()` 看到 walking 就 `return` → 沒有人送封包、
+    沒有人重新規劃 → 一直到 `_FROZEN_SEC`(45) 的保護把它踢醒。
+
+    釘住的行為：**座標沒動就是沒進展**，不管客戶端說什麼 ——
+    幾秒內一定要有新的封包送出去。
+    """
+    from ro_toolbox.services import farm_bot as mod
+
+    clock = {"now": T0}
+    bot, sent = _walking_forever_bot(clock)
+    bot._note_moved(clock["now"], (200, 200))
+    bot._roam(clock["now"], (200, 200))
+    assert len(sent) == 1, "第一拍應該送出第一段"
+
+    recovered_at = None
+    for _ in range(300):                        # 60 秒（遠超過 45 秒的保護）
+        clock["now"] += 0.2
+        bot._note_moved(clock["now"], (200, 200))
+        bot._roam(clock["now"], (200, 200))
+        if recovered_at is None and len(sent) > 1:
+            recovered_at = clock["now"] - T0
+    assert recovered_at is not None, "座標一直不動，卻沒有再送過任何封包"
+    assert recovered_at < mod._FROZEN_SEC / 2, (
+        f"過了 {recovered_at:.1f} 秒才重試，等於把救援留給 45 秒的保護"
+    )
+    assert recovered_at <= mod._STALL_SEC + 1.0, f"{recovered_at:.1f} 秒才重試，太慢"
+
+
+def test_standing_still_on_purpose_is_not_a_stall():
+    """⛔ 反面：交戰中站著打、讓路給詠唱、打死後停下來撿東西都是**故意**的，
+    不准被當成卡住 —— 誤判的代價是把打到一半的怪丟掉。"""
+    from ro_toolbox.services import farm_bot as mod
+
+    clock = {"now": T0}
+    bot, _sent = _walking_forever_bot(clock)
+    bot._note_moved(clock["now"], (200, 200))
+    for _ in range(100):
+        clock["now"] += 0.2
+        bot._stand_still(clock["now"])          # 交戰中：主迴圈會這樣做
+        assert bot._stalled(clock["now"]) == 0.0
+    clock["now"] += mod._STALL_SEC + 0.1
+    assert bot._stalled(clock["now"]) > 0, "不再故意站著之後就要算得出來"
