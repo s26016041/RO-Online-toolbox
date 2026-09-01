@@ -65,10 +65,11 @@ _D_STATE = _D_GID + actor.STATE // 4
 _D_DEST_X = _D_GID + actor.DEST_X // 4
 _D_DEST_Y = _D_GID + actor.DEST_Y // 4
 _D_TICK = _D_GID + actor.TICK // 4
+_D_DEAD = _D_GID + actor.DEAD // 4
 #: 掃描時 class 欄位前面要留多少 dword 讀得到（vtable 在最前面）
 _HEAD_DWORDS = actor.HEAD // 4
 #: class 欄位後面要留多少 dword 讀得到
-_TAIL_DWORDS = _D_TICK + 2
+_TAIL_DWORDS = _D_DEAD + 2
 
 
 class MemoryEntity:
@@ -99,13 +100,18 @@ class EntityScanner:
       1. **vtable 落在 Ragexe.exe 的模組映像內** —— 實體物件的第一個欄位。
          列舉不到模組時（GameGuard 偶爾會擋，[MEM-031]）這一關自動略過，
          其餘四關照常，屬安全退化。
-      2. **動作 tick `+0x134` 還在更新**（`actor.FRESH_MS` 內）——
-         這是「還在世界上」唯一可靠的訊號，取代舊版那兩個猜錯的旗標。
-      3. class ID 在**這張地圖的出沒表**裡（[DAT-016]）
-      4. GID 在合理範圍
-      5. **座標**（`+0x5C/+0x60`，走路中讀路徑節點）落在地圖內、
+      2. **死亡旗標 `+0x1A0` 是 0** —— 伺服器的 `0x0080 type=1` 同一拍它就變 1，
+         而**屍體的 GID 不會失效**、座標也還在。少了這道就是對著屍體送攻擊
+         （使用者說的「打空氣」）。封包對照：11 次死亡全中、
+         活體 1007 筆取樣裡 1006 筆是 0。
+      3. **動作 tick `+0x134` 還在更新**（`actor.FRESH_MS` 內）——
+         前兩道都沒觸發時的最後一道網子（例如換圖後被丟下的整批實體）。
+         走出視野的實體 GID 會被寫成 `0xFFFFFFFF`，由下面第 5 條擋掉。
+      4. class ID 在**這張地圖的出沒表**裡（[DAT-016]）
+      5. GID 在合理範圍（**離開視野的實體 GID 是 `0xFFFFFFFF`，這裡就擋掉了**）
+      6. **座標**（`+0x5C/+0x60`，走路中讀路徑節點）落在地圖內、
          而且站在 .gat 的可走格上
-      6. 離角色不超過 view（超出視野的不可能是現在看得到的怪）
+      7. 離角色不超過 view（超出視野的不可能是現在看得到的怪）
 
     每次掃「曾經掃到過怪」的熱區段（實測 4 ms），再加掃一小段冷區段慢慢輪完
     整份記憶體 —— 一次掃全部要 0.5~1.5 秒，直接做會讓 bot 每隔幾秒定格一下。
@@ -207,6 +213,8 @@ class EntityScanner:
             return None
         if not self._lut[class_id]:
             return None
+        if view.dead:
+            return None                      # 屍體：GID 還在、座標還在，但打不到
         if not view.fresh(now_tick):
             return None                      # 動作 tick 停了＝已經不在世界上
         cell = view.cell(self._scanner)
@@ -398,6 +406,7 @@ class EntityScanner:
             (gid > 0)
             & (gid < _MAX_GID)
             & (age < actor.FRESH_MS)          # 動作 tick 停了＝已經不在世界上
+            & (words[index + _D_DEAD] == 0)   # 死亡旗標：屍體不算怪
             & (dest_x > 0)
             & (dest_x < self._terrain.width)
             & (dest_y > 0)

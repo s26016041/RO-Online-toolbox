@@ -243,3 +243,39 @@ def test_read_known_returns_live_entries(monkeypatch):
     found = scanner.read_known((100, 100))
     assert [e.gid for e in found] == [777]
     assert scanner.known_count == 1
+
+
+# ---- 屍體不算怪（封包對照：11 次死亡全中）----------------------------------
+
+
+def _kill(blob: bytes, slot: int = _SLOT) -> bytes:
+    """把一段記憶體裡那隻怪標成死的（`GID+0x1A0` = 1）。"""
+    buf = bytearray(blob)
+    struct.pack_into("<I", buf, slot * 4 + 4 + actor.DEAD, 1)
+    return bytes(buf)
+
+
+def test_a_corpse_is_rejected_by_the_scan():
+    """⚠⚠ 屍體的 **GID 還在、座標也還在**，只有 `+0x1A0` 變成 1。
+
+    伺服器的 `0x0080 type=1` 同一拍記憶體就翻好了（比封包還快）。
+    少了這道就是走過去對著屍體送攻擊 —— 使用者說的「打空氣」。
+    """
+    blob = _kill(make_region(CLASS_ID, 2870, 221, 256))
+    assert not scan(scanner_with(blob), (220, 255))
+
+
+def test_a_corpse_is_rejected_on_the_fast_path(monkeypatch):
+    dead = bytearray(_one_struct(gid=777))
+    struct.pack_into("<I", dead, actor.HEAD + actor.DEAD, 1)
+    scanner = _scanner_with(monkeypatch, bytes(dead))
+    assert scanner.read_one(0xDEAD0000, (100, 100)) is None
+
+
+def test_a_monster_that_left_view_is_rejected(monkeypatch):
+    """離開視野時客戶端把 GID 寫成 0xFFFFFFFF（實測 8 次全部如此）——
+    「GID 在合理範圍」那道驗證本來就擋得掉，這裡把它釘住。"""
+    gone = bytearray(_one_struct(gid=777))
+    struct.pack_into("<I", gone, actor.HEAD + actor.GID, actor.GID_GONE)
+    scanner = _scanner_with(monkeypatch, bytes(gone))
+    assert scanner.read_actor(0xDEAD0000) is None

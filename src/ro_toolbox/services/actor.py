@@ -27,14 +27,34 @@ GID 是這個結構裡唯一「我們有辦法當場搜出來」的錨（角色�
 | 偏移 | 型別 | 意義 |
 |---|---|---|
 | `-0x110` | ptr  | vtable（一定落在 Ragexe.exe 的模組映像內） |
+| `-0x24`  | i32  | **不是存活旗標**（死了 60 秒還是 1，活著的怪身上也會是 0）|
 | `-0x04`  | i32  | class ID（怪種／職業） |
-| `+0x00`  | u32  | GID（角色的就是 AID） |
-| `+0x38`  | u32  | 狀態：站著 1、走路 2…（**怪身上會跑到 0~6，不能當存活旗標**）|
+| `+0x00`  | u32  | GID（角色的就是 AID）；**離開視野時被寫成 `0xFFFFFFFF`** |
+| `+0x38`  | u32  | 動作狀態（怪身上會跑到 0~6：走、攻擊、受傷、死亡動畫…）|
 | `+0x5C` / `+0x60` | i32 | **移動終點**；沒在走的時候就是目前所在格 |
 | `+0x110` / `+0x114` | ptr | 路徑陣列 begin／end（節點 0x10 bytes，開頭是 x,y）|
 | `+0x120` / `+0x124` | f32 | 這一段移動的插值座標（**沒走過路就是 0**）|
 | `+0x12C` | i32  | 目前走到路徑第幾個節點，沒在走是 -1 |
+| `+0x130` | f32  | 累計里程（世界單位，每格 5；斜走 5√2）|
 | `+0x134` | u32  | **動作 tick**（毫秒，跟 `GetTickCount()` 同一個時基）|
+| `+0x13C` | u32  | 牠正在打誰的 GID（實測就是我的 AID）|
+| `+0x19C` | u32  | 交戰中 1、否則 0（**不是**存活旗標）|
+| `+0x1A0` | u32  | **死亡旗標**：`0x0080 type=1` 的同一拍變成 1 |
+| `+0x1CC` | u32  | 離開視野的時間戳（tick），還在世界上時是 0 |
+
+## 「牠還在不在世界上」有三個獨立訊號（都用封包對過答案）
+
+2026-09-01 拿伺服器封包當答案卡，跟蹤 41 隻怪、16 次確認死亡、16 次離開視野：
+
+1. **離開視野**（`0x0080` type=0）→ 客戶端把 **GID 寫成 `0xFFFFFFFF`**。
+   所以「GID 在合理範圍」這道驗證本身就擋掉了走出視野的實體。
+2. **死亡**（`0x0080` type=1）→ **`+0x1A0` 變成 1**（`DEAD`）。
+   11 次死亡全中、0 個反例；反過來，封包說活著的 **1007 筆取樣裡 1006 筆是 0**
+   （唯一那筆 1 出現在死亡封包送達之前 —— 記憶體比封包還快，正是我們要的）。
+   ⚠ 屍體的 GID **不會**變 -1，牠會躺在那裡播完死亡動畫 —— 少了這道，
+   我們會對著屍體送攻擊，那就是使用者說的「打空氣」。
+3. **動作 tick 停住**（下面那張表）—— 前兩個都沒觸發時的最後一道網子
+   （例如換圖後被丟下的整批實體）。活體 1007/1007 都判定新鮮，0 個誤殺。
 
 ## 「牠現在站哪」只有兩行
 
@@ -79,7 +99,16 @@ PATH_END = 0x114
 MOVE_LERP_X = 0x120  # ⚠ 插值座標，不是「現在站哪」。要位置請用 cell_from()
 MOVE_LERP_Y = 0x124
 PATH_INDEX = 0x12C
+MILEAGE = 0x130
 TICK = 0x134
+TARGET = 0x13C      # 牠正在打誰的 GID
+IN_COMBAT = 0x19C   # 交戰中 1（⚠ 不是存活旗標）
+DEAD = 0x1A0        # 死亡旗標：0x0080 type=1 的同一拍變成 1
+GONE_AT = 0x1CC     # 離開視野的時間戳，還在世界上時是 0
+
+#: 離開視野時客戶端寫進 GID 欄位的值（實測 8 次「離開視野」全部如此）。
+#: 不必特別檢查它 —— `0 < gid < 0x7FFFFFFF` 這道驗證本來就擋掉了。
+GID_GONE = 0xFFFF_FFFF
 
 PATH_STRIDE = 0x10
 #: 路徑不可能有這麼多節點（單次移動上限 17 格）。擋「指標像陣列但其實是垃圾」。
@@ -91,10 +120,10 @@ MAX_STATE = 8
 #: ⚠ (0,0) 一定要擋掉 —— [MEM-039] 就是被 (0,0) 通過驗證害的。
 MAX_CELL = 512
 
-#: 從 vtable 讀到動作 tick 要涵蓋多少 bytes（讀一整塊比分次讀便宜）。
+#: 從 vtable 讀到死亡旗標要涵蓋多少 bytes（讀一整塊比分次讀便宜）。
 HEAD = -VTABLE          # 0x110：GID 之前要往回讀多少
-SPAN = TICK + 4         # 0x138：GID 之後要往後讀多少
-BLOCK = HEAD + SPAN     # 一次讀 0x248 bytes 就有全部欄位
+SPAN = DEAD + 4         # 0x1A4：GID 之後要往後讀多少
+BLOCK = HEAD + SPAN     # 一次讀 0x2B4 bytes 就有全部欄位
 
 #: 動作 tick 落後現在多久之內算「還在世界上」。出處見模組開頭的門檻掃描。
 FRESH_MS = 2000
@@ -188,6 +217,25 @@ class ActorView:
     def dest(self) -> tuple[int, int]:
         return self._i32(DEST_X), self._i32(DEST_Y)
 
+    @property
+    def target(self) -> int:
+        """牠正在打誰的 GID（0 = 沒有）。"""
+        return self._u32(TARGET)
+
+    @property
+    def dead(self) -> bool:
+        """死了嗎。伺服器的 `0x0080 type=1` **同一拍**這裡就是 1 了。
+
+        ⚠ 屍體的 GID 不會變 `GID_GONE`，牠會躺在原地播完死亡動畫 ——
+        少了這道，我們會對著屍體送攻擊（使用者說的「打空氣」）。
+        """
+        return self._u32(DEAD) != 0
+
+    @property
+    def gone(self) -> bool:
+        """已經被移出視野了嗎（`0x0080 type=0` 時 GID 被寫成 `GID_GONE`）。"""
+        return self._u32(GID) == GID_GONE
+
     def fresh(self, now: int | None = None, limit_ms: int = FRESH_MS) -> bool:
         """這個實體還在世界上嗎（動作 tick 還在更新嗎）。"""
         return tick_age(self.tick, now) < limit_ms
@@ -225,14 +273,19 @@ class ActorView:
 __all__ = [
     "BLOCK",
     "CLASS",
+    "DEAD",
     "DEST_X",
     "DEST_Y",
     "FRESH_MS",
     "GID",
+    "GID_GONE",
+    "GONE_AT",
+    "IN_COMBAT",
     "HEAD",
     "MAX_CELL",
     "MAX_PATH_NODES",
     "MAX_STATE",
+    "MILEAGE",
     "MOVE_LERP_X",
     "MOVE_LERP_Y",
     "PATH_BEGIN",
@@ -241,6 +294,7 @@ __all__ = [
     "PATH_STRIDE",
     "SPAN",
     "STATE",
+    "TARGET",
     "TICK",
     "VTABLE",
     "ActorView",
