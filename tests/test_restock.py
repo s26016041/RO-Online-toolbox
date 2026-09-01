@@ -222,7 +222,6 @@ def test_buying_finishes_with_the_total():
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
     bot.feed(*par(shop.SP_ZENY, 10_000_000))
 
-    catalog = ((HP_ITEM, 50), (SP_ITEM, 100))
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 探路第一瓶
     bot.feed(*par(shop.SP_WEIGHT, 20100))           # 一瓶 = 100
