@@ -356,15 +356,38 @@ def test_it_will_not_reconnect_without_a_snapshot(qtbot, monkeypatch, caplog):
     assert any("快照" in r.getMessage() for r in caplog.records)
 
 
-def test_a_saved_potion_setting_is_not_cancelled_by_a_slow_bag(qtbot, monkeypatch):
-    """⚠ 實測抱怨：「是否使用藥水的那個選擇要記錄」。
+def test_a_saved_potion_setting_starts_even_before_the_bag_is_read(qtbot, monkeypatch):
+    """⚠ 實測抱怨：「是否使用藥水的那個選擇要記錄」「白狐一樣沒記憶到藥水」。
 
-    真正的原因不是沒存 —— 是**還原的時機**。開程式時背包是背景讀的，
-    還原當下下拉是空的，舊版就判定「還沒選道具」把勾取消掉。
+    設定存的是**道具編號**，`PotionBot` 每次喝之前自己查格號（`_slot_of()`）
+    —— 它根本不需要那份下拉清單。所以「背包還沒讀到」**不是**「還沒設定」，
+    照樣要啟動。
+
+    ⚠ 舊版在這裡等背包，而背包**只讀正在看的那一頁** —— 背景分頁勾著自動補水
+    卻什麼都沒在跑，日誌每 5 秒一行「自動補水先等背包讀到再啟動」
+    （實機 2026-09-01：登入後 40 秒才真的開始補水）。
     """
     from ro_toolbox.services.potion_store import PotionSaved
     from ro_toolbox.ui.pages.farm_page import CharacterCard
 
+    made = []
+
+    class _Bot:
+        def __init__(self, pid, config, on_update=None):
+            made.append((pid, config))
+            self.stats = type("S", (), {"running": True, "went_home": False,
+                                        "needs_supplies": False})()
+
+        def start(self):
+            return True
+
+        def stop(self):
+            pass
+
+        def configure(self, config):
+            pass
+
+    monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.PotionBot", _Bot)
     page = _page(qtbot)
     card = CharacterCard()
     qtbot.addWidget(card)
@@ -374,15 +397,71 @@ def test_a_saved_potion_setting_is_not_cancelled_by_a_slow_bag(qtbot, monkeypatc
 
     page._toggle_potion(1234, True)            # 背包還沒到
     assert card.auto_potion.isChecked() is True, "不能因為背包慢就把設定取消掉"
-    assert 1234 in page._pending_potion
-    assert 1234 not in page._potions, "也不該用空設定去啟動"
+    assert 1234 in page._potions, "背包還沒到也要開始補水"
+    assert made and made[0][1].hp_item == 501, "拿的是記住的道具編號"
+    assert 1234 not in page._pending_potion, "不必再等背包"
 
-    started = []
-    monkeypatch.setattr(page, "_toggle_potion",
-                        lambda pid, on: started.append((pid, on)))
-    page._bags[1234] = {6: (501, 99)}
-    page._apply_bag(1234)
-    assert started == [(1234, True)], "背包回來就要接著啟動"
+
+def test_the_potion_tick_is_put_back_if_it_ever_goes_missing(qtbot, monkeypatch, caplog):
+    """★ 使用者指定：「自動補水啟動按鈕應該要記憶並且永遠不會自己關閉」。
+
+    勾勾只是畫面，**意圖才是事實**。兩者對不上（勾勾自己不見了）就是 bug ——
+    這裡把它勾回去並**大聲留紀錄**，下次才找得到是誰拿掉的。
+    停用不是安全退化，是致命的：實機踩過補水被關掉之後角色死了。
+    """
+    import logging
+
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    class _Bot:
+        def __init__(self, pid, config, on_update=None):
+            self.running = True
+            self.stats = type("S", (), {"running": True, "went_home": False,
+                                        "needs_supplies": False})()
+
+        def start(self):
+            return True
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.PotionBot", _Bot)
+    monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.find_server",
+                        lambda _pid: ("1.2.3.4", 6900))
+    page = _page(qtbot)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "白狐"
+    card.hp_threshold.setValue(50)
+    card._want_item["hp"] = 501
+    page._cards[7] = card
+    page._names[7] = "白狐"
+    card.auto_potion.setChecked(True)            # 使用者開的 → 意圖 = 開著
+    page._toggle_potion(7, True)                 # （正式流程由 signal 呼叫）
+    assert page._potion_intent.get(7) is True
+
+    card.auto_potion.blockSignals(True)          # 有人偷偷把勾勾拿掉
+    card.auto_potion.setChecked(False)
+    card.auto_potion.blockSignals(False)
+
+    with caplog.at_level(logging.WARNING):
+        page._watch_potion_alive()
+    assert card.auto_potion.isChecked() is True, "意圖還在就要勾回去"
+    assert any("勾勾不見了" in r.message for r in caplog.records), "要大聲留紀錄"
+
+
+def test_turning_the_potion_off_is_respected(qtbot, monkeypatch):
+    """⚠ 反過來也要對：**使用者自己關掉的就不准自作主張開回去**。"""
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    page = _page(qtbot)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "白狐"
+    page._cards[8] = card
+    page._toggle_potion(8, False)                # 使用者關掉
+    page._watch_potion_alive()
+    assert card.auto_potion.isChecked() is False
 
 
 def test_a_genuinely_empty_setting_says_so_but_keeps_the_box_ticked(qtbot, caplog):
@@ -1621,26 +1700,44 @@ def test_the_snapshot_remembers_where_he_was_farming(monkeypatch, qtbot):
     assert snap.farm_map == "mjolnir_07"
 
 
-def test_a_supply_run_waits_for_the_bag_instead_of_giving_up(monkeypatch, qtbot):
+def test_a_supply_run_starts_even_while_the_bag_is_still_loading(monkeypatch, qtbot):
     """⚠⚠ 實機（白狐）：回連之後印了「補給途中斷線，回來接著補完再走回去」，
     然後**什麼都沒發生**。分頁才剛長出來 1 秒，背包還在背景讀，
     `potion_config()` 是空的 —— 舊版就跳一個「請先選道具」的框然後 return。
-    人整晚站在城裡。背包還在讀不等於使用者沒設定。
+    人整晚站在城裡。**背包還在讀不等於使用者沒設定。**
+
+    現在設定直接來自還原回來的道具編號（`_picked()`），補給當場就出發；
+    「背包裡有幾個回程道具」由 `RestockBot._home_count()` 自己現查。
     """
     page = _blank_page(monkeypatch, qtbot)
     pid = 4242
     card = make_card(qtbot)
     page._cards[pid] = card
-    # 還原存檔時選了道具，但背包還沒讀到 → 下拉是空的、pending 有值
+    # 還原存檔時選了道具，但背包還沒讀到 → 下拉是空的
     card._want_item["hp"] = 501
     notices = []
     monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.show_notice",
                         lambda *a: notices.append(a))
+    started = []
+
+    class _Bot:
+        def __init__(self, pid, hp_item, home_item=None, on_update=None, back_to=""):
+            started.append((pid, hp_item, back_to))
+            self.stats = type("S", (), {"running": True, "broke": False,
+                                        "done": False, "note": ""})()
+
+        def start(self):
+            return True
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.RestockBot", _Bot)
 
     page._start_restock(pid, back_to="mjolnir_07")
-    assert page._restocks == {}, "還不能開始"
     assert notices == [], "不准跳「請先選道具」—— 使用者明明選了"
-    assert pid in page._supply_pending, "要留著，背包讀到再試"
+    assert started == [(pid, 501, "mjolnir_07")], "當場出發，不用等背包"
+    assert pid in page._restocks
 
 
 # ---- 補給完要真的接回掛機（2026-08-30 實機） -------------------------------
@@ -1996,7 +2093,10 @@ def test_saving_before_the_bag_arrives_keeps_the_restored_choice(qtbot):
     card.apply_saved_potion(
         PotionSaved(hp_item=501, home_item=601, hp_percent=55, go_home=True)
     )
-    assert card.hp_item.currentData() is None, "下拉的確是空的"
+    # 還原的那一刻就把它放上去（數量等背包回來再補），使用者馬上看得到
+    # 自己選的是什麼 —— 不是一片「未選擇」。
+    assert card.hp_item.currentData() == 501
+    assert "× 0" in card.hp_item.currentText(), "數量還不知道，先寫 0"
 
     saved = card.saved_potion()
     assert saved.hp_item == 501, "存的要是使用者選的那個"

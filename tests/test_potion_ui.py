@@ -231,15 +231,23 @@ def test_saved_settings_keep_the_item_id_not_the_slot(card):
     assert saved.hp_item == 501
 
 
-def test_wanted_item_is_selected_once_the_bag_finally_loads(card):
-    """背包是非同步讀的：還原當下清單還是空的，等它填好要自己選起來。"""
+def test_the_restored_item_shows_up_before_the_bag_does(card):
+    """★ 背包是非同步讀的 —— 但**記住的東西不必等它**。
+
+    使用者兩次回報「藥水跟回程使用物品一直不見沒紀錄」。真正看到的是：
+    分頁剛長出來時下拉一片「未選擇」（背包還在背景讀，而且**只讀正在看的
+    那一頁**），看起來就像沒記住。存的是道具編號，所以這裡直接把它放上去，
+    數量寫 0，等背包回來再補上真的數量。
+    """
     from ro_toolbox.services.potion_store import PotionSaved
 
     card.apply_saved_potion(PotionSaved(hp_item=501, hp_percent=40))
-    assert card.hp_item.currentData() is None, "清單還沒填，當然還選不到"
+    assert card.hp_item.currentData() == 501, "記住的那個要馬上看得到"
+    assert "× 0" in card.hp_item.currentText(), "數量還不知道，先寫 0"
 
     card.set_slots({44: (501, 10)})
-    assert card.hp_item.currentData() == 501, "清單填好之後要把存檔選的那個選起來"
+    assert card.hp_item.currentData() == 501, "背包回來還是同一個"
+    assert "× 10" in card.hp_item.currentText(), "數量補上了"
 
 
 # ---- 水用完回程 --------------------------------------------------------

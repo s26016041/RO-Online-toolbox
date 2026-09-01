@@ -34,6 +34,37 @@
 所以每買一次就重來一輪 `0x0090 接觸 → 0x00C4 → 0x00C5 → 0x00C6 商品清單`，
 拿到清單才送下一筆 `0x00C8`。多花幾個來回，換到「不會安靜地停在半路」。
 
+## ⚠⚠ 真正把訂單吃掉的是 `0x09D4` —— **客戶端買完會自己關店**（[PKT-092]）
+
+2026-09-01 實機證明（狐狐狸 @ prt_fild05 道具商人，`close_race.py`）：
+在 `0x00C6 商品清單` 與 `0x00C8 下單` 中間插一個 `0x09D4`，那一筆
+**完全沒有回應** —— 沒有 `0x0B41`、沒有 `0x00CA`，跟使用者回報的
+「等買賣結果逾時」一模一樣。對照組（不插）當場買到。
+
+而那一包**不是我們送的**：客戶端每收到一次 `0x00CA` 就會自己送一個
+`0x09D4` 把它的商店視窗關掉（實測落在結果後 **16~78 ms**，客戶端在背景時更久）。
+我們一收到結果就重開店，於是那一包會**插進我們的開店流程中間**，
+把伺服器那邊的交易狀態關掉，後面的 `0x00C8` 就被安靜地丟掉。
+這解釋了為什麼同一段程式碼 06:33 買得到 192 個、14:09 卻停在「共買了 1 個」——
+**它從頭到尾是個時序賽跑，不是設定或商人的問題。**
+
+### 修法：**把一筆單的三包併成一次 `send()`**
+
+`接觸 0x0090 ＋ 選買 0x00C5 ＋ 下單 0x00C8` 一次寫進 socket
+（`shop.order_packet()`）。同一次寫入的位元組是連續的，客戶端**插不進來** ——
+那個縫隙從此不存在，不是「比較不容易中」而是**沒有了**。
+
+實機驗收（同一隻角色、同一個商人、客戶端當時正處在「每收到商品清單就馬上
+送 `0x09D4`」的狀態）：**分開送 0/3 成交、併成一包 3/3 成交**。
+
+順帶拿掉的東西：不必再等 `0x00C4`、不必「重開店」那一輪、不必等客戶端關店。
+每一筆單自己帶著開店，所以 `一次開店只能下一筆單`（[PKT-079]）也自動滿足了。
+
+還留著的保險（時序以外的原因也可能吃掉訂單）：
+
+- 下單之後沒等到 `0x00CA`：先看 **`0x0B41`（東西進背包了沒）**，
+  進了就照成交算，沒進就**重下一次**，不再整趟放棄。
+
 ## 每一步都等讀得到的訊號
 
 送出去就等對應的回封包（`0x00C4` → `0x00C6` → `0x00CA`），逾時只是**放棄的
@@ -55,6 +86,9 @@ log = logging.getLogger(__name__)
 NPC_SNAP = 3
 #: 每一步等回應的上限。**只是放棄的上限**，不是成功的依據。
 STEP_TIMEOUT = 8.0
+#: 同一筆訂單最多重下幾次。時序以外的原因（伺服器忙、封包掉了）也可能吃掉
+#: 一筆單，重下一次很便宜；試完還是沒回應就大聲停。
+ORDER_RETRIES = 2
 #: 探路各買幾個。買 1 個就量得出單位重量，不必多花錢。
 PROBE_AMOUNT = 1
 #: 探路要做幾次（兩次才有差值）。
@@ -138,13 +172,15 @@ class Restocker:
         self._zeny: int | None = None
         self._probe: list[int] = []      # 每次探路量到的負重
         self._probing = True             # 這個道具還在探單位重量嗎
-        #: 重新開店之後要買幾個（None = 開店後照 `_next_item()` 走）。
-        #: 一次開店只能下一筆單，所以每一筆都要先把店重開一次。
-        self._want: int | None = None
         self._step = ""                  # 現在在等什麼
         self._since = 0.0
         #: 商店視窗開著嗎。**開著的時候角色不能移動** —— 收尾一定要關掉。
         self._opened = False
+        #: 這一筆已經有幾個進背包了（`0x0B41`）。逾時的時候用它分辨
+        #: 「其實成交了」與「伺服器整包丟掉了」，不必猜。
+        self._got = 0
+        #: 這一筆重下過幾次。
+        self._retries = 0
         self.stats = RestockStats()
 
     # ---- 控制 -------------------------------------------------------
@@ -162,7 +198,8 @@ class Restocker:
         self._items = []
         self._probe = []
         self._probing = True
-        self._want = None
+        self._got = 0
+        self._retries = 0
         self.stats = RestockStats(running=True)
         self._enter("找商人")
 
@@ -195,18 +232,22 @@ class Restocker:
             return
         if not self.stats.running:
             return
-        if opcode == shop.OP_DEAL_TYPE and self._step == "等商店回應":
-            self._send(shop.choose_buy(self._gid or 0))
-            self._enter("等商品清單")
-        elif opcode == shop.OP_SHOP_LIST and self._step == "等商品清單":
+        if opcode == shop.OP_CLOSE_SHOP:
+            # 客戶端把它的商店視窗關掉了。**現在無所謂** —— 每一筆單都自己
+            # 帶著開店（`shop.order_packet()`），它插不進去了。記一下就好，
+            # 收尾才知道要不要補一個關閉。
+            self._opened = False
+            return
+        if opcode == shop.OP_ITEM_ADDED and self._step == "等買賣結果":
+            got = shop.parse_item_added(payload)
+            if got is not None and got[0] == self._item:
+                self._got += got[1]
+            return
+        if opcode == shop.OP_SHOP_LIST and self._step == "等商品清單":
             self._items = shop.parse_shop_list(payload)
             self._opened = True
             log.info("商店有 %d 項商品", len(self._items))
-            if self._want is not None:
-                amount, self._want = self._want, None
-                self._buy(amount)       # 這是「重開店來下一筆」
-            else:
-                self._next_item(fresh=True)
+            self._next_item()
         elif opcode == shop.OP_BUY_RESULT and self._step == "等買賣結果":
             self._on_result(shop.parse_buy_result(payload))
 
@@ -215,15 +256,20 @@ class Restocker:
         if not self.stats.running:
             return "idle" if not self.stats.note else self._settled()
         moment = self._now() if now is None else now
-        if self._step in ("找商人", "重新開店"):
+        if self._step == "找商人":
             if self._gid is None:
                 return self._maybe_timeout(
                     moment, f"⚠ 走到了卻認不出商人（外觀 {self._look} @ {self._cell}）"
                 )
-            self._send(shop.contact_npc(self._gid))
-            self._enter("等商店回應")
+            self._send(shop.open_shop(self._gid))     # 接觸 ＋ 選買，一次送
+            self._opened = True
+            self._enter("等商品清單")
             return "working"
-        if self._step in ("等商店回應", "等商品清單", "等買賣結果"):
+        if self._step == "等買賣結果":
+            if moment - self._since <= STEP_TIMEOUT:
+                return "working"
+            return self._order_timed_out()
+        if self._step == "等商品清單":
             return self._maybe_timeout(moment, f"⚠ {self._step}逾時，補藥水已停止")
         return "working"
 
@@ -242,6 +288,26 @@ class Restocker:
         if now - self._since <= STEP_TIMEOUT:
             return "working"
         return self._fail(why)
+
+    def _order_timed_out(self) -> str:
+        """`0x00CA` 沒回來。**先看東西有沒有進背包**，不要憑逾時下結論。
+
+        伺服器把訂單安靜地丟掉是**時序賽跑**（客戶端的 `0x09D4` 插進中間），
+        重下一次多半就過了 —— 舊版在這裡直接整趟放棄，於是使用者看到的是
+        「補了 蝴蝶翅膀 1 個」然後一瓶藥水都沒有。
+        """
+        what = item_name(self._item or 0)
+        if self._got:
+            log.warning("買 %s 沒收到 0x00CA，但 %d 個已經進背包了 —— 照成交算",
+                        what, self._got)
+            return self._bought(self._got)
+        if self._retries < ORDER_RETRIES:
+            self._retries += 1
+            log.warning("買 %s 這一筆伺服器沒有任何回應，再下一次（第 %d 次）",
+                        what, self._retries)
+            self._buy(self._pending)
+            return "working"
+        return self._fail(f"⚠ 買 {what} 送出去沒有任何回應（試了 {self._retries + 1} 次），已停止")
 
     def _close_shop(self) -> None:
         """把商店視窗關掉。**每一條收尾路徑都要走這裡。**
@@ -282,11 +348,11 @@ class Restocker:
             return False
         return self._weight >= shop.fill_target(self._max_weight, self._order.ratio)
 
-    def _next_item(self, fresh: bool = False) -> str:
+    def _next_item(self) -> str:
         """換下一個要買的道具。都買完了（或負重滿了）就結束。
 
-        `fresh=True` 代表**剛收到商品清單**（店是開著的），可以直接下單；
-        否則要先把店重開一次（一次開店只能下一筆單，見檔頭）。
+        ⚠ 不必先重開店：每一筆單都**自己帶著開店**（`shop.order_packet()`），
+        那是唯一擋得住客戶端 `0x09D4` 的做法（見檔頭 [PKT-092]）。
         """
         self._probe = []
         self._probing = True
@@ -310,14 +376,10 @@ class Restocker:
                 if amount <= 0:
                     continue
                 self._probing = False
-                if fresh:
-                    self._buy(amount)
-                    return "working"
-                return self._order_more(amount)
-            if fresh:
-                self._buy(PROBE_AMOUNT)
+                self._buy(amount)
                 return "working"
-            return self._order_more(PROBE_AMOUNT)
+            self._buy(PROBE_AMOUNT)
+            return "working"
         self._item = None
         self._queue = []
         total = sum(self.stats.bought.values())
@@ -330,19 +392,25 @@ class Restocker:
         return self._fail("⚠ 這家店沒有你設定的藥水，什麼都沒買")
 
     def _order_more(self, amount: int) -> str:
-        """再買一筆。**一次開店只能下一筆單**，所以先把店重開一次（見檔頭）。"""
+        """再買一筆（探路的第二瓶、或算完之後的大單）。"""
         if self._item is None or amount <= 0:
             return "working"
-        self._want = amount
-        self._enter("重新開店")
+        self._buy(amount)
         return "working"
 
     def _buy(self, amount: int) -> None:
-        """送出下單封包。⚠ 只有在**剛拿到商品清單**之後呼叫才有用。"""
+        """下一筆單：**接觸 ＋ 選買 ＋ 下單一次送出去**（[PKT-092]）。
+
+        ⚠ 一次開店只能下一筆單（[PKT-079]），所以每一筆本來就要重開；
+        而**分開送就會被客戶端的 `0x09D4` 插進來**，訂單被安靜地丟掉。
+        併成一包之後那個縫隙就不存在了 —— 實機 0/3 → 3/3。
+        """
         if self._item is None or amount <= 0:
             return
         self._pending = amount
-        self._send(shop.buy_packet([(self._item, amount)]))
+        self._got = 0                    # 這一筆的答案卡（0x0B41）重新算
+        self._opened = True
+        self._send(shop.order_packet(self._gid or 0, [(self._item, amount)]))
         self._enter("等買賣結果")
 
     def _on_result(self, result: int | None) -> str:
@@ -350,9 +418,20 @@ class Restocker:
             return "working"
         if result != shop.RESULT_OK:
             return self._fail(f"⚠ 買 {item_name(self._item)} 被拒絕（結果 {result}）")
+        return self._bought(self._pending)
+
+    def _bought(self, amount: int) -> str:
+        """這一筆成交了：記帳，再決定下一步。
+
+        `amount` 是**真的買到幾個** —— 正常路徑是送出去的數量，
+        「沒收到 0x00CA 但東西進背包了」那條路是 `0x0B41` 數出來的。
+        """
+        if self._item is None:
+            return "working"
         self.stats.bought[self._item] = (
-            self.stats.bought.get(self._item, 0) + self._pending
+            self.stats.bought.get(self._item, 0) + amount
         )
+        self._retries = 0
         if not self._probing:
             return self._next_item()
         # 探路：兩次之間的負重差就是**量出來的**單位重量

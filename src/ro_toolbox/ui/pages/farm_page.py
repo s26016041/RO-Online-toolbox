@@ -67,7 +67,7 @@ from ro_toolbox.services.mail_bot import MailBot
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.process_monitor import local_network_up
 from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
-from ro_toolbox.services.restock_bot import RestockBot
+from ro_toolbox.services.restock_bot import RestockBot, forget_npcs
 from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.skills import SkillReader
 from ro_toolbox.services.travel_bot import TravelBot
@@ -899,10 +899,18 @@ class CharacterCard(QWidget):
             for key, combo in (
                 ("hp", self.hp_item), ("sp", self.sp_item), ("home", self.home_item)
             ):
-                position = combo.findData(self._want_item[key])
+                item_id = self._want_item[key]
+                position = combo.findData(item_id)
+                if position < 0 and item_id:
+                    # ⚠ 背包是背景讀的，分頁剛長出來時下拉是**空的** ——
+                    #   舊版只好等，於是使用者看到的是「未選擇」，
+                    #   回報「白狐喝水的藥水跟回程使用物品怎麼一直不見沒紀錄」。
+                    #   記住的是道具編號，這裡就先用「× 0」把它放上去，
+                    #   數量等背包回來（`set_slots()`）再補上。
+                    combo.addItem(item_icon(item_id), self._slot_text(item_id, 0), item_id)
+                    position = combo.count() - 1
                 if position >= 0:
                     combo.setCurrentIndex(position)
-                    self._want_item[key] = None
             self.auto_potion.setChecked(bool(saved.enabled))
         finally:
             self.quiet = False
@@ -933,13 +941,25 @@ class CharacterCard(QWidget):
         return combo.currentData() or self._want_item.get(key)
 
     def potion_config(self) -> PotionConfig:
+        """要拿去跑的補水設定。
+
+        ⚠⚠ **一律走 `_picked()`，不准用 `currentData()`。** 下拉是照背包重建的，
+        而背包是背景執行緒讀的、又只讀「正在看的那一頁」—— 背景分頁的下拉
+        可能一直是空的。用 `currentData()` 的話 `wants_hp()` 就永遠是 False，
+        於是勾著自動補水卻**什麼都沒在跑**（實機日誌：「自動補水先等背包讀到
+        再啟動」每 5 秒一行，跑了 40 秒才起來）。
+        存的是**道具編號**，`PotionBot` 每次喝之前自己查格號（`_slot_of()`），
+        它根本不需要那份下拉清單。
+        """
         return PotionConfig(
-            hp_item=self.hp_item.currentData(),
+            hp_item=self._picked("hp", self.hp_item),
             hp_percent=self.hp_threshold.value(),
-            sp_item=self.sp_item.currentData(),
+            sp_item=self._picked("sp", self.sp_item),
             sp_percent=self.sp_threshold.value(),
             # 沒勾就不帶道具進去 —— 沒勾卻回程是「安靜地做錯事」
-            home_item=self.home_item.currentData() if self.go_home.isChecked() else None,
+            home_item=(
+                self._picked("home", self.home_item) if self.go_home.isChecked() else None
+            ),
         )
 
     def _apply_potion_stats(self, stats: PotionStats) -> None:
@@ -1219,6 +1239,13 @@ class FarmPage(BasePage):
         #: 這一趟補水是「沒水自動觸發」的（補完要把掛機接回去），
         #: 不是使用者自己按「補水」按鈕。
         self._auto_restock: set[int] = set()
+        #: 使用者到底要不要自動補水（`{pid: True/False}`）。
+        #:
+        #: ⚠ 使用者指定（2026-08-30）：「**自動補水不管何時都不需要關閉**」。
+        #: 勾勾只是畫面，**意圖才是事實** —— 兩者對不上（勾勾自己不見了）
+        #: 就是 bug，`_watch_potion_alive()` 會把它勾回去並大聲留紀錄。
+        #: 只有兩個地方寫它：還原存檔與使用者自己切勾勾（都走 `_toggle_potion`）。
+        self._potion_intent: dict[int, bool] = {}
         #: 自動補水下次可以重開的時刻（見 `_watch_potion_alive`）。
         self._potion_retry: dict[int, float] = {}
         #: 自動打怪下次可以接回去的時刻（見 `_watch_farm_alive`）。
@@ -1581,6 +1608,7 @@ class FarmPage(BasePage):
         if traveler is not None:
             traveler.stop()
         self._names.pop(pid, None)
+        self._potion_intent.pop(pid, None)
         self._bag_loaded.discard(pid)
         self._bags.pop(pid, None)
         worker = self._bag_workers.pop(pid, None)
@@ -1592,6 +1620,9 @@ class FarmPage(BasePage):
         restock_bot = self._restocks.pop(pid, None)
         if restock_bot is not None:
             restock_bot.stop()
+        # NPC 的 GID 是伺服器**執行時**給的，跟著這個行程活 —— 行程沒了就忘掉，
+        # 免得 Windows 把 PID 回收給別的遊戲視窗時拿到上一隻的答案。
+        forget_npcs(pid)
         self._skill_loaded.discard(pid)
         skill_reader = self._skill_readers.pop(pid, None)
         # ⚠ 一定要等它結束再往下 —— QThread 還在跑就被解構會**殺掉整支程式**
@@ -2306,6 +2337,19 @@ class FarmPage(BasePage):
         """
         now = time.monotonic()
         for pid, card in list(self._cards.items()):
+            if self._potion_intent.get(pid) and not card.auto_potion.isChecked():
+                # ⚠⚠ **勾勾自己不見了。** 使用者實測回報：「自動補水啟動按鈕
+                #   應該要記憶並且永遠不會自己關閉才對，但她會偷偷關閉」。
+                #   意圖還在就把它勾回去 —— 停用不是安全退化，是**致命的**
+                #   （實機踩過：補水被關掉之後角色死了）。
+                #   大聲留紀錄，下次才找得到是誰把它拿掉的。
+                log.warning("「%s」的自動補水勾勾不見了（設定是開著的）—— 勾回去",
+                            self._names.get(pid) or pid)
+                card.quiet = True          # 這不是使用者改的，別當成新設定存回去
+                try:
+                    card.auto_potion.setChecked(True)
+                finally:
+                    card.quiet = False
             if not card.auto_potion.isChecked() or pid in self._restocks:
                 continue
             bot = self._potions.get(pid)
@@ -2545,6 +2589,8 @@ class FarmPage(BasePage):
 
     def _toggle_potion(self, pid: int, on: bool) -> None:
         card = self._cards.get(pid)
+        # 勾勾動了就是意圖動了 —— 這是唯一寫意圖的地方（見 `_potion_intent`）。
+        self._potion_intent[pid] = on
         if not on:
             bot = self._potions.pop(pid, None)
             if bot is not None:

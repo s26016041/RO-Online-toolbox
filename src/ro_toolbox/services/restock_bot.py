@@ -8,6 +8,11 @@
 2. **走過去**：`TravelBot`，目的地是**商人腳邊那一格**（`nearest_walkable`）。
    ⚠ 走路那一段還負責**把沿路看到的 NPC 記下來**：實體只在「進入視野」時
    送一次封包（[PKT-061]），到了才開擷取是接不到的 —— 認不出商人就開不了店。
+   ⚠⚠ 走 5 格是**看不到任何實體封包**的（人本來就站在旁邊）。所以這裡還要
+   **記住這次執行看過的 NPC**（`_NPC_SEEN`），走不出新東西時就拿記著的用；
+   連記著的都沒有就**走遠再走回來**（`_shake_view()`）逼他重新進一次視野。
+   使用者實機 2026-09-01：第一趟認得出商人、第二三趟都「走到了卻認不出商人」，
+   因為那時人就站在他旁邊，走 5 格不會有任何人進視野。
 3. **買**：`Restocker`（認人 → 開店 → 量單位重 → 買到負重 65%）。
    回程道具另外補到 20 個（`RestockOrder.home_needed()`）。
    ⚠ 買完**一定要關掉商店視窗**（`0x09D4`）—— 對話開著時角色**不能移動**，
@@ -21,6 +26,7 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from collections.abc import Callable
@@ -36,14 +42,50 @@ from ro_toolbox.services.gamedata import (
     potion_sellers_on,
 )
 from ro_toolbox.services.mapdata import GatError, load_terrain
-from ro_toolbox.services.restock import HOME_TARGET, Restocker, RestockOrder
+from ro_toolbox.services.restock import (
+    HOME_TARGET,
+    NPC_SNAP,
+    Restocker,
+    RestockOrder,
+)
 from ro_toolbox.services.travel import nearest_map_with, nearest_walkable
+from ro_toolbox.services.travel_bot import OUT_OF_VIEW as _OUT_OF_VIEW
 from ro_toolbox.services.travel_bot import TravelBot
 
 log = logging.getLogger(__name__)
 
 #: 走去商人最多花多久。**放棄的上限，不是成功的依據**（CLAUDE.md）。
 WALK_GIVEUP = 240.0
+#: 走遠再走回來最多做幾輪（逼 NPC 重新進一次視野）。
+_SHAKE_ROUNDS = 2
+#: 這一次執行期間，各行程在各張圖上看過的 NPC：`{(pid, 地圖): {gid: (外觀, x, y)}}`。
+#:
+#: ⚠ 為什麼要記：實體只在**進入視野**時送一次封包（[PKT-061]）。第二趟補水
+#: 出發時人已經站在商人旁邊，那一包早就過去了 —— 走那 5 格不會有任何人重新
+#: 進視野，於是「走到了卻認不出商人」。記的是**身分（GID）不是位置**
+#: （CLAUDE.md），而且只活在這一次執行期間：換一次遊戲就是新的 PID，
+#: 舊的自然不會被拿來用。
+_NPC_SEEN: dict[tuple[int, str], dict[int, tuple[int, int, int]]] = {}
+_NPC_LOCK = threading.Lock()
+
+
+def remember_npcs(pid: int, map_name: str, seen: dict) -> dict:
+    """把這一趟看到的 NPC 併進記憶，回傳這張圖上目前認得的全部 NPC。"""
+    if not map_name:
+        return dict(seen or {})
+    with _NPC_LOCK:
+        known = _NPC_SEEN.setdefault((pid, map_name), {})
+        known.update(seen or {})
+        return dict(known)
+
+
+def forget_npcs(pid: int) -> None:
+    """遊戲關掉／換人了就把記憶丟掉 —— GID 是伺服器給的，不是永久的。"""
+    with _NPC_LOCK:
+        for key in [k for k in _NPC_SEEN if k[0] == pid]:
+            _NPC_SEEN.pop(key, None)
+
+
 #: 站到商人旁邊之後，整段買賣最多花多久。
 SHOP_GIVEUP = 90.0
 #: 主迴圈一拍。
@@ -167,6 +209,9 @@ class RestockBot:
                 self._say(f"往 {where} 的{name}…")
                 known = self._walk(target_map, cell)
                 if known is not None:
+                    known = self._make_sure_he_is_visible(
+                        target_map, cell, seller_cell, look, name, known
+                    )
                     break
                 skip.add(target_map)
                 self._say(f"⚠ 走不到 {where} 的{name}，換一家試試")
@@ -249,6 +294,62 @@ class RestockBot:
             self._say(f"⚠ 沒走到商人那裡：{bot.stats.note}")
             return None
         return known
+
+    def _make_sure_he_is_visible(
+        self, target_map: str, cell, seller_cell, look: int, name: str, known: dict
+    ) -> dict:
+        """走到了，但認得出這個商人嗎？認不出就**走遠再走回來**。
+
+        ⚠ 實體只在「進入視野」時送一次封包（[PKT-061]）。第二趟補水出發時人
+        已經站在商人旁邊，走那 5 格**不會有任何人重新進視野** —— 使用者實機
+        2026-09-01 連續兩趟都停在「走到了卻認不出商人（外觀 83 @ (290,221)）」。
+
+        兩層保險，都很便宜：
+
+        1. **這次執行記過的**（`_NPC_SEEN`）：第一趟走過來時看到的 GID
+           還在，直接拿來用。
+        2. 記憶裡也沒有 → 走到視野外再走回來，逼伺服器重送一次那一包
+           （做法跟 `travel_bot._shake_view()` 一樣，那條路已經實機驗過）。
+
+        ⚠ 一定要走 `Walker`（`TravelBot`），不能自己送一個很遠的走路封包：
+        單次移動超過 17 格伺服器**靜默忽略**（[PKT-030]）。
+        """
+        known = remember_npcs(self._pid, target_map, known)
+        if self._can_see(known, seller_cell, look):
+            return known
+        try:
+            terrain = load_terrain(target_map)
+        except GatError:
+            return known                      # 讀不到地形就別亂走，交給下一段大聲說
+        for round_no in range(1, _SHAKE_ROUNDS + 1):
+            if self._stop.is_set():
+                return known
+            away = terrain.random_walkable(
+                random, near=seller_cell, radius=_OUT_OF_VIEW + 8,
+                min_radius=_OUT_OF_VIEW,
+            )
+            if away is None:
+                return known
+            self._say(f"認不出{name}，先走遠一點讓他重新進視野（第 {round_no} 次）")
+            if self._walk(target_map, away) is None:
+                return known
+            back = self._walk(target_map, cell)
+            if back is None:
+                return known
+            known = remember_npcs(self._pid, target_map, back)
+            if self._can_see(known, seller_cell, look):
+                return known
+        return known
+
+    @staticmethod
+    def _can_see(known: dict, seller_cell, look: int) -> bool:
+        """記著的 NPC 裡有沒有「外觀對、位置也對」的那一個（[DAT-027]）。"""
+        return any(
+            info[0] == look
+            and max(abs(info[1] - seller_cell[0]), abs(info[2] - seller_cell[1]))
+            <= NPC_SNAP
+            for info in known.values()
+        )
 
     def _buy(self, look: int, cell: tuple[int, int], known: dict) -> None:
         order = RestockOrder(

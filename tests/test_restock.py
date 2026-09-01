@@ -49,24 +49,21 @@ def make(order: RestockOrder | None = None):
 
 
 def walk_up_to_the_shop_list(bot, sent, *items):
-    """把「認人 → 講話 → 選買 → 收到商品清單」跑完。"""
+    """把「認人 → 開店 → 收到商品清單」跑完。
+
+    ⚠ 開店是 `0x0090 接觸 ＋ 0x00C5 選買` **一次送出去**（`shop.open_shop()`）
+      —— 分開送的話客戶端那一包 `0x09D4` 會插進中間（[PKT-092]）。
+    """
     bot.start(LOOK, CELL)
     bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
-    bot.update()                                   # 送 0x0090
-    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")   # 送 0x00C5
+    bot.update()                                       # 送 0x0090 + 0x00C5
     bot.feed(shop.OP_SHOP_LIST, shop_list(*items))     # 收清單 → 買第一個探路
     return sent
 
 
-def reopen(bot, *items):
-    """一次開店只能下一筆單，所以每一筆之前店都會被重開一次。
-
-    ⚠ 這不是測試的裝飾品：實機第二筆 `0x00C8` 送出去**石沉大海**，
-      一路等到逾時（兩次都是）。手上唯一那份真人擷取也只有一個 `0x00C8`。
-    """
-    assert bot.update() == "working"                   # 送 0x0090
-    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")   # 送 0x00C5
-    bot.feed(shop.OP_SHOP_LIST, shop_list(*items))     # 收清單 → 下一筆
+def one_order(item_id: int, amount: int) -> bytes:
+    """一筆單長什麼樣：**接觸 ＋ 選買 ＋ 下單，一次送**（[PKT-092]）。"""
+    return shop.order_packet(0x1F52, [(item_id, amount)])
 
 
 def test_it_only_talks_to_an_npc_that_matches_look_and_cell():
@@ -81,7 +78,7 @@ def test_it_only_talks_to_an_npc_that_matches_look_and_cell():
 
     bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0] + 1, y=CELL[1])
     assert bot.update() == "working"
-    assert sent == [shop.contact_npc(0x1F52)]
+    assert sent == [shop.open_shop(0x1F52)], "接觸＋選買要一次送"
 
 
 def test_it_gives_up_loudly_when_the_merchant_never_shows_up():
@@ -104,41 +101,38 @@ def test_the_unit_weight_is_measured_not_guessed():
     """
     bot, sent, _clock = make()
     walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)]), "第一次只買 1 個探路"
+    assert sent[-1] == one_order(HP_ITEM, 1), "第一次只買 1 個探路"
 
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
     bot.feed(*par(shop.SP_ZENY, 1_000_000))
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
-    reopen(bot, (HP_ITEM, 50))
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)]), "第二次還是 1 個"
+    assert sent[-1] == one_order(HP_ITEM, 1), "第二次還是 1 個"
 
     bot.feed(*par(shop.SP_WEIGHT, 20100))          # 一瓶 = 100
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
-    reopen(bot, (HP_ITEM, 50))
     # 上限 48100 × 65% = 31265，現在 20100 → 還有 11165 → 111 個
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 111)])
+    assert sent[-1] == one_order(HP_ITEM, 111)
 
 
-def test_every_order_reopens_the_shop_first():
-    """⚠ 一次開店只能下一筆單（實機兩次驗證：第二筆石沉大海）。
+def test_every_order_opens_the_shop_itself():
+    """⚠ 一次開店只能下一筆單（[PKT-079]，實機兩次驗證：第二筆石沉大海）。
 
-    所以每買一次就要重來一輪 0x0090 → 0x00C4 → 0x00C5 → 0x00C6，
-    拿到清單才准送下一個 0x00C8。
+    所以每一筆單都要**自己帶著開店** —— 而且要跟下單黏在同一次送出去，
+    不然客戶端那一包 `0x09D4` 會插進中間把訂單吃掉（[PKT-092]）。
     """
     bot, sent, _clock = make()
     walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)])
+    assert sent[-1] == one_order(HP_ITEM, 1)
 
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
     bot.feed(*par(shop.SP_ZENY, 1_000_000))
     bot.feed(*par(shop.SP_WEIGHT, 20000))
-    before = len(sent)
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
-    # ⚠ 收到結果之後**不准**直接再送 0x00C8
-    assert len(sent) == before, "第二筆不能直接送，要先重開店"
-    assert bot.update() == "working"
-    assert sent[-1] == shop.contact_npc(0x1F52), "要重新接觸 NPC"
+
+    # 第二瓶探路：一樣是「接觸＋選買＋下單」一包，不是光一個 0x00C8
+    assert sent[-1] == one_order(HP_ITEM, 1)
+    assert sent[-1].startswith(shop.contact_npc(0x1F52)), "自己帶著開店"
 
 
 def test_running_out_of_money_is_reported_for_the_ui_to_act_on():
@@ -149,13 +143,11 @@ def test_running_out_of_money_is_reported_for_the_ui_to_act_on():
     bot.feed(*par(shop.SP_ZENY, 600))              # 只買得起 12 個
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
-    reopen(bot, (HP_ITEM, 50))
     bot.feed(*par(shop.SP_WEIGHT, 20100))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
-    reopen(bot, (HP_ITEM, 50))
 
     assert bot.stats.broke is True
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 12)])
+    assert sent[-1] == one_order(HP_ITEM, 12)
 
 
 def test_restock_only_ever_buys_hp():
@@ -172,8 +164,8 @@ def test_the_sp_potion_on_the_shelf_is_never_touched():
     """店裡同時賣 SP 藥水也不准去碰它 —— 只補 HP。"""
     bot, sent, _clock = make()
     walk_up_to_the_shop_list(bot, sent, (SP_ITEM, 100), (HP_ITEM, 50))
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)]), "第一筆就該是 HP 那瓶"
-    assert all(shop.buy_packet([(SP_ITEM, n)]) not in sent for n in range(1, 300))
+    assert sent[-1] == one_order(HP_ITEM, 1), "第一筆就該是 HP 那瓶"
+    assert all(one_order(SP_ITEM, n) not in sent for n in range(1, 300))
 
 
 def test_an_item_the_shop_does_not_sell_is_skipped_not_substituted():
@@ -182,7 +174,7 @@ def test_an_item_the_shop_does_not_sell_is_skipped_not_substituted():
     walk_up_to_the_shop_list(bot, sent, (SP_ITEM, 100))   # 只賣別的瓶子
 
     # 設定的那瓶不在清單裡 → 什麼都不買，不准拿架上那瓶頂替
-    assert all(shop.buy_packet([(SP_ITEM, n)]) not in sent for n in range(1, 300))
+    assert all(one_order(SP_ITEM, n) not in sent for n in range(1, 300))
     assert bot.update() == "blocked"
 
 
@@ -199,10 +191,9 @@ def test_a_broken_shop_list_buys_nothing():
     bot.start(LOOK, CELL)
     bot.note_entity(gid=1, look=LOOK, x=CELL[0], y=CELL[1])
     bot.update()
-    bot.feed(shop.OP_DEAL_TYPE, b"\x01\x00\x00\x00")
     bot.feed(shop.OP_SHOP_LIST, b"\x05\x00\x01")     # 壞掉的清單
     assert bot.update() == "blocked"
-    assert shop.buy_packet([(HP_ITEM, 1)]) not in sent
+    assert one_order(HP_ITEM, 1) not in sent
 
 
 def test_it_will_not_buy_without_knowing_the_weight_limit():
@@ -211,7 +202,6 @@ def test_it_will_not_buy_without_knowing_the_weight_limit():
     walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")
-    reopen(bot, (HP_ITEM, 50))
     bot.feed(*par(shop.SP_WEIGHT, 20100))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")           # 沒有上限也沒有 zeny
     assert bot.update() == "blocked"
@@ -235,12 +225,10 @@ def test_buying_finishes_with_the_total():
     catalog = ((HP_ITEM, 50), (SP_ITEM, 100))
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 探路第一瓶
-    reopen(bot, *catalog)
     bot.feed(*par(shop.SP_WEIGHT, 20100))           # 一瓶 = 100
     bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 探路第二瓶
-    reopen(bot, *catalog)
     # 上限 48100 × 65% = 31265，現在 20100 → 還有 11165 → 111 個
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 111)])
+    assert sent[-1] == one_order(HP_ITEM, 111)
     bot.feed(*par(shop.SP_WEIGHT, 31200))           # 買完之後的負重
     bot.feed(shop.OP_BUY_RESULT, b"\x00")          # 大單成交
 
@@ -259,7 +247,6 @@ def test_already_heavy_enough_buys_nothing_at_all():
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
     bot.feed(*par(shop.SP_WEIGHT, 31300))           # 65% 是 31265，已經超過
     bot.update()
-    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
     bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50)))
 
     assert all(not b.startswith(b"\xc8\x00") for b in sent), "一瓶都不准買"
@@ -274,7 +261,7 @@ def test_weight_unknown_still_probes():
     """
     bot, sent, _clock = make()
     walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, 1)])
+    assert sent[-1] == one_order(HP_ITEM, 1)
 
 
 # ---- 回程道具：固定補到 20 個（使用者指定）--------------------------------
@@ -314,10 +301,9 @@ def test_the_return_item_skips_the_weight_probe():
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(*par(shop.SP_ZENY, 10_000_000))
     bot.update()
-    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
     bot.feed(shop.OP_SHOP_LIST, shop_list((HOME_ITEM, 60)))
 
-    assert sent[-1] == shop.buy_packet([(HOME_ITEM, 15)]), "一次就買足 20-5=15 個"
+    assert sent[-1] == one_order(HOME_ITEM, 15), "一次就買足 20-5=15 個"
 
 
 def test_a_full_bag_still_buys_the_return_item():
@@ -331,10 +317,9 @@ def test_a_full_bag_still_buys_the_return_item():
     bot.feed(*par(shop.SP_WEIGHT, 47000))          # 早就超過 65%
     bot.feed(*par(shop.SP_ZENY, 10_000_000))
     bot.update()
-    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
     bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50), (HOME_ITEM, 60)))
 
-    assert sent[-1] == shop.buy_packet([(HOME_ITEM, restock.HOME_TARGET)])
+    assert sent[-1] == one_order(HOME_ITEM, restock.HOME_TARGET)
 
 
 def test_a_shop_without_the_return_item_just_skips_it():
@@ -348,10 +333,9 @@ def test_a_shop_without_the_return_item_just_skips_it():
     bot.feed(*par(shop.SP_WEIGHT, 20000))
     bot.feed(*par(shop.SP_ZENY, 10_000_000))
     bot.update()
-    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
     bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50)))    # 只賣藥水
 
-    assert sent[-1] == shop.buy_packet([(HP_ITEM, restock.PROBE_AMOUNT)]), "跳過它，照樣買藥水"
+    assert sent[-1] == one_order(HP_ITEM, restock.PROBE_AMOUNT), "跳過它，照樣買藥水"
 
 
 def test_return_item_purchase_ignores_the_weight_target():
@@ -402,7 +386,6 @@ def test_the_shop_is_closed_when_the_buying_is_done():
     bot.feed(*par(shop.SP_WEIGHT, 47000))          # 早就超過目標 → 一瓶都不買
     bot.feed(*par(shop.SP_ZENY, 1_000_000))
     bot.update()
-    bot.feed(shop.OP_DEAL_TYPE, b"\x52\x1f\x00\x00")
     bot.feed(shop.OP_SHOP_LIST, shop_list((HP_ITEM, 50)))
 
     assert bot.update() == "done"
@@ -430,3 +413,109 @@ def test_a_shop_that_never_opened_is_not_closed():
     clock.now += 999
     assert bot.update() == "blocked"
     assert shop.close_shop() not in sent
+
+
+# ---- 客戶端自己關店造成的時序賽跑（[PKT-092]，2026-09-01 實機證明）--------
+
+
+def item_added(item_id: int, amount: int, slot: int = 0x1C) -> bytes:
+    """組一個 `0x0B41` 的 payload：格號(2) + 數量(2) + 道具編號(4) + 其餘。"""
+    return struct.pack("<HHI", slot, amount, item_id) + bytes(58)
+
+
+def test_an_order_is_one_send_so_nothing_can_get_between():
+    """★★ **一筆單 = 接觸 ＋ 選買 ＋ 下單，一次送出去。**
+
+    實機證明（2026-09-01，狐狐狸 @ prt_fild05 道具商人）：在「商品清單」與
+    「下單」中間插一個 `0x09D4`，那一筆**完全沒有回應** —— 沒有 `0x0B41`、
+    沒有 `0x00CA`，跟使用者回報的「等買賣結果逾時」一模一樣。
+    而那一包**不是我們送的**：客戶端會自己關掉它的商店視窗。
+
+    同一次 `send()` 寫進 socket 的位元組是連續的，客戶端插不進來 ——
+    分開送 0/3 成交、併成一包 **3/3 成交**。
+    ⚠ 所以「只送 `0x00C8`」的單子一個都不准出現。
+    """
+    bot, sent, _clock = make()
+    walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
+
+    assert sent[-1] == (
+        shop.contact_npc(0x1F52) + shop.choose_buy(0x1F52)
+        + shop.buy_packet([(HP_ITEM, 1)])
+    ), "三包要黏在同一次送出去"
+    assert all(
+        packet != shop.buy_packet([(HP_ITEM, n)]) for packet in sent for n in (1, 111)
+    ), "不准有單獨的 0x00C8 —— 那個縫隙就是訂單被吃掉的地方"
+
+
+def test_a_close_packet_does_not_derail_anything():
+    """客戶端隨時會送 `0x09D4`。**現在無所謂**，但不准把流程弄壞。"""
+    bot, sent, clock = make()
+    walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
+    bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
+    bot.feed(*par(shop.SP_ZENY, 1_000_000))
+    bot.feed(*par(shop.SP_WEIGHT, 20000))
+    bot.feed(shop.OP_CLOSE_SHOP, b"")              # 客戶端關掉它的視窗
+    bot.feed(shop.OP_BUY_RESULT, b"\x00")
+
+    assert bot.stats.bought == {HP_ITEM: 1}
+    assert sent[-1] == one_order(HP_ITEM, 1), "下一筆照樣送得出去"
+    assert bot.update() == "working"
+
+
+def test_an_order_the_server_swallows_is_ordered_again():
+    """訂單被安靜地丟掉 → **重下一次**，不是整趟放棄。
+
+    使用者實機（2026-09-01 14:09）：買到蝴蝶翅膀 1 個之後，藥水那一筆
+    石沉大海，舊版直接停用 —— 於是角色一瓶水都沒有，回頭又被判定成
+    「沒水要補給」，一分鐘來一次，整晚都在原地。
+    """
+    bot, sent, clock = make()
+    walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
+    assert sent[-1] == one_order(HP_ITEM, 1)
+    before = len(sent)
+
+    clock.now += restock.STEP_TIMEOUT + 1
+    assert bot.update() == "working", "沒回應不准整趟放棄"
+    assert len(sent) == before + 1, "同一筆要重下"
+    assert sent[-1] == one_order(HP_ITEM, 1)
+
+
+def test_it_gives_up_loudly_after_the_retries_run_out():
+    """重試不是無限的：試完還是沒回應就**大聲**停下來。"""
+    bot, sent, clock = make()
+    walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
+    for _ in range(restock.ORDER_RETRIES):
+        clock.now += restock.STEP_TIMEOUT + 1
+        assert bot.update() == "working"
+    clock.now += restock.STEP_TIMEOUT + 1
+    assert bot.update() == "blocked"
+    assert "沒有任何回應" in bot.stats.note
+
+
+def test_goods_in_the_bag_beat_a_missing_result():
+    """`0x00CA` 沒來、但 `0x0B41` 說東西進背包了 → **照成交算**。
+
+    逾時只是放棄的上限，不是「什麼都沒發生」的證據。重下一次會多買一份，
+    所以要先看答案卡（哪個道具、進來幾個），不要憑逾時下結論。
+    """
+    bot, sent, clock = make()
+    walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
+    bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
+    bot.feed(*par(shop.SP_ZENY, 1_000_000))
+    bot.feed(*par(shop.SP_WEIGHT, 20000))
+    bot.feed(shop.OP_ITEM_ADDED, item_added(HP_ITEM, 1))   # 東西真的進來了
+
+    clock.now += restock.STEP_TIMEOUT + 1
+    assert bot.update() == "working"
+    assert bot.stats.bought == {HP_ITEM: 1}, "進背包了就是買到了"
+
+
+def test_an_item_added_for_something_else_is_not_our_order():
+    """別的道具進背包不算這一筆成交 —— 不准亂認。"""
+    bot, sent, clock = make()
+    walk_up_to_the_shop_list(bot, sent, (HP_ITEM, 50))
+    bot.feed(shop.OP_ITEM_ADDED, item_added(SP_ITEM, 3))
+
+    clock.now += restock.STEP_TIMEOUT + 1
+    bot.update()
+    assert bot.stats.bought == {}, "不是我們訂的那個道具"

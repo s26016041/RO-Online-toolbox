@@ -62,6 +62,18 @@ OP_BUY_RESULT = 0x00CA
 #: 出處：使用者擷取的購買流程 `封包/購買藥水.txt` #29/#30 —— 買完
 #: （`0x00C8`）之後 29 ms 內連送兩次 `0x09D4`，payload 皆為空。
 OP_CLOSE_SHOP = 0x09D4
+#: ↓ 道具進背包（ZC_ITEM_PICKUP_ACK）。**買東西成交最直接的證據**：
+#: 它把「哪一個道具、進來幾個」講清楚，比 `0x00CA` 的一個 0 更有分辨力。
+#:
+#: 版面（2026-09-01 實機三次，狐狐狸 @ prt_fild05 道具商人）：
+#:
+#:     格號(2) + 數量(2) + 道具編號(4) + …（整包 len=70）
+#:     18 00 | 01 00 | 9f 5b 00 00 → 第 0x18 格、1 個、23455（蝴蝶翅膀）
+#:     1c 00 | 8b 00 | f6 01 00 00 → 第 0x1c 格、139 個、502（赤色藥水）
+#:
+#: 數量與送出去的 `0x00C8` 完全對得上（1／1／139），所以拿它當
+#: 「這一筆到底成交了沒」的答案卡 —— 逾時的時候不必猜。
+OP_ITEM_ADDED = 0x0B41
 #: ↓ 數值變動（ZC_PAR_CHANGE，type u16 + value u32）
 OP_PAR_CHANGE = 0x00B0
 #: ↓ 數值變動的大數版（ZC_LONGPAR_CHANGE，type u16 + value i32）
@@ -135,6 +147,30 @@ def close_shop() -> bytes:
     return OP_CLOSE_SHOP.to_bytes(2, "little")
 
 
+def open_shop(gid: int) -> bytes:
+    """↑ 開店：`0x0090 接觸` ＋ `0x00C5 選買`，**併成一次送出去**。
+
+    ⚠⚠ 併成一包不是省事，是**正確性**（[PKT-092]）：客戶端會在它覺得該關的
+    時候自己送 `0x09D4`，那一包插進我們的開店流程中間，伺服器就把交易狀態
+    關掉了 —— 後面的封包被**安靜地丟掉**。同一次 `send()` 寫進 socket 的
+    位元組是連續的，客戶端**插不進來**。
+
+    代價是不等 `0x00C4`（「這個 NPC 真的是商店」）就先送選買。認錯 NPC 的話
+    照樣不會有 `0x00C6 商品清單`，那時候一樣大聲逾時 —— 安全退化沒有變。
+    """
+    return contact_npc(gid) + choose_buy(gid)
+
+
+def order_packet(gid: int, orders: list[tuple[int, int]]) -> bytes:
+    """↑ 下一筆單：`接觸 ＋ 選買 ＋ 下單`，**一次送出去**（見 `open_shop()`）。
+
+    實機驗收（2026-09-01，狐狐狸 @ prt_fild05 道具商人）：客戶端當時處在
+    「每收到一次商品清單就馬上送 `0x09D4`」的狀態，分開送 **0/3 成交**、
+    併成一包 **3/3 成交**。
+    """
+    return open_shop(gid) + buy_packet(orders)
+
+
 def buy_packet(orders: list[tuple[int, int]]) -> bytes:
     """↑ 0x00C8：下單。`orders` 是 [(道具編號, 數量)]。
 
@@ -165,6 +201,22 @@ def parse_shop_list(payload: bytes) -> list[ShopItem]:
         price, _discount, kind, item_id = struct.unpack_from("<IIBI", body, offset)
         out.append(ShopItem(item_id=item_id, price=price, kind=kind))
     return out
+
+
+def parse_item_added(payload: bytes) -> tuple[int, int] | None:
+    """↓ 0x0B41：(道具編號, 數量)。版面不合就回 None（**不猜**）。
+
+    ⚠ 這是「東西真的進背包了」的答案卡。伺服器對同一筆訂單會先送它、
+    再送 `0x00CA` —— 所以 `0x00CA` 沒來的時候，它是唯一分得出
+    「其實成交了」與「伺服器整包丟掉了」的東西（[PKT-092]）。
+    """
+    if len(payload) < 8:
+        return None
+    amount = struct.unpack_from("<H", payload, 2)[0]
+    item_id = struct.unpack_from("<I", payload, 4)[0]
+    if not item_id or not amount:
+        return None
+    return item_id, amount
 
 
 def parse_buy_result(payload: bytes) -> int | None:

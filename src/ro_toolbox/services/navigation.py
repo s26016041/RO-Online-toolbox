@@ -70,6 +70,10 @@ class NavigationReader:
         #: 用來把「還沒設定目的地」跟「設了但我們讀不到」講清楚 ——
         #: 對使用者說「請先設定目的地」而他明明設了，是最惹人火的錯誤訊息。
         self.blank = False
+        #: 上一次讀到的原始字串（**驗不過的時候要拿它去跟使用者講**）。
+        #: 實機 2026-09-01 讀到過 `'座標'` —— 那是尋路視窗的分頁名，不是地圖。
+        #: 使用者用「座標／NPC」那種找法時，這個全域裡就不是地圖名。
+        self.raw = ""
 
     @property
     def located(self) -> bool:
@@ -109,6 +113,7 @@ class NavigationReader:
         if self._scanner is None or self._address is None:
             return None
         raw = self._scanner.read_string(self._address, NAVI_DEST_MAX_BYTES, "ascii")
+        self.raw = raw or ""
         if not raw:
             # 空的 = 這一場還沒在遊戲裡設過尋路目標。
             # （舊版讀錯全域時這裡會**誤判**成「沒設定」，見上面的 [MEM-046]。）

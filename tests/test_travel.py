@@ -737,12 +737,12 @@ def test_the_shake_walks_all_the_way_out_then_back(monkeypatch):
     bot._shake_view(hop)
     assert bot._shake == "away"
 
-    for step in (5, 10, mod._OUT_OF_VIEW - 1):
+    for step in (5, 10, mod.OUT_OF_VIEW - 1):
         bot._reader.pos = (108 + step, 27)
         bot._shake_view(hop)
         assert bot._shake == "away", f"才 {step} 格就說出視野了"
 
-    bot._reader.pos = (108 + mod._OUT_OF_VIEW, 27)    # 出去了
+    bot._reader.pos = (108 + mod.OUT_OF_VIEW, 27)    # 出去了
     bot._shake_view(hop)
     assert bot._shake == "back"
 

@@ -76,7 +76,7 @@ _NUDGE_SPACING = MAX_STEP
 #: 實體進入視野的封包（版面見 services/world.py 的欄位表）
 _OP_ENTITY = (0x09FF, 0x09FE, 0x09FD)
 #: 走多遠才確定出了 NPC 的視野。RO 的視野約 14 格，抓 22 有餘裕。
-_OUT_OF_VIEW = 22
+OUT_OF_VIEW = 22
 #: 「走遠再走回來」最多做幾輪。做不到就跳警告交給人，不要一直來回踱步。
 _SHAKE_ROUNDS = 2
 #: 每一步的逾時：走不到就當這一輪失敗。只是放棄的上限。
@@ -347,6 +347,7 @@ class TravelBot:
                 return self._fail("⚠ 導航目標定位失敗（遊戲可能已改版），自動尋路停用")
             destination = reader.destination()
             blank = reader.blank
+            raw = reader.raw
         finally:
             reader.close()
         if not destination:
@@ -354,7 +355,15 @@ class TravelBot:
                 return self._fail(
                     "⚠ 遊戲的尋路目標是空的 —— 請先在遊戲的尋路視窗選一個目的地"
                 )
-            return self._fail("⚠ 讀不到導航目標 —— 請先在遊戲的尋路視窗設定目的地")
+            # ⚠ **不要說「請先設定目的地」** —— 他明明設了（實機 2026-09-01
+            #   讀到 `'座標'`，那是尋路視窗的分頁名）。把讀到的東西講出來，
+            #   並且給一條走得通的路：用地圖分頁，或用我們自己的目的地下拉。
+            return self._fail(
+                f"⚠ 遊戲的尋路目標讀到「{raw}」，那不是地圖名 —— "
+                f"遊戲的尋路視窗如果是用「座標」或「NPC」那種找法，"
+                f"我們讀不出它要去哪張圖。請改用**地圖**那個分頁選一張圖，"
+                f"或直接在這裡的目的地下拉選。"
+            )
         self._destination = destination
         self._stats.goal = destination
         self._stats.goal_label = map_display_name(destination)
@@ -567,7 +576,7 @@ class TravelBot:
 
         if self._shake is None:
             cell = terrain.random_walkable(
-                random, near=npc, radius=_OUT_OF_VIEW + 8, min_radius=_OUT_OF_VIEW
+                random, near=npc, radius=OUT_OF_VIEW + 8, min_radius=OUT_OF_VIEW
             )
             if cell is None or not self._walk_to(pos, cell):
                 return
@@ -585,7 +594,7 @@ class TravelBot:
             return
 
         if self._shake == "away":
-            if far >= _OUT_OF_VIEW:
+            if far >= OUT_OF_VIEW:
                 self._shake, self._shake_since = "back", now
                 self._note(f"出了「{hop.npc}」的視野，走回去")
                 self._walk_to(pos, npc)

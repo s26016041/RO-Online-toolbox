@@ -1,0 +1,106 @@
+"""「按一下補水」那條路：**認得出商人**才開得了店。
+
+⚠ 這一整支測的是同一件事：實體（NPC）只在**進入視野**時送一次封包
+（[PKT-061]）。第二趟補水出發時人**已經站在商人旁邊**，走那 5 格不會有任何人
+重新進視野 —— 使用者實機 2026-09-01 連續兩趟都停在
+「⚠ 走到了卻認不出商人（外觀 83 @ (290, 221)）」，一瓶藥水都沒補到。
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from ro_toolbox.services import restock_bot as mod
+from ro_toolbox.services.restock_bot import RestockBot, forget_npcs, remember_npcs
+
+PID = 4242
+MAP = "prt_fild05"
+LOOK = 83
+SELLER = (290, 221)
+DOOR = (285, 221)
+
+
+@pytest.fixture(autouse=True)
+def _clean():
+    forget_npcs(PID)
+    yield
+    forget_npcs(PID)
+
+
+def test_what_we_saw_on_the_first_trip_is_still_known_on_the_second():
+    """★ 第一趟走過來時看到的 GID，第二趟要**還記得**。
+
+    第二趟根本走不出新東西（人就站在旁邊），記憶是唯一的來源。
+    """
+    remember_npcs(PID, MAP, {8016: (LOOK, 290, 221)})
+    assert remember_npcs(PID, MAP, {}) == {8016: (LOOK, 290, 221)}
+
+    # 換一張圖、換一個行程都是另一份記憶 —— GID 是伺服器給的，不能亂借。
+    assert remember_npcs(PID, "prontera", {}) == {}
+    assert remember_npcs(PID + 1, MAP, {}) == {}
+
+
+def test_a_dead_process_forgets_its_npcs():
+    """⚠ PID 會被 Windows 回收給別的視窗。行程沒了就要忘掉，不然會拿到
+    上一隻的 GID —— 那是「存身分」也擋不住的，因為身分本身過期了。"""
+    remember_npcs(PID, MAP, {8016: (LOOK, 290, 221)})
+    forget_npcs(PID)
+    assert remember_npcs(PID, MAP, {}) == {}
+
+
+def test_recognising_needs_both_the_look_and_the_cell():
+    """認人要**外觀 ＋ 座標兩個都對上**（[DAT-027]），不是挑一個像的。"""
+    assert RestockBot._can_see({1: (LOOK, 290, 221)}, SELLER, LOOK) is True
+    assert RestockBot._can_see({1: (LOOK, 291, 222)}, SELLER, LOOK) is True, "差一格算"
+    assert RestockBot._can_see({1: (LOOK + 1, 290, 221)}, SELLER, LOOK) is False
+    assert RestockBot._can_see({1: (LOOK, 250, 221)}, SELLER, LOOK) is False
+    assert RestockBot._can_see({}, SELLER, LOOK) is False
+
+
+def test_the_remembered_gid_saves_a_trip(monkeypatch):
+    """記憶裡有他就**不必走遠再走回來** —— 那一趟要一二十秒。"""
+    bot = RestockBot(PID, hp_item=502)
+    remember_npcs(PID, MAP, {8016: (LOOK, 290, 221)})
+    monkeypatch.setattr(RestockBot, "_walk",
+                        lambda *a, **k: pytest.fail("不該再走"))
+
+    known = bot._make_sure_he_is_visible(MAP, DOOR, SELLER, LOOK, "道具商人", {})
+    assert 8016 in known
+
+
+def test_it_walks_out_of_view_and_back_when_nobody_knows_him(monkeypatch):
+    """★ 誰都不認得他 → **走遠再走回來**，逼伺服器重送一次進視野的封包。
+
+    舊版在這裡直接回報「走到了卻認不出商人」然後整趟放棄 ——
+    而那是**站得越近越容易發生**的失敗（走的距離越短，越沒有人進視野）。
+    """
+    walks: list[tuple] = []
+
+    def fake_walk(self, where, cell):
+        walks.append((where, cell))
+        # 走遠那一趟什麼都沒看到；走回來的那一趟他進視野了。
+        return {} if len(walks) == 1 else {8016: (LOOK, 290, 221)}
+
+    monkeypatch.setattr(RestockBot, "_walk", fake_walk)
+    bot = RestockBot(PID, hp_item=502)
+    known = bot._make_sure_he_is_visible(MAP, DOOR, SELLER, LOOK, "道具商人", {})
+
+    assert len(walks) == 2, "一趟走遠、一趟走回來"
+    away = walks[0][1]
+    assert max(abs(away[0] - SELLER[0]), abs(away[1] - SELLER[1])) >= mod._OUT_OF_VIEW, (
+        "要真的走出視野，不然他不會重新進視野"
+    )
+    assert walks[1][1] == DOOR, "再走回商人腳邊"
+    assert 8016 in known
+
+
+def test_it_does_not_shake_for_ever(monkeypatch):
+    """搖不出來也要收手 —— 下一段會大聲說「認不出商人」。"""
+    walks = []
+    monkeypatch.setattr(RestockBot, "_walk",
+                        lambda self, where, cell: walks.append(cell) or {})
+    bot = RestockBot(PID, hp_item=502)
+    known = bot._make_sure_he_is_visible(MAP, DOOR, SELLER, LOOK, "道具商人", {})
+
+    assert known == {}
+    assert len(walks) == mod._SHAKE_ROUNDS * 2, "每輪兩趟，做完就停"
