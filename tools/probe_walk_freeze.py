@@ -5,11 +5,14 @@ r"""量「自動打怪卡住 45 秒」到底卡在哪一層 —— **只讀記�
 `farm_bot` 的保護機制說「45 秒沒進展」，而那 45 秒裡日誌**一行都沒有**
 （不是打怪、不是脫離傳點，就是漫遊）。可能性只有三種，三種的修法完全不同：
 
-| 現場長什麼樣 | 代表 | 該修哪裡 |
-|---|---|---|
-| 角色真的站著，客戶端說**「我正在走」**（`index>=0` 且路徑陣列有值）| `Walker` 永遠等不到「停住」，不重送也不判 blocked | `walker.update()` 的 `moving()` 那道防線沒有上限 |
-| 角色真的站著，客戶端說**站著**，而**移動終點一直在變** | 我們一直送、伺服器一直收，人就是不動 | 送出去的目標本身有問題（或角色被定身） |
-| 角色其實**有在動**，只是我們讀到的座標凍住 | 讀取端（移動元件挑錯／路徑索引解錯）| `player_position` |
+1. **角色真的站著，客戶端卻說「我正在走」**（`index>=0` 且路徑陣列有值）
+   → `Walker` 永遠等不到「停住」，不重送也不判 blocked
+   → 修 `walker.update()` 裡那道沒有上限的 `moving()` 防線。
+2. **角色真的站著，客戶端也說站著，而移動終點一直在變**
+   → 我們一直送、伺服器一直收，人就是不動
+   → 送出去的目標本身有問題（或角色被定身）。
+3. **角色其實有在動，只是我們讀到的座標凍住**
+   → 讀取端的問題（移動元件挑錯／路徑索引解錯），修 `player_position`。
 
 所以這支工具就盯著這幾個欄位取樣，把「座標凍住」的每一段攤開來看。
 
@@ -23,11 +26,11 @@ r"""量「自動打怪卡住 45 秒」到底卡在哪一層 —— **只讀記�
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
 import struct
 import sys
 import time
 from collections import Counter
-from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,7 +162,8 @@ def main() -> int:
             print(line)
 
     REPORTS.mkdir(exist_ok=True)
-    path = REPORTS / f"walk_freeze-{datetime.now():%Y%m%d-%H%M%S}.tsv"
+    stamp = _dt.datetime.now(tz=_dt.UTC).astimezone().strftime("%Y%m%d-%H%M%S")
+    path = REPORTS / f"walk_freeze-{stamp}.tsv"
     with path.open("w", encoding="utf-8") as fh:
         fh.write("pid\tt\tpos\tlive\tmoving\tstate\tindex\tbegin\tdest\taddr\n")
         for w in watches:
