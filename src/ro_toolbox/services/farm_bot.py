@@ -47,6 +47,9 @@ from ro_toolbox.services.warpzone import (
     KEEP_OUT as _WARP_KEEP_OUT,
 )
 from ro_toolbox.services.warpzone import (
+    NO_FIGHT as _WARP_NO_FIGHT,
+)
+from ro_toolbox.services.warpzone import (
     keep_out as _keep_out,
 )
 from ro_toolbox.services.warpzone import (
@@ -274,6 +277,14 @@ class FarmBot:
         #: gid → 被列入黑名單的時間。用來判斷「之後有沒有再看到它」——
         #: 收到更新的實體封包就是**它還在那裡的證據**，那比我們的黑名單可信。
         self._skip_at: dict[int, float] = {}
+        #: 跑進傳點範圍而收手的怪 → 冷卻到期時間。
+        #:
+        #: ⚠ **故意跟 `_skip` 分開**：`_skip` 有一條「再看到牠就取消黑名單」的
+        #: 規則（那是為了「座標過時打到空氣」設計的，新的目擊確實比黑名單可信）。
+        #: 但這裡拉黑的理由不是座標不準，是**牠站的地方我們不去** ——
+        #: 再看到牠一百次也不會改變這件事。混在一起的話，牠在範圍邊緣走來走去，
+        #: 我們就跟著鎖定→收手→鎖定，每次都白送一個移動封包。
+        self._warp_skip: dict[int, float] = {}
         self._bad_goals: list[tuple[tuple[int, int], float]] = []
         self._loot_since: dict[int, float] = {}  # 掉落物 → 開始嘗試撿的時間
         self._loot_until = 0.0  # 剛打死一隻，停到這個時間讓它撿東西
@@ -303,6 +314,10 @@ class FarmBot:
         self._warp_zone: frozenset[tuple[int, int]] = frozenset()
         #: 傳點**本體**（踩到就被傳走）。禁區是本體再加周圍。
         self._warp_cells: frozenset[tuple[int, int]] = frozenset()
+        #: 這片裡面的怪**一律不打**（`warpzone.NO_FIGHT`，比走路禁區大）。
+        #: 為什麼要另外一片：打怪的最後一段路是**伺服器**帶的，我們的 A*
+        #: 繞得再漂亮也管不到 —— 詳見 `warpzone.NO_FIGHT` 的說明。
+        self._no_fight_zone: frozenset[tuple[int, int]] = frozenset()
         #: 正在往哪裡脫離禁區（None = 沒在脫離）
         self._escape_goal: tuple[int, int] | None = None
         #: 這個脫離目標是什麼時候挑的（見 `_ESCAPE_GIVE_UP_SEC`）。
@@ -696,6 +711,7 @@ class FarmBot:
             self._aim = None
             self._skip.clear()
             self._skip_at.clear()
+            self._warp_skip.clear()
             self._bad_goals.clear()
             self._loot_since.clear()
             if self._entities is not None:
@@ -809,6 +825,8 @@ class FarmBot:
         for gid in [g for g, until in self._skip.items() if now > until]:
             del self._skip[gid]
             self._skip_at.pop(gid, None)
+        for gid in [g for g, until in self._warp_skip.items() if now > until]:
+            del self._warp_skip[gid]
         with self._dmg_lock:
             for gid in [g for g, at in self._aggro.items() if now - at > _AGGRO_SEC]:
                 del self._aggro[gid]
@@ -833,6 +851,14 @@ class FarmBot:
                 self._loot_until = now + _LOOT_PAUSE
                 self._note(f"擊殺 {self._stats.kills} 隻")
                 self._aim = aim = None
+            elif self._no_fight(self._pos_of(aim.gid)):
+                # ⚠⚠ **每一拍都要重驗，不能只在挑目標時看一次。**
+                # 怪會自己走 —— 挑的時候離傳點很遠，打到一半牠往傳點跑，
+                # 而 `0x0437` 是**連續**攻擊：牠走到哪，伺服器就把角色拉到哪。
+                # 這就是使用者回報的「自動戰鬥會因為打怪物跑到傳送點傳出去」：
+                # 從頭到尾我們沒有送過任何一個往傳點的移動封包。
+                self._break_off(aim, now, pos)
+                aim = None
             elif not self._world.is_present(aim.gid):
                 if not aim.attacked:
                     self._drop_aggro(aim.gid)
@@ -882,17 +908,18 @@ class FarmBot:
             if mob is not None and mob.seen_at > at:
                 self._skip.pop(gid, None)
                 self._skip_at.pop(gid, None)
-        skip = set(self._skip)
+        skip = set(self._skip) | set(self._warp_skip)
         skip.update(m.gid for m in self._world.monsters() if not is_farmable(m.class_id))
-        # ⚠ **站在傳點裡（或旁邊）的怪一律不打。** 追過去就會踩到傳點被傳走 ——
-        # 新地圖可能有打不動的怪，而 bot 會在那裡繼續打（使用者實測回報）。
+        # ⚠ **站在傳點那一片裡的怪一律不打**（`warpzone.NO_FIGHT`，比走路禁區大）。
+        # 追過去就會踩到傳點被傳走 —— 新地圖可能有打不動的怪，
+        # 而 bot 會在那裡繼續打（使用者實測回報）。
         # 連正在打我的怪也不追：被打幾下，好過被傳到不該去的地方。
-        in_warp = {m.gid for m in self._world.monsters() if self._near_warp(m.pos)}
+        in_warp = {m.gid for m in self._world.monsters() if self._no_fight(m.pos)}
         skip.update(in_warp)
         # 正在打我的怪**不受「打到空氣」黑名單限制**：它打得到我就代表它真的在旁邊，
         # 座標不可能過時。以前被黑名單擋住，症狀就是「怪在打我卻不理它」。
         no_hunt = {m.gid for m in self._world.monsters() if not is_farmable(m.class_id)}
-        no_hunt |= in_warp
+        no_hunt |= in_warp | set(self._warp_skip)
         with self._dmg_lock:
             aggro = sorted(self._aggro.items(), key=lambda kv: -kv[1])
         for gid, _at in aggro:
@@ -956,6 +983,15 @@ class FarmBot:
             if why is not None:
                 self._give_up_target(aim, now, why)
             return
+        # ⚠⚠ **送攻擊等於把方向盤交給伺服器。** 攻擊封包只帶 GID、不帶座標，
+        # 最後那一段路是伺服器帶的（`_ATTACK_RANGE` 放到 10 格就是靠這個），
+        # 而它走的是自己算的路，不是我們那條繞開傳點的 A*。
+        # 所以送出去之前要先問一句「這一路上會不會踩到傳點」——
+        # 怪站在傳點帶的另一側、中間直線又乾淨時，`_close_enough()` 會說
+        # 「貼到了」，然後伺服器帶著角色直直穿過去（使用者實測回報的症狀）。
+        if pos is not None and mob is not None and self._crosses_warp(pos, mob.pos):
+            self._give_up_target(aim, now, "打過去會被伺服器帶著穿過傳點")
+            return
         # 貼到了：直線 _ATTACK_RANGE 格內，而且中間乾淨
         self._walker.clear()
         self._world.note_attacking(aim.gid)
@@ -974,6 +1010,70 @@ class FarmBot:
         self._drop_aggro(aim.gid)
         self._walker.clear()
         self._aim = None
+
+    def _break_off(
+        self, aim: _Aim, now: float, pos: tuple[int, int] | None
+    ) -> None:
+        """鎖定的怪跑進傳點範圍了 —— **當場收手，而且要主動把連續攻擊掐掉**。
+
+        ⚠⚠ 這裡跟 `_give_up_target()` 差在**多送一個移動封包**，那不是順手，
+        是這整件事的重點：`0x0437` action=7 是**連續**攻擊，送出去之後
+        「角色走去哪」就交給伺服器了 —— 怪往傳點走，伺服器就把角色帶上去。
+        只把 `_aim` 設成 None 的話，我們這邊看起來已經放棄了，
+        **伺服器那邊還在追**（使用者實測：整段日誌沒有任何往傳點的移動，
+        人卻被傳走了）。移動封包會取消連續攻擊（見 `_fight` 的說明），
+        所以收手＝送一步走開。
+
+        走去哪不重要，重要的是「有送出去」，所以目標挑最保守的：
+        旁邊一格、在**走路禁區外**、而且盡量離那隻怪遠一點。
+        """
+        who = mob_name(self._class_of(aim.gid))
+        # ⚠ WARNING 級：使用者手上的預設層級就是 WARNING —— 這件事正是他回報的
+        # 那個災難，被降級成 INFO 的話等於沒有記錄。
+        log.warning("[自動打怪] 「%s」跑進傳點範圍，收手（取消連續攻擊）", who)
+        self._warp_skip[aim.gid] = now + _SKIP_SEC
+        self._drop_aggro(aim.gid)
+        self._walker.clear()
+        self._aim = None
+        self._note(f"「{who}」跑到傳點旁邊了，不追")
+        if not aim.attacked:
+            return  # 還沒開打，伺服器手上沒有這隻，不必掐
+        step = self._step_away(pos, self._pos_of(aim.gid))
+        if step is not None:
+            self._send_move(*step)
+
+    def _step_away(
+        self, pos: tuple[int, int] | None, away_from: tuple[int, int] | None
+    ) -> tuple[int, int] | None:
+        """挑一格「走開」用的目標：旁邊一格、禁區外、離 `away_from` 越遠越好。
+
+        找不到就退回 `_nearest_outside()`（它一圈一圈往外找）—— 那條也沒有的話
+        就回 None，呼叫端不送封包。**不准退而求其次挑禁區裡的格**：
+        為了取消攻擊而自己踩上傳點，比不取消還糟。
+        """
+        terrain = self._terrain
+        if terrain is None or pos is None:
+            return None
+        best, best_distance = None, -1
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                cell = (pos[0] + dx, pos[1] + dy)
+                if cell == pos or not terrain.is_walkable(*cell):
+                    continue
+                if self._near_warp(cell):
+                    continue
+                distance = (
+                    max(abs(cell[0] - away_from[0]), abs(cell[1] - away_from[1]))
+                    if away_from is not None
+                    else 0
+                )
+                if distance > best_distance:
+                    best, best_distance = cell, distance
+        return best if best is not None else self._nearest_outside(pos)
+
+    def _pos_of(self, gid: int) -> tuple[int, int] | None:
+        mob = self._world.get(gid)
+        return mob.pos if mob is not None else None
 
     def _class_of(self, gid: int) -> int | None:
         mob = self._world.get(gid)
@@ -1261,9 +1361,15 @@ class FarmBot:
         # 傳點**本體**那一格。禁區是「不想去」，本體是「踩到就被傳走」——
         # 從禁區裡面往外走時只避開本體，避開整片禁區的話就永遠走不出來。
         self._warp_cells = frozenset(cells)
-        log.info("%s 的傳點 %d 格（資料＋帶狀 %d、實際踩過學到 %d）、禁區 %d 格",
-                 map_name, len(self._warp_cells), len(from_data), len(learned),
-                 len(self._warp_zone))
+        # 「不打」的範圍另外一片，而且更大 —— 走路我們自己控得住（A* 繞開就好），
+        # 打怪的最後一段是伺服器帶的，控不住，只能離遠一點。
+        self._no_fight_zone = _keep_out(cells, radius=_WARP_NO_FIGHT)
+        log.info(
+            "%s 的傳點 %d 格（資料＋帶狀 %d、實際踩過學到 %d）、"
+            "走路禁區 %d 格、不打範圍 %d 格",
+            map_name, len(self._warp_cells), len(from_data), len(learned),
+            len(self._warp_zone), len(self._no_fight_zone),
+        )
 
     def _learn_warp(self, old_map: str) -> None:
         """剛剛真的被傳走了 —— 把「當時正在走的那一段」記成傳點，之後不再踩。
@@ -1463,6 +1569,13 @@ class FarmBot:
             return False
         self._escape_goal = goal
         self._escape_since = now
+        # ⚠⚠ **脫離的時候一定要把鎖定的怪放掉。** 連續攻擊還掛在伺服器身上的話，
+        # 我們往外走一步、伺服器就把人拉回怪旁邊 —— 兩邊拔河，人出不去，
+        # 45 秒之後被當成卡住（那正是使用者看到的「在船點前面自己關掉」）。
+        # 不必另外送封包取消：下面 `set_path()` 送出去的移動就是取消。
+        if self._aim is not None:
+            self._warp_skip[self._aim.gid] = now + _SKIP_SEC
+            self._aim = None
         self._walker.set_path(path, avoid=self._warp_cells)
         self._walker.update(pos)
         self._note(f"太靠近傳點，先走開（往 {goal[0]},{goal[1]}）")
@@ -1499,7 +1612,31 @@ class FarmBot:
         return None
 
     def _near_warp(self, cell: tuple[int, int] | None) -> bool:
+        """走路禁區：這一格不要踩（`warpzone.KEEP_OUT`）。"""
         return cell is not None and cell in self._warp_zone
+
+    def _crosses_warp(self, a: tuple[int, int], b: tuple[int, int]) -> bool:
+        """a→b 這條直線會不會經過走路禁區。
+
+        用直線是因為**那一段路不是我們走的**：伺服器帶人（送攻擊、或送一個
+        遠一點的移動點）時走的是它自己算的路，直線是最好的近似
+        （跟 `Walker._clear_line` 同一個理由）。
+
+        ⚠ 起點自己不算：站在禁區裡的時候由 `_escape_warp()` 負責走出去，
+        在那之前把每一個目標都判死刑，只會變成「站在禁區裡把附近的怪全部拉黑」。
+        """
+        return any(cell in self._warp_zone for cell in line_cells(a, b)[1:])
+
+    def _no_fight(self, cell: tuple[int, int] | None) -> bool:
+        """站在這一格的怪**不打**（`warpzone.NO_FIGHT`，涵蓋走路禁區）。
+
+        ⚠ 兩片都問。`_no_fight_zone` 本來就是 `_warp_zone` 的超集，
+        但「不打的範圍不准比不踩的範圍窄」是這裡唯一不能出錯的性質 ——
+        用 `or` 寫死它，就不必依賴兩片是不是同一次算出來的。
+        """
+        return cell is not None and (
+            cell in self._no_fight_zone or cell in self._warp_zone
+        )
 
     def _is_bad_goal(self, cell: tuple[int, int]) -> bool:
         return any(

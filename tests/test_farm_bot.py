@@ -591,6 +591,101 @@ def test_escape_does_nothing_outside_the_zone(monkeypatch):
     assert bot._escape_warp((10, 10)) is False
 
 
+# ---- 傳點：不打的範圍要比不踩的範圍大 --------------------------------------
+#
+# ⚠⚠ 使用者實測回報：「自動戰鬥會因為打怪物跑到傳送點傳出去」。
+# 關鍵是**最後那一段路不是我們走的**：攻擊封包只帶 GID，`0x0437` 是連續攻擊，
+# 怪走到哪伺服器就把角色拉到哪 —— 我們的 A* 繞得再漂亮也管不到那一段。
+
+
+def _bot_with_warp(monkeypatch, warp=(50, 50)):
+    """一張全可走的圖，`warp` 那一格是傳點（走路禁區與不打範圍都從它算）。"""
+    from ro_toolbox.services import farm_bot as mod
+
+    bot = bot_with_map()
+    monkeypatch.setattr(mod, "_warp_cells_of", lambda _m: frozenset({warp}))
+    bot._load_warps("t")
+    return bot
+
+
+def test_the_no_fight_zone_reaches_further_than_the_walk_keep_out(monkeypatch):
+    """走路禁區之外還有一圈「不打」的範圍 —— 因為怪自己會走過去。"""
+    from ro_toolbox.services.warpzone import KEEP_OUT, NO_FIGHT
+
+    bot = _bot_with_warp(monkeypatch)
+    edge = (50, 50 + KEEP_OUT + 1)
+    assert not bot._near_warp(edge), "走路禁區只有 KEEP_OUT 格"
+    assert bot._no_fight(edge), "但這裡的怪還是不能打（牠幾步就走到傳點）"
+    assert not bot._no_fight((50, 50 + NO_FIGHT + 1)), "再遠就正常打"
+
+
+def test_a_monster_that_walks_into_the_warp_makes_us_break_off(monkeypatch):
+    """挑的時候離傳點很遠，打到一半牠自己跑過去 —— 要當場收手。
+
+    ⚠ 光把 `_aim` 設成 None 沒有用：連續攻擊還在伺服器手上，牠會繼續
+    追著那隻怪跑（整段日誌不會有任何往傳點的移動，人卻被傳走了）。
+    移動封包會取消連續攻擊，所以收手一定要**送一步走開**。
+    """
+    bot = _bot_with_warp(monkeypatch)
+    moves = []
+    monkeypatch.setattr(bot, "_send_move", lambda x, y: moves.append((x, y)))
+    see(bot, 7, 80, 80)
+    bot._update_aim(T0, (80, 80))
+    assert bot._aim is not None and bot._aim.gid == 7
+    bot._aim.attacked = True
+
+    see(bot, 7, 50, 52)  # 牠自己走到傳點旁邊了
+    bot._update_aim(T0 + 1, (79, 79))
+    assert bot._aim is None, "怪跑進傳點範圍就要收手"
+    assert 7 in bot._warp_skip, "而且要拉黑，不然下一拍又挑到牠"
+    assert moves, "沒送移動 = 沒取消連續攻擊 = 伺服器繼續追過去"
+    assert all(cell not in bot._warp_zone for cell in moves), \
+        "為了取消攻擊而自己踩上傳點，比不取消還糟"
+
+
+def test_breaking_off_before_the_first_hit_sends_nothing(monkeypatch):
+    """還沒開打就不必掐 —— 伺服器手上根本沒有這隻，白送一個移動只是洗封包。"""
+    bot = _bot_with_warp(monkeypatch)
+    moves = []
+    monkeypatch.setattr(bot, "_send_move", lambda x, y: moves.append((x, y)))
+    see(bot, 7, 80, 80)
+    bot._update_aim(T0, (80, 80))
+    see(bot, 7, 50, 52)
+    bot._update_aim(T0 + 1, (79, 79))
+    assert bot._aim is None
+    assert moves == []
+
+
+def test_no_attack_when_the_server_would_drag_us_across_a_warp(monkeypatch):
+    """`_close_enough()` 說「貼到了」不代表可以打。
+
+    怪在傳點斜對面 9 格、直線乾淨，於是舊版直接送攻擊 —— 然後伺服器
+    帶著角色走它自己那條路，正好切過傳點的角。**線上碰到禁區就不准送。**
+    """
+    bot = _bot_with_warp(monkeypatch)
+    sent = []
+    monkeypatch.setattr(bot, "_send", lambda data: bool(sent.append(data)) or True)
+    see(bot, 9, 50, 59)
+    assert not bot._no_fight((50, 59)), "牠本身在不打範圍外，擋它的只有那條線"
+    assert bot._close_enough((46, 50), (50, 59), 9), "直線乾淨、也夠近"
+    bot._aim = _Aim(gid=9, since=T0)
+    bot._fight(T0, (46, 50))
+    assert sent == [], "一發都不准送"
+    assert bot._aim is None and 9 in bot._skip
+
+
+def test_a_clean_line_still_gets_attacked(monkeypatch):
+    """別擋過頭：離傳點遠的怪照常打。"""
+    bot = _bot_with_warp(monkeypatch)
+    sent = []
+    monkeypatch.setattr(bot, "_send", lambda data: bool(sent.append(data)) or True)
+    see(bot, 11, 200, 200)
+    bot._aim = _Aim(gid=11, since=T0)
+    bot._fight(T0, (198, 200))
+    assert len(sent) == 2, "查詢 + 攻擊"
+    assert bot._aim is not None and bot._aim.attacked
+
+
 # ---- 傳點：資料只給取樣點，真正的傳點是一片 --------------------------------
 
 
