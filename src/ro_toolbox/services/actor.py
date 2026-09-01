@@ -168,7 +168,7 @@ class ActorView:
         self.base = base
 
     @classmethod
-    def read(cls, scanner, gid_addr: int) -> "ActorView | None":  # noqa: ANN001
+    def read(cls, scanner, gid_addr: int) -> ActorView | None:  # noqa: ANN001
         """從 GID 欄位的位址讀一整塊。讀不完整回 None。"""
         raw = scanner.read_region(gid_addr + VTABLE, BLOCK)
         if raw is None or len(raw) < BLOCK:
