@@ -155,6 +155,14 @@ _RETURN_GIVEUP_SEC = 300.0
 #: （使用者自己點出來的）。學到的禁區通常一次就擋掉了，這是最後一道保險。
 _RETURN_MAX = 5
 _MISS_SKIP_SEC = 20.0  # 打到空氣的目標冷卻多久（座標過時，等它重新出現）
+#: 座標未知的怪「最遠可能在幾格外」。
+#:
+#: 這種怪唯一的來源是傷害封包（`WorldTracker.note_monster`）——
+#: **它打得到我**，所以它一定在自己的攻擊距離內。RO 一般怪最遠的射程約 9~10 格，
+#: 這裡取 12 留餘裕。用途只有一個：沒有座標時，改成證明「我周圍這個圓裡
+#: 完全沒有傳點禁區」，那不管牠站在圓裡哪一格，伺服器把我帶過去都踩不到。
+#: 🔬 調大 = 更保守（傳點附近更大一片都不還手）；調小就有機會被帶過傳點。
+_BLIND_REACH = 12
 #: 要不要把記憶體掃到的怪也算進來。**開著。**
 #:
 #: 為什麼需要它：**站著不動的怪只在「進入視野」時送一次封包**。
@@ -851,7 +859,7 @@ class FarmBot:
                 self._loot_until = now + _LOOT_PAUSE
                 self._note(f"擊殺 {self._stats.kills} 隻")
                 self._aim = aim = None
-            elif self._no_fight(self._pos_of(aim.gid)):
+            elif self._no_fight(self._pos_of(aim.gid)) or self._blind_near_warp(aim, pos):
                 # ⚠⚠ **每一拍都要重驗，不能只在挑目標時看一次。**
                 # 怪會自己走 —— 挑的時候離傳點很遠，打到一半牠往傳點跑，
                 # 而 `0x0437` 是**連續**攻擊：牠走到哪，伺服器就把角色拉到哪。
@@ -989,7 +997,21 @@ class FarmBot:
         # 所以送出去之前要先問一句「這一路上會不會踩到傳點」——
         # 怪站在傳點帶的另一側、中間直線又乾淨時，`_close_enough()` 會說
         # 「貼到了」，然後伺服器帶著角色直直穿過去（使用者實測回報的症狀）。
-        if pos is not None and mob is not None and self._crosses_warp(pos, mob.pos):
+        #
+        # ⚠⚠ **座標未知的怪要另外處理，不能把 None 丟進去。**
+        # 只從傷害封包知道它存在的怪（`WorldTracker.note_monster`：它打到我了，
+        # 但我們沒有它的實體封包、記憶體也還沒掃到）`pos` 是 None，
+        # 舊版直接丟給 `line_cells()`，整個自動打怪執行緒當場炸掉
+        # （TypeError: cannot unpack non-iterable NoneType；使用者實測
+        #  2026-09-01 十分鐘內炸了 20 次，每次都靠「連線回來了」重啟）。
+        # 沒有座標就驗不了那條線，改用**能證明的事**：那隻怪打得到我，
+        # 代表它在我身邊 `_BLIND_REACH` 格內；這個圓裡沒有任何禁區的話，
+        # 伺服器不管把我帶到圓裡哪一格都踩不到傳點。
+        if mob is not None and mob.pos is None:
+            if not self._warp_free_around(pos):
+                self._give_up_blind(aim, now)
+                return
+        elif pos is not None and mob is not None and self._crosses_warp(pos, mob.pos):
             self._give_up_target(aim, now, "打過去會被伺服器帶著穿過傳點")
             return
         # 貼到了：直線 _ATTACK_RANGE 格內，而且中間乾淨
@@ -1011,6 +1033,23 @@ class FarmBot:
         self._walker.clear()
         self._aim = None
 
+    def _give_up_blind(self, aim: _Aim, now: float) -> None:
+        """座標未知、又在傳點附近 —— 這一隻先放掉。
+
+        ⚠ 拉黑要用 `_warp_skip` 而不是 `_skip`：這種怪幾乎都是**正在打我**的怪，
+        而 `_pick_target()` 的「打我的怪優先」那一段**故意不看 `_skip`**
+        （見那裡的說明）。用 `_skip` 的話下一拍又挑回同一隻，
+        每一拍放棄一次，日誌洗到爆而角色一步都不會動。
+        """
+        log.info(
+            "%s：還不知道牠在哪，而這附近有傳點，先不打",
+            mob_name(self._class_of(aim.gid)),
+        )
+        self._warp_skip[aim.gid] = now + _SKIP_SEC
+        self._drop_aggro(aim.gid)
+        self._walker.clear()
+        self._aim = None
+
     def _break_off(
         self, aim: _Aim, now: float, pos: tuple[int, int] | None
     ) -> None:
@@ -1028,14 +1067,15 @@ class FarmBot:
         旁邊一格、在**走路禁區外**、而且盡量離那隻怪遠一點。
         """
         who = mob_name(self._class_of(aim.gid))
+        why = "跑進傳點範圍" if self._pos_of(aim.gid) is not None else "座標不明又走到傳點附近"
         # ⚠ WARNING 級：使用者手上的預設層級就是 WARNING —— 這件事正是他回報的
         # 那個災難，被降級成 INFO 的話等於沒有記錄。
-        log.warning("[自動打怪] 「%s」跑進傳點範圍，收手（取消連續攻擊）", who)
+        log.warning("[自動打怪] 「%s」%s，收手（取消連續攻擊）", who, why)
         self._warp_skip[aim.gid] = now + _SKIP_SEC
         self._drop_aggro(aim.gid)
         self._walker.clear()
         self._aim = None
-        self._note(f"「{who}」跑到傳點旁邊了，不追")
+        self._note(f"「{who}」{why}，不追")
         if not aim.attacked:
             return  # 還沒開打，伺服器手上沒有這隻，不必掐
         step = self._step_away(pos, self._pos_of(aim.gid))
@@ -1626,6 +1666,45 @@ class FarmBot:
         在那之前把每一個目標都判死刑，只會變成「站在禁區裡把附近的怪全部拉黑」。
         """
         return any(cell in self._warp_zone for cell in line_cells(a, b)[1:])
+
+    def _blind_near_warp(
+        self, aim: _Aim, pos: tuple[int, int] | None
+    ) -> bool:
+        """鎖定的怪座標未知，而我們已經走到傳點附近了嗎？
+
+        ⚠ 開打之後也要問：`_fight()` 只在**送攻擊之前**驗過一次，而
+        `0x0437` 是連續攻擊 —— 那隻怪往傳點走、伺服器就把角色一路拉過去，
+        座標未知的話 `_no_fight()` 那條（看怪站在哪）永遠是 False，
+        擋不住任何東西。這裡改看**自己**走到哪：只要我被拉到禁區
+        `_BLIND_REACH` 格內，就當場收手（`_break_off` 會送一步取消攻擊）。
+        """
+        mob = self._world.get(aim.gid)
+        if mob is None or mob.pos is not None:
+            return False
+        return not self._warp_free_around(pos)
+
+    def _warp_free_around(
+        self, pos: tuple[int, int] | None, radius: int = _BLIND_REACH
+    ) -> bool:
+        """`pos` 周圍 `radius` 格內完全沒有走路禁區嗎？
+
+        給**座標未知的怪**用的（見 `_fight`）。禁區全在這個圓外面的話，
+        伺服器不管把角色帶到圓裡哪一格、走哪一條路，都踩不到傳點 ——
+        這是沒有對方座標時唯一能證明的事，比「先打了再說」誠實。
+
+        自己的座標也讀不到（`pos is None`）就算**不安全**：
+        兩邊都不知道還送連續攻擊，等於閉著眼睛把方向盤交給伺服器。
+        """
+        if not self._warp_zone:
+            return True     # 這張圖沒有傳點，沒有東西可踩
+        if pos is None:
+            return False
+        x, y = pos
+        return not any(
+            (x + dx, y + dy) in self._warp_zone
+            for dx in range(-radius, radius + 1)
+            for dy in range(-radius, radius + 1)
+        )
 
     def _no_fight(self, cell: tuple[int, int] | None) -> bool:
         """站在這一格的怪**不打**（`warpzone.NO_FIGHT`，涵蓋走路禁區）。

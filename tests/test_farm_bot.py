@@ -686,6 +686,93 @@ def test_a_clean_line_still_gets_attacked(monkeypatch):
     assert bot._aim is not None and bot._aim.attacked
 
 
+# ---- 座標未知的怪（只從傷害封包知道它存在）---------------------------------
+#
+# ⚠⚠ 使用者實測 2026-09-01：自動打怪十分鐘內炸了 20 次
+# `TypeError: cannot unpack non-iterable NoneType`（farm_bot `_crosses_warp`
+# → walker `line_cells`）。`WorldTracker.note_monster()` 只知道「這個 GID 打到我」，
+# 沒有座標，而 `_pick_target()` 的「打我的怪優先」照樣會挑它。
+
+
+def blind(bot: FarmBot, gid: int) -> None:
+    """只從傷害封包看到的怪：知道它存在，不知道它在哪。"""
+    bot._world.note_monster(gid)
+    bot._aggro[gid] = T0
+
+
+def test_a_monster_with_no_known_position_does_not_crash_the_thread(monkeypatch):
+    """沒有座標就把 None 丟進 `line_cells()` —— 整個自動打怪執行緒當場死掉。"""
+    bot = bot_with_map()          # 這張圖沒有傳點
+    sent = []
+    monkeypatch.setattr(bot, "_send", lambda data: bool(sent.append(data)) or True)
+    blind(bot, 7)
+    bot._aim = _Aim(gid=7, since=T0)
+    bot._fight(T0, (10, 10))      # 舊版：TypeError
+    assert len(sent) == 2, "沒有傳點的圖照打（查詢 + 攻擊）"
+
+
+def test_a_monster_with_no_known_position_is_left_alone_near_a_warp(monkeypatch):
+    """不知道它在哪 + 附近有傳點 = 驗不了那條線，先不打。
+
+    它打得到我，代表它就在 `_BLIND_REACH` 格內；這個圓裡有禁區的話，
+    伺服器把我帶過去就可能踩上傳點。
+    """
+    from ro_toolbox.services.farm_bot import _BLIND_REACH
+    from ro_toolbox.services.warpzone import KEEP_OUT
+
+    bot = _bot_with_warp(monkeypatch)          # 傳點在 (50, 50)
+    sent = []
+    monkeypatch.setattr(bot, "_send", lambda data: bool(sent.append(data)) or True)
+    blind(bot, 7)
+    bot._aim = _Aim(gid=7, since=T0)
+    # 禁區是傳點外擴 KEEP_OUT 格，所以距離要從禁區邊緣算起
+    bot._fight(T0, (50, 50 + KEEP_OUT + _BLIND_REACH))
+    assert sent == [], "一發都不准送"
+    assert 7 in bot._warp_skip, "要拉黑，而且要用 _warp_skip"
+    assert bot._pick_target((50, 50 + KEEP_OUT + _BLIND_REACH)) is None, (
+        "『打我的怪優先』故意不看 _skip —— 用錯集合就會每一拍放棄一次"
+    )
+
+
+def test_a_blind_monster_far_from_any_warp_is_still_fought(monkeypatch):
+    """別擋過頭：離傳點夠遠時，座標未知的怪照樣還手。"""
+    from ro_toolbox.services.farm_bot import _BLIND_REACH
+    from ro_toolbox.services.warpzone import KEEP_OUT
+
+    bot = _bot_with_warp(monkeypatch)
+    sent = []
+    monkeypatch.setattr(bot, "_send", lambda data: bool(sent.append(data)) or True)
+    blind(bot, 7)
+    bot._aim = _Aim(gid=7, since=T0)
+    bot._fight(T0, (50, 50 + KEEP_OUT + _BLIND_REACH + 1))
+    assert len(sent) == 2, "圓裡沒有禁區就沒有東西可踩"
+
+
+def test_a_blind_fight_breaks_off_when_the_server_drags_us_near_a_warp(monkeypatch):
+    """開打之後也要看：座標未知時 `_no_fight()` 永遠是 False，擋不住任何東西。
+
+    連續攻擊在伺服器手上，怪往傳點走就會把角色一路拉過去 ——
+    所以改看**自己**被拉到哪，進禁區 `_BLIND_REACH` 格內就收手。
+    """
+    from ro_toolbox.services.farm_bot import _BLIND_REACH
+    from ro_toolbox.services.warpzone import KEEP_OUT
+
+    bot = _bot_with_warp(monkeypatch)
+    moves = []
+    monkeypatch.setattr(bot, "_send_move", lambda x, y: moves.append((x, y)))
+    blind(bot, 7)
+    bot._aim = _Aim(gid=7, since=T0, attacked=True)
+
+    far = 50 + KEEP_OUT + _BLIND_REACH + 1
+    bot._update_aim(T0 + 1, (50, far))
+    assert bot._aim is not None, "還離得遠，不必收手"
+
+    bot._update_aim(T0 + 2, (50, far - 1))
+    assert bot._aim is None, "被拉到傳點附近了，要收手"
+    assert 7 in bot._warp_skip
+    assert moves, "沒送移動 = 沒取消連續攻擊 = 伺服器繼續拉"
+
+
 # ---- 傳點：資料只給取樣點，真正的傳點是一片 --------------------------------
 
 

@@ -210,6 +210,7 @@
 - **每一段中間的路是伺服器走的** → A* 繞開傳點不夠，送出去的那一段**直線**也不能碰到傳點（prontera 實測 221 趟有 27 段會穿過去）（[PKT-071]）。
 - **傳點是一片，navi 只給幾個取樣點**（moc_fild01 一條 40 格的帶只取樣 3 次）→ 共線且 ≤60 格的同目的地傳點要連成一條帶；踩到了還要學起來（[DAT-030]）。
 - **連續攻擊會拉著角色追怪** → 怪跑進傳點就把人一起帶進去，全程沒有我們送的移動封包。所以「不打」的範圍要另外畫一片、比走路禁區大（`warpzone.NO_FIGHT`=8），而且收手要**多送一個移動**才取消得掉（[DAT-058]）。
+- **有一種怪「只知道它存在、不知道它在哪」**：只從傷害封包看到的怪（`note_monster`）沒有座標，任何「算它在哪」的檢查都會拿到 None。這種怪不能丟給幾何判斷，要改用「我周圍 12 格內沒有傳點禁區」來證明安全（[DAT-059]）。
 
 ### 跨地圖尋路
 
@@ -3524,6 +3525,83 @@ ReadProcessMemory 本身** —— numpy 比對只佔 0.04 秒，換 `re` 反而�
    角色狀態、負重、對話框）。
 4. 把 `send_on_socket` 攔下來跑真的 `TravelBot` → 看到 21 個一樣的封包（找到症狀）。
 5. 逐格改變距離重送 → 量出 12 會被忽略、10 會動（找到界線）。
+
+### [DAT-059] ★★★ 只從傷害封包看到的怪**沒有座標** —— 幾何檢查會拿到 None 當場炸掉
+
+- **狀態**：已驗證（2026-09-01，使用者實機日誌 ＋ 回歸測試）
+- **使用者回報**：「你看自動戰鬥有BUG」（附 10 分鐘日誌）
+
+### 症狀
+
+十分鐘內同一個例外炸了 **20 次**，每次都把自動打怪的執行緒打死，
+再靠「連線回來了，自動打怪接回去」重啟 —— 所以外面看起來像**斷線**，
+不像程式錯誤：
+
+    ERROR farm_bot | 自動打怪執行緒發生例外
+      farm_bot.py:992 in _fight → farm_bot.py:1628 in _crosses_warp
+      walker.py:82 in line_cells
+      TypeError: cannot unpack non-iterable NoneType object
+
+兩隻角色（白狐／狐狸）在 mjolnir_07 交替中獎，每次存活 5~40 秒。
+
+### 原因：`Monster.pos` 是 `tuple | None`，而 `_fight()` 只擋了 `mob is None`
+
+怪有兩種來源，**只有一種帶座標**：
+
+| 來源 | 有座標嗎 |
+|---|---|
+| 實體封包（`0x09FF`/`0x09FD`）、記憶體掃描（`sync_from_memory`） | 有 |
+| **傷害封包**（`WorldTracker.note_monster`：「這個 GID 打到我」） | **沒有**，只有 GID |
+
+第二種是 [PKT-027]「主動怪常常沒送 0x09FD 就先打人」那條留下來的：被打到就是它還在的
+證據，所以就算我們看不到它，也要把它補進追蹤讓 bot 反擊。
+`_pick_target()` 的「打我的怪優先」那一段因此會回一隻 `pos is None` 的怪。
+
+`_fight()` 送攻擊前的傳點檢查（[DAT-058] 第 4 點）寫成：
+
+    if pos is not None and mob is not None and self._crosses_warp(pos, mob.pos):
+
+`mob.pos` 是 None 也照樣進去 → `line_cells(a, None)` → `(x1, y1) = b` 炸。
+**「mob 不是 None」跟「mob 的座標不是 None」是兩件事**，這是這條最容易漏的地方。
+
+### 修法：沒有座標就換一種**能證明**的說法
+
+不能拿 None 去算幾何，但也不該「先打了再說」（那正是 [DAT-058] 的災難）。
+能確定的事只有一件：**它打得到我，所以它在我的 `_BLIND_REACH`（12）格內**
+（RO 一般怪射程約 9~10，留餘裕）。於是把命題換掉：
+
+    原本：從我到牠的那條線會不會經過傳點禁區   ← 需要牠的座標
+    改成：我周圍 12 格內有沒有傳點禁區         ← 只需要我的座標
+
+圓裡完全沒有禁區的話，牠不管站在圓裡哪一格、伺服器帶我走哪條路，都踩不到傳點。
+沒有傳點的地圖（`_warp_zone` 空）直接放行，不會誤傷。
+
+三個落點（缺一不可）：
+
+1. `_fight()`：`mob.pos is None` 走另一條分支，圓裡有禁區就 `_give_up_blind()`。
+2. `_update_aim()`：**開打之後每一拍也要問**（`_blind_near_warp()`）。
+   座標未知時 `_no_fight()`（看怪站在哪）永遠是 False，擋不住任何東西 ——
+   而 `0x0437` 是連續攻擊，牠往傳點走伺服器就把人一路拉過去。
+   這裡改看**自己**被拉到哪，進禁區 12 格內就 `_break_off()` 收手。
+3. 拉黑要用 `_warp_skip`，**不能用 `_skip`**：這種怪幾乎都是正在打我的怪，
+   而「打我的怪優先」那一段**故意不看 `_skip`**（[DAT-058] 的說明）。
+   用錯集合的話下一拍又挑回同一隻，變成每一拍放棄一次、角色一步都不動。
+
+### 這條的教訓（下次照這個查）
+
+- **例外被 `except` 包起來重啟，症狀會偽裝成別的東西。** 日誌裡「連線回來了，
+  自動打怪接回去」出現得異常頻繁（10 分鐘 20 次）就該懷疑不是網路。
+- **`X | None` 的欄位，護欄要擋的是 `X.欄位`，不是 `X`。** 這次擋了 `mob is not None`
+  卻沒擋 `mob.pos is not None`，型別註記其實已經寫著 `tuple[int, int] | None`。
+
+### 回歸測試
+
+`tests/test_farm_bot.py`：
+`test_a_monster_with_no_known_position_does_not_crash_the_thread`（就是這個例外）、
+`test_a_monster_with_no_known_position_is_left_alone_near_a_warp`（含「拉黑要用
+_warp_skip，不然每一拍放棄一次」）、
+`test_a_blind_monster_far_from_any_warp_is_still_fought`（別擋過頭）、
+`test_a_blind_fight_breaks_off_when_the_server_drags_us_near_a_warp`。
 
 ### [DAT-058] ★★★ 被傳走的兇手是**伺服器**：連續攻擊會拉著角色追進傳點
 
