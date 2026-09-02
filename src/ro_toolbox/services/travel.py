@@ -429,6 +429,9 @@ class Traveler:
         #: 判準是**位置有沒有變**，不是時間 —— 有進展就重新起算。
         self._blocks = 0
         self._block_pos: tuple[int, int] | None = None
+        #: 最後一段算不出路時的 `(站的格, 目的地)`。同一組再算一次一定是同一個
+        #: 答案（地形是靜態的），所以第二次就直接放棄 —— 見 `_start_leg`。
+        self._dead_goal: tuple[tuple[int, int], tuple[int, int]] | None = None
         self._here: tuple[int, int] = (0, 0)
         self.note = ""
 
@@ -1075,8 +1078,29 @@ class Traveler:
                              map_name, goal, inner)
                     path, avoid = self._path_to(terrain, map_name, pos, inner)
                 if not path:
+                    # ⚠⚠ **同一組（站的格 → 目的地）不必再算第二次。**
+                    # 地形是靜態的，`_inner_hop` 也試過了 —— 重算一定是同一個
+                    # 答案。舊版在這裡走 `_give_up_leg()`，而「人已經在目的地
+                    # 那張圖上」時 `plan_route` 一定成功（空路線），所以它回
+                    # "walking"、下一拍又算同一條、又失敗…… 實機 2026-09-01：
+                    # **5 秒內重算 40 次**才吐出「重新規劃 40 次仍到不了 prt_in」
+                    # —— 那句話還把原因講錯了（不是路線，是房間不相連），
+                    # 而且每次補水都要白花這 5 秒（[DAT-061]）。
+                    #
+                    # 留一次重試：換圖後座標可能還停在上一張圖（[MEM-022]），
+                    # 那時的 `pos` 是假的，值得再等一拍。同一組再來就放棄。
+                    if self._dead_goal == (pos, goal):
+                        self.note = (
+                            f"⚠ 已經在 {map_name} 上，但目的地 {goal} 跟我站的"
+                            f" {pos} 不相連 —— 室內圖是一張地圖裡好幾間互不相連"
+                            "的房間，這一間走不過去。換一個地點或自己走過去。"
+                        )
+                        self._walker.clear()
+                        return "blocked"
+                    self._dead_goal = (pos, goal)
                     self.note = f"⚠ {map_name} 上走不到 {goal}"
                     return self._give_up_leg(map_name)
+            self._dead_goal = None
             self._walker.set_path(path, avoid=avoid)
             self._walker.update(pos)
             self.note = self._progress_note()

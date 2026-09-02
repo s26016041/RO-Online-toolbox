@@ -33,7 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ro_toolbox.core.ro_protocol import unpack_position
-from ro_toolbox.services import bag
+from ro_toolbox.services import bag, shop_reach
 from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import (
     item_name,
@@ -209,11 +209,19 @@ class RestockBot:
                 self._say(f"往 {where} 的{name}…")
                 known = self._walk(target_map, cell)
                 if known is not None:
+                    # 走到了 = 上次那筆「走不到」被推翻了（如果有的話）
+                    shop_reach.note_good(target_map, seller_cell)
                     known = self._make_sure_he_is_visible(
                         target_map, cell, seller_cell, look, name, known
                     )
                     break
                 skip.add(target_map)
+                # ⚠⚠ **這一趟的 `skip` 只活到這一趟結束** —— 下次補水又會挑到
+                # 同一家最近的店、再失敗一次。實機 2026-09-01 的四次補水
+                # **每一次都先去 prt_in、每一次都走不到**，每次白花 1.5~2 分鐘
+                # （使用者：「狐狐狸一直找不到商店買水」）。所以要記到檔案裡，
+                # 下次直接排最後（見 `services/shop_reach.py`：降級不是刪除）。
+                shop_reach.note_bad(target_map, seller_cell)
                 self._say(f"⚠ 走不到 {where} 的{name}，換一家試試")
                 if self._stop.is_set():
                     return
@@ -255,7 +263,12 @@ class RestockBot:
         target_map = here
         if not sellers:
             candidates = set(maps_with_potion_sellers()) - skip
-            found = nearest_map_with(here, candidates) if candidates else None
+            # ⚠ 上次走不到的排最後，**不是排除**：`usable` 空了就退回整份清單
+            # （安全退化 —— 記憶本身不可以變成「一瓶水都買不到」的原因）。
+            usable = {m for m in candidates if not self._known_bad(m)}
+            if candidates and not usable:
+                log.info("有藥水的圖全都被記成走不到 —— 這次忽略紀錄，照原本的挑")
+            found = nearest_map_with(here, usable or candidates) if candidates else None
             if found is None:
                 self._say("⚠ 附近找不到藥水商人 —— 沒有路線可以走過去")
                 return None
@@ -273,6 +286,15 @@ class RestockBot:
             return None
         cell = nearest_walkable(terrain, (x, y)) or (x, y)
         return target_map, cell, (x, y), look, name
+
+    @staticmethod
+    def _known_bad(map_name: str) -> bool:
+        """這張圖的藥水商人上次走不到嗎（見 `services/shop_reach.py`）。"""
+        sellers = potion_sellers_on(map_name)
+        if not sellers:
+            return False
+        x, y, _name, _look = sellers[0]
+        return shop_reach.is_bad(map_name, (x, y))
 
     def _walk(self, target_map: str, cell: tuple[int, int] | None) -> dict | None:
         """走過去。回沿路看到的 NPC（認商人要用），走不到就回 None。"""

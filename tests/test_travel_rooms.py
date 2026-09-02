@@ -125,3 +125,48 @@ def test_the_budgets_are_big_enough_for_a_real_indoor_map():
     doors = [w for w in warps_on_map("prontera") if w[2] == "prt_in"]
     assert travel.FILL_BUDGET >= len(doors), "每一道門都要驗得到"
     assert travel.ROUTE_TRIES >= len(doors), "每一道門都要試得到"
+
+
+def test_an_unreachable_last_leg_gives_up_instead_of_replanning_forever():
+    """★ 實機 2026-09-01：補水被 NPC 傳送丟在 prt_in (79,110)，商人在 (126,76)
+    —— 兩間房不相連。舊版在這裡走 `_give_up_leg()`，而「人已經在目的地那張圖
+    上」時 `plan_route` 一定成功（空路線），所以它回 "walking"、下一拍算同一條、
+    又失敗…… **5 秒內重算 40 次**才吐出「重新規劃 40 次仍到不了 prt_in」，
+    而且那句話把原因講錯了（不是路線，是房間）。每次補水都白花這一段。
+
+    釘住：同一組（站的格 → 目的地）第二次就放棄，而且理由要講到房間。
+    """
+    terrain = _terrain("prt_in")
+    pos = nearest_walkable(terrain, (79, 110))
+    goal = nearest_walkable(terrain, (126, 76))
+    assert pos is not None and goal is not None
+    assert goal not in terrain.reachable_from(pos), "前提：那兩格本來就不相連"
+
+    traveler = _traveler()
+    traveler.set_goal("prt_in", (126, 76))
+    traveler._terrain = terrain
+    traveler._route = []
+    traveler._route_map = "prt_in"
+
+    first = traveler._start_leg("prt_in", pos)
+    assert first != "blocked", "第一次要留一拍給「座標還停在上一張圖」"
+    assert traveler._start_leg("prt_in", pos) == "blocked", "同一組不必算第二次"
+    assert "不相連" in traveler.note and "房間" in traveler.note, traveler.note
+
+
+def test_a_reachable_last_leg_clears_the_dead_end_memory():
+    """⛔ 反面：走得到就不准留著「這裡是死路」，不然下一次真的走得到也會放棄。"""
+    terrain = _terrain("prt_in")
+    pos = nearest_walkable(terrain, (79, 110))
+    near = next(iter(sorted(terrain.reachable_from(pos))))
+
+    traveler = _traveler()
+    traveler.set_goal("prt_in", (126, 76))
+    traveler._terrain = terrain
+    traveler._route = []
+    traveler._route_map = "prt_in"
+    traveler._dead_goal = (pos, (126, 76))
+
+    traveler._goal_cell = near          # 換一個走得到的目的地
+    assert traveler._start_leg("prt_in", pos) in ("walking", "arrived")
+    assert traveler._dead_goal is None

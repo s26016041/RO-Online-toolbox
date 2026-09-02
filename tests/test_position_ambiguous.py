@@ -93,3 +93,76 @@ def test_a_map_change_drops_the_reference():
     loc.invalidate()
     assert loc._last_pos is None
     assert loc._said_many is False
+
+
+# ---- 「離上一次最近」對殘留物有系統性偏心（2026-09-01 實機）----------------
+
+
+class _Ticks:
+    """假的記憶體：只回答 `+0x134` 動作 tick。"""
+
+    def __init__(self, ticks: dict[int, int]) -> None:
+        self._ticks = ticks
+
+    def read_region(self, addr: int, size: int):
+        from ro_toolbox.services import actor
+
+        base = addr - actor.TICK
+        if base not in self._ticks or size != 4:
+            return None
+        return self._ticks[base].to_bytes(4, "little")
+
+
+def _ticker(ticks: dict[int, int]) -> pp.PlayerPosition:
+    loc = pp.PlayerPosition.__new__(pp.PlayerPosition)
+    loc._scanner = _Ticks(ticks)
+    return loc
+
+
+def test_a_component_whose_tick_stopped_is_not_alive():
+    """殘留物的動作 tick 會停住 —— 那是它跟本人最乾淨的差別。"""
+    from ro_toolbox.services import actor
+
+    now = actor.now_tick()
+    loc = _ticker({0xA: now, 0xB: (now - 60_000) & 0xFFFF_FFFF})
+    assert loc._ticking(0xA) is True
+    assert loc._ticking(0xB) is False
+
+
+def test_a_tick_from_the_future_still_counts_as_alive():
+    """走路中 tick 是**未來**的值（實測領先約 965 ms）—— 那也是活的。"""
+    from ro_toolbox.services import actor
+
+    now = actor.now_tick()
+    loc = _ticker({0xA: (now + 965) & 0xFFFF_FFFF})
+    assert loc._ticking(0xA) is True
+
+
+def test_an_unreadable_tick_does_not_exclude_anybody():
+    """⛔ 讀不到就別動它 —— 這支是用來排除殘留物，不是用來挑人。"""
+    loc = _ticker({})
+    assert loc._ticking(0xDEAD) is True
+
+
+def test_the_live_component_is_kept_even_when_the_dead_one_sits_on_us():
+    """★ 這就是 2026-09-01 那顆：**殘留物剛好停在我們上一次讀到的那一格**。
+
+    「離上一次最近」會系統性地挑到它 —— 實機補水走到 prt_fild05，落地
+    (20,333) 之後座標整整 7 秒不變，`travel_bot` 判定「角色一步都沒動」
+    放棄那家店；換挑另一個候選之後座標立刻變成 (30,333)。
+
+    先用動作 tick 把停住的剔掉，剩下的才輪到「離上一次最近」。
+    """
+    from ro_toolbox.services import actor
+
+    now = actor.now_tick()
+    live, dead = 0xA, 0xB
+    loc = _ticker({live: now, dead: (now - 60_000) & 0xFFFF_FFFF})
+    good = [live, dead]
+    alive = [a for a in good if loc._ticking(a)]
+    assert alive == [live]
+
+    # 反證：沒有 tick 這一關的話，舊規則會挑到停在原地的那個
+    stale_loc = _locator(last=(20, 333), last_at=1000.0)
+    seen = {live: (30, 333), dead: (20, 333)}
+    assert stale_loc._closest(good, seen) == dead
