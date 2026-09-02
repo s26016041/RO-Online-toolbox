@@ -92,12 +92,35 @@ def note_good(map_name: str, cell: tuple[int, int]) -> None:
         log.info("%s 的商店 %s 這次走到了，清掉舊紀錄", map_name, cell)
 
 
+class Memory:
+    """「現在哪幾家被記成走不到」的一份快照。
+
+    ⚠ 為什麼要有這個：挑店會把**每一張有藥水商人的圖**問過一遍，一家一次
+    `is_bad()` 就是一次開檔＋解析 JSON，而挑店一趟最多跑三次 ——
+    幾十次多餘的磁碟讀取。快照讀一次就好，而且一趟裡的判斷也一致。
+    """
+
+    def __init__(self, data: dict[str, float], now: float) -> None:
+        self._bad = frozenset(k for k, at in data.items() if now - at < _RETRY_AFTER)
+
+    def is_bad(self, map_name: str, cell: tuple[int, int]) -> bool:
+        return _key(map_name, cell) in self._bad
+
+    def __len__(self) -> int:
+        return len(self._bad)
+
+
+def snapshot(now: float | None = None) -> Memory:
+    """讀一次檔，之後想問幾家就問幾家（見 `Memory`）。"""
+    return Memory(_load(), time.time() if now is None else now)
+
+
 def is_bad(map_name: str, cell: tuple[int, int], now: float | None = None) -> bool:
-    """這家店最近被記成走不到嗎（過了 `_RETRY_AFTER` 就當沒記過）。"""
-    at = _load().get(_key(map_name, cell))
-    if at is None:
-        return False
-    return (time.time() if now is None else now) - at < _RETRY_AFTER
+    """這家店最近被記成走不到嗎（過了 `_RETRY_AFTER` 就當沒記過）。
+
+    ⚠ 一次一家。要問很多家請用 `snapshot()`，不然每問一家就開一次檔。
+    """
+    return snapshot(now).is_bad(map_name, cell)
 
 
 def forget_all() -> None:

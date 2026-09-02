@@ -197,6 +197,20 @@
 - **回程道具固定補到 20 個**，跟藥水是兩套規則：藥水買到負重滿，它只補到數量夠。
   負重滿了只擋藥水**不擋回程道具**（沒有它就回不了城，而 20 個蝴蝶翼很輕）。
   商店沒賣就跳過，不算失敗（使用者指定）。
+- **「走不到」記的是商人不是地圖**（[DAT-063]）：一張圖可以有兩個藥水商人，
+  裡面那個走不到、門口那個走得到。整張圖一起寫掉的話好圖會被永久放棄。
+- **買不買得到都要 `_go_back()`**（[DAT-063]）：三家都走不到就 return 的話，
+  `came_back` 是 False，後面每一條接手的路都不敢動，角色整晚站在城裡。
+
+### 練功地圖（`_farm_map`）—— 補給要走回哪裡
+
+- **「該不該把現在站的地方記成練功地圖」不可以用推論的**（[DAT-063]）。
+  決定寫在呼叫端（`_ProgramFarm.record_map`），`record_map=True` 目前只有
+  一個入口：`_watch_travel_resumes()`（走完使用者選的尋路、到站了）。
+- ⛔ **不准拿「現在站的地方」當空值的退化。** 留空＝安全退化（可以大聲說），
+  填錯＝角色在城裡漫遊一整晚（安靜地做錯事）。[DAT-062]／[DAT-063] 都是這條。
+- 練功地圖要跟著回連的快照回來（`restore_into`），也要跟著 PID 死（`_remove`）
+  —— Windows 會回收 PID（[DAT-063]）。
 - **挑店要挑「一般」那家**：`potion_sellers_on()` 把名字剛好等於關鍵字的
   （「道具商人」）排前面，有前綴的特殊商人（「高級藥水商人」「忍術道具商人」）
   排後面。實機踩過 —— izlude_in 三家，舊版挑到高級藥水商人，那家貨架短、
@@ -3796,6 +3810,118 @@ ReadProcessMemory 本身** —— numpy 比對只佔 0.04 秒，換 `re` 反而�
 4. 把 `send_on_socket` 攔下來跑真的 `TravelBot` → 看到 21 個一樣的封包（找到症狀）。
 5. 逐格改變距離重送 → 量出 12 會被忽略、10 會動（找到界線）。
 
+### [DAT-063] ★★★ [DAT-062] 的修法自己漏了六道門：**「該不該記練功地圖」不可以用推論的**
+
+- **狀態**：已驗證（2026-09-02，程式碼審查 ＋ 測試；實機尚未跑滿一晚）
+- **來源**：`/code-review` 對 commit `f7ee075`（v0.5.35，[DAT-062] 的修正）的審查
+
+#### 一句話
+
+[DAT-062] 用「pid 在不在 `_quiet_farm` 這個集合裡」去**推論**「現在站的地方
+可不可以當練功地圖」。那個集合的本職是 `_want_farm` 的記帳（「這不是使用者
+按的，意圖要留著」），拿來兼差第二件事之後，**六個地方各自推錯一次**，
+而且每一個的症狀都一樣：角色在城裡漫遊，或整晚站著不動。
+
+#### 六道門
+
+**1. 使用者主動尋路到新練功區 → 練功地圖永遠停在舊的那張**
+
+`_watch_travel_resumes()` 是程式呼叫的，所以被一律當成「不要記」。但走完的是
+**使用者自己選的目的地**，人就站在那張圖上。於是他從 prt_fild08 搬到
+mjolnir_02 之後，下一趟補水把他帶回 prt_fild08 —— 一張他已經放棄的地圖。
+
+**2. 回連 → 城裡被永久釘成練功地圖**
+
+`restore_into()` 從頭到尾沒有把 `snap.farm_map` 寫回 `self._farm_map`。回連
+之後是一張全新的卡片（新 PID、空的 `_farm_map`），而 [DAT-062] 留的退化
+「還沒記過就照記現在這裡」這時候就會把**存檔點（城裡）**記起來，之後永不修正。
+**[DAT-062] 的棘輪從回連這道門原封不動地走回來了。**
+
+**3. `_watch_farm_alive()` 的守門在 `wanted_map` 是空的時候整條短路**
+
+    if wanted_map and status.map_name and status.map_name != wanted_map:
+
+docstring 明講「**人要在練功地圖上**」，但 `wanted_map` 空的時候這個條件是
+False，於是「就地開打」—— 而那個地點接著被第 2 條記成練功地圖。
+
+**4. `_remove()` 沒清 `_farm_map`**
+
+Windows 會把 PID 回收。從「每次開都刷新」改成「只記一次」之後，留下來的舊值
+**再也不會被蓋掉** —— 補給就「走回」一張這隻角色從來沒去過的圖。
+
+**5. 三家店全部走不到 → 角色整晚站在城裡**
+
+`restock_bot._run()` 的 `for/else: return` 跳過了 `_go_back()`。`came_back`
+是 False → `_resume_after_supplies()` 直接 return → `_watch_farm_alive()` 又
+因為「人不在練功地圖上」不敢開 → 而自動那一趟**不跳框**（使用者指定），
+`log.info` 在預設層級底下看不到。早上起來人在城裡。
+
+**6. 救援路徑只看「bot 在不在」，不看「bot 死了沒」**
+
+`if on and pid not in self._bots` —— bot 物件還掛著但執行緒已經死了的話永遠
+救不回來，而 `_watch_farm_alive()` 還**先印**「自動打怪接回去」再動作
+（報喜不報憂，跟 `_resume_after_supplies()` 當初同一個坑）。
+
+#### 修法：把決定講出來，不要用旗標猜
+
+    @dataclass(frozen=True)
+    class _ProgramFarm:
+        keep_intent: bool     # 這不是使用者的意思，意圖要留著
+        record_map: bool      # 現在站的地方可以當練功地圖嗎
+
+勾勾是 signal 驅動的（`setChecked()` → `_toggle_farm()`），沒辦法把參數直接
+傳進去 —— 所以用 `FarmPage._program_farm()` 這個 context manager 把呼叫端
+知道的兩件事放著給 `_toggle_farm()` 讀。**沒有這一筆就代表是使用者自己按的。**
+
+`record_map=True` 目前**只有一個呼叫端**：`_watch_travel_resumes()`（走完
+使用者選的尋路、到站了）。其餘全部 False。
+
+⚠ 巢狀要還原成外層那一份，不可以無條件 `discard` —— 內層的 `finally` 把外層
+的旗標清掉的話，`_toggle_farm()` 的關閉那條就會把使用者的「要掛機」意圖一起
+洗掉（[DAT-062] 之前踩過的那個症狀）。
+
+#### ⛔ 被否決的做法：「還沒記過就先記現在這裡，總比空的好」
+
+那是 [DAT-062] 留下來的退化，也是上面第 2、3 條的成因。留空會讓補給不知道
+要走回哪裡（可以**大聲說**），填錯會讓角色在城裡漫遊一整晚（**安靜地做錯事**）。
+CLAUDE.md 講得很清楚：**留空＝安全退化，填錯＝很有自信的錯**。
+現在讀不到地圖時是一行 WARNING，`_watch_farm_alive()` 也拒絕在不知道練功
+地圖的情況下開打。
+
+#### 順便修掉的挑店 bug（[DAT-061] 那條記憶）
+
+- **腳下那張圖不查黑名單**：`sellers = [] if here in skip else potion_sellers_on(here)`
+  —— 少了 `_known_bad(here)`。第一次走失敗會把人丟在 prt_in 裡面，重試那一次
+  `here` 就是 prt_in，直接跳過記憶又挑了同一家。**記憶在它專門要解的情境裡失效。**
+- **一張圖只看 `sellers[0]`**：一張圖可以有兩個藥水商人，裡面那個走不到、
+  門口那個走得到。舊版整張圖一起寫掉，門口那個永遠沒被試過。
+  現在 `_find_shop()` 的「試過了」記的是**商人的身分**（地圖 ＋ 他站的格），
+  不是地圖；`_known_bad()` 也改成「**全部**都走不到才算」。
+- **每問一家開一次檔**：`shop_reach.snapshot()` 讀一次檔，一趟挑店只讀一次。
+
+#### 值得記住的形狀
+
+**一個集合只准代表一件事。** `_quiet_farm` 的本職是「意圖要不要留著」，
+兼差「該不該記地圖」之後，每一個沒想到的呼叫端都會沉默地推錯 ——
+而且推錯的方向剛好都是「安靜地做錯事」。決定要**寫在呼叫端**。
+
+- **驗證方式**：
+  - `tests/test_farm_page.py::test_arriving_where_the_user_asked_updates_the_farm_map`
+  - `tests/test_farm_page.py::test_a_program_start_never_invents_a_farm_map`
+  - `tests/test_farm_page.py::test_the_farm_map_comes_back_with_the_snapshot`
+  - `tests/test_farm_page.py::test_a_recycled_pid_does_not_inherit_the_old_farm_map`
+  - `tests/test_farm_page.py::test_it_refuses_to_start_farming_without_a_farm_map`
+  - `tests/test_farm_page.py::test_a_dead_bot_behind_a_ticked_box_gets_restarted`
+  - `tests/test_farm_page.py::test_a_nested_program_start_keeps_the_outer_intent`
+  - `tests/test_restock_bot.py::test_it_walks_home_even_when_every_shop_was_unreachable`
+  - `tests/test_shop_reach.py::test_the_map_we_are_standing_on_also_asks_the_memory`
+  - `tests/test_shop_reach.py::test_a_second_seller_on_the_same_map_still_gets_a_turn`
+  - `tests/test_shop_reach.py::test_the_memory_is_read_once_per_search`
+- **影響**：`ui/pages/farm_page.py`、`services/restock_bot.py`、`services/shop_reach.py`。
+- ⚠ **測試隔離**：`tests/test_restock_bot.py` 以前沒有把 `shop_reach._path()`
+  導到暫存目錄，`_find_shop()` 會讀開發機真實的
+  `%APPDATA%\RO-Online-toolbox\shop_reach.json` —— 本機綠、別台紅。已修。
+
 ### [DAT-062] ★★★ 「補水後角色會亂走」＝**「家」被寫成城裡**，而且會一路滾下去
 
 - **狀態**：已驗證（2026-09-01/02，使用者實機日誌）
@@ -3842,6 +3968,12 @@ ReadProcessMemory 本身** —— numpy 比對只佔 0.04 秒，換 `re` 反而�
 還沒記過的話照記（沒有比這更好的猜測，總比空的好）。
 ⚠ `_set_auto_hunt()` 裡那條「勾著但沒東西在跑，補一個起來」的救援路徑也要
 把 `keep_intent` 帶下去，不然它會變成第三個入口。
+
+> ⚠⚠ **上面這一段修法已經被 [DAT-063] 取代。** 用 `_quiet_farm` 這個集合去
+> **推論**「該不該記練功地圖」，推錯了三個地方（使用者主動尋路到新練功區、
+> 回連、PID 被回收），而「還沒記過就照記」本身就是同一條棘輪的另一道門。
+> 現在的形狀是**呼叫端把決定講出來**（`_ProgramFarm.record_map`），
+> 而且**不准拿「現在站的地方」當退化值**。
 
 #### 值得記住的形狀
 

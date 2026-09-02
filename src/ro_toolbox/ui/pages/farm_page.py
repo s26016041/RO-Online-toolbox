@@ -13,6 +13,8 @@ from __future__ import annotations
 import html
 import logging
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
@@ -114,6 +116,30 @@ _MAX_READ_FAILURES = 3  # 連續讀取失敗幾次就當它登出／關閉了
 #: ⚠ **不看升等**：升等不會改技能，要玩家自己點下去才會變（使用者指出）。
 #: 所以只有定期重掃，沒有「升等就掃」那條。
 _SKILL_REFRESH_MS = 5_000
+
+
+@dataclass(frozen=True)
+class _ProgramFarm:
+    """「這一次自動打怪是**程式**開關的」—— 決定放在呼叫端，不要用旗標猜。
+
+    勾勾是 signal 驅動的（`setChecked()` → `_toggle_farm()`），沒辦法把參數直接
+    傳進去，所以由 `FarmPage._program_farm()` 把呼叫端知道的兩件事放著，
+    `_toggle_farm()` 去讀。**沒有這一筆就代表是使用者自己按的。**
+
+    - `keep_intent`：這不是使用者的意思（趕路、補給、斷線），
+      「要掛機」那件事要留著，等狀況結束再接回去。
+    - `record_map`：**現在站的地方可以當練功地圖嗎。**
+      走完使用者選的尋路、到站了 → 可以（人就在新的練功點上）。
+      補完貨／回連接回去 → **不可以**，那一刻人多半還在城裡；記錯的話
+      下一次補水就「走回城裡」，然後在城裡漫遊，而且下一趟的家又是城裡，
+      一路滾下去（GAMEDATA [DAT-062]，使用者：「補水後角色會亂走」）。
+
+    ⚠ 舊版是用一個 `set` 硬推出這兩件事，於是「使用者主動尋路到新地圖」
+    也被當成「程式接回去」，練功地圖永遠停在舊的那張。決定要**講出來**。
+    """
+
+    keep_intent: bool
+    record_map: bool
 
 
 class AttachWorker(QThread):
@@ -1262,8 +1288,12 @@ class FarmPage(BasePage):
         #: 只有兩種情況會把意圖清掉：**使用者自己按掉**，或使用者指定要停的
         #: 狀況（負重滿了、角色死亡）。
         self._want_farm: set[str] = set()
-        #: 正在「程式自己關掉自動打怪」的 PID —— 那不算使用者的意思。
-        self._quiet_farm: set[int] = set()
+        #: 正在被**程式**開關自動打怪的 PID → 呼叫端的決定（見 `_ProgramFarm`）。
+        #: 沒有這一筆＝使用者自己按的勾勾。只有 `_program_farm()` 會寫它。
+        self._farm_quiet: dict[int, _ProgramFarm] = {}
+        #: 已經講過「不知道練功地圖在哪」的 PID（`_watch_farm_alive` 每拍都會
+        #: 走到那條，不擋會洗版，而且真正的訊息會被自己洗掉）。
+        self._no_farm_map_said: set[int] = set()
         #: 趕路結束、等著把自動打怪接回去的 PID（收攤順序會咬人，見 `_toggle_travel`）。
         self._arrived_pending: set[int] = set()
         #: 走到目的地之後要自己把「自動打怪」打開的 PID。
@@ -1609,6 +1639,19 @@ class FarmPage(BasePage):
             traveler.stop()
         self._names.pop(pid, None)
         self._potion_intent.pop(pid, None)
+        # ⚠⚠ **跟著 PID 的東西一律要跟著 PID 死。** Windows 會把 PID 回收給
+        # 下一個遊戲視窗，而練功地圖從「每次開機都重記」改成「只記一次」之後，
+        # 留下來的舊值不會再被蓋掉 —— 它會安靜地變成永久的錯答案，補給就
+        # 「走回」一張這隻角色從來沒去過的圖（[DAT-062] 的同一條棘輪）。
+        # 回連不受影響：要接回去的那份在 `self._snaps` 的快照裡（見 `restore_into`）。
+        self._farm_map.pop(pid, None)
+        self._farm_quiet.pop(pid, None)
+        self._farm_retry.pop(pid, None)
+        self._potion_retry.pop(pid, None)
+        self._exp_start.pop(pid, None)
+        self._no_farm_map_said.discard(pid)
+        self._resume_farm.discard(pid)
+        self._arrived_pending.discard(pid)
         self._bag_loaded.discard(pid)
         self._bags.pop(pid, None)
         worker = self._bag_workers.pop(pid, None)
@@ -1902,6 +1945,14 @@ class FarmPage(BasePage):
         who = self._names.get(pid)
         if snap.farming and who:
             self._want_farm.add(who)     # 意圖跟著快照回來
+        if snap.farm_map:
+            # ⚠⚠ **練功地圖也要跟著快照回來。** 回連之後這是一張全新的卡片
+            # （新 PID、空的 `_farm_map`），不接回去的話「補完要走回哪裡」
+            # 就沒有答案了 —— 而人這時候正站在存檔點（城裡）。
+            # 舊版漏掉這一條，於是 [DAT-062] 那條棘輪從「回連」這道門走回來：
+            # 城裡被記成練功地圖，之後每一趟補水都走回城裡。
+            self._farm_map[pid] = snap.farm_map
+            self._no_farm_map_said.discard(pid)
         if snap.supply_back_to or (pid in self._supply_pending):
             # 補給途中斷線 —— **從頭再跑一次**。已經買到的部分不會重買
             # （`Restocker` 是「補到目標數量」不是「買固定幾個」），
@@ -1965,37 +2016,53 @@ class FarmPage(BasePage):
                 who = self._names.get(pid) or f"PID {pid}"
                 log.warning("%s 負重滿了，但自動補水沒在跑，回不了城", who)
 
-    def _set_auto_hunt(self, pid: int, on: bool, *, keep_intent: bool) -> None:
+    @contextmanager
+    def _program_farm(self, pid: int, *, keep_intent: bool, record_map: bool):
+        """接下來這一段 `_toggle_farm()` 是**程式**開關的（見 `_ProgramFarm`）。
+
+        ⚠ 巢狀要能還原成**外層那一份**，不可以無條件丟掉：內層的 `finally`
+        把外層的旗標清掉的話，`_toggle_farm()` 關閉那條會把使用者的
+        「要掛機」意圖一起洗掉 —— 之後補完貨就再也接不回去了。
+        """
+        before = self._farm_quiet.get(pid)
+        self._farm_quiet[pid] = _ProgramFarm(
+            keep_intent=keep_intent, record_map=record_map
+        )
+        try:
+            yield
+        finally:
+            if before is None:
+                self._farm_quiet.pop(pid, None)
+            else:
+                self._farm_quiet[pid] = before
+
+    def _set_auto_hunt(self, pid: int, on: bool, *, keep_intent: bool,
+                       record_map: bool = False) -> None:
         """程式自己開關自動打怪。
 
         `keep_intent=True` 代表**這不是使用者的意思**（趕路、補給、斷線），
         使用者「要掛機」那件事要留著，等狀況結束再接回去。
+
+        `record_map=True` 代表**現在站的地方就是新的練功地圖**。預設 False：
+        程式接回去的那一刻人常常還在城裡（補完貨、剛回連），記成練功地圖
+        的話下一次補水就走回城裡（[DAT-062]）。只有「走完使用者選的尋路、
+        到站了」那條路才給 True —— 那時人確實站在新的練功點上。
         """
         card = self._cards.get(pid)
         if card is None:
             return
-        if card.auto_hunt.isChecked() == on:
-            # ⚠ 勾勾已經是要的狀態了，但**東西不一定真的在跑**。
-            # 勾著卻沒有 bot ＝ 介面說「掛機中」、實際什麼都沒做，
-            # 那是規範說的「安靜地做錯事」—— 直接補一個起來。
-            if on and pid not in self._bots:
-                log.warning("「自動打怪」勾著但沒有東西在跑（PID %s），重新啟動", pid)
-                # ⚠ 這也是**程式自己**開的，`keep_intent` 要一路帶下去 ——
-                #   不然 `_toggle_farm()` 會把「現在站的地方」當成練功地圖
-                #   （見那裡的說明：補完貨站在城裡的話，家就變成城裡）。
-                if keep_intent:
-                    self._quiet_farm.add(pid)
-                try:
+        with self._program_farm(pid, keep_intent=keep_intent, record_map=record_map):
+            if card.auto_hunt.isChecked() == on:
+                # ⚠ 勾勾已經是要的狀態了，但**東西不一定真的在跑**。
+                # 勾著卻沒有 bot、或 bot 已經死在那裡 ＝ 介面說「掛機中」、
+                # 實際什麼都沒做，那是規範說的「安靜地做錯事」——
+                # 直接補一個起來（`_toggle_farm()` 會把死的那個收掉再開）。
+                bot = self._bots.get(pid)
+                if on and (bot is None or not bot.stats.running):
+                    log.warning("「自動打怪」勾著但沒有東西在跑（PID %s），重新啟動", pid)
                     self._toggle_farm(pid, True)
-                finally:
-                    self._quiet_farm.discard(pid)
-            return
-        if keep_intent:
-            self._quiet_farm.add(pid)
-        try:
+                return
             card.auto_hunt.setChecked(on)
-        finally:
-            self._quiet_farm.discard(pid)
 
     def _forget_farm_intent(self, pid: int) -> None:
         """使用者指定要停的狀況（負重滿了、角色死亡）—— 意圖也一起清掉。"""
@@ -2010,6 +2077,8 @@ class FarmPage(BasePage):
     def _toggle_farm(self, pid: int, on: bool) -> None:
         card = self._cards.get(pid)
         who = self._names.get(pid)
+        # 沒有這一筆＝**使用者自己按的**（勾勾只有兩種來源：他，或 `_set_auto_hunt`）。
+        program = self._farm_quiet.get(pid)
         if on:
             if who:
                 self._want_farm.add(who)      # 使用者要掛機
@@ -2030,18 +2099,26 @@ class FarmPage(BasePage):
             status = reader.read() if reader is not None else None
             if status is not None and status.has_exp:
                 self._exp_start[pid] = (time.monotonic(), status.base_exp, status.job_exp)
-            if status is not None and status.map_name and (
-                pid not in self._quiet_farm or not self._farm_map.get(pid)
-            ):
-                # 沒水回城補給之後要走回**這裡**，不是走回城裡（見 `_watch_supply_runs`）。
-                #
-                # ⚠⚠ **只有使用者自己開的那一次算數。** `_quiet_farm` 裡的是
-                # 程式自己開回去的（補完貨、回連、趕路結束）—— 那一刻人可能
-                # 還站在城裡，把它記成「練功地圖」的話，下一次補水就會
-                # 「走回城裡」，然後在城裡漫遊（使用者：「補水後角色會亂走」），
-                # 而且下一趟的家又是城裡，一路滾下去（GAMEDATA [DAT-062]）。
-                # 還沒記過的話照記 —— 沒有比這更好的猜測，總比空的好。
-                self._farm_map[pid] = status.map_name
+            # 沒水回城補給之後要走回**這裡**，不是走回城裡（見 `_watch_supply_runs`）。
+            #
+            # ⚠⚠ **只有「人確定站在練功點上」的那一次算數**（`record_map`）：
+            # 使用者自己按的、或走完他選的尋路到站了。程式接回去的那些
+            # （補完貨、回連）那一刻人多半還在城裡，記成練功地圖的話下一次
+            # 補水就「走回城裡」，然後在城裡漫遊，而且下一趟的家又是城裡，
+            # 一路滾下去（GAMEDATA [DAT-062]）。
+            #
+            # ⛔ **不准用「還沒記過就先記現在這裡」當退化。** 那正是 [DAT-062]
+            #    從別的門走回來的路：一個空的 `_farm_map` 加上一次在城裡的
+            #    自動接回，城裡就被永久釘成練功地圖。留空是安全退化，
+            #    填錯是「很有自信的錯」（CLAUDE.md）。
+            if status is not None and status.map_name:
+                if program is None or program.record_map:
+                    self._farm_map[pid] = status.map_name
+            elif not self._farm_map.get(pid):
+                # 讀不到現在在哪張圖，而且以前也沒記過 —— 補給之後不知道要
+                # 走回哪裡去。**大聲說**，不要猜一個。
+                log.warning("⚠ 讀不到「%s」現在在哪張圖，也沒有記過練功地圖 ——"
+                            "補給後沒辦法自己走回去", who or pid)
             bot.start()
         else:
             bot = self._bots.pop(pid, None)
@@ -2049,7 +2126,9 @@ class FarmPage(BasePage):
             # 卡片把勾勾拿掉 —— 把那個當成「使用者不想掛了」的話，回連之後
             # 就永遠接不回去了。使用者按下去的時候 bot 還在跑，分得出來。
             stopped_itself = bot is not None and not bot.stats.running
-            if who and not stopped_itself and pid not in self._quiet_farm:
+            if who and not stopped_itself and (
+                program is None or not program.keep_intent
+            ):
                 self._want_farm.discard(who)
             if bot is not None:
                 if bot.stats.overweight:
@@ -2339,7 +2418,11 @@ class FarmPage(BasePage):
             if not arrived:
                 log.warning("⚠「%s」沒能走回練功地圖，自動打怪沒有接回去", who)
                 continue
-            self._set_auto_hunt(pid, True, keep_intent=True)
+            # ⚠ 這一條是**唯一**准許程式更新練功地圖的路：走完的是使用者自己
+            # 選的目的地，人現在就站在那張圖上。不更新的話，使用者主動尋路
+            # 到新的練功區之後，`_farm_map` 還停在舊的那張 —— 下一趟補水
+            # 就把人帶回他已經放棄的地圖（`record_map` 的說明見 `_ProgramFarm`）。
+            self._set_auto_hunt(pid, True, keep_intent=True, record_map=True)
             log.warning("「%s」走回練功地圖了，自動打怪接回去", who)
 
     def _watch_potion_alive(self) -> None:
@@ -2432,11 +2515,29 @@ class FarmPage(BasePage):
                 continue                       # 讀不到狀態就不亂開
             if status.hp <= 0:
                 continue                       # 死著就別開（死亡本來就會清意圖）
-            if wanted_map and status.map_name and status.map_name != wanted_map:
-                continue                       # 不在練功地圖上 —— 交給回程那條
             who = self._names.get(pid) or f"PID {pid}"
-            log.warning("「%s」連線回來了，自動打怪接回去", who)
+            if not wanted_map:
+                # ⛔ **不知道練功地圖在哪就不准在這裡開打。** 這一拍人多半站在
+                #    存檔點（城裡），開下去等於「就地開打」，而那個地點會被
+                #    當成練功地圖記起來，之後每一趟補水都走回城裡（[DAT-062]）。
+                #    大聲停用比安靜地做錯事好（CLAUDE.md）。
+                if pid not in self._no_farm_map_said:
+                    self._no_farm_map_said.add(pid)
+                    log.warning("⚠「%s」要掛機但沒有記到練功地圖，"
+                                "不敢就地開打（請自己走到練功點再勾一次）", who)
+                continue
+            if status.map_name and status.map_name != wanted_map:
+                continue                       # 不在練功地圖上 —— 交給回程那條
             self._set_auto_hunt(pid, True, keep_intent=True)
+            # ⚠ **不准報喜不報憂**（跟 `_resume_after_supplies` 同一條規矩）：
+            # 舊版把這行印在動作**前面**，於是 bot 沒起來的時候日誌照樣說
+            # 「接回去了」，而那正是查問題時最像線索的一行。
+            started = self._bots.get(pid)
+            if started is not None and started.stats.running:
+                log.warning("「%s」連線回來了，自動打怪接回去", who)
+            else:
+                log.warning("⚠「%s」連線回來了，但自動打怪沒能啟動 ——"
+                            "%.0f 秒後再試", who, _FARM_RETRY_SEC)
 
     def _watch_supply_runs(self) -> None:
         """沒水自己回城了 → **接著去補給，補完走回練功點**（使用者指定）。
@@ -2498,7 +2599,9 @@ class FarmPage(BasePage):
             else:
                 title, body = "補水沒完成", f"{who}：{bot.stats.note}"
             if automatic:
-                log.info("%s —— %s", title, body)
+                # ⚠ 自動那一趟**不跳框**（使用者指定），所以日誌是唯一的線索 ——
+                # 失敗要 WARNING，不然預設層級底下整晚的失敗一行都看不到。
+                (log.info if bot.stats.done else log.warning)("%s —— %s", title, body)
                 continue
             show_notice(title, body)
 

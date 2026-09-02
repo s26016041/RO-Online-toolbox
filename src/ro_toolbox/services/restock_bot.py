@@ -197,11 +197,17 @@ class RestockBot:
             # 然後「沒走到商人那裡」，藥水一瓶都沒補，人就留在城裡。
             #
             # 換一張有藥水商人的圖就好了（izlude_in 那家一直都走得到）。
-            skip: set[str] = set()
+            #: 這一趟已經試過、走不到的**商人**（地圖 ＋ 他站的那一格）。
+            #: ⚠ 記商人不記地圖：一張圖上可以有兩個藥水商人，第一個在走不到
+            #: 的房間、第二個就在門口 —— 整張圖一起放棄的話，好的那個永遠
+            #: 不會被試到。
+            tried: set[tuple[str, tuple[int, int]]] = set()
+            known: dict | None = None
+            look, seller_cell = 0, (0, 0)
             for _ in range(_SHOP_TRIES):
-                plan = self._find_shop(skip)
+                plan = self._find_shop(tried)
                 if plan is None:
-                    return
+                    break
                 target_map, cell, seller_cell, look, name = plan
                 self.stats.shop_map = target_map
                 self.stats.shop_name = name
@@ -215,8 +221,8 @@ class RestockBot:
                         target_map, cell, seller_cell, look, name, known
                     )
                     break
-                skip.add(target_map)
-                # ⚠⚠ **這一趟的 `skip` 只活到這一趟結束** —— 下次補水又會挑到
+                tried.add((target_map, seller_cell))
+                # ⚠⚠ **這一趟的 `tried` 只活到這一趟結束** —— 下次補水又會挑到
                 # 同一家最近的店、再失敗一次。實機 2026-09-01 的四次補水
                 # **每一次都先去 prt_in、每一次都走不到**，每次白花 1.5~2 分鐘
                 # （使用者：「狐狐狸一直找不到商店買水」）。所以要記到檔案裡，
@@ -225,9 +231,17 @@ class RestockBot:
                 self._say(f"⚠ 走不到 {where} 的{name}，換一家試試")
                 if self._stop.is_set():
                     return
+            if known is not None:
+                self._buy(look, seller_cell, known)
             else:
-                return
-            self._buy(look, seller_cell, known)
+                self._say("⚠ 試過的藥水商人都走不到 —— 這趟沒補到水")
+            # ⚠⚠ **買不買得到都要走回去。** 舊版在「每一家都走不到」時直接
+            # return，於是角色就留在最後一次失敗的地方（城裡某個房間）：
+            # `came_back` 是 False → 補給那條不接掛機、`_watch_farm_alive`
+            # 又因為「人不在練功地圖上」不敢開 → **整晚站在城裡**，
+            # 而且自動那一趟不跳框，早上起來才看得到。
+            # 走回去至少能讓後面的流程繼續（走不到的店已經記進 `shop_reach`，
+            # 下一趟會先挑別家）。
             self._go_back()
         except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
             log.exception("補水停了：%s", exc)
@@ -236,11 +250,13 @@ class RestockBot:
             self.stats.running = False
             self._emit()
 
-    def _find_shop(self, skip: set[str] | None = None):
+    def _find_shop(self, tried: set[tuple[str, tuple[int, int]]] | None = None):
         """回 (地圖, 走到哪一格, 商人格, 外觀, 名字)。找不到就回 None 並說明。
 
-        `skip` 是**這一趟已經試過、走不到的地圖** —— 換一家的時候要跳過它們，
-        不然 `nearest_map_with()` 每次都回同一張最近的圖。
+        `tried` 是**這一趟已經試過、走不到的商人**（地圖 ＋ 他站的那一格）——
+        換一家的時候要跳過他們，不然 `nearest_map_with()` 每次都回同一張
+        最近的圖。⚠ 記的是**商人的身分**不是地圖（CLAUDE.md：存身分）：
+        一張圖上可以有兩個藥水商人，只有一個走不到。
         """
         from ro_toolbox.services.character import CharacterReader
 
@@ -272,27 +288,38 @@ class RestockBot:
         # 完整經過見 GAMEDATA [DAT-062]。
         if not self.stats.home_map:
             self.stats.home_map = self._back_to or here
-        skip = skip or set()
-        sellers = [] if here in skip else potion_sellers_on(here)
-        target_map = here
-        if not sellers:
-            candidates = set(maps_with_potion_sellers()) - skip
-            # ⚠ 上次走不到的排最後，**不是排除**：`usable` 空了就退回整份清單
-            # （安全退化 —— 記憶本身不可以變成「一瓶水都買不到」的原因）。
-            usable = {m for m in candidates if not self._known_bad(m)}
-            if candidates and not usable:
-                log.info("有藥水的圖全都被記成走不到 —— 這次忽略紀錄，照原本的挑")
-            found = nearest_map_with(here, usable or candidates) if candidates else None
-            if found is None:
-                self._say("⚠ 附近找不到藥水商人 —— 沒有路線可以走過去")
-                return None
-            _route, target_map = found
-            sellers = potion_sellers_on(target_map)
-        if not sellers:
-            self._say("⚠ 附近找不到藥水商人")
+        tried = tried or set()
+        # ⚠ 讀一次檔就好：下面要問**每一張**有藥水商人的圖「上次走得到嗎」。
+        bad = shop_reach.snapshot()
+
+        # 第一輪只挑沒被記成走不到的；全都被記過的話第二輪連他們也算 ——
+        # **降級不是刪除**（`services/shop_reach.py`）：記憶本身不可以變成
+        # 「一瓶水都買不到」的原因。
+        for allow_bad in (False, True):
+            target_map = here
+            # ⚠ 腳下這張圖也要問記憶。舊版只對**別的**地圖查，於是第一次走失敗
+            # 把人丟在 prt_in 之後，重試那一次 `here` 就是 prt_in，
+            # 直接跳過黑名單又挑了同一家 —— 記憶在它專門要解的情境裡失效。
+            seller = self._pick_seller(here, tried, bad, allow_bad=allow_bad)
+            if seller is None:
+                candidates = {
+                    m for m in maps_with_potion_sellers()
+                    if self._pick_seller(m, tried, bad, allow_bad=allow_bad)
+                }
+                found = nearest_map_with(here, candidates) if candidates else None
+                if found is None:
+                    continue                  # 換成「連走不到的也算」再找一次
+                _route, target_map = found
+                seller = self._pick_seller(target_map, tried, bad, allow_bad=allow_bad)
+            if seller is not None:
+                if allow_bad:
+                    log.info("有藥水的圖全都被記成走不到 —— 這次忽略紀錄，照原本的挑")
+                break
+        else:
+            self._say("⚠ 附近找不到藥水商人 —— 沒有路線可以走過去")
             return None
 
-        x, y, name, look = sellers[0]
+        x, y, name, look = seller
         try:
             terrain = load_terrain(target_map)
         except GatError as exc:
@@ -302,13 +329,37 @@ class RestockBot:
         return target_map, cell, (x, y), look, name
 
     @staticmethod
+    def _pick_seller(map_name: str, tried: set, bad, *, allow_bad: bool = False):
+        """這張圖上還可以試的藥水商人。回 None ＝ 這張圖沒得試了。
+
+        ⚠ **一張圖可以有好幾個藥水商人。** 上次走不到的只是**那一個**走不到，
+        不是整張圖 —— 舊版只看 `sellers[0]`，於是「第一個在走不到的房間、
+        第二個就在門口」的圖會被整個寫掉，門口那個永遠沒被試過。
+
+        `allow_bad=True` 是安全退化：全都被記成走不到的時候還是要有東西可試。
+        """
+        stale = None
+        for seller in potion_sellers_on(map_name):
+            cell = (seller[0], seller[1])
+            if (map_name, cell) in tried:
+                continue                       # 這一趟已經走過、走不到
+            if not bad.is_bad(map_name, cell):
+                return seller
+            stale = stale or seller
+        return stale if allow_bad else None
+
+    @staticmethod
     def _known_bad(map_name: str) -> bool:
-        """這張圖的藥水商人上次走不到嗎（見 `services/shop_reach.py`）。"""
+        """這張圖上的藥水商人**全部**上次都走不到嗎（`services/shop_reach.py`）。
+
+        ⚠ 「全部」很重要：只看第一個的話，一張有兩個商人的好圖會被整個寫掉
+        （見 `_pick_seller`）。
+        """
         sellers = potion_sellers_on(map_name)
         if not sellers:
             return False
-        x, y, _name, _look = sellers[0]
-        return shop_reach.is_bad(map_name, (x, y))
+        bad = shop_reach.snapshot()
+        return all(bad.is_bad(map_name, (x, y)) for x, y, _name, _look in sellers)
 
     def _walk(self, target_map: str, cell: tuple[int, int] | None) -> dict | None:
         """走過去。回沿路看到的 NPC（認商人要用），走不到就回 None。"""

@@ -21,7 +21,17 @@ DOOR = (285, 221)
 
 
 @pytest.fixture(autouse=True)
-def _clean():
+def _clean(monkeypatch, tmp_path):
+    """⚠ **不准碰使用者真實的 `shop_reach.json`。**
+
+    `_find_shop()` 會問「這家店上次走得到嗎」，而那份記憶存在
+    `%APPDATA%\\RO-Online-toolbox\\` 底下 —— 不導到暫存目錄的話，測試會照
+    開發機當下的紀錄走不同的分支（本機綠、CI 紅，或反過來），
+    而且還會把測試用的假地圖寫進使用者的檔案。
+    """
+    from ro_toolbox.services import shop_reach
+
+    monkeypatch.setattr(shop_reach, "_path", lambda: tmp_path / "shop_reach.json")
     forget_npcs(PID)
     yield
     forget_npcs(PID)
@@ -147,9 +157,33 @@ def test_home_is_captured_once_not_on_every_retry(monkeypatch):
     bot = RestockBot(PID, hp_item=502)
     bot._find_shop()
     assert bot.stats.home_map == "mjolnir_07"
-    bot._find_shop(skip={"prt_in"})          # 第二家：人已經在城裡了
-    bot._find_shop(skip={"prt_in", "prt_mk"})
+    bot._find_shop({("prt_in", (126, 76))})          # 第二家：人已經在城裡了
+    bot._find_shop({("prt_in", (126, 76)), ("prt_mk", (0, 0))})
     assert bot.stats.home_map == "mjolnir_07", "家只能是出發前那張圖"
+
+
+def test_it_walks_home_even_when_every_shop_was_unreachable(monkeypatch):
+    """★ 每一家都走不到 → 舊版直接 return，角色就**整晚站在城裡**。
+
+    `came_back` 是 False，所以補給那條不接掛機；`_watch_farm_alive()` 又因為
+    「人不在練功地圖上」不敢開；而自動那一趟不跳框 —— 早上起來才看得到。
+    買不買得到都要走回去（走不到的店已經記進 `shop_reach`，下一趟先挑別家）。
+    """
+    plan = ("prt_in", (79, 110), (126, 76), LOOK, "道具商人")
+    monkeypatch.setattr(RestockBot, "_find_shop", lambda self, tried=None: plan)
+    monkeypatch.setattr(RestockBot, "_walk", lambda self, where, cell: None)
+    monkeypatch.setattr(RestockBot, "_buy",
+                        lambda *a, **k: pytest.fail("沒走到就不該開店"))
+    went: list[str] = []
+    monkeypatch.setattr(RestockBot, "_go_back",
+                        lambda self: went.append(self.stats.home_map))
+
+    bot = RestockBot(PID, hp_item=502, back_to="mjolnir_07")
+    bot.stats.home_map = "mjolnir_07"
+    bot._run()
+
+    assert went == ["mjolnir_07"], "買不到也要走回去"
+    assert bot.stats.done is False, "沒買到就不准說成功"
 
 
 def test_the_caller_can_pin_home_explicitly(monkeypatch):

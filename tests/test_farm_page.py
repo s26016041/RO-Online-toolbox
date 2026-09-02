@@ -1700,6 +1700,45 @@ def test_the_snapshot_remembers_where_he_was_farming(monkeypatch, qtbot):
     assert snap.farm_map == "mjolnir_07"
 
 
+def test_the_farm_map_comes_back_with_the_snapshot(monkeypatch, qtbot):
+    """★ **練功地圖也要跟著快照接回來。**
+
+    回連之後是一張全新的卡片（新 PID、空的 `_farm_map`），而人正站在存檔點。
+    不接回去的話「補完要走回哪裡」就沒有答案 —— [DAT-062] 那條棘輪會從
+    「回連」這道門走回來：城裡被記成練功地圖，之後每一趟補水都走回城裡。
+    """
+    from ro_toolbox.services.reconnect_bot import Snapshot
+
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    card = make_card(qtbot)
+    page._cards[pid] = card
+    page._names[pid] = "白狐"
+    target = card.destination.itemData(1)
+
+    page.restore_into(pid, Snapshot(farming=True, farm_map=target, labels=["自動打怪"]))
+    assert page._farm_map[pid] == target
+
+
+def test_a_recycled_pid_does_not_inherit_the_old_farm_map(monkeypatch, qtbot):
+    """⚠ Windows 會把 PID 回收給下一個遊戲視窗。
+
+    練功地圖從「每次開機都重記」改成「只記一次」之後，留下來的舊值再也不會
+    被蓋掉 —— 它會安靜地變成永久的錯答案，補給就「走回」一張這隻角色從來
+    沒去過的圖。跟著 PID 的東西一律要跟著 PID 死。
+    """
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4242
+    page._cards[pid] = make_card(qtbot)
+    page._names[pid] = "白狐"
+    page._farm_map[pid] = "mjolnir_07"
+    page._farm_retry[pid] = 999.0
+
+    page._remove(pid, "遊戲關掉了")
+    assert pid not in page._farm_map
+    assert pid not in page._farm_retry
+
+
 def test_a_supply_run_starts_even_while_the_bag_is_still_loading(monkeypatch, qtbot):
     """⚠⚠ 實機（白狐）：回連之後印了「補給途中斷線，回來接著補完再走回去」，
     然後**什麼都沒發生**。分頁才剛長出來 1 秒，背包還在背景讀，
@@ -2048,6 +2087,62 @@ def test_it_waits_for_the_link_instead_of_spinning(qtbot, monkeypatch):
     assert card.auto_hunt.isChecked() is False
 
 
+def test_it_refuses_to_start_farming_without_a_farm_map(qtbot, monkeypatch, caplog):
+    """⛔ **不知道練功地圖在哪就不准在這裡開打。**
+
+    這一拍人多半站在存檔點（城裡）。舊版的守門是
+    `if wanted_map and status.map_name != wanted_map` —— `wanted_map` 是空的
+    就整條短路過去，於是「就地開打」，而那個地點會被當成練功地圖記起來。
+    大聲停用比安靜地做錯事好。
+    """
+    page = _page(qtbot, monkeypatch)
+    card = _farm_alive_card(page, qtbot, monkeypatch)
+    page._set_auto_hunt(1234, False, keep_intent=True)
+    page._farm_map.pop(1234, None)                  # 沒有人記過練功地圖
+    page._farm_retry.clear()
+
+    with caplog.at_level("WARNING"):
+        page._watch_farm_alive()
+    assert card.auto_hunt.isChecked() is False
+    assert "沒有記到練功地圖" in caplog.text, "要大聲說，不要安靜地不動"
+
+
+def test_a_dead_bot_behind_a_ticked_box_gets_restarted(qtbot, monkeypatch):
+    """⚠ 勾勾在、bot 物件也在，但它**已經死了** —— 那一樣是「介面說掛機中、
+    實際什麼都沒做」。舊版只看 `pid not in self._bots`，於是這種永遠救不回來，
+    而 `_watch_farm_alive()` 還照樣印「自動打怪接回去」（報喜不報憂）。
+    """
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.setattr(mod, "FarmBot", _ResumeFarmBot)
+    page = _page(qtbot, monkeypatch)
+    card = _wired_card(page, qtbot)
+    card.auto_hunt.setChecked(True)
+    page._bots[1234].stats.running = False          # 執行緒死了，物件還掛著
+
+    page._set_auto_hunt(1234, True, keep_intent=True)
+    assert page._bots[1234].stats.running is True, "要收掉死的那個再開一個"
+
+
+def test_a_nested_program_start_keeps_the_outer_intent(qtbot, monkeypatch):
+    """⚠ 巢狀的 `_program_farm()` 收尾要還原成**外層那一份**。
+
+    無條件丟掉的話，內層結束之後 `_toggle_farm()` 的關閉那條就會把使用者的
+    「要掛機」意圖一起洗掉 —— 之後補完貨再也接不回去。
+    """
+    page = _page(qtbot, monkeypatch)
+    page._names[1234] = "白狐"
+    page._want_farm.add("白狐")
+
+    with page._program_farm(1234, keep_intent=True, record_map=False):
+        with page._program_farm(1234, keep_intent=False, record_map=True):
+            pass
+        assert page._farm_quiet[1234].keep_intent is True, "外層那一份要還在"
+        page._toggle_farm(1234, False)
+    assert page._wants_farm(1234) is True
+    assert 1234 not in page._farm_quiet
+
+
 def test_it_keeps_its_hands_off_a_supply_run(qtbot, monkeypatch):
     """⛔ 補給途中不碰 —— 那條路自己會在補完之後接回去。"""
     page = _page(qtbot, monkeypatch)
@@ -2223,22 +2318,51 @@ def test_resuming_by_ourselves_does_not_move_the_farm_map_into_town(
     page._readers[1234] = _Where("prt_in")          # 補完貨，人在城裡
     monkeypatch.setattr(mod.FarmBot, "start", lambda self: True)
 
-    # `_set_auto_hunt(keep_intent=True)` 就是把 pid 放進 `_quiet_farm` 再開
-    page._quiet_farm.add(1234)
-    page._toggle_farm(1234, True)                   # 程式自己接回去
+    # 程式自己接回去 ＝ `record_map=False`（見 `_ProgramFarm`）
+    with page._program_farm(1234, keep_intent=True, record_map=False):
+        page._toggle_farm(1234, True)
     assert page._farm_map[1234] == "mjolnir_07", "城裡不是練功地圖"
 
 
-def test_the_first_ever_reading_is_still_recorded(qtbot, monkeypatch):
-    """⛔ 反面：還沒記過的話照記 —— 沒有比這更好的猜測，總比空的好。"""
+def test_a_program_start_never_invents_a_farm_map(qtbot, monkeypatch, caplog):
+    """⛔ **還沒記過也不准拿「現在站的地方」頂替。**
+
+    舊版有一條退化：`_farm_map` 是空的就照記現在這裡，「總比空的好」。
+    那正是 [DAT-062] 從別的門走回來的路 —— 回連之後人在存檔點、
+    `_farm_map` 又是空的（新 PID），城裡就被永久釘成練功地圖。
+    留空是安全退化，填錯是「很有自信的錯」（CLAUDE.md）。
+    """
     from ro_toolbox.ui.pages import farm_page as mod
 
     page = _page(qtbot, monkeypatch)
     card = make_card(qtbot)
     page._cards[1234] = card
-    page._readers[1234] = _Where("prt_fild05")
+    page._readers[1234] = _Where("prontera")        # 存檔點
     monkeypatch.setattr(mod.FarmBot, "start", lambda self: True)
 
-    page._quiet_farm.add(1234)
-    page._toggle_farm(1234, True)
-    assert page._farm_map[1234] == "prt_fild05"
+    with page._program_farm(1234, keep_intent=True, record_map=False):
+        page._toggle_farm(1234, True)
+    assert 1234 not in page._farm_map
+
+
+def test_arriving_where_the_user_asked_updates_the_farm_map(qtbot, monkeypatch):
+    """★ 使用者自己尋路到**新的**練功區 —— 那張才是家。
+
+    `_watch_travel_resumes()` 是程式呼叫的，但走完的是使用者選的目的地、
+    人就站在那張圖上。舊版一律不更新，於是下一趟補水把人帶回**他已經
+    放棄的舊地圖**。
+    """
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    monkeypatch.setattr(mod, "FarmBot", _ResumeFarmBot)
+    page = _page(qtbot, monkeypatch)
+    card = _wired_card(page, qtbot)
+    page._want_farm.add("白狐")
+    page._farm_map[1234] = "prt_fild08"             # 舊的練功地圖
+    page._readers[1234] = _Where("mjolnir_02")      # 已經走到新的了
+
+    page._arrived_pending.add(1234)                 # 到站了（`_toggle_travel` 記的）
+    page._watch_travel_resumes()
+
+    assert page._farm_map[1234] == "mjolnir_02"
+    assert card.auto_hunt.isChecked() is True
