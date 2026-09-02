@@ -104,3 +104,60 @@ def test_it_does_not_shake_for_ever(monkeypatch):
 
     assert known == {}
     assert len(walks) == mod._SHAKE_ROUNDS * 2, "每輪兩趟，做完就停"
+
+
+# ---- 「出發前在哪張圖」只准記一次（2026-09-01：補水後角色會亂走）------------
+
+
+class _Reader:
+    """假的角色讀取：每次 `read()` 回下一張圖（模擬換一家店之後人已經移動了）。"""
+
+    def __init__(self, maps: list[str]) -> None:
+        self._maps = list(maps)
+
+    def attach(self, _pid) -> bool:
+        return True
+
+    def read(self):
+        from types import SimpleNamespace
+
+        name = self._maps.pop(0) if len(self._maps) > 1 else self._maps[0]
+        return SimpleNamespace(map_name=name)
+
+    def close(self) -> None: ...
+
+
+def test_home_is_captured_once_not_on_every_retry(monkeypatch):
+    """★ 使用者：「補水後角色會亂走」。
+
+    `_find_shop()` 在「走不到就換一家」的迴圈裡會被叫好幾次，而 `here` 是
+    **現在**站的地方 —— 第一家走不到的話人已經在城裡了，於是「家」就變成
+    城裡那張圖。實機日誌：
+
+        18:30 從 prt_fild04 出發 → 兩家店都走不到
+        18:32 補水：買完了，**走回 普隆德拉內部**…     ← 回到城裡的房間
+        19:31 補水：買完了，**走回 普隆德拉內部**…     ← 下一趟又從那裡出發
+
+    回到城裡之後自動打怪照樣接回去 → 角色在城裡漫遊，而且會一直滾下去。
+    """
+    from ro_toolbox.services import character as char_mod
+
+    monkeypatch.setattr(char_mod, "CharacterReader",
+                        lambda: _Reader(["mjolnir_07", "prt_in", "prt_mk"]))
+    bot = RestockBot(PID, hp_item=502)
+    bot._find_shop()
+    assert bot.stats.home_map == "mjolnir_07"
+    bot._find_shop(skip={"prt_in"})          # 第二家：人已經在城裡了
+    bot._find_shop(skip={"prt_in", "prt_mk"})
+    assert bot.stats.home_map == "mjolnir_07", "家只能是出發前那張圖"
+
+
+def test_the_caller_can_pin_home_explicitly(monkeypatch):
+    """自動補給會把練功地圖交進來 —— 那個永遠優先於「現在站哪」。"""
+    from ro_toolbox.services import character as char_mod
+
+    monkeypatch.setattr(char_mod, "CharacterReader",
+                        lambda: _Reader(["prt_in"]))
+    bot = RestockBot(PID, hp_item=502, back_to="mjolnir_07")
+    bot._find_shop()
+    assert bot.stats.home_map == "mjolnir_07"

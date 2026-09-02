@@ -1980,7 +1980,15 @@ class FarmPage(BasePage):
             # 那是規範說的「安靜地做錯事」—— 直接補一個起來。
             if on and pid not in self._bots:
                 log.warning("「自動打怪」勾著但沒有東西在跑（PID %s），重新啟動", pid)
-                self._toggle_farm(pid, True)
+                # ⚠ 這也是**程式自己**開的，`keep_intent` 要一路帶下去 ——
+                #   不然 `_toggle_farm()` 會把「現在站的地方」當成練功地圖
+                #   （見那裡的說明：補完貨站在城裡的話，家就變成城裡）。
+                if keep_intent:
+                    self._quiet_farm.add(pid)
+                try:
+                    self._toggle_farm(pid, True)
+                finally:
+                    self._quiet_farm.discard(pid)
             return
         if keep_intent:
             self._quiet_farm.add(pid)
@@ -2022,8 +2030,17 @@ class FarmPage(BasePage):
             status = reader.read() if reader is not None else None
             if status is not None and status.has_exp:
                 self._exp_start[pid] = (time.monotonic(), status.base_exp, status.job_exp)
-            if status is not None and status.map_name:
+            if status is not None and status.map_name and (
+                pid not in self._quiet_farm or not self._farm_map.get(pid)
+            ):
                 # 沒水回城補給之後要走回**這裡**，不是走回城裡（見 `_watch_supply_runs`）。
+                #
+                # ⚠⚠ **只有使用者自己開的那一次算數。** `_quiet_farm` 裡的是
+                # 程式自己開回去的（補完貨、回連、趕路結束）—— 那一刻人可能
+                # 還站在城裡，把它記成「練功地圖」的話，下一次補水就會
+                # 「走回城裡」，然後在城裡漫遊（使用者：「補水後角色會亂走」），
+                # 而且下一趟的家又是城裡，一路滾下去（GAMEDATA [DAT-062]）。
+                # 還沒記過的話照記 —— 沒有比這更好的猜測，總比空的好。
                 self._farm_map[pid] = status.map_name
             bot.start()
         else:

@@ -2174,3 +2174,71 @@ def test_the_same_character_is_left_alone(qtbot, monkeypatch):
     card = _wired_card(page, qtbot, who="白狐")
     card.character = "白狐"
     assert page._changed_character(1234, card, _status("白狐")) is False
+
+
+# ---- 練功地圖只認使用者開的那一次（2026-09-01：補水後角色會亂走）------------
+
+
+class _Where:
+    """假的角色狀態讀取：回一張指定的地圖。"""
+
+    def __init__(self, map_name: str) -> None:
+        self.map_name = map_name
+
+    def read(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(map_name=self.map_name, has_exp=False)
+
+
+def test_the_user_turning_it_on_records_the_farm_map(qtbot, monkeypatch):
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot, monkeypatch)
+    card = make_card(qtbot)
+    page._cards[1234] = card
+    page._readers[1234] = _Where("mjolnir_07")
+    monkeypatch.setattr(mod.FarmBot, "start", lambda self: True)
+
+    page._toggle_farm(1234, True)
+    assert page._farm_map[1234] == "mjolnir_07"
+
+
+def test_resuming_by_ourselves_does_not_move_the_farm_map_into_town(
+    qtbot, monkeypatch
+):
+    """★ 使用者：「補水後角色會亂走」。
+
+    補完貨人可能還站在城裡，而程式會自己把自動打怪接回去 —— 舊版在那一刻
+    把**城裡**記成練功地圖，於是下一次補水「走回城裡」，然後在城裡漫遊，
+    而且下一趟的家又是城裡，一路滾下去（實機 18:32／19:31 都是
+    「買完了，走回 普隆德拉內部」）。
+    """
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot, monkeypatch)
+    card = make_card(qtbot)
+    page._cards[1234] = card
+    page._farm_map[1234] = "mjolnir_07"
+    page._readers[1234] = _Where("prt_in")          # 補完貨，人在城裡
+    monkeypatch.setattr(mod.FarmBot, "start", lambda self: True)
+
+    # `_set_auto_hunt(keep_intent=True)` 就是把 pid 放進 `_quiet_farm` 再開
+    page._quiet_farm.add(1234)
+    page._toggle_farm(1234, True)                   # 程式自己接回去
+    assert page._farm_map[1234] == "mjolnir_07", "城裡不是練功地圖"
+
+
+def test_the_first_ever_reading_is_still_recorded(qtbot, monkeypatch):
+    """⛔ 反面：還沒記過的話照記 —— 沒有比這更好的猜測，總比空的好。"""
+    from ro_toolbox.ui.pages import farm_page as mod
+
+    page = _page(qtbot, monkeypatch)
+    card = make_card(qtbot)
+    page._cards[1234] = card
+    page._readers[1234] = _Where("prt_fild05")
+    monkeypatch.setattr(mod.FarmBot, "start", lambda self: True)
+
+    page._quiet_farm.add(1234)
+    page._toggle_farm(1234, True)
+    assert page._farm_map[1234] == "prt_fild05"

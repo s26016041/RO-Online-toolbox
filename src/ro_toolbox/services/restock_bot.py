@@ -257,7 +257,21 @@ class RestockBot:
             return None
 
         here = status.map_name
-        self.stats.home_map = self._back_to or here
+        # ⚠⚠ **「出發前在哪」只准記一次。**
+        #
+        # 這一支在「走不到就換一家」的迴圈裡會被呼叫好幾次，而每一次的 `here`
+        # 都是**現在**站的地方 —— 第一家走不到的話，人已經在城裡了，於是
+        # 「家」就變成那張城裡的圖。實機 2026-09-01（使用者：「補水後角色會亂走」）：
+        #
+        #     18:30 從 prt_fild04 出發 → prt_fild05 走不到 → prt_in 走不到
+        #     18:32 補水：買完了，**走回 普隆德拉內部**…      ← 回到城裡的房間
+        #     19:31 補水：買完了，**走回 普隆德拉內部**…      ← 下一趟又從那裡出發
+        #
+        # 回到城裡之後自動打怪照樣接回去，於是角色就在城裡漫遊 —— 那就是
+        # 使用者看到的「亂走」。而且下一趟的「家」又是城裡，會一直滾下去。
+        # 完整經過見 GAMEDATA [DAT-062]。
+        if not self.stats.home_map:
+            self.stats.home_map = self._back_to or here
         skip = skip or set()
         sellers = [] if here in skip else potion_sellers_on(here)
         target_map = here
