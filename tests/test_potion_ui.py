@@ -364,3 +364,88 @@ def test_pending_items_means_the_bag_has_not_arrived_yet(card):
     card.set_slots(ROWS)                       # 背包回來了
     assert card.pending_items() == []
     assert card.hp_item.currentData() == RED
+
+
+# ---- ⛔ 記住的道具不准被洗成「未選擇」（2026-09-03：一直沒紀錄）------------
+
+
+def _page(monkeypatch, tmp_path):
+    """一個只有「存設定」那幾條線的 FarmPage（不開 timer、不掃 process）。"""
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.ui.pages.farm_page import FarmPage
+
+    monkeypatch.setattr(potion_store, "_path",
+                        lambda: tmp_path / "potion_settings.json")
+    page = FarmPage.__new__(FarmPage)
+    page._cards = {}
+    page._bags = {}
+    page._potions = {}
+    return page
+
+
+def test_a_remembered_item_survives_a_save_while_the_bag_is_unread(
+    qtbot, monkeypatch, tmp_path
+):
+    """★★ 使用者 2026-09-03：「我的程式一直沒紀錄　藥水跟回程道具」。
+
+    下拉是照背包重建的，而背包是背景執行緒讀的、又只讀「正在看的那一頁」。
+    背景分頁的下拉可能一直是空的 —— 這時候**任何別的動作**（改門檻、勾自動
+    補水、勾水用完回程）都會觸發存檔，而 `saved_potion()` 對空下拉只能回
+    `None`，一次就把記住的藥水與回程道具洗掉。
+
+    `_picked()` 的 `_want_item` 只活到「還原成功」為止（`set_slots()` 會清掉
+    它），之後就沒有任何東西擋了。
+    """
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.services.potion_store import PotionSaved
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    orange, wing = 502, 23455
+    page = _page(monkeypatch, tmp_path)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "狐狐狸"
+    page._cards[1] = card
+    potion_store.save("狐狐狸", PotionSaved(hp_item=orange, hp_percent=60,
+                                          home_item=wing, go_home=True, enabled=True))
+
+    # 還原 → 背包讀過一次（`_want_item` 被清掉）→ 下拉又被重建成空的
+    card.apply_saved_potion(potion_store.get("狐狐狸"))
+    card._want_item = {"hp": None, "sp": None, "home": None}
+    card.hp_item.clear()
+    card.hp_item.addItem("未選擇", None)
+    card.home_item.clear()
+    card.home_item.addItem("未選擇", None)
+    assert card.saved_potion().hp_item is None, "前提：這時候畫面上真的是空的"
+
+    page._save_potion(1)
+
+    after = potion_store.get("狐狐狸")
+    assert after.hp_item == orange, "背包沒讀到，不准把記住的藥水洗掉"
+    assert after.home_item == wing, "回程道具同理"
+
+
+def test_the_user_really_can_clear_it_once_the_bag_is_read(
+    qtbot, monkeypatch, tmp_path
+):
+    """⚠ 保險不可以變成「改不掉」：背包讀到了，空白就是使用者的意思。"""
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.services.potion_store import PotionSaved
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    page = _page(monkeypatch, tmp_path)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "狐狐狸"
+    page._cards[1] = card
+    page._bags[1] = {6: (502, 5)}          # 這一頁的背包讀到了
+    potion_store.save("狐狐狸", PotionSaved(hp_item=502, home_item=23455))
+
+    card.apply_saved_potion(potion_store.get("狐狐狸"))
+    card._want_item = {"hp": None, "sp": None, "home": None}
+    card.hp_item.setCurrentIndex(card.hp_item.findData(None))
+    card.home_item.setCurrentIndex(card.home_item.findData(None))
+    page._save_potion(1)
+
+    assert potion_store.get("狐狐狸").hp_item is None
+    assert potion_store.get("狐狐狸").home_item is None

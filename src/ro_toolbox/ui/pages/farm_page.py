@@ -14,7 +14,7 @@ import html
 import logging
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPixmap
@@ -2733,10 +2733,15 @@ class FarmPage(BasePage):
                 # 勾著等背包回來，`_apply_bag()` 會再啟動一次。
                 self._pending_potion.add(pid)
                 log.info("自動補水先等背包讀到再啟動（PID %s）", pid)
+                # ⚠ **勾了就要記住勾了**，不管 bot 這一刻起不起得來。
+                #   舊版在這裡直接 return，於是「勾起來 → 背包還沒讀到 →
+                #   重開程式」的設定是**沒存過的**，看起來就是「一直沒紀錄」。
+                self._save_potion(pid)
                 return
             # ⚠ 一樣不拿掉勾勾（見 `_POTION_RETRY_SEC`）：只講一聲，
             # 選好道具之後 `_watch_potion_alive()` 會自己把它開起來。
             card.set_alert("⚠ 還沒選道具或百分比是 0，沒有東西可以補")
+            self._save_potion(pid)
             return
         self._pending_potion.discard(pid)
         bot = PotionBot(pid, config, on_update=lambda s, c=card: c.potion_stats.emit(s))
@@ -2758,11 +2763,52 @@ class FarmPage(BasePage):
         ⚠ `card.quiet` 為 True 時**不存**：那是程式自己在改 UI ——
         還原存檔、或 bot 啟動失敗自動取消勾選。把那些當成使用者的意思，
         一次啟動失敗就會把設定覆蓋成「關閉」。
+
+        ⚠⚠ **一定要留一行日誌。** 使用者回報過三次「藥水跟回程道具一直沒紀錄」
+        （[DAT-052]／[DAT-057]／2026-09-03），而這條路以前**一個字都不印** ——
+        檔案裡只看得到最後的結果，看不到是誰、在哪一拍、把它寫成什麼。
+        沒有這一行就只能猜（`~/.claude` memory：日誌一定要看得到）。
         """
         card = self._cards.get(pid)
         if card is None or card.quiet or not card.character:
             return
-        potion_store.save(card.character, card.saved_potion())
+        config = self._keep_remembered_items(pid, card.character, card.saved_potion())
+        potion_store.save(card.character, config)
+        log.info("記住「%s」的補水設定：藥水=%s(%s%%) 魔水=%s(%s%%) "
+                 "回程=%s(%s) 自動補水=%s",
+                 card.character, config.hp_item, config.hp_percent,
+                 config.sp_item, config.sp_percent,
+                 config.home_item, "勾" if config.go_home else "沒勾",
+                 "開" if config.enabled else "關")
+
+    def _keep_remembered_items(self, pid: int, who: str, config):  # noqa: ANN001
+        """⛔ **背包還沒讀到的時候，不准把記住的道具寫成「未選擇」。**
+
+        下拉是照背包重建的，而背包是背景執行緒讀的、又只讀「正在看的那一頁」
+        —— 背景分頁的下拉可能一直是空的。這時候任何一個**別的**動作
+        （改門檻、勾自動補水、勾水用完回程）都會觸發存檔，而 `saved_potion()`
+        對那幾個空下拉只能回 `None` —— 一次就把記住的藥水與回程道具洗掉。
+
+        `_picked()` 用 `_want_item` 擋過一層，但那份只活到「還原成功」為止
+        （`set_slots()` 會清掉它），之後就沒有任何東西擋了。
+
+        判準是**量得到的**：這個 PID 的背包讀到了沒（`self._bags`）。讀到了
+        才承認「畫面上是空的」是使用者的意思；沒讀到就沿用檔案裡那個。
+        ⚠ 只補 `None`，不覆蓋使用者真的改成別的道具那種 —— 那是他的意思。
+        """
+        saved = potion_store.get(who)
+        if saved is None or self._bags.get(pid):
+            return config
+        keep = {
+            field: getattr(saved, field)
+            for field in ("hp_item", "sp_item", "home_item")
+            if getattr(saved, field) and getattr(config, field) is None
+        }
+        if not keep:
+            return config
+        log.warning("「%s」的背包還沒讀到 —— 保留記住的道具，不洗成未選擇：%s",
+                    who, keep)
+        return replace(config, **keep)
 
     # ---- 數值更新 ---------------------------------------------------
 
