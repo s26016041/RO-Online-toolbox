@@ -120,6 +120,39 @@ RO 的 Ragexe.exe 掛著 nProtect GameGuard，會偵測並反制對行程的寫�
 - 失效模式只允許兩種：**大聲停用**（警示＋功能不動）或**安全退化**（顯示編號／少做事）。
   「安靜地做錯事」（送錯格、算錯百分比）一律當 bug 修。
 
+## 終端機輸出：一律導到檔案，對話只留判定行
+
+**使用者的終端機會被大量輸出拖到當機**（2026-09-03 回報：「會導致我 CMD 很卡
+甚至當機」）。這不是美觀問題，是**會讓他必須重開視窗、中斷工作**的問題。
+
+所以任何**輸出可能超過 20 行**的指令，一律：導到 scratchpad 的 log →
+只印判定行 → 需要細節時用 `Select-String` 撈那個檔，不重跑、不整檔讀。
+
+本專案最常犯的三個（照抄）：
+
+```powershell
+# 測試：只要那一行 "N passed"
+$log = "$env:TEMP\claude\pytest.log"
+$env:PYTHONUTF8='1'; .\.venv\Scripts\python.exe -m pytest -q *> $log
+Select-String -Path $log -Pattern '(passed|failed|error)' | Select-Object -Last 1
+
+# 失敗時才撈細節（不要整份倒進對話）
+Select-String -Path $log -Pattern '^(FAILED|E )' | Select-Object -First 20
+
+# 打包／發版：本來就很長，只看結尾
+.\.venv\Scripts\python.exe release.py *> $log; "exit=$LASTEXITCODE"
+Get-Content $log -Tail 12
+```
+
+⚠ 幾個容易忘的：
+
+- `pytest -q` 的**進度點也算輸出**（1390 個測試就是好幾百行）。`-q` 不夠，
+  一定要導檔。
+- `git diff`／`git log`／`git show` 沒有上限，一律 `--stat` 或 `-n`、
+  或導檔再撈。
+- **同一個檢查跑第二次是純粹的浪費**：測試綠了就別再跑，除非又改了程式碼。
+- 這條**不是**「少做驗證」——驗證照做，只是結果不要全部倒進對話。
+
 ## 做完一個段落就自己 push，不要等人叫
 
 一個段落 = 功能可用、測試全綠、事實已經寫進 `GAMEDATA.md` **與 memory**
