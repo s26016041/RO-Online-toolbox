@@ -174,6 +174,8 @@ class Restocker:
         self._price = 0
         self._pending = 0                # 這一筆送出去買了幾個
         self._items: list[shop.ShopItem] = []
+        #: 「我要的編號」→「這家店裡同名但不同編號的那個」（見 `_note_twin`）。
+        self._twins: dict[int, int] = {}
         self._weight: int | None = None
         self._max_weight: int | None = None
         self._zeny: int | None = None
@@ -355,6 +357,43 @@ class Restocker:
             return False
         return self._weight >= shop.fill_target(self._max_weight, self._order.ratio)
 
+    def _note_twin(self, item_id: int) -> None:
+        """這家店有沒有**同名但編號不同**的道具？有就記下來講給人聽。
+
+        ★ 實機 2026-09-03：使用者的回程道具選的是背包裡的「蝴蝶翅膀」，
+        編號 **23455**；而所有商店賣的是編號 **602** 的「蝴蝶翅膀」——
+        **同名，不同物**。下拉是照背包長的（存身分不存位置，[MEM-028]），
+        所以他選的沒有錯，錯的是「同名就以為是同一個」這個假設。
+        症狀：每一家店都回報「沒有蝴蝶翅膀」，而使用者在遊戲裡看得到店裡有。
+
+        ⛔ **不准自己換成 602 買下去。** ID 不照系列連號、同名不代表同物
+        （CLAUDE.md），猜錯就是花錢買了一個不會用的東西。我們只**講出來**，
+        換不換由使用者決定。
+        """
+        name = item_name(item_id)
+        if name.startswith("#"):
+            return                         # 連名字都查不到，沒得比
+        for row in self._items:
+            if row.item_id != item_id and item_name(row.item_id) == name:
+                self._twins[item_id] = row.item_id
+                log.warning(
+                    "⚠ 這家店有**同名不同編號**的「%s」：你選的是 %s，店裡賣的是 %s"
+                    " —— 是兩個不同的道具，不會自動幫你換",
+                    name, item_id, row.item_id,
+                )
+                return
+
+    def _twin_note(self) -> str:
+        """把同名不同編號的發現接成一句人看得懂的話（沒有就回空字串）。"""
+        if not self._twins:
+            return ""
+        parts = [
+            f"你選的「{item_name(mine)}」是編號 {mine}，這家賣的同名道具是"
+            f" {theirs} —— 同名但是不同的東西"
+            for mine, theirs in self._twins.items()
+        ]
+        return "（" + "；".join(parts) + "）"
+
     def _next_item(self) -> str:
         """換下一個要買的道具。都買完了（或負重滿了）就結束。
 
@@ -375,6 +414,7 @@ class Restocker:
                 log.warning("這家店沒有 %s（%s），跳過", item_name(item_id), item_id)
                 if item_id not in self.stats.missing:
                     self.stats.missing.append(item_id)
+                self._note_twin(item_id)
                 continue
             self._item = item_id
             self._price = found.price
@@ -398,7 +438,7 @@ class Restocker:
             return self._finish(
                 f"負重已達上限的 {self._order.ratio:.0%}，不用補"
             )
-        return self._fail("⚠ 這家店沒有你設定的藥水，什麼都沒買")
+        return self._fail("⚠ 這家店沒有你設定的藥水，什麼都沒買" + self._twin_note())
 
     def _order_more(self, amount: int) -> str:
         """再買一筆（探路的第二瓶、或算完之後的大單）。"""

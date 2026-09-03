@@ -518,3 +518,30 @@ def test_an_item_added_for_something_else_is_not_our_order():
     clock.now += restock.STEP_TIMEOUT + 1
     bot.update()
     assert bot.stats.bought == {}, "不是我們訂的那個道具"
+
+
+def test_it_says_when_the_shop_has_a_same_name_different_id_item():
+    """★ 使用者 2026-09-03：背包裡的「蝴蝶翅膀」是 23455，商店賣的是 602。
+
+    **同名，不同物**。每一家店都回報「沒有蝴蝶翅膀」，而使用者在遊戲裡看得到
+    店裡明明有。⛔ 不准自己換成 602 買下去（ID 不照系列連號，猜錯就是買錯
+    東西）—— 只把發現講出來，換不換由人決定。
+    """
+    from ro_toolbox.services import shop
+    from ro_toolbox.services.restock import Restocker, RestockOrder
+
+    r = Restocker(lambda _b: None, lambda: 0.0,
+                  RestockOrder(hp_item=502, home_item=23455))
+    r._items = [shop.ShopItem(price=60, item_id=602, kind=0)]
+
+    assert r._twin_note() == "", "還沒發現就不要亂講"
+    r._note_twin(23455)
+    note = r._twin_note()
+    assert "23455" in note and "602" in note
+    assert "蝴蝶翅膀" in note
+
+    # 名字不一樣的不算 —— 不准把「像的」當成同一個
+    r2 = Restocker(lambda _b: None, lambda: 0.0, RestockOrder(hp_item=502))
+    r2._items = [shop.ShopItem(price=50, item_id=501, kind=0)]
+    r2._note_twin(502)
+    assert r2._twin_note() == ""

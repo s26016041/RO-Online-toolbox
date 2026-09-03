@@ -121,6 +121,9 @@ class WalkResult(NamedTuple):
     #: 走太久放棄（`WALK_GIVEUP`）。**這不是「走不到」的證據** ——
     #: 逾時只能當放棄的上限（CLAUDE.md），所以不記憶，但換一家還是值得試。
     timed_out: bool = False
+    #: ★ 路算得出來，但**角色一步都沒動**（對話框開著、背包太重、被定身）。
+    #: 跟這家店無關 —— 不記憶，而且該**重試同一家**，換一家也是一樣的下場。
+    stuck: bool = False
 
     @property
     def arrived(self) -> bool:
@@ -254,6 +257,26 @@ class RestockBot:
                     )
                     break
                 known = None
+                if walked.stuck:
+                    # ★★ **角色動不了跟這家店無關** —— 路算得出來，是送出去的
+                    #    移動被伺服器靜默忽略（對話框開著、背包太重、被定身）。
+                    #    所以：不記憶、也**不換一家**（換了也是一樣的下場，
+                    #    而且旁邊那家常常是不賣紅藥的高級藥水商人），
+                    #    就重試同一家。實機 2026-09-03：
+                    #
+                    #      14:05:11 ⚠ 在 izlude_in (60,108) 送出去的移動連續被
+                    #               伺服器忽略，角色一步都沒動
+                    #      14:05:11 記下來：izlude_in 的商店 (57,110) 走不到  ← 冤枉
+                    #      14:05:13 補水：往 依斯魯得島內部 的高級藥水商人…
+                    #      14:05:41 補水：⚠ 這家店沒有你設定的藥水，什麼都沒買
+                    #
+                    #    三秒後同一隻角色走去別的地方**走得動** —— 所以那句
+                    #    「走不到」從頭到尾都是假的（[DAT-065]）。
+                    self._say(f"⚠ 角色在 {where} 動不了（對話框開著／背包太重／"
+                              f"狀態異常），等一下再試同一家")
+                    if self._stop.is_set():
+                        return
+                    continue
                 tried.add((target_map, seller_cell))
                 if not walked.unreachable:
                     # ⛔⛔ **沒走到 ≠ 走不到。**
@@ -460,6 +483,7 @@ class RestockBot:
         timed_out = bool(bot.running) and not self._stop.is_set()
         arrived = bool(getattr(bot.stats, "arrived", False))
         unreachable = bool(getattr(bot.stats, "unreachable", False))
+        stuck = bool(getattr(bot.stats, "stuck", False))
         known = bot.npc_seen
         bot.stop()
         self._travel = None
@@ -468,7 +492,8 @@ class RestockBot:
             return WalkResult()
         if not arrived:
             self._say(f"⚠ 沒走到商人那裡：{bot.stats.note}")
-            return WalkResult(unreachable=unreachable, timed_out=timed_out)
+            return WalkResult(unreachable=unreachable, timed_out=timed_out,
+                              stuck=stuck)
         return WalkResult(known)
 
     def _make_sure_he_is_visible(

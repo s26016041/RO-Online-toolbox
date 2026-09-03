@@ -109,6 +109,13 @@ class TravelStats:
     #: 一週）只准看這一格：實機 2026-09-03 三秒內因為斷線把三家好店寫成
     #: 「走不到」，之後整整一週都挑到不賣藥水的高級藥水商人。
     unreachable: bool = False
+    #: ★ 路算得出來，但**送出去的移動被伺服器靜默忽略、角色一步都沒動**
+    #: （對話框開著、背包太重、被定身）。
+    #:
+    #: ⚠ 這跟 `unreachable` 互斥：它講的是**角色現在的狀態**，
+    #: 不是目的地 —— 換一個目的地也是一樣的下場，所以呼叫端該做的是
+    #: **重試同一個目標**，不是換一家、更不是把這家記成走不到（[DAT-065]）。
+    stuck: bool = False
     #: 使用者按了暫停。**還在跑**（連線、擷取、路線都留著），只是不送走路封包。
     paused: bool = False
     #: 角色死了。跟一般的失敗分開報 —— 介面要跳「按確定才消失」的通知窗。
@@ -536,9 +543,13 @@ class TravelBot:
                 return
             if state == "blocked":
                 self._stats.running = False
-                # ★ 只有這裡才是「真的走不到」——`Traveler` 把路算過了，
-                #   算不出來。其他每一種收場都不是（見 `TravelStats.unreachable`）。
-                self._stats.unreachable = True
+                # ★ `blocked` 底下藏著兩種完全不同的事實，要分開報：
+                #   `no_route` 才是「真的走不到」（關於地圖，值得記住）；
+                #   `stuck` 是「角色動不了」（關於角色，記了就冤枉一家好店）。
+                #   其他（地形讀不到、座標不對、來回彈、等 NPC 逾時）兩個都不是。
+                why = self._traveler.blocked_reason
+                self._stats.unreachable = why == "no_route"
+                self._stats.stuck = why == "stuck"
                 self._note(self._traveler.note or "⚠ 到不了目的地，已停止")
                 return
 

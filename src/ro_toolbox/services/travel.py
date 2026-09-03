@@ -434,6 +434,26 @@ class Traveler:
         self._dead_goal: tuple[tuple[int, int], tuple[int, int]] | None = None
         self._here: tuple[int, int] = (0, 0)
         self.note = ""
+        #: ★ 上一次回 `"blocked"` 的**原因**（`""` = 還沒 blocked 過）。
+        #:
+        #: ⚠⚠ `"blocked"` 這個狀態底下藏著兩種完全不同的事實，
+        #: 而呼叫端會拿它做**長期決策**（`services/shop_reach.py`
+        #: 把走不到的店凍結一週）：
+        #:
+        #: - `"no_route"` —— 真的沒有路：算不出路線、或目的地跟我站的
+        #:   地方不相連（室內圖不同房間）。這是**關於地圖**的事實，值得記住。
+        #: - `"stuck"` —— 路算得出來，但送出去的移動被伺服器靜默忽略、
+        #:   角色一步都沒動（對話框開著、背包太重、被定身）。
+        #:   這是**關於角色現在的狀態**，跟目的地一點關係都沒有 ——
+        #:   記住它就是冤枉一家好店。
+        #: - `""`（其他）—— 地形讀不到、座標一直不對、來回彈、等 NPC 逾時。
+        #:   一樣不是關於目的地的事實。
+        #:
+        #: 實機 2026-09-03：「移動被忽略」被當成「走不到」寫進記憶，於是
+        #: izlude_in 的道具商人被凍結，補水改挑旁邊三格、不賣紅藥的
+        #: 高級藥水商人（使用者：「又來又說沒賣，這商店明明就有賣」）。
+        #: 見 GAMEDATA [DAT-065]。
+        self.blocked_reason = ""
 
     def _settle(self, pos: tuple[int, int]) -> tuple[int, int] | None:
         """把座標校正成「這張地圖上真的站得住的一格」。還沒更新就回 None。
@@ -559,6 +579,9 @@ class Traveler:
         return len(back_and_forth) >= BOUNCE_LIMIT
 
     def update(self, map_name: str, pos: tuple[int, int]) -> str:
+        # ⚠ 每一拍先清掉：`blocked_reason` 只描述**這一拍**的結論，
+        #   留著上一拍的會讓呼叫端把舊原因套在新的失敗上。
+        self.blocked_reason = ""
         if not self._goal_map:
             return "idle"
         if not map_name:
@@ -1096,6 +1119,7 @@ class Traveler:
                             "的房間，這一間走不過去。換一個地點或自己走過去。"
                         )
                         self._walker.clear()
+                        self.blocked_reason = "no_route"
                         return "blocked"
                     self._dead_goal = (pos, goal)
                     self.note = f"⚠ {map_name} 上走不到 {goal}"
@@ -1311,6 +1335,7 @@ class Traveler:
         if plan_route(map_name, self._goal_map, self._avoid, allow_npc=True) is None:
             fallback = _no_route_note(map_name, self._goal_map, excluded=True)
             self.note = f"{reason}\n{fallback}" if reason else fallback
+            self.blocked_reason = "no_route"
             return "blocked"
         return "walking"
 
@@ -1346,6 +1371,11 @@ class Traveler:
                 f"狀態異常或被定身。處理完再按一次自動尋路。"
             )
             self.clear()
+            # ⚠⚠ **這裡絕對不是 `no_route`。** 上面那句話自己就寫著
+            #   「路本身算得出來」—— 問題出在角色現在動不了，
+            #   換一個目的地也是一樣的下場。呼叫端不准拿它去冤枉
+            #   這家店（[DAT-065]）。
+            self.blocked_reason = "stuck"
             return "blocked"
         self.note = f"⚠ {map_name} 上這條路走不成，重新規劃"
         self._route_map = ""  # 下一拍重新規劃

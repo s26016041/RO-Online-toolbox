@@ -225,6 +225,7 @@ class _FakeTravel:
         self.npc_seen = dict(seen)
         self.stats.arrived = how == "arrived"
         self.stats.unreachable = how == "blocked"
+        self.stats.stuck = how == "stuck"
 
     def stop(self) -> None:
         self.running = False
@@ -360,3 +361,54 @@ def test_a_shop_without_our_potion_is_written_down(monkeypatch, tmp_path):
     mem = shop_reach.snapshot()
     assert mem.skip("izlude_in", (59, 113), (501,)) is True
     assert mem.is_bad("izlude_in", (59, 113)) is False, "沒賣 ≠ 走不到"
+
+
+def test_a_character_that_cannot_move_is_not_the_shop_s_fault(monkeypatch, tmp_path):
+    """★★ 使用者 2026-09-03：「又來又說沒賣，這商店明明就有賣」。
+
+    `Traveler` 自己就寫著「路本身算得出來」—— 移動被伺服器靜默忽略是
+    **角色現在動不了**（對話框開著／背包太重／被定身），跟這家店無關。
+    舊版把它跟「真的沒有路」一起塞進 `blocked`，於是：
+
+        14:05:11 ⚠ 在 izlude_in (60,108) 送出去的移動連續被伺服器忽略
+        14:05:11 記下來：izlude_in 的商店 (57,110) 走不到        ← 冤枉道具商人
+        14:05:13 補水：往 依斯魯得島內部 的高級藥水商人…
+        14:05:41 補水：⚠ 這家店沒有你設定的藥水，什麼都沒買
+
+    三秒後同一隻角色走去別的地方走得動 —— 那句「走不到」從頭到尾都是假的。
+    """
+    from ro_toolbox.services import shop_reach
+
+    _travel(monkeypatch, "stuck")
+    walked = RestockBot(PID, hp_item=501)._walk("izlude_in", (57, 110))
+
+    assert walked.arrived is False
+    assert walked.stuck is True
+    assert walked.unreachable is False, "動不了跟有沒有路是兩件事"
+    assert shop_reach.is_bad("izlude_in", (57, 110)) is False
+
+
+def test_being_stuck_retries_the_same_shop(monkeypatch, tmp_path):
+    """★ 動不了就**重試同一家**，不要換 —— 換了也是一樣的下場，
+
+    而且旁邊那家常常正是不賣紅藥的高級藥水商人。
+    """
+    from ro_toolbox.services import shop_reach
+
+    plan = ("izlude_in", (57, 110), (57, 110), 47, "道具商人")
+    seen_tried: list[set] = []
+
+    def fake_find(self, tried=None):
+        seen_tried.append(set(tried or ()))
+        return plan
+
+    monkeypatch.setattr(RestockBot, "_find_shop", fake_find)
+    monkeypatch.setattr(RestockBot, "_walk",
+                        lambda self, where, cell: WalkResult(stuck=True))
+    monkeypatch.setattr(RestockBot, "_go_back", lambda self: None)
+
+    RestockBot(PID, hp_item=501)._run()
+
+    assert len(seen_tried) == mod._SHOP_TRIES
+    assert all(t == set() for t in seen_tried), "動不了不算『這家試過了』"
+    assert shop_reach.is_bad("izlude_in", (57, 110)) is False
