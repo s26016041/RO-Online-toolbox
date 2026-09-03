@@ -231,6 +231,10 @@ class PlayerPosition:
         #: 讀到過就代表角色已經在這張圖上動過 —— 那一刻起「進圖座標」就過期了，
         #: 元件再壞掉也**不准**退回去用它（見 `read()`）。
         self._moved_here = False
+        #: 上一次 `read()` 是為哪一張圖問的（自己偵測換圖用，見 `read()`）。
+        self._read_map = ""
+        #: 上一次看到的進圖座標。**它一變就是伺服器把我們移動了**。
+        self._entry_seen: tuple[int, int] | None = None
         #: 地形快取：驗證「這一格站得住嗎」用，換圖才重載
         self._terrain_map = ""
         self._terrain = None
@@ -423,6 +427,8 @@ class PlayerPosition:
         self.invalidate()
         self._aid = 0
         self._entry = None
+        self._entry_seen = None
+        self._read_map = ""
         self._terrain_map = ""
         self._terrain = None
         self._complained = False
@@ -434,7 +440,27 @@ class PlayerPosition:
 
         `map_name` 是**現在這張圖**（呼叫端從角色結構讀）。有它才驗得了
         「這一格站得住嗎」—— 那是分辨「上一張圖的殘留值」最有效的一關。
+
+        ⚠⚠ **開頭那兩道偵測不是多餘的。**
+
+        使用者 2026-09-03：「常常換圖抓不到座標，右上角地圖明明都及時會換」。
+        舊版把「換圖了」這件事**完全外包給呼叫端**（`character._note_map()` 比對
+        角色結構裡的地圖名，變了才呼叫 `invalidate()`）。可是換圖那一刻有三件事
+        各自發生、順序不保證：
+
+        1. 客戶端**回收舊的移動元件** → `_component_pos()` 開始回 None
+        2. 伺服器的 `0x0091` 寫**進圖座標全域**（右上角小地圖也是這一刻換的）
+        3. **角色結構裡的地圖名**變成新的那張
+
+        只要 1 早於 3，中間那段時間 `_moved_here` 還記著上一張圖 ——
+        於是 `read()` 走到「這張圖上動過了，進圖座標不可信」那條，**回 None**。
+        呼叫端看到的就是「讀不到角色座標」，然後開始送移動去逼位置出來
+        （實機 22:06:26 起連送 657 個目標）。
+
+        所以這裡自己看得到的兩個訊號都要用：地圖名變了、**或**進圖座標變了
+        （後者跟小地圖同一刻，不需要等任何人通知，也不需要接到封包）。
         """
+        self._watch_for_a_move(map_name)
         pos = self._component_pos()
         if pos is None and self._addr is None and self._can_relocate():
             self._locate_component()
@@ -461,6 +487,41 @@ class PlayerPosition:
             self._note_missing()
             return entry
         return None
+
+    def _watch_for_a_move(self, map_name: str) -> None:
+        """自己發現「伺服器把我們移動了」，不等呼叫端通知。
+
+        兩個訊號，任一個成立就當場 `invalidate()`：
+
+        - **地圖名變了**：呼叫端每一拍都從角色結構讀進來，比對一下不花錢。
+          呼叫端（`character._note_map()`）通常已經先做過了 —— 那時候
+          `_moved_here` 是 False、`_addr` 是 None，這裡就不會重做一次。
+        - ★ **進圖座標全域變了**：那個全域只有 `0x0091`（伺服器說「你被移到
+          這裡」）會寫，也就是右上角小地圖換掉的**同一刻**。它不依賴角色結構
+          的地圖名什麼時候更新，也不需要封包擷取接得到 —— 連線正在重綁、
+          封包漏接的時候照樣準（實機 22:06 那次就是封包沒接到）。
+
+        ⚠ 同一張圖上被傳走（同圖傳點）也會寫，那**也**是「被移動了」，
+        一樣該重找元件 —— 不是誤判。
+        """
+        entry = self._entry_pos()
+        # ⚠ 第一次讀到不算「變了」—— 還沒有基準線可以比。把它記下來就好，
+        #   不然每一個剛建好的 PlayerPosition 都會先白白重掃一次。
+        moved = (entry is not None and self._entry_seen is not None
+                 and entry != self._entry_seen)
+        if entry is not None:
+            self._entry_seen = entry
+        changed_map = bool(map_name) and map_name != self._read_map
+        if map_name:
+            self._read_map = map_name
+        if not (moved or changed_map):
+            return
+        # 已經是乾淨狀態（呼叫端剛 invalidate 過）就不要再重掃一次。
+        if self._addr is None and not self._moved_here:
+            return
+        log.info("座標來源：偵測到角色被移動（%s）—— 重新定位移動元件",
+                 "換圖" if changed_map else f"進圖座標變成 {entry}")
+        self.invalidate()
 
     def moving(self) -> bool | None:
         """客戶端認為角色**現在正在走**嗎？讀不到回 None。
