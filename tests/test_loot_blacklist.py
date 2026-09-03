@@ -43,39 +43,49 @@ def bot_with_map(blacklist=()) -> FarmBot:
 # ---- 存檔 ------------------------------------------------------------------
 
 
-def test_it_is_remembered_per_character(store):
-    """「同時也要記錄起來」—— 而且鍵是角色名，不是 PID。"""
-    loot_store.save("商狐", [JELLOPY, RED])
-    assert loot_store.get("商狐") == frozenset({JELLOPY, RED})
-    assert loot_store.get("別隻") == frozenset()
-    assert json.loads(store.read_text(encoding="utf-8"))["商狐"] == [RED, JELLOPY]
+def test_it_is_shared_by_every_character(store):
+    """使用者指定：「全部角色共用，不區分角色，大家都讀同一個」。"""
+    loot_store.save([JELLOPY, RED])
+    assert loot_store.get() == frozenset({JELLOPY, RED})
+    assert json.loads(store.read_text(encoding="utf-8")) == {"items": [RED, JELLOPY]}
 
 
 def test_no_settings_means_pick_everything_up(store):
     """安全退化的方向只有一個：不知道就照撿。"""
-    assert loot_store.get("商狐") == frozenset()
+    assert loot_store.get() == frozenset()
 
 
 def test_a_broken_file_does_not_stop_the_farm(store):
     """壞檔案 = 沒有黑名單，不是「什麼都不撿」——
     後者會讓角色打了一整晚什麼都沒帶回來，而且全程不報錯。"""
     store.write_text("{ 這不是 json", encoding="utf-8")
-    assert loot_store.get("商狐") == frozenset()
+    assert loot_store.get() == frozenset()
 
 
 def test_junk_values_are_dropped_but_the_good_ones_stay(store):
     """一個壞值不該整份放棄 —— 頂多多撿到一樣東西。"""
     store.write_text(
-        json.dumps({"商狐": [JELLOPY, "紅色藥水", -1, 0, 999999, True, None]}),
+        json.dumps({"items": [JELLOPY, "紅色藥水", -1, 0, 999999, True, None]}),
         encoding="utf-8",
     )
-    assert loot_store.get("商狐") == frozenset({JELLOPY})
+    assert loot_store.get() == frozenset({JELLOPY})
 
 
-def test_an_empty_character_name_is_not_saved(store):
-    """名字讀不到的時候存下去只會汙染檔案（下次也對不回來）。"""
-    loot_store.save("", [JELLOPY])
-    assert not store.exists()
+def test_the_old_per_character_file_is_carried_over(store):
+    """⚠ 舊版是**依角色存**的。改成共用時要把各角色的名單**聯集**接過來 ——
+    直接丟掉的話使用者只會發現「設定不見了」，而且不會知道是改版造成的。"""
+    store.write_text(
+        json.dumps({"商狐": [JELLOPY], "白狐": [RED, JELLOPY]}), encoding="utf-8"
+    )
+    assert loot_store.get() == frozenset({JELLOPY, RED})
+
+
+def test_saving_replaces_the_old_format(store):
+    """接過來之後就寫成新格式，不要留著兩份會不一致的東西。"""
+    store.write_text(json.dumps({"商狐": [JELLOPY]}), encoding="utf-8")
+    loot_store.save(loot_store.get() | {RED})
+    assert json.loads(store.read_text(encoding="utf-8")) == {"items": [RED, JELLOPY]}
+    assert loot_store.get() == frozenset({JELLOPY, RED})
 
 
 # ---- 搜尋 ------------------------------------------------------------------

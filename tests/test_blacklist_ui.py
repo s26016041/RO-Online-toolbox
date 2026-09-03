@@ -22,9 +22,7 @@ JELLOPY = 909
 
 @pytest.fixture
 def dialog(qtbot):
-    widget = BlacklistDialog(
-        saved=[JELLOPY], character="商狐", bag_counts={RED: 12, JELLOPY: 300}
-    )
+    widget = BlacklistDialog(saved=[JELLOPY], bag_counts={RED: 12, JELLOPY: 300})
     qtbot.addWidget(widget)
     return widget
 
@@ -102,7 +100,7 @@ def test_there_is_no_on_off_switch(dialog):
     assert dialog.findChildren(QCheckBox) == []
 
 
-# ---- 「背包」那一頁（「在遊戲裡點右鍵」的替代品）---------------------------
+# ---- 「背包」那一頁 ---------------------------------------------------------
 
 
 def test_the_bag_tab_lists_what_we_are_carrying(dialog):
@@ -186,9 +184,8 @@ def test_a_long_list_is_trimmed(card):
 
 # ---- 「道具總攬」右鍵加入 ---------------------------------------------------
 #
-# 使用者本來要的是「在遊戲裡對道具點右鍵」。那條做不到（右鍵開的是客戶端自己的
-# 說明視窗，不送封包，要接到只能注入 —— GAMEDATA [DAT-069]），這是替代品：
-# 撿到垃圾的那一刻，在我們自己的清單上按右鍵。
+# ⛔ 「在遊戲裡對道具按右鍵，程式自己認出來」做過也驗證可行（GAMEDATA [DAT-070]），
+#    但使用者 2026-09-04 說「算了，不做了」—— 整條已移除。這是留下來的那個。
 
 
 @pytest.fixture
@@ -230,9 +227,28 @@ def test_adding_from_the_loot_table_saves_and_shows_it(page_with_loot, qtbot):
     card = CharacterCard()
     qtbot.addWidget(card)
     page_with_loot._cards[1234] = card
-    page_with_loot._apply_blacklist(1234, {JELLOPY})
-    assert loot_store.get("白狐") == frozenset({JELLOPY})
+    page_with_loot._apply_blacklist({JELLOPY})
+    assert loot_store.get() == frozenset({JELLOPY})
     assert card.blacklist_summary.isVisibleTo(card)
+
+
+def test_every_open_character_is_updated(page_with_loot, qtbot):
+    """名單是所有角色共用的 —— 每一張卡片都要跟著更新。
+
+    ⚠ 只更新目前這一隻的話，別隻會繼續撿使用者剛剛才說不要的東西，
+    而且他完全看不出哪裡不對。
+    """
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    cards = []
+    for pid in (1234, 5678):
+        card = CharacterCard()
+        qtbot.addWidget(card)
+        page_with_loot._cards[pid] = card
+        cards.append(card)
+    page_with_loot._apply_blacklist({RED})
+    for card in cards:
+        assert "紅色藥水" in card.blacklist_summary.text()
 
 
 def test_adding_from_the_loot_table_reaches_a_running_bot(page_with_loot):
@@ -244,7 +260,9 @@ def test_adding_from_the_loot_table_reaches_a_running_bot(page_with_loot):
         def set_blacklist(self, ids):
             self.got = frozenset(ids)
 
-    bot = _Bot()
-    page_with_loot._bots[1234] = bot
-    page_with_loot._apply_blacklist(1234, {JELLOPY})
-    assert bot.got == frozenset({JELLOPY})
+    bots = [_Bot(), _Bot()]
+    page_with_loot._bots[1234] = bots[0]
+    page_with_loot._bots[5678] = bots[1]
+    page_with_loot._apply_blacklist({JELLOPY})
+    # ⚠ **每一個**在跑的 bot 都要推到，不是只有目前這一頁的。
+    assert [b.got for b in bots] == [frozenset({JELLOPY})] * 2

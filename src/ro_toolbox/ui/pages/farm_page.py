@@ -65,9 +65,7 @@ from ro_toolbox.services.gamedata import (
     map_name_table,
     mob_spawn_rows,
 )
-from ro_toolbox.services.item_window import ItemWindowReader, wait_for_right_click
 from ro_toolbox.services.mail_bot import MailBot
-from ro_toolbox.services.memory_scan import MemoryScanner
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.process_monitor import local_network_up
 from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
@@ -214,40 +212,6 @@ class SkillWorker(QThread):
         except Exception as exc:  # noqa: BLE001 - 背景執行緒不能讓例外逸出
             log.debug("PID %s 讀技能失敗：%s", self._pid, exc)
         self.done.emit(self._pid, rows)
-
-
-class PickWorker(Worker):
-    """在背景等使用者在遊戲裡對道具按右鍵，然後**從記憶體**讀出那是什麼。
-
-    使用者指定（2026-09-04）：「不准用圖片辨識」「讀記憶體」「絕對有記憶體」。
-    做法見 `services/item_window` —— 讀說明小視窗渲染出來的**說明文**，
-    反查 `assets/items.json.gz` 就得到道具編號。
-
-    ⚠ 一定要在背景：等按鍵會等到使用者動作為止，而第一次要整份掃記憶體
-    （實機 29 秒；之後靠位址提示是 0.05 秒）。放在 UI 執行緒會整個凍住。
-
-    ⚠ **一直等下去**，直到視窗關掉或使用者叫停 —— 他通常要連續加好幾樣，
-    每加一樣就要重按一次按鈕的話很難用。
-    """
-
-    picked = Signal(object)      # item_window.Shown
-
-    def __init__(self, pid: int, items) -> None:
-        super().__init__()
-        self._pid = pid
-        self._items = frozenset(items)
-
-    def run(self) -> None:
-        scanner = MemoryScanner()
-        scanner.open(self._pid)
-        try:
-            reader = ItemWindowReader(scanner)
-            while not self.should_stop:
-                if not wait_for_right_click(lambda: self.should_stop):
-                    return
-                self.picked.emit(reader.read(self._items))
-        finally:
-            scanner.close()
 
 
 class CharacterCard(QWidget):
@@ -1532,8 +1496,10 @@ class FarmPage(BasePage):
     def _loot_menu(self, point) -> None:
         """「道具總攬」列上按右鍵：把那一樣加進（或移出）撿取黑名單。
 
-        ⚠ 加進去是**立刻生效**的（`_apply_blacklist` 會推給正在跑的 bot）——
+        ⚠ 加進去是**立刻生效**的（`_apply_blacklist` 會推給每一個正在跑的 bot）——
         撿到垃圾按右鍵，下一個就不撿了，不用停掛機。
+
+        ⚠ 這裡**不需要知道是哪隻角色**：名單是所有角色共用的（使用者指定）。
         """
         cell = self.loot_table.itemAt(point)
         if cell is None:
@@ -1542,22 +1508,18 @@ class FarmPage(BasePage):
         item_id = row.data(Qt.ItemDataRole.UserRole) if row is not None else None
         if not isinstance(item_id, int):
             return
-        pid = self._current_pid()
-        who = self._names.get(pid, "") if pid is not None else ""
-        if pid is None or not who:
-            return          # 不知道是哪隻角色就沒得存（存檔的鍵是角色名）
 
-        listed = loot_store.get(who)
+        listed = loot_store.get()
         menu = QMenu(self.loot_table)
         name = item_name(item_id)
         if item_id in listed:
             action = menu.addAction(f"把「{name}」移出黑名單（恢復撿取）")
-            new = listed - {item_id}
+            wanted = listed - {item_id}
         else:
             action = menu.addAction(f"把「{name}」加入黑名單（不再撿取）")
-            new = listed | {item_id}
+            wanted = listed | {item_id}
         if menu.exec(self.loot_table.viewport().mapToGlobal(point)) is action:
-            self._apply_blacklist(pid, new)
+            self._apply_blacklist(wanted)
 
     def _keep_loot(self, pid: int, bot: FarmBot) -> None:
         """把要停掉的 bot 撿到的東西併進累計，這樣關掉掛機列表不會被清空。"""
@@ -1684,7 +1646,7 @@ class FarmPage(BasePage):
         self._apply_mail(pid, mail_store.get(status.name), save=False)
         # 撿取黑名單也帶回來。**沒有開關**（使用者指定）—— 名單裡有就生效，
         # 所以這裡只要把它畫出來，不用判斷「有沒有啟用」。
-        card.set_blacklist_summary(loot_store.get(status.name))
+        card.set_blacklist_summary(loot_store.get())
         self._failures[pid] = 0
         self._names[pid] = status.name
         self.tabs.addTab(card, status.name or f"PID {pid}")
@@ -2191,8 +2153,8 @@ class FarmPage(BasePage):
                 pid,
                 on_update=lambda s, c=card: c.farm_stats.emit(s),
                 # ⚠ 現查存檔，不拿卡片上顯示的字回推 —— 顯示的是名字（會被截成
-                # 「等 N 樣」），存檔裡才是完整的編號名單。
-                blacklist=loot_store.get(who or ""),
+                # 「等 N 樣」），存檔裡才是完整的編號名單。所有角色共用同一份。
+                blacklist=loot_store.get(),
             )
             self._bots[pid] = bot
             reader = self._readers.get(pid)
@@ -2393,89 +2355,34 @@ class FarmPage(BasePage):
         """按下「撿取黑名單」：開視窗搜尋道具，加進去的就不撿。
 
         ⚠ 這裡**不需要背包**（跟寄信不一樣）：使用者指定要能搜尋**全部**道具，
-        所以背包還沒讀到也照開 —— 沒有東西會列不出來。
+        所以背包還沒讀到也照開 —— 只是「背包現有」那一頁會列不出東西。
         """
-        card = self._cards.get(pid)
-        who = self._names.get(pid, "")
-        if card is None or not who:
-            return
         dialog = BlacklistDialog(
             self,
-            saved=loot_store.get(who),
-            character=who,
-            # 「背包」那一頁 = 「在遊戲裡點右鍵加入」的替代品（那條做不到，
-            # 見 GAMEDATA [DAT-069]）。讀不到就是空的，那一頁會說一聲 ——
-            # **不擋住視窗**：搜尋那一頁本來就不需要背包。
+            saved=loot_store.get(),
+            # 「背包現有」那一頁：撿到垃圾之後最想擋的那一樣通常就在背包裡。
             bag_counts=self._bag_counts(pid),
         )
-        dialog.pick_requested.connect(lambda p=pid, d=dialog: self._start_pick(p, d))
-        # ⚠ 視窗關掉就要叫停背景那條 —— 不然它會抱著一個已經不在的視窗繼續等，
-        #    使用者在別的地方點一下就被吃掉。
-        dialog.finished.connect(lambda _r, d=dialog: self._stop_pick(d))
-        try:
-            if dialog.exec() and dialog.items is not None:
-                self._apply_blacklist(pid, dialog.items)
-        finally:
-            self._stop_pick(dialog)
+        if dialog.exec() and dialog.items is not None:
+            self._apply_blacklist(dialog.items)
 
-    def _start_pick(self, pid: int, dialog) -> None:
-        """「在遊戲裡按右鍵選道具」：背景等他按下去，認出來就加進名單。
+    def _apply_blacklist(self, item_ids) -> None:
+        """存檔、每一張卡片都畫出來、**推給每一個正在跑的 bot**。
 
-        ⚠ 三件事任一缺了就**當場說原因**，不要讓他對著遊戲點半天才發現沒反應：
-        找得到遊戲視窗、讀得到背包、還沒有一條在等。
+        ⚠ 使用者指定「全部角色共用，不區分角色，大家都讀同一個」——
+        所以這裡**沒有 pid**：一份名單、每張卡片都更新、每個 bot 都推。
+        只推目前這一隻的話，別隻會繼續撿到使用者剛剛才說不要的東西，
+        而且他完全看不出哪裡不對。
+
+        ⚠ 推給 bot 這一步不能省：黑名單沒有開關可以關掉再打開，
+        改完不立刻生效的話使用者只會看到它繼續撿 —— 看起來就像設定沒存到。
         """
-        if getattr(dialog, "_pick_thread", None) is not None:
-            return                       # 已經在等了，不要疊第二條
-        items = set(self._bag_counts(pid))
-        if not items:
-            dialog.picking(False, "還讀不到背包 —— 認道具要比對背包裡那幾樣的說明文。")
-            return
-        worker = PickWorker(pid, items)
-        worker.picked.connect(lambda shown, d=dialog: self._pick_done(d, shown))
-        thread = WorkerThread(worker)
-        dialog._pick_thread = thread
-        dialog.picking(
-            True,
-            "切到遊戲，對背包裡的道具**按右鍵**（開出說明視窗）——"
-            "第一次要掃一遍記憶體約 30 秒，之後就即時。可以連續加好幾樣。",
-        )
-        thread.start()
-
-    def _pick_done(self, dialog, shown) -> None:
-        # ⚠ **不收掉執行緒**：使用者通常要連續加好幾樣，收掉的話每加一樣
-        #   都要重按一次按鈕。要停就是關視窗或再按一次（`_stop_pick`）。
-        # ⚠ 讀到什麼一律記進日誌：使用者手上只有 .exe，認不出來時這是唯一線索。
-        log.info(
-            "認道具：%s（%.2fs）%s｜說明文「%s」",
-            [item_name(i) for i in shown.items], shown.seconds, shown.why,
-            shown.text[:40],
-        )
-        dialog.picked(shown.items, shown.why)
-
-    @staticmethod
-    def _stop_pick(dialog) -> None:
-        thread = getattr(dialog, "_pick_thread", None)
-        if thread is not None:
-            dialog._pick_thread = None
-            thread.stop()
-
-    def _apply_blacklist(self, pid: int, item_ids) -> None:
-        """存檔、畫出來、**順手推給正在跑的 bot**。
-
-        ⚠ 最後那一步不能省：黑名單沒有開關可以關掉再打開，改完不立刻生效的話
-        使用者只會看到它繼續撿 —— 看起來就像設定根本沒存到。
-        """
-        who = self._names.get(pid, "")
-        if not who:
-            return
-        loot_store.save(who, item_ids)
-        card = self._cards.get(pid)
-        if card is not None:
+        loot_store.save(item_ids)
+        for card in self._cards.values():
             card.set_blacklist_summary(item_ids)
-        bot = self._bots.get(pid)
-        if bot is not None:
+        for bot in self._bots.values():
             bot.set_blacklist(item_ids)
-        log.info("撿取黑名單更新（%s）：%d 樣不撿", who, len(item_ids))
+        log.info("撿取黑名單更新：%d 樣不撿（所有角色共用）", len(item_ids))
 
     def _bag_counts(self, pid: int) -> dict[int, int]:
         """背包裡每種道具**總共**幾個（同一種散在好幾格要加起來）。"""

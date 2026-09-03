@@ -8,15 +8,15 @@
 - 「搜尋的時候會出現**名字跟物品圖案**」
 - 「這個是**永遠開啟**的，所以不會有開關」→ 這裡沒有啟用勾勾
 - 「同時也要記錄起來」（存檔見 `services/loot_store`）
+- 「**做成全部角色共用，不區分角色，大家都讀同一個**」（2026-09-04）
 
-使用者追問（同日）：「我想要我在遊戲物品**按右鍵**，程式可以識別，
-然後加入黑名單」，並且明確否決抓圖：「**不准用圖片辨識**」「讀記憶體」
-「絕對有記憶體」→ 「在遊戲裡按右鍵選道具」那顆按鈕。做法見
-`services/item_window`：**讀說明小視窗渲染出來的說明文**，反查道具表拿編號
-（GAMEDATA [DAT-070]）。攔遊戲自己的滑鼠事件是注入、GameGuard 會擋，所以
-「什麼時候去讀」是我們自己看 `GetAsyncKeyState`，不碰遊戲行程。
+⛔ 「在遊戲裡對道具按右鍵，程式自己認出來」做過也**驗證可行**（讀說明視窗
+渲染出來的說明文，見 GAMEDATA [DAT-070]），但使用者 2026-09-04 說
+「**算了，把在遊戲裡右鍵選道具刪掉吧，不做了**」—— 整條已移除。
+要復活的話 [DAT-070] 有完整做法與踩過的坑，不必從頭研究。
 
-「背包」那一頁是同一件事的鍵盤版：撿到垃圾之後最想擋的那一樣通常就在背包裡。
+「背包」那一頁就是它的替代：撿到垃圾之後最想擋的那一樣通常就在背包裡，
+點一下就加入，不用打字。
 
 ⚠ 道具表有兩萬多筆，**不准整份列出來**：那要抓兩萬張圖示，視窗會卡死。
 搜尋框空著就什麼都不列，命中太多也只顯示前 `_MAX_ROWS` 筆並說一聲 ——
@@ -29,7 +29,7 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -39,7 +39,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
-    QMenu,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -56,20 +55,16 @@ _MAX_ROWS = 200
 class BlacklistDialog(QDialog):
     """按下「儲存」之後從 `items` 拿名單（`frozenset[int]`）；按取消是 None。"""
 
-    #: 使用者按下「在遊戲裡點一下道具」。頁面那邊接手去監看滑鼠
-    #: （這裡沒有 hwnd、也不該自己開執行緒）。
-    pick_requested = Signal()
-
     def __init__(
         self,
         parent: QWidget | None = None,
         saved=(),
-        character: str = "",
         bag_counts: dict[int, int] | None = None,
     ) -> None:
         super().__init__(parent)
-        who = f"（{character}）" if character else ""
-        self.setWindowTitle(f"撿取黑名單{who}")
+        # ⚠ 標題不掛角色名：這份名單是**所有角色共用**的（使用者指定）。
+        #   掛了角色名會讓人以為只影響這一隻，然後放心加一樣其實全部都不撿的東西。
+        self.setWindowTitle("撿取黑名單（所有角色共用）")
         self.setMinimumSize(600, 480)
         #: 按下儲存才有值；取消是 None。
         self.items: frozenset[int] | None = None
@@ -88,8 +83,9 @@ class BlacklistDialog(QDialog):
         layout = QVBoxLayout(self)
 
         hint = QLabel(
-            "加進黑名單的東西，自動掛機**永遠不會去撿**（沒有開關，"
-            "名單裡有就一定生效）。打字搜尋全部道具，雙擊或按「加入」就進名單。"
+            "加進黑名單的東西，自動掛機**永遠不會去撿** —— 沒有開關，"
+            "而且**所有角色共用同一份**。打字搜尋全部道具，"
+            "雙擊或按「加入」就進名單。"
         )
         hint.setWordWrap(True)
         hint.setObjectName("pageSubtitle")
@@ -157,65 +153,10 @@ class BlacklistDialog(QDialog):
         self.tabs.addTab(self.bag, "背包現有")
         column.addWidget(self.tabs, 1)
 
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
         button = QPushButton("加入 →")
         button.clicked.connect(self._add)
-        row.addWidget(button, 1)
-
-        # ★ 使用者要的那顆：在遊戲裡點一下道具，程式自己認出是什麼。
-        self.pick_button = QPushButton("在遊戲裡按右鍵選道具")
-        self.pick_button.setToolTip(
-            "按下去之後切到遊戲，對背包裡的道具**按右鍵**開出說明視窗，"
-            "程式會從記憶體讀出那是什麼並加進黑名單。可以連續加好幾樣。"
-            "（只認右鍵：左鍵在背包裡是拿起／拖曳，順手一點就會誤加。）"
-        )
-        self.pick_button.clicked.connect(self.pick_requested)
-        row.addWidget(self.pick_button, 1)
-        column.addLayout(row)
+        column.addWidget(button)
         return pane
-
-    # ---- 「在遊戲裡點一下」的回報 ---------------------------------------
-
-    def picking(self, on: bool, note: str = "") -> None:
-        """切換「正在等你按右鍵」的狀態。
-
-        ⚠ 等的期間按鈕要按不下去 —— 不然會疊出第二條背景執行緒，
-        兩條搶同一個右鍵。
-        """
-        self.pick_button.setEnabled(not on)
-        self.pick_button.setText(
-            "等你在遊戲裡按右鍵…" if on else "在遊戲裡按右鍵選道具")
-        if note:
-            self.status.setText(note)
-
-    def picked(self, item_ids, why: str = "") -> None:
-        """認出來了就加進名單；認不出來就照實說，**不准挑一個最像的湊數**。
-
-        好幾樣共用同一張圖示是常態（卡片、礦石）—— 那時候問人，不要自己選。
-        """
-        ids = [int(i) for i in item_ids or ()]
-        if not ids:
-            self.status.setText(
-                why or "認不出說明視窗裡是什麼 —— 再按一次右鍵試試。")
-            return
-        if len(ids) > 1:
-            menu = QMenu(self)
-            actions = {menu.addAction(self._label(i)): i for i in ids}
-            chosen = menu.exec(self.pick_button.mapToGlobal(
-                self.pick_button.rect().bottomLeft()))
-            if chosen not in actions:
-                self.status.setText("好幾樣道具共用同一張圖示 —— 這次沒加。")
-                return
-            ids = [actions[chosen]]
-        added = [i for i in ids if i not in self._chosen]
-        self._chosen.extend(added)
-        self._chosen.sort()
-        self._fill_chosen()
-        self.status.setText(
-            f"認出來了：{self._label(ids[0])}"
-            + ("" if added else "（本來就在名單裡了）")
-        )
 
     def _source(self) -> QListWidget:
         """現在看得到的是哪一個清單。"""
