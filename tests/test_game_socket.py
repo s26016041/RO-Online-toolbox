@@ -78,3 +78,51 @@ def test_a_long_outage_still_gets_a_summary(monkeypatch, caplog):
             game_socket.send_on_socket(7, b"x")
     assert len(caplog.records) == 2
     assert "已經連續" in caplog.records[-1].getMessage()
+
+
+class _ExplodingWs2:
+    """任何 ws2_32 呼叫都當場炸掉 —— 收尾時不准碰到它。"""
+
+    def __getattr__(self, name: str):  # noqa: ANN204
+        raise AssertionError(
+            f"close_socket() 不准呼叫 ws2_32.{name}："
+            "closesocket 會把遊戲的連線一起關掉"
+        )
+
+
+class _FakeK32:
+    def __init__(self) -> None:
+        self.closed: list[int] = []
+
+    def CloseHandle(self, handle) -> int:  # noqa: ANN001, N802 - 照 Win32 的名字
+        self.closed.append(handle.value if hasattr(handle, "value") else handle)
+        return 1
+
+
+def test_close_socket_only_releases_our_handle(monkeypatch):
+    """⛔ 釘住 2026-09-03 那個 bug：關掉工具會把使用者的 RO 一起弄斷線。
+
+    複製來的 handle 跟遊戲手上那個是同一條連線的兩個 handle。
+    `CloseHandle` 只放掉我們這一份；`closesocket` 是「關掉這個 socket」，
+    遊戲的連線會跟著收掉。
+    """
+    k32 = _FakeK32()
+    monkeypatch.setattr(game_socket, "_k32", k32)
+    monkeypatch.setattr(game_socket, "_ws2", _ExplodingWs2())
+
+    game_socket.close_socket(0x29C)
+
+    assert k32.closed == [0x29C]
+
+
+def test_close_socket_forgets_that_sockets_error_count(monkeypatch):
+    """handle 值會被系統回收再發給別條連線，計數不清會讓節流提早吞錯誤。"""
+    monkeypatch.setattr(game_socket, "_ws2", _FakeWs2({7}))
+    game_socket.send_on_socket(7, b"x")
+    assert any(key[0] == 7 for key in game_socket._send_errors)
+
+    monkeypatch.setattr(game_socket, "_k32", _FakeK32())
+    monkeypatch.setattr(game_socket, "_ws2", _ExplodingWs2())
+    game_socket.close_socket(7)
+
+    assert not any(key[0] == 7 for key in game_socket._send_errors)

@@ -51,7 +51,8 @@ _ws2.getpeername.argtypes = [
 _ws2.getpeername.restype = ctypes.c_int
 _ws2.send.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
 _ws2.send.restype = ctypes.c_int
-_ws2.closesocket.argtypes = [ctypes.c_void_p]
+# ⛔ 這裡**故意不宣告 `closesocket`** —— 見 `close_socket()`：對複製來的 handle
+#    呼叫 closesocket 會把遊戲的連線一起關掉。不宣告就不會有人不小心用到。
 
 
 class _HandleEntry(ctypes.Structure):
@@ -282,4 +283,29 @@ def send_on_socket(sock: int, data: bytes) -> int:
 
 
 def close_socket(sock: int) -> None:
-    _ws2.closesocket(sock)
+    """放掉我們複製來的那個 handle。
+
+    ⛔⛔ **一定要用 `CloseHandle`，不准改回 `closesocket`。**
+
+    這個 handle 是 `DuplicateHandle` 從遊戲行程複製過來的，它跟遊戲手上那個是
+    **同一條連線的兩個 handle**，不是另一條連線（[PKT-012]、[PKT-014]）。
+
+    - `CloseHandle` = 「我這一份不要了」→ 遊戲那一份還在，連線活著。
+    - `closesocket` = 「**把這個 socket 關掉**」→ 遊戲的連線跟著收掉。
+
+    使用者實際踩過（2026-09-03 回報）：掛機中把工具關掉，RO 立刻跳
+    「與伺服器斷線」。路徑是 `MainWindow.closeEvent` → `page.shutdown()` →
+    `GameLink.close()` → 這裡，而那一刻關到的正是**當下活著的那條地圖連線**。
+
+    為什麼換頻道／換地圖的重綁沒暴露這個問題：那時 `_close_socket()` 關掉的是
+    **已經作廢的舊連線**（遊戲自己早就丟了），關不關都看不出差別。
+
+    佐證：`find_game_socket()` 每次掃描都把遊戲全部 handle（實測 773 個，
+    含 GameGuard 那條 443）複製一遍再 `CloseHandle` 掉，一秒好幾次，
+    從來沒弄斷過任何連線 —— 動作一樣，差別只在用哪一支函式關。
+    """
+    _k32.CloseHandle(wintypes.HANDLE(sock))
+    # 順手清掉這條 socket 的送出錯誤計數：handle 值會被系統回收再發給別條連線，
+    # 留著的話新連線一開始就頂著舊的計數，節流會提早把錯誤吞掉。
+    for key in [k for k in _send_errors if k[0] == sock]:
+        del _send_errors[key]

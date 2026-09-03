@@ -38,6 +38,7 @@
   不是 `std::map`、沒有靜態指標路徑。actor 是池配置且槽會重用，熱區段快取就夠。
 - RO 掛 nProtect GameGuard：**讀記憶體可以，寫記憶體／注入一律不行**，會當機（[PKT-010]、[PKT-011]、[PKT-013]）。
 - 要讓角色動作 → **送封包**。複製遊戲 socket（DUP_HANDLE 沒被剝），全程不碰記憶體（[PKT-012]、[PKT-014]）。
+- **複製來的遊戲 socket 收尾一律 `CloseHandle`，不准 `closesocket`** —— 那是同一條連線的第二個 handle，`closesocket` 會把遊戲的連線一起關掉。使用者實測：掛機中關掉工具，RO 當場跳「與伺服器斷線」（[PKT-094]）。
 - 客戶端有 WinLicense/Themida 加殼：**靜態匯入表是假的**，要看執行時的 IAT（[PKT-008]、[PKT-009]）。
 - 換地圖／換頻道之後 socket、地形、封包擷取**全部失效**，要主動重綁 —— 不重綁會**安靜地全瞎**（[PKT-038]、[PKT-040]）。
 - **不准 `rmtree` 別人的 `%TEMP%\_MEI*`**：`rmtree` 會先刪光刪得掉的才報錯，等於把還在跑的程式**挖空**（DLL 留著所以它不會當，只是資料表消失）。動手前要有行程認領檢查＋`python3XX.dll` 刪除探測（[ENV-007]）。
@@ -799,6 +800,41 @@
   （06:33 / 14:09 / 14:26 三次都一樣）—— 它是伺服器端的編號。
   但**不准存到檔案裡**：伺服器重開就會變，而且變了以後接觸不到 NPC
   是安靜的失敗。只在記憶體裡記，行程結束就忘（`forget_npcs()`）。
+
+### [PKT-094] ★★★ 收尾用 `closesocket()` 會把**遊戲的連線一起關掉** —— 關工具＝RO 斷線
+
+- **狀態**：症狀已驗證（2026-09-03 使用者實測回報）；**機制是從程式碼推出來的，
+  實機複驗待做**（做法見下面「怎麼複驗」）。
+- **日期**：2026-09-03
+- **環境**：Ragexe.exe 掛 GameGuard，工具以系統管理員執行，掛機中（`FarmBot` ＋
+  自動補水都在跑，socket 綁在當下的地圖伺服器）。
+- **症狀**：掛機中把工具關掉，RO **立刻**跳「與伺服器斷線」（[INP-012] 那個對話框）。
+- **路徑**：`MainWindow.closeEvent` → `BasePage.shutdown()` → `GameLink.close()`
+  → `_close_socket()` → `game_socket.close_socket()`，舊版那一支是
+  `_ws2.closesocket(sock)`。
+- **機制**：送封包用的 handle 是 `DuplicateHandle` 從遊戲行程複製來的
+  （[PKT-012]、[PKT-014]），它跟遊戲手上那個是**同一條連線的兩個 handle**。
+  - `CloseHandle` = 「我這一份不要了」。
+  - `closesocket` = 「**把這個 socket 關掉**」—— 走的是 Winsock 關閉連線那條路。
+- **為什麼拖到現在才被發現**：換地圖／換頻道的重綁也會呼叫 `_close_socket()`
+  （`game_link.resync()`、`potion._keep_in_sync()`），但那時關掉的是**已經作廢的
+  舊連線**（伺服器已經把人搬到另一台，遊戲自己早就丟了），關不關看不出差別。
+  **只有關程式／停止 bot 時關到的是「當下活著的那條」。**
+- **旁證（同一個動作、不同函式，結果相反）**：`find_game_socket()` 每次掃描都把
+  遊戲**全部** handle 複製一遍（實測 773 個，含 GameGuard 那條連到 443 的 socket）
+  再一個個 `CloseHandle` 掉，一秒跑好幾次 —— 從來沒弄斷過任何連線。
+  差別只在用哪一支函式關。
+- **修法**：`close_socket()` 改成 `_k32.CloseHandle(wintypes.HANDLE(sock))`，
+  並且**故意不再宣告 `_ws2.closesocket` 的 argtypes**，讓下一個人不會不小心用到。
+  回歸測試 `tests/test_game_socket.py::test_close_socket_only_releases_our_handle`
+  用一個「碰到就炸」的假 ws2_32 釘住這件事。
+- **怎麼複驗**：開著掛機 → 記下當時的地圖伺服器 → 關掉工具 →
+  看遊戲有沒有跳「與伺服器斷線」。修好後應該**照常掛在線上**。
+  停止（不關程式）自動打怪也走同一條路，一樣要試。
+- **影響**：`services/game_socket.py::close_socket`（唯一一處），
+  呼叫端有 `game_link._close_socket`、`potion._release_socket`、`auto_login`。
+  順帶：關掉時會清掉這條 socket 的送出錯誤計數 —— handle 值會被系統回收再發給
+  別條連線，留著的話新連線一開始就頂著舊計數，節流會提早把錯誤吞掉。
 
 ## WIN — 遊戲視窗
 
