@@ -166,6 +166,30 @@ push 之前一定要做的三件事：
 
 還在 debug、中間狀態、或功能只做一半，就**不要**推。那不叫段落。
 
+## push 完**一定要接著發版**（以 .exe 為準）
+
+**使用者手上跑的是 .exe，不是原始碼。** 而 .exe 與 `python main.py` 直接跑
+**行為差很多**（打包後 `sys.frozen`、`_MEIPASS` 的資產路徑、簽章、
+以系統管理員啟動、WinDivert 驅動、Qt 外掛…都不一樣）。
+所以「程式碼推上去了」不等於「修好了」——沒發版的修正，對使用者等於沒發生。
+
+**規則：每一次改動 push 之後，馬上把最新版發出去。** 不用問，也不要累積。
+
+    # 1) 三處版號一起加（`tests/test_version.py` 會擋住不同步）
+    #    VERSION / pyproject.toml / src/ro_toolbox/__init__.py
+    # 2) 測試全綠 → commit → push
+    # 3) 發版（本來就很長，只看結尾）
+    $log = "$env:TEMP\claude\ro-release.log"
+    .\.venv\Scripts\python.exe release.py *> $log; "exit=$LASTEXITCODE"
+    Get-Content $log -Tail 12
+
+`release.py` 會自己編 .exe、跑 `--selftest`、建 GitHub Release 並上傳。
+**`--selftest` 沒過就不准發** —— 資產漏收不會有任何錯誤訊息，
+使用者只會拿到一個選單空白的程式。
+
+⚠ 驗證也要以 .exe 為準：`pytest` 綠只代表邏輯對，**不代表打包後跑得起來**。
+只有原始碼跑得動、exe 跑不動的問題，測試一個都抓不到（[ENV] 那幾條就是這樣來的）。
+
 ## 事實記錄：**確認過的事情，兩個地方都要寫**
 
 「確認過」= 實機量到、或從真的封包／資料解出來的。推論、猜測、「應該是」不算，
