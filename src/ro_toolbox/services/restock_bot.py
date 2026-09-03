@@ -31,6 +31,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from ro_toolbox.core.ro_protocol import unpack_position
 from ro_toolbox.services import bag, shop_reach
@@ -95,6 +96,35 @@ SHOP_GIVEUP = 90.0
 #: 無限試下去等於整晚都在城裡繞。
 _SHOP_TRIES = 3
 TICK = 0.2
+
+
+class WalkResult(NamedTuple):
+    """走過去的結果。
+
+    ⚠⚠ **「沒走到」不等於「走不到」。** 舊版 `_walk()` 對每一種失敗都回同一個
+    `None`，呼叫端只好把它們全部當成「這家店走不到」寫進 `shop_reach` ——
+    實機 2026-09-03 斷線那一拍，三秒內把三家好店冷凍了一週：
+
+        10:48:56 ⚠ 遊戲連線已中斷   → 記下來：izlude_in  的商店走不到
+        10:48:59 找不到伺服器連線   → 記下來：lasagna    的商店走不到
+        10:49:02 找不到伺服器連線   → 記下來：cmd_fild07 的商店走不到
+
+    之後每一張圖的「道具商人」都被寫掉，挑店只剩同一張圖上的高級藥水商人 ——
+    那家沒有紅色藥水（使用者：「自動補水 藥水商人都找錯」）。
+    """
+
+    #: 走到了 = 沿路看到的 NPC（可能是空 dict）。沒走到 = None。
+    npc: dict | None = None
+    #: ★ 真的**沒有路**可以走過去（`TravelStats.unreachable`）。
+    #: 斷線、還沒登入、取消、逾時一律是 False。
+    unreachable: bool = False
+    #: 走太久放棄（`WALK_GIVEUP`）。**這不是「走不到」的證據** ——
+    #: 逾時只能當放棄的上限（CLAUDE.md），所以不記憶，但換一家還是值得試。
+    timed_out: bool = False
+
+    @property
+    def arrived(self) -> bool:
+        return self.npc is not None
 
 
 @dataclass
@@ -203,6 +233,8 @@ class RestockBot:
             #: 不會被試到。
             tried: set[tuple[str, tuple[int, int]]] = set()
             known: dict | None = None
+            #: 連走都走不成（連線沒了／角色死了）—— 跟「走不到」要分開講。
+            cant_start = False
             look, seller_cell = 0, (0, 0)
             for _ in range(_SHOP_TRIES):
                 plan = self._find_shop(tried)
@@ -213,15 +245,45 @@ class RestockBot:
                 self.stats.shop_name = name
                 where = map_display_name(target_map) or target_map
                 self._say(f"往 {where} 的{name}…")
-                known = self._walk(target_map, cell)
-                if known is not None:
+                walked = self._walk(target_map, cell)
+                if walked.arrived:
                     # 走到了 = 上次那筆「走不到」被推翻了（如果有的話）
                     shop_reach.note_good(target_map, seller_cell)
                     known = self._make_sure_he_is_visible(
-                        target_map, cell, seller_cell, look, name, known
+                        target_map, cell, seller_cell, look, name, walked.npc or {}
                     )
                     break
+                known = None
                 tried.add((target_map, seller_cell))
+                if not walked.unreachable:
+                    # ⛔⛔ **沒走到 ≠ 走不到。**
+                    #
+                    # 斷線、還沒登入、角色死了、使用者取消、逾時全都會走到這裡，
+                    # 而這些跟「有沒有路過去」一點關係都沒有。寫進 `shop_reach`
+                    # 就是把一家好店冷凍一週 —— 實機 2026-09-03 斷線那一拍，
+                    # 三秒內記掉三家道具商人：
+                    #
+                    #     10:48:56 ⚠ 遊戲連線已中斷 → izlude_in  (57,110)
+                    #     10:48:59 找不到伺服器連線 → lasagna    (165,125)
+                    #     10:49:02 找不到伺服器連線 → cmd_fild07 (257,126)
+                    #
+                    # 之後每張圖的「道具商人」都被寫掉，只剩同一張圖上的
+                    # 高級藥水商人可挑 —— 那家沒有紅色藥水也沒有回程道具，
+                    # 於是每一趟都走到底才發現「這家店沒有你設定的藥水」
+                    # （使用者：「自動補水 藥水商人都找錯」）。
+                    if not walked.timed_out:
+                        # 連走都走不成（連線沒了／角色死了）——**當場停**。
+                        # 換一家也是同樣的下場：上面那份日誌裡後兩家各花 3 秒
+                        # 失敗，純粹是噪音（memory：確定的失敗不准重試到逾時）。
+                        # ⚠ 不覆蓋 `_walk()` 剛說的那句 —— 那句才寫著真正的
+                        #   原因（「遊戲連線已中斷」「找不到伺服器連線」），
+                        #   下面那句「都走不到」會把它蓋掉、變成假線索。
+                        cant_start = True
+                        break
+                    self._say(f"⚠ 走去 {where} 的{name}太久了，換一家試試")
+                    if self._stop.is_set():
+                        return
+                    continue
                 # ⚠⚠ **這一趟的 `tried` 只活到這一趟結束** —— 下次補水又會挑到
                 # 同一家最近的店、再失敗一次。實機 2026-09-01 的四次補水
                 # **每一次都先去 prt_in、每一次都走不到**，每次白花 1.5~2 分鐘
@@ -233,7 +295,7 @@ class RestockBot:
                     return
             if known is not None:
                 self._buy(look, seller_cell, known)
-            else:
+            elif not cant_start:
                 self._say("⚠ 試過的藥水商人都走不到 —— 這趟沒補到水")
             # ⚠⚠ **買不買得到都要走回去。** 舊版在「每一家都走不到」時直接
             # return，於是角色就留在最後一次失敗的地方（城裡某個房間）：
@@ -300,17 +362,19 @@ class RestockBot:
             # ⚠ 腳下這張圖也要問記憶。舊版只對**別的**地圖查，於是第一次走失敗
             # 把人丟在 prt_in 之後，重試那一次 `here` 就是 prt_in，
             # 直接跳過黑名單又挑了同一家 —— 記憶在它專門要解的情境裡失效。
-            seller = self._pick_seller(here, tried, bad, allow_bad=allow_bad)
+            want = self._key_items()
+            seller = self._pick_seller(here, tried, bad, want, allow_bad=allow_bad)
             if seller is None:
                 candidates = {
                     m for m in maps_with_potion_sellers()
-                    if self._pick_seller(m, tried, bad, allow_bad=allow_bad)
+                    if self._pick_seller(m, tried, bad, want, allow_bad=allow_bad)
                 }
                 found = nearest_map_with(here, candidates) if candidates else None
                 if found is None:
                     continue                  # 換成「連走不到的也算」再找一次
                 _route, target_map = found
-                seller = self._pick_seller(target_map, tried, bad, allow_bad=allow_bad)
+                seller = self._pick_seller(target_map, tried, bad, want,
+                                           allow_bad=allow_bad)
             if seller is not None:
                 if allow_bad:
                     log.info("有藥水的圖全都被記成走不到 —— 這次忽略紀錄，照原本的挑")
@@ -328,22 +392,39 @@ class RestockBot:
         cell = nearest_walkable(terrain, (x, y)) or (x, y)
         return target_map, cell, (x, y), look, name
 
+    def _key_items(self) -> tuple[int, ...]:
+        """挑店時**非有不可**的道具。
+
+        補水的重點是藥水；沒設藥水才輪到回程道具。⚠ 這個判斷放在呼叫端 ——
+        `shop_reach` 只回答「這家有沒有被記成不賣這幾樣」，不去猜哪一樣重要
+        （CLAUDE.md：「該不該做 X」寫在呼叫端）。
+        """
+        if self._hp_item:
+            return (self._hp_item,)
+        return (self._home_item,) if self._home_item else ()
+
     @staticmethod
-    def _pick_seller(map_name: str, tried: set, bad, *, allow_bad: bool = False):
+    def _pick_seller(map_name: str, tried: set, bad, items=(), *,
+                     allow_bad: bool = False):
         """這張圖上還可以試的藥水商人。回 None ＝ 這張圖沒得試了。
 
         ⚠ **一張圖可以有好幾個藥水商人。** 上次走不到的只是**那一個**走不到，
         不是整張圖 —— 舊版只看 `sellers[0]`，於是「第一個在走不到的房間、
         第二個就在門口」的圖會被整個寫掉，門口那個永遠沒被試過。
 
-        `allow_bad=True` 是安全退化：全都被記成走不到的時候還是要有東西可試。
+        排除兩種：上次**走不到**的、以及上次開了店發現**沒賣**我們要的藥水的
+        （`items`）。後者實機踩過 —— izlude_in 的「高級藥水商人」就在道具商人
+        旁邊三格，貨架上沒有紅色藥水也沒有回程道具，但每一趟都要走到底、
+        開了店才知道（使用者：「自動補水 藥水商人都找錯」）。
+
+        `allow_bad=True` 是安全退化：全都被記過的時候還是要有東西可試。
         """
         stale = None
         for seller in potion_sellers_on(map_name):
             cell = (seller[0], seller[1])
             if (map_name, cell) in tried:
                 continue                       # 這一趟已經走過、走不到
-            if not bad.is_bad(map_name, cell):
+            if not bad.skip(map_name, cell, items):
                 return seller
             stale = stale or seller
         return stale if allow_bad else None
@@ -361,8 +442,13 @@ class RestockBot:
         bad = shop_reach.snapshot()
         return all(bad.is_bad(map_name, (x, y)) for x, y, _name, _look in sellers)
 
-    def _walk(self, target_map: str, cell: tuple[int, int] | None) -> dict | None:
-        """走過去。回沿路看到的 NPC（認商人要用），走不到就回 None。"""
+    def _walk(self, target_map: str, cell: tuple[int, int] | None) -> WalkResult:
+        """走過去。回 `WalkResult`（沿路看到的 NPC ＋ **是不是真的走不到**）。
+
+        ⚠ `unreachable` 只會在 `TravelBot` 自己算完路、說「到不了」時是 True。
+        逾時放棄也**不算** —— 逾時是放棄的上限，不是「這條路不存在」的證據
+        （CLAUDE.md：逾時只能當放棄的上限，不能當成功／失敗的依據）。
+        """
         bot = TravelBot(self._pid, destination=target_map, destination_cell=cell,
                         on_update=lambda s: self._say(s.note))
         self._travel = bot
@@ -370,17 +456,20 @@ class RestockBot:
         deadline = time.monotonic() + WALK_GIVEUP
         while bot.running and time.monotonic() < deadline and not self._stop.is_set():
             self._stop.wait(TICK)
+        # ⚠ 「還在跑就被我們喊停」＝逾時。先問再 `stop()`，不然問不出來。
+        timed_out = bool(bot.running) and not self._stop.is_set()
         arrived = bool(getattr(bot.stats, "arrived", False))
+        unreachable = bool(getattr(bot.stats, "unreachable", False))
         known = bot.npc_seen
         bot.stop()
         self._travel = None
         if self._stop.is_set():
             self._say("已取消")
-            return None
+            return WalkResult()
         if not arrived:
             self._say(f"⚠ 沒走到商人那裡：{bot.stats.note}")
-            return None
-        return known
+            return WalkResult(unreachable=unreachable, timed_out=timed_out)
+        return WalkResult(known)
 
     def _make_sure_he_is_visible(
         self, target_map: str, cell, seller_cell, look: int, name: str, known: dict
@@ -418,12 +507,12 @@ class RestockBot:
             if away is None:
                 return known
             self._say(f"認不出{name}，先走遠一點讓他重新進視野（第 {round_no} 次）")
-            if self._walk(target_map, away) is None:
+            if not self._walk(target_map, away).arrived:
                 return known
             back = self._walk(target_map, cell)
-            if back is None:
+            if not back.arrived:
                 return known
-            known = remember_npcs(self._pid, target_map, back)
+            known = remember_npcs(self._pid, target_map, back.npc or {})
             if self._can_see(known, seller_cell, look):
                 return known
         return known
@@ -474,6 +563,13 @@ class RestockBot:
         self.stats.bought = dict(shopper.stats.bought)
         self.stats.broke = shopper.stats.broke
         self.stats.done = bool(shopper.stats.bought) or "不用補" in shopper.stats.note
+        # ★ 貨架看過了才知道 —— 把「這家沒賣什麼」記下來，下一趟不要再撲空。
+        #   ⚠ 記的是**開店那一包實際少了哪幾樣**，不是「這趟沒買到」：
+        #   沒買到還可能是負重滿了、錢不夠，那些跟這家店賣什麼無關。
+        if shopper.stats.missing and self.stats.shop_map:
+            shop_reach.note_no_stock(self.stats.shop_map, cell, shopper.stats.missing)
+        if self.stats.bought and self.stats.shop_map:
+            shop_reach.note_good(self.stats.shop_map, cell, self.stats.bought)
         self._say(self.stats.summary() if self.stats.bought else shopper.stats.note)
 
     def _go_back(self) -> None:
@@ -490,7 +586,7 @@ class RestockBot:
             return          # 本來就在同一張圖，不用走
         where = map_display_name(home) or home
         self._say(f"買完了，走回 {where}…")
-        if self._walk(home, None) is not None:
+        if self._walk(home, None).arrived:
             self.stats.came_back = True
             self._say(f"{self.stats.summary()}；已經走回 {where}")
 

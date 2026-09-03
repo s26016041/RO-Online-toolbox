@@ -101,6 +101,14 @@ class TravelStats:
     hops_left: int = 0  # 還要換幾張圖
     note: str = ""
     arrived: bool = False
+    #: ★ **真的沒有路可以走過去**（`Traveler` 自己判定 `blocked`）。
+    #:
+    #: ⚠⚠ 這跟「沒抵達」是**兩件事**。斷線、還沒登入、角色死了、使用者取消、
+    #: 逾時 —— 全都是 `arrived=False` 但 `unreachable=False`。呼叫端要拿
+    #: 「走不走得到」當長期結論時（`services/shop_reach.py` 把走不到的店冷凍
+    #: 一週）只准看這一格：實機 2026-09-03 三秒內因為斷線把三家好店寫成
+    #: 「走不到」，之後整整一週都挑到不賣藥水的高級藥水商人。
+    unreachable: bool = False
     #: 使用者按了暫停。**還在跑**（連線、擷取、路線都留著），只是不送走路封包。
     paused: bool = False
     #: 角色死了。跟一般的失敗分開報 —— 介面要跳「按確定才消失」的通知窗。
@@ -528,6 +536,9 @@ class TravelBot:
                 return
             if state == "blocked":
                 self._stats.running = False
+                # ★ 只有這裡才是「真的走不到」——`Traveler` 把路算過了，
+                #   算不出來。其他每一種收場都不是（見 `TravelStats.unreachable`）。
+                self._stats.unreachable = True
                 self._note(self._traveler.note or "⚠ 到不了目的地，已停止")
                 return
 

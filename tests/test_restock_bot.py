@@ -11,7 +11,12 @@ from __future__ import annotations
 import pytest
 
 from ro_toolbox.services import restock_bot as mod
-from ro_toolbox.services.restock_bot import RestockBot, forget_npcs, remember_npcs
+from ro_toolbox.services.restock_bot import (
+    RestockBot,
+    WalkResult,
+    forget_npcs,
+    remember_npcs,
+)
 
 PID = 4242
 MAP = "prt_fild05"
@@ -89,7 +94,7 @@ def test_it_walks_out_of_view_and_back_when_nobody_knows_him(monkeypatch):
     def fake_walk(self, where, cell):
         walks.append((where, cell))
         # 走遠那一趟什麼都沒看到；走回來的那一趟他進視野了。
-        return {} if len(walks) == 1 else {8016: (LOOK, 290, 221)}
+        return WalkResult({} if len(walks) == 1 else {8016: (LOOK, 290, 221)})
 
     monkeypatch.setattr(RestockBot, "_walk", fake_walk)
     bot = RestockBot(PID, hp_item=502)
@@ -108,7 +113,7 @@ def test_it_does_not_shake_for_ever(monkeypatch):
     """搖不出來也要收手 —— 下一段會大聲說「認不出商人」。"""
     walks = []
     monkeypatch.setattr(RestockBot, "_walk",
-                        lambda self, where, cell: walks.append(cell) or {})
+                        lambda self, where, cell: walks.append(cell) or WalkResult({}))
     bot = RestockBot(PID, hp_item=502)
     known = bot._make_sure_he_is_visible(MAP, DOOR, SELLER, LOOK, "道具商人", {})
 
@@ -171,7 +176,8 @@ def test_it_walks_home_even_when_every_shop_was_unreachable(monkeypatch):
     """
     plan = ("prt_in", (79, 110), (126, 76), LOOK, "道具商人")
     monkeypatch.setattr(RestockBot, "_find_shop", lambda self, tried=None: plan)
-    monkeypatch.setattr(RestockBot, "_walk", lambda self, where, cell: None)
+    monkeypatch.setattr(RestockBot, "_walk",
+                        lambda self, where, cell: WalkResult(unreachable=True))
     monkeypatch.setattr(RestockBot, "_buy",
                         lambda *a, **k: pytest.fail("沒走到就不該開店"))
     went: list[str] = []
@@ -195,3 +201,162 @@ def test_the_caller_can_pin_home_explicitly(monkeypatch):
     bot = RestockBot(PID, hp_item=502, back_to="mjolnir_07")
     bot._find_shop()
     assert bot.stats.home_map == "mjolnir_07"
+
+
+# ---- ⛔ 「沒走到」不是「走不到」（2026-09-03：藥水商人都找錯）---------------
+
+
+class _FakeTravel:
+    """一個不碰遊戲的 `TravelBot`：照 `outcome` 決定這一趟怎麼收場。"""
+
+    outcome = ("arrived", {})
+
+    def __init__(self, pid, destination=None, on_update=None, destination_cell=None):
+        from ro_toolbox.services.travel_bot import TravelStats
+
+        self.stats = TravelStats(goal=destination)
+        self.npc_seen = {}
+        self.running = False
+
+    def start(self) -> None:
+        how, seen = self.outcome
+        # 真的 `TravelBot` 是背景執行緒；這裡直接把結果擺好、`running=False`
+        # 讓 `_walk()` 的等待迴圈馬上結束（逾時那條另外測）。
+        self.npc_seen = dict(seen)
+        self.stats.arrived = how == "arrived"
+        self.stats.unreachable = how == "blocked"
+
+    def stop(self) -> None:
+        self.running = False
+
+
+def _travel(monkeypatch, how: str, seen=None):
+    cls = type("_T", (_FakeTravel,), {"outcome": (how, seen or {})})
+    monkeypatch.setattr(mod, "TravelBot", cls)
+
+
+def test_a_dropped_connection_is_not_remembered_as_unreachable(monkeypatch, tmp_path):
+    """★★ 使用者 2026-09-03：「自動補水 藥水商人都找錯」。
+
+    舊版 `_walk()` 對每一種失敗都回同一個 `None`，呼叫端只好全部當成
+    「這家店走不到」寫進 `shop_reach`。實機日誌 —— 三秒鐘冷凍三家好店：
+
+        10:48:56 ⚠ 遊戲連線已中斷 → 記下來：izlude_in  的商店 (57,110) 走不到
+        10:48:59 找不到伺服器連線 → 記下來：lasagna    的商店 (165,125) 走不到
+        10:49:02 找不到伺服器連線 → 記下來：cmd_fild07 的商店 (257,126) 走不到
+
+    之後每張圖的道具商人都被寫掉，只剩同一張圖上的高級藥水商人可挑 ——
+    那家沒有紅色藥水，於是每一趟都走到底才發現「這家店沒有你設定的藥水」。
+    """
+    from ro_toolbox.services import shop_reach
+
+    _travel(monkeypatch, "disconnected")
+    bot = RestockBot(PID, hp_item=501)
+    walked = bot._walk("izlude_in", (57, 110))
+
+    assert walked.arrived is False
+    assert walked.unreachable is False, "斷線跟有沒有路可以走過去無關"
+    assert shop_reach.is_bad("izlude_in", (57, 110)) is False
+
+
+def test_really_having_no_route_is_remembered(monkeypatch, tmp_path):
+    """⚠ 反過來也要成立：真的算不出路（`blocked`）還是要記，
+    不然 prt_in 那家每一趟都要再白走 1.5~2 分鐘（[DAT-061]）。"""
+    _travel(monkeypatch, "blocked")
+    walked = RestockBot(PID, hp_item=501)._walk("prt_in", (126, 76))
+    assert walked.arrived is False
+    assert walked.unreachable is True
+
+
+def test_a_trip_that_could_not_even_start_stops_instead_of_trying_more_shops(
+    monkeypatch, tmp_path
+):
+    """★ 連線沒了就**當場停**，不要再換兩家店各失敗一次。
+
+    上面那份日誌裡後兩家各花 3 秒失敗，全是噪音 —— 遊戲都不在了，
+    換一家也是同樣的下場（memory：確定的失敗不准重試到逾時）。
+    """
+    from ro_toolbox.services import shop_reach
+
+    plans = [("izlude_in", (57, 110), (57, 110), 47, "道具商人"),
+             ("lasagna", (165, 125), (165, 125), 47, "道具商人"),
+             ("cmd_fild07", (257, 126), (257, 126), 47, "道具商人")]
+    asked: list[int] = []
+
+    def fake_find(self, tried=None):
+        asked.append(len(asked))
+        return plans[min(len(asked) - 1, 2)]
+
+    monkeypatch.setattr(RestockBot, "_find_shop", fake_find)
+    monkeypatch.setattr(RestockBot, "_walk", lambda self, where, cell: WalkResult())
+    monkeypatch.setattr(RestockBot, "_go_back", lambda self: None)
+    monkeypatch.setattr(RestockBot, "_buy",
+                        lambda *a, **k: pytest.fail("沒走到就不該開店"))
+
+    bot = RestockBot(PID, hp_item=501, back_to="mjolnir_07")
+    bot._run()
+
+    assert len(asked) == 1, "走不成就停，不要再換店"
+    assert shop_reach.is_bad("izlude_in", (57, 110)) is False
+
+
+def test_walking_too_long_tries_another_shop_but_remembers_nothing(
+    monkeypatch, tmp_path
+):
+    """⚠ 逾時只能當**放棄的上限**，不能當「這條路不存在」的證據（CLAUDE.md）。
+
+    所以換一家還是要換，但一個字都不准寫進記憶。
+    """
+    from ro_toolbox.services import shop_reach
+
+    plan = ("izlude_in", (57, 110), (57, 110), 47, "道具商人")
+    tries: list[int] = []
+    monkeypatch.setattr(RestockBot, "_find_shop",
+                        lambda self, tried=None: tries.append(1) or plan)
+    monkeypatch.setattr(RestockBot, "_walk",
+                        lambda self, where, cell: WalkResult(timed_out=True))
+    monkeypatch.setattr(RestockBot, "_go_back", lambda self: None)
+
+    RestockBot(PID, hp_item=501)._run()
+
+    assert len(tries) == mod._SHOP_TRIES, "逾時照樣換下一家"
+    assert shop_reach.is_bad("izlude_in", (57, 110)) is False
+
+
+def test_a_shop_without_our_potion_is_written_down(monkeypatch, tmp_path):
+    """★ 開了店、貨架上沒有我們要的藥水 —— 那是**當場量到的事實**，記下來。
+
+    不記的話下一趟又挑同一家、又走到底、又撲空（實機連續好幾趟）。
+    """
+    from ro_toolbox.services import restock as restock_mod
+    from ro_toolbox.services import shop_reach
+
+    class _Shopper:
+        def __init__(self, *a, **k):
+            self.stats = restock_mod.RestockStats(missing=[501], note="這家店沒有…")
+            self.active = False
+
+        def start(self, *a) -> None: ...
+        def note_entity(self, *a) -> None: ...
+        def update(self) -> str:
+            return "blocked"
+
+    class _Link:
+        def __init__(self, *a, **k): ...
+        def open(self) -> str:
+            return ""
+
+        def send(self, _data) -> None: ...
+        def close(self) -> None: ...
+
+    monkeypatch.setattr(mod, "Restocker", _Shopper)
+    monkeypatch.setattr(mod, "GameLink", _Link)
+    monkeypatch.setattr(RestockBot, "_home_count", lambda self: 0)
+
+    bot = RestockBot(PID, hp_item=501)
+    bot.stats.shop_map = "izlude_in"
+    bot._buy(558, (59, 113), {})
+
+    mem = shop_reach.snapshot()
+    assert mem.skip("izlude_in", (59, 113), (501,)) is True
+    assert mem.is_bad("izlude_in", (59, 113)) is False, "沒賣 ≠ 走不到"

@@ -159,3 +159,96 @@ def test_the_memory_is_read_once_per_search(monkeypatch, tmp_path):
                         lambda: reads.append(1) or real_load())
     RestockBot(4242, hp_item=502)._find_shop()
     assert len(reads) == 1
+
+
+# ---- ⛔ 只准記「真的走不到」（2026-09-03：藥水商人都找錯）-------------------
+
+
+def test_a_v1_file_is_thrown_away(monkeypatch, tmp_path):
+    """★ 舊格式整份丟掉重學。
+
+    v1 是「任何失敗都記一筆」的年代：使用者的檔案裡混著斷線那一拍寫進去的
+    假紀錄（三秒鐘記掉三家道具商人），而檔案裡只有時間，分不出哪筆是真的。
+    留著等於讓每一台已經裝過的機器繼續挑錯商人一整週。
+    """
+    _use_tmp(monkeypatch, tmp_path)
+    (tmp_path / "shop_reach.json").write_text(
+        '{"izlude_in:57,110": 1788403835.35}', encoding="utf-8"
+    )
+    assert shop_reach.is_bad("izlude_in", (57, 110)) is False
+    # 還要能繼續記（新格式）
+    shop_reach.note_bad("izlude_in", (57, 110))
+    assert shop_reach.is_bad("izlude_in", (57, 110)) is True
+
+
+def test_a_shop_without_our_potion_is_remembered_per_item(monkeypatch, tmp_path):
+    """★ 開了店才知道沒賣 —— 記下來，但**要連道具編號一起記**。
+
+    izlude_in 的「高級藥水商人」就在道具商人旁邊三格，貨架上沒有紅色藥水，
+    但每一趟都要走到底、開了店才知道。同一家對紅色藥水沒貨不代表對白色藥水
+    也沒貨，所以換一種藥水就當沒記過（安全退化：最多多走一趟）。
+    """
+    _use_tmp(monkeypatch, tmp_path)
+    mem = shop_reach.snapshot()
+    assert mem.skip("izlude_in", (59, 113), (501,)) is False
+
+    shop_reach.note_no_stock("izlude_in", (59, 113), [501])
+    mem = shop_reach.snapshot()
+    assert mem.skip("izlude_in", (59, 113), (501,)) is True
+    assert mem.skip("izlude_in", (59, 113), (502,)) is False, "換一種藥水＝沒記過"
+    assert mem.is_bad("izlude_in", (59, 113)) is False, "沒賣 ≠ 走不到"
+    # 旁邊那個道具商人不受影響
+    assert mem.skip("izlude_in", (57, 110), (501,)) is False
+
+
+def test_only_missing_every_wanted_item_counts(monkeypatch, tmp_path):
+    """⚠ 要 `all` 不要 `any`：只有一樣沒貨，另一樣買得到，那還是值得去。"""
+    _use_tmp(monkeypatch, tmp_path)
+    shop_reach.note_no_stock("prt_in", (126, 76), [501])
+    mem = shop_reach.snapshot()
+    assert mem.lacks("prt_in", (126, 76), (501, 602)) is False
+    assert mem.lacks("prt_in", (126, 76), (501,)) is True
+    assert mem.lacks("prt_in", (126, 76), ()) is False, "沒指定要買什麼＝不排除"
+
+
+def test_buying_it_there_clears_the_no_stock_record(monkeypatch, tmp_path):
+    """買到了就是推翻了（改版可能把貨補上了）。"""
+    _use_tmp(monkeypatch, tmp_path)
+    shop_reach.note_no_stock("prt_in", (126, 76), [501])
+    shop_reach.note_good("prt_in", (126, 76), {501: 30})
+    assert shop_reach.snapshot().skip("prt_in", (126, 76), (501,)) is False
+
+
+def test_the_no_stock_record_also_expires(monkeypatch, tmp_path):
+    _use_tmp(monkeypatch, tmp_path)
+    shop_reach.note_no_stock("prt_in", (126, 76), [501], now=1000.0)
+    later = 1000.0 + shop_reach._RETRY_AFTER + 1
+    assert shop_reach.snapshot(1000.0 + 60).skip("prt_in", (126, 76), (501,)) is True
+    assert shop_reach.snapshot(later).skip("prt_in", (126, 76), (501,)) is False
+
+
+def test_a_seller_who_has_no_stock_loses_his_turn(monkeypatch, tmp_path):
+    """★ 使用者 2026-09-03：「自動補水 藥水商人都找錯」。
+
+    izlude_in 三個商人裡，道具商人排第一（`potion_sellers_on()` 的順序）。
+    高級藥水商人被記成「沒賣 501」之後，挑的還是道具商人；反過來，道具商人
+    走不到的時候才輪到高級藥水商人 —— **降級不是刪除**。
+    """
+    from ro_toolbox.services import restock_bot as mod
+
+    _use_tmp(monkeypatch, tmp_path)
+    _fake_world(monkeypatch, {
+        "izlude_in": [(57, 110, "道具商人", 47), (59, 113, "高級藥水商人", 558)],
+    }, here="izlude_in")
+
+    shop_reach.note_no_stock("izlude_in", (59, 113), [501])
+    plan = RestockBot(4242, hp_item=501)._find_shop()
+    assert plan is not None and plan[2] == (57, 110)
+
+    # 兩個都被記過 → **降級不是刪除**，還是要有東西可試。退回原本的順序
+    # （道具商人在前）：「走不到」是會過期的事實（落地點會變），
+    # 「沒賣」是貨架上量到的 —— 賭前者比賭後者划算。
+    shop_reach.note_bad("izlude_in", (57, 110))
+    plan = RestockBot(4242, hp_item=501)._find_shop()
+    assert plan is not None and plan[2] == (57, 110)
+    assert mod is not None

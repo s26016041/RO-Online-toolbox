@@ -141,6 +141,13 @@ class RestockStats:
     bought: dict[int, int] = field(default_factory=dict)
     #: 錢不夠。⚠ 介面看到這個要**停掉自動打怪並跳通知**（使用者指定）。
     broke: bool = False
+    #: ★ 開了店之後**貨架上沒有**的道具編號。
+    #:
+    #: 開店那一包（`0x00C6`）把整個貨架送過來，所以這是**當場量到的事實**，
+    #: 不是推論。呼叫端拿它記進 `services/shop_reach.py`，下一趟就不會再走
+    #: 同一條路去撲空（實機 2026-09-03：連續好幾趟走到高級藥水商人，
+    #: 每次都走到底才說「這家店沒有你設定的藥水」）。
+    missing: list[int] = field(default_factory=list)
     note: str = ""
 
 
@@ -366,6 +373,8 @@ class Restocker:
             if found is None:
                 # ⚠ 清單裡沒有就是沒有 —— 不准挑一個「看起來像」的來買。
                 log.warning("這家店沒有 %s（%s），跳過", item_name(item_id), item_id)
+                if item_id not in self.stats.missing:
+                    self.stats.missing.append(item_id)
                 continue
             self._item = item_id
             self._price = found.price
