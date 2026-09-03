@@ -56,7 +56,6 @@ from ro_toolbox.services import (
 from ro_toolbox.services.buffs import BuffBot
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
-from ro_toolbox.services.game_screen import find_window
 from ro_toolbox.services.gamedata import (
     density_label,
     heals_hp,
@@ -66,8 +65,9 @@ from ro_toolbox.services.gamedata import (
     map_name_table,
     mob_spawn_rows,
 )
-from ro_toolbox.services.item_pick import ClickWatcher
+from ro_toolbox.services.item_window import ItemWindowReader, wait_for_right_click
 from ro_toolbox.services.mail_bot import MailBot
+from ro_toolbox.services.memory_scan import MemoryScanner
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.process_monitor import local_network_up
 from ro_toolbox.services.reconnect import RECONNECT, ReconnectDecider
@@ -216,30 +216,38 @@ class SkillWorker(QThread):
         self.done.emit(self._pid, rows)
 
 
-#: 「在遊戲裡按右鍵選道具」最多等多久。逾時只是**放棄的上限**，不是成功的依據
-#: （CLAUDE.md）—— 沒等到就照實說「沒等到你點」。
-_PICK_TIMEOUT_SEC = 60.0
-
-
 class PickWorker(Worker):
-    """在背景等使用者在遊戲裡對道具按右鍵（見 `services/item_pick`）。
+    """在背景等使用者在遊戲裡對道具按右鍵，然後**從記憶體**讀出那是什麼。
 
-    ⚠ 一定要在背景：`ClickWatcher.wait()` 會等到使用者按下去為止（最多一分鐘），
-    放在 UI 執行緒的話整個程式會凍住，看起來就像當掉。
+    使用者指定（2026-09-04）：「不准用圖片辨識」「讀記憶體」「絕對有記憶體」。
+    做法見 `services/item_window` —— 讀說明小視窗渲染出來的**說明文**，
+    反查 `assets/items.json.gz` 就得到道具編號。
+
+    ⚠ 一定要在背景：等按鍵會等到使用者動作為止，而第一次要整份掃記憶體
+    （實機 29 秒；之後靠位址提示是 0.05 秒）。放在 UI 執行緒會整個凍住。
+
+    ⚠ **一直等下去**，直到視窗關掉或使用者叫停 —— 他通常要連續加好幾樣，
+    每加一樣就要重按一次按鈕的話很難用。
     """
 
-    picked = Signal(object)      # item_pick.Pick，或 None（沒等到）
+    picked = Signal(object)      # item_window.Shown
 
-    def __init__(self, hwnd: int, items) -> None:
+    def __init__(self, pid: int, items) -> None:
         super().__init__()
-        self._hwnd = hwnd
+        self._pid = pid
         self._items = frozenset(items)
 
     def run(self) -> None:
-        watcher = ClickWatcher(self._hwnd, self._items)
-        self.picked.emit(
-            watcher.wait(_PICK_TIMEOUT_SEC, should_stop=lambda: self.should_stop)
-        )
+        scanner = MemoryScanner()
+        scanner.open(self._pid)
+        try:
+            reader = ItemWindowReader(scanner)
+            while not self.should_stop:
+                if not wait_for_right_click(lambda: self.should_stop):
+                    return
+                self.picked.emit(reader.read(self._items))
+        finally:
+            scanner.close()
 
 
 class CharacterCard(QWidget):
@@ -2418,39 +2426,31 @@ class FarmPage(BasePage):
         """
         if getattr(dialog, "_pick_thread", None) is not None:
             return                       # 已經在等了，不要疊第二條
-        hwnd = find_window(pid)
-        if not hwnd:
-            dialog.picking(False, "找不到遊戲視窗 —— 遊戲還開著嗎？")
-            return
         items = set(self._bag_counts(pid))
         if not items:
-            dialog.picking(False, "還讀不到背包 —— 認道具要拿背包裡的圖示來比對。")
+            dialog.picking(False, "還讀不到背包 —— 認道具要比對背包裡那幾樣的說明文。")
             return
-        worker = PickWorker(hwnd, items)
-        worker.picked.connect(lambda pick, d=dialog: self._pick_done(d, pick))
+        worker = PickWorker(pid, items)
+        worker.picked.connect(lambda shown, d=dialog: self._pick_done(d, shown))
         thread = WorkerThread(worker)
         dialog._pick_thread = thread
         dialog.picking(
             True,
-            "切到遊戲，對背包裡的道具**按右鍵**（一分鐘內）——"
-            "請點在圖案上，不要點到名字或數量那一欄。",
+            "切到遊戲，對背包裡的道具**按右鍵**（開出說明視窗）——"
+            "第一次要掃一遍記憶體約 30 秒，之後就即時。可以連續加好幾樣。",
         )
         thread.start()
 
-    def _pick_done(self, dialog, pick) -> None:
-        dialog._pick_thread = None
-        dialog.picking(False)
-        if pick is None:
-            dialog.picked((), "沒等到你按右鍵 —— 再按一次「在遊戲裡按右鍵選道具」。")
-            return
-        # ⚠ 前幾名一起記下來：認不出來的時候，唯一能判斷「是門檻太嚴還是
-        #   抓圖對不上」的線索就是這幾個分數（使用者手上只有 .exe 與日誌）。
-        ranked = "、".join(f"{item_name(i)} {s:.2f}" for i, s in pick.ranked)
+    def _pick_done(self, dialog, shown) -> None:
+        # ⚠ **不收掉執行緒**：使用者通常要連續加好幾樣，收掉的話每加一樣
+        #   都要重按一次按鈕。要停就是關視窗或再按一次（`_stop_pick`）。
+        # ⚠ 讀到什麼一律記進日誌：使用者手上只有 .exe，認不出來時這是唯一線索。
         log.info(
-            "認道具：命中 %s（分數 %.2f）%s；前幾名 %s",
-            [item_name(i) for i in pick.items], pick.score, pick.why, ranked,
+            "認道具：%s（%.2fs）%s｜說明文「%s」",
+            [item_name(i) for i in shown.items], shown.seconds, shown.why,
+            shown.text[:40],
         )
-        dialog.picked(pick.items, pick.why)
+        dialog.picked(shown.items, shown.why)
 
     @staticmethod
     def _stop_pick(dialog) -> None:

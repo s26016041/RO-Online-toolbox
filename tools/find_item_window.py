@@ -1,51 +1,69 @@
-r"""找出「道具說明視窗現在顯示的是哪個道具」存在記憶體的哪裡。
+r"""找出「道具說明小視窗現在顯示的是哪個道具」存在記憶體的哪裡。
 
-使用者提的方向（2026-09-04）：「右鍵物品會出現物品介紹小視窗，所以應該可以
-看記憶體」—— 對，而且這比抓圖比對好：它是**遊戲自己載進記憶體的資料**
-（CLAUDE.md 資料來源優先序第 1 條），不受 DPI、佈景、視窗被蓋住影響。
+使用者堅持走這條（2026-09-04）：「不准用圖片辨識」「讀記憶體」「絕對有記憶體」。
+方向是對的：那是遊戲自己載進記憶體的資料（CLAUDE.md 資料來源優先序第 1 條），
+不受 DPI、佈景、視窗被蓋住影響。
 
-## 怎麼用（兩步，各跑一次）
+## ⛔ 走過的冤枉路（同一天，全部落空，不要再走一次）
 
-    # 1) 在遊戲裡對「紅色藥水」按右鍵，讓說明視窗開著，然後：
-    .\.venv\Scripts\python.exe tools\find_item_window.py 501
+全部都建立在「它存的是**道具編號**」這個假設上 —— 而這個假設**是錯的**：
 
-    # 2) 換成對「弄不壞的東西」按右鍵（說明視窗換一個道具），然後：
-    .\.venv\Scripts\python.exe tools\find_item_window.py 909 --filter
+1. 「值 = 背包裡任一編號」當第一道濾網 → uint16 留 **130 萬**個候選，
+   每輪重讀 9 秒，使用者按的第 2、3、4 次全被吃掉。最後剩的兩個是
+   **主執行緒堆疊上的垃圾**（值每秒亂跳二十幾次，剛好瞬間等於 2112）。
+2. 「先掃 905、再篩 939」→ **0 個**活下來。
+3. 關掉視窗看誰消失 → **只有 4 個**，而且全是雜訊。
+   （被釋放的記憶體會**留著舊值**，關視窗根本不是好訊號。）
+4. 開視窗看誰**新增** → 955 只多 1 個，是浮點頂點資料。
+5. 全記憶體快照比對 `int32 / uint16 / float32 / float64`
+   「舊 = 955、新 = 757」→ **四種全部 0 個**。
+6. 找「指到 955 附近的指標變成指到 757 附近」→ 6 個，全是**音訊 PCM 波形**。
+7. 找「指向道具名字串的指標」→ 0 個。
+   而且 `昆蟲外殼` 23 處、`鋁原石` 6 處，換道具前後**一個字都沒變** ——
+   所以視窗**沒有複製名字**，是從共用的表直接畫。
 
-第 2 步只留下「第 1 步是 501、現在是 909」的位址 —— 那就是說明視窗記著的
-道具編號。還太多就換第三個道具再 `--filter` 一次。
+**結論：它存的不是編號，也不是名字。** 可能是索引、控制代碼、指標鏈…
+所以下面這一版**不假設任何表示法**。
+
+## 現在的做法：讓它在 A、B 兩個道具之間來回
+
+    # 1) 視窗顯示道具 A：
+    .\.venv\Scripts\python.exe tools\find_item_window.py --reset --phase a
+    # 2) 換成道具 B：
+    .\.venv\Scripts\python.exe tools\find_item_window.py --phase b
+    # 3) 換回 A：      4) 換回 B：      5) 換回 A…（每次都會再篩一輪）
+    .\.venv\Scripts\python.exe tools\find_item_window.py --phase a
+
+一個位址要活下來，必須**每一次都回到那一相對應的值**。
+不管它存的是編號、索引、指標還是雜湊，都躲不掉；
+而「剛好跟著我們來回切」的雜訊活不過三、四輪。
 
 ⚠ 這是**調查工具**，不是功能。找到位址之後**不准把位址寫進程式**
-（CLAUDE.md 最高原則）：要拿它當錨，反查是哪一段程式碼寫進去的，
-做成 `CodeSignature` 收進 `services/signatures.py`。
-
-⚠ 為什麼是 int32 又是 int16：封包裡的 `name_id` 是 2 bytes，但客戶端
-內部通常存成 int。兩種都掃，哪一種留得下來就是哪一種。
+（CLAUDE.md 最高原則：位址一律 AOB 特徵掃描）——
+要拿它當錨反查是哪一段程式碼寫進去的，做成 `CodeSignature`。
 """
-
 from __future__ import annotations
 
 import argparse
-import json
+import pickle
 import sys
 import tempfile
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ro_toolbox.services import window_list  # noqa: E402
-from ro_toolbox.services.gamedata import item_name  # noqa: E402
-from ro_toolbox.services.memory_scan import (  # noqa: E402
-    VALUE_TYPES,
-    MemoryScanner,
-)
+from ro_toolbox.services.memory_scan import MemoryScanner  # noqa: E402
 from ro_toolbox.services.process_monitor import is_admin  # noqa: E402
 
 PROCESS = "ragexe.exe"
-#: 兩步之間要把第一步的結果放著。放暫存目錄，不進版控。
-STATE = Path(tempfile.gettempdir()) / "ro-item-window-scan.json"
-#: 候選超過這個數量就只印前幾筆（印幾萬行會把終端機拖垮）。
+STATE = Path(tempfile.gettempdir()) / "ro-item-window.pkl"
+#: 印出來的上限（全域規定：大量輸出會把終端機拖垮）。
 _SHOW = 40
+#: 剩這麼少就算收斂了。
+_DONE = 12
 
 
 def pick_pid(want: int | None) -> int | None:
@@ -66,44 +84,35 @@ def pick_pid(want: int | None) -> int | None:
     return None
 
 
-def scan(scanner: MemoryScanner, kind: str, value: int) -> list[int]:
-    """整份掃一次，回符合的位址。"""
-    scanner.first_scan(VALUE_TYPES[kind], "exact", value)
-    return [int(addr) for addr, _v in scanner.results(limit=1 << 20)]
-
-
-def survivors(scanner: MemoryScanner, kind: str, addrs: list[int],
-              value: int) -> list[int]:
-    """上一輪留下來的位址裡，**現在**等於 `value` 的那些。
-
-    ⚠ 這裡自己重讀，不用 `next_scan()` —— 那要接著上一次的掃描狀態，
-    而我們是**兩次獨立執行**（中間使用者去遊戲裡點了東西）。
-    """
-    vt = VALUE_TYPES[kind]
-    out = []
-    for addr in addrs:
-        got = scanner.read_value(addr, vt)
-        if got is not None and int(got) == value:
-            out.append(addr)
+def read_all(scanner: MemoryScanner) -> dict[int, np.ndarray]:
+    """每個可寫區段現在的內容（dword）。"""
+    out = {}
+    for base, size in scanner.regions(writable_only=True):
+        raw = scanner.read_region(base, size)
+        if raw is None:
+            continue
+        n = len(raw) // 4
+        if n:
+            out[base] = np.frombuffer(raw, dtype="<u4", count=n).copy()
     return out
 
 
-def report(scanner: MemoryScanner, kind: str, addrs: list[int]) -> None:
-    print(f"  {kind}: 剩 {len(addrs)} 個")
-    for addr in addrs[:_SHOW]:
-        where = scanner.module_for_address(addr)
-        tag = f"  {where[0].name}+0x{where[1]:X}" if where else "  （不在模組裡）"
-        print(f"    0x{addr:08X}{tag}")
-    if len(addrs) > _SHOW:
-        print(f"    …還有 {len(addrs) - _SHOW} 個（沒印出來）")
+def read_at(scanner: MemoryScanner, addrs: np.ndarray) -> np.ndarray:
+    """讀這些位址現在的 dword。讀不到的填 0xFFFFFFFF（一定篩不過）。"""
+    out = np.empty(len(addrs), dtype=np.uint32)
+    for i, a in enumerate(addrs):
+        raw = scanner.read_region(int(a), 4)
+        out[i] = (np.frombuffer(raw, dtype="<u4", count=1)[0]
+                  if raw is not None and len(raw) >= 4 else 0xFFFFFFFF)
+    return out
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="找『說明視窗顯示的道具編號』在記憶體哪裡")
-    parser.add_argument("item_id", type=int, help="現在說明視窗開著的那個道具編號")
-    parser.add_argument("--filter", action="store_true",
-                        help="接著上一次的結果篩選（第二步以後都要加）")
+        description="找『說明小視窗顯示哪個道具』在記憶體哪裡（A/B 來回篩）")
+    parser.add_argument("--phase", choices=("a", "b"), required=True,
+                        help="視窗**現在**顯示的是 A 還是 B 那個道具")
+    parser.add_argument("--reset", action="store_true", help="從頭開始（整份快照）")
     parser.add_argument("--pid", type=int, help="指定遊戲行程")
     args = parser.parse_args()
 
@@ -116,54 +125,79 @@ def main() -> int:
     scanner = MemoryScanner()
     scanner.open(pid)
     try:
-        name = item_name(args.item_id)
-        print(f"PID {pid}：找現在等於 {args.item_id}（{name}）的位址")
-        if not args.filter:
-            found = {k: scan(scanner, k, args.item_id) for k in ("int32", "int16")}
-            print("第一輪：")
-            for kind, addrs in found.items():
-                print(f"  {kind}: {len(addrs)} 個")
-            STATE.write_text(json.dumps({
-                "pid": pid, "item_id": args.item_id,
-                "hits": {k: v for k, v in found.items()},
-            }), encoding="utf-8")
-            print(f"\n結果存到 {STATE}")
-            print("→ 現在去遊戲裡對**另一個**道具按右鍵，再跑一次："
-                  "\n   tools\\find_item_window.py <那個道具編號> --filter")
+        if args.reset:
+            if args.phase != "a":
+                print("--reset 要從 --phase a 開始。", file=sys.stderr)
+                return 1
+            snap = read_all(scanner)
+            STATE.write_bytes(pickle.dumps({"pid": pid, "stage": "snap", "snap": snap}))
+            print(f"整份快照好了：{len(snap)} 個區段，"
+                  f"{sum(len(v) for v in snap.values())/1e6:.0f}M dword")
+            print("→ 換成**另一個道具 B** 按右鍵，再跑 --phase b")
             return 0
 
         if not STATE.exists():
-            print("沒有上一輪的結果 —— 先跑一次不加 --filter 的。", file=sys.stderr)
+            print("還沒開始 —— 先跑 --reset --phase a。", file=sys.stderr)
             return 1
-        state = json.loads(STATE.read_text(encoding="utf-8"))
-        if state.get("pid") != pid:
-            # ⚠ 位址只在同一個行程裡有意義。換了行程（重開遊戲）就得重來，
-            #   拿舊的去讀只會得到一堆看似合法的垃圾。
-            print(f"上一輪是 PID {state.get('pid')}，跟現在的 {pid} 不同 —— "
-                  "重開過遊戲就要從第一步重來。", file=sys.stderr)
-            return 1
-        if state.get("item_id") == args.item_id:
-            print("跟上一輪同一個道具 —— 這樣篩不掉任何東西，"
-                  "請換一個道具再試。", file=sys.stderr)
+        state = pickle.loads(STATE.read_bytes())
+        if state["pid"] != pid:
+            # ⚠ 位址只在同一個行程裡有意義；重開過遊戲一定要 --reset 重來。
+            print(f"上一輪是 PID {state['pid']}，跟現在的 {pid} 不同 —— 請 --reset 重來。",
+                  file=sys.stderr)
             return 1
 
-        print(f"接著上一輪（{state['item_id']} {item_name(state['item_id'])}）篩選：")
-        left = {}
-        for kind, addrs in state["hits"].items():
-            left[kind] = survivors(scanner, kind, addrs, args.item_id)
-            report(scanner, kind, left[kind])
-        state.update(item_id=args.item_id, hits=left)
-        STATE.write_text(json.dumps(state), encoding="utf-8")
-
-        total = sum(len(v) for v in left.values())
-        if total == 0:
-            print("\n⚠ 一個都不剩 —— 說明視窗可能沒把編號原樣存著，"
-                  "或存的是別的東西（索引、指標）。")
-        elif total > 5:
-            print("\n還太多 —— 換第三個道具再 --filter 一次。")
+        if state["stage"] == "snap":
+            if args.phase != "b":
+                print("這一步要顯示**另一個**道具（--phase b）。", file=sys.stderr)
+                return 1
+            # 第一次收斂：留下「跟 A 那一刻不一樣」的位址，記住 A 值與 B 值。
+            snap = state["snap"]
+            addrs, va, vb = [], [], []
+            for base, before in snap.items():
+                raw = scanner.read_region(base, len(before) * 4)
+                if raw is None:
+                    continue
+                n = len(raw) // 4
+                if n != len(before):
+                    continue
+                now = np.frombuffer(raw, dtype="<u4", count=n)
+                idx = np.nonzero(now != before)[0]
+                if len(idx):
+                    addrs.append(base + idx.astype(np.int64) * 4)
+                    va.append(before[idx])
+                    vb.append(now[idx])
+            state = {
+                "pid": pid, "stage": "pair", "round": 1,
+                "addr": np.concatenate(addrs),
+                "a": np.concatenate(va), "b": np.concatenate(vb),
+            }
+            print(f"第 1 輪（A→B 有變的）：{len(state['addr'])} 個")
         else:
-            print("\n✔ 剩沒幾個了。下一步：**不要把位址寫進程式**，"
-                  "反查是哪段程式碼寫進去的，做成 CodeSignature。")
+            # 之後每一輪：值必須**回到**這一相該有的那個。
+            want = state[args.phase]
+            now = read_at(scanner, state["addr"])
+            keep = now == want
+            state["round"] += 1
+            for key in ("addr", "a", "b"):
+                state[key] = state[key][keep]
+            print(f"第 {state['round']} 輪（回到 {args.phase.upper()} 的值）："
+                  f"{len(state['addr'])} 個")
+
+        STATE.write_bytes(pickle.dumps(state))
+        left = len(state["addr"])
+        if left == 0:
+            print("\n⚠ 一個都不剩 —— 這一輪視窗可能沒真的換人（或換錯道具了）。"
+                  "從 --reset --phase a 重來一次。")
+        elif left <= _DONE:
+            print("\n✔ 收斂了：")
+            for a, x, y in zip(state["addr"][:_SHOW], state["a"][:_SHOW],
+                               state["b"][:_SHOW], strict=False):
+                print(f"    0x{int(a):08X}   A=0x{int(x):08X}  B=0x{int(y):08X}")
+            print("下一步：**不要把位址寫進程式** —— 反查是哪段程式碼寫的，"
+                  "做成 CodeSignature。")
+        else:
+            nxt = "a" if args.phase == "b" else "b"
+            print(f"→ 換回**{nxt.upper()}** 那個道具按右鍵，再跑 --phase {nxt}")
         return 0
     finally:
         scanner.close()

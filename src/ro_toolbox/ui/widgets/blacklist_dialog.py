@@ -9,10 +9,12 @@
 - 「這個是**永遠開啟**的，所以不會有開關」→ 這裡沒有啟用勾勾
 - 「同時也要記錄起來」（存檔見 `services/loot_store`）
 
-使用者追問（同日）：「我想要我在遊戲**右鍵或左鍵物品**，程式可以識別，
-然後加入黑名單」→ 「在遊戲裡點一下」那顆按鈕。做法見 `services/item_pick`：
-**我們自己看滑鼠 ＋ 抓圖比對背包裡那幾十張圖示**，完全不碰遊戲行程
-（攔遊戲自己的滑鼠事件＝注入，GameGuard 擋，見 GAMEDATA [DAT-069]）。
+使用者追問（同日）：「我想要我在遊戲物品**按右鍵**，程式可以識別，
+然後加入黑名單」，並且明確否決抓圖：「**不准用圖片辨識**」「讀記憶體」
+「絕對有記憶體」→ 「在遊戲裡按右鍵選道具」那顆按鈕。做法見
+`services/item_window`：**讀說明小視窗渲染出來的說明文**，反查道具表拿編號
+（GAMEDATA [DAT-070]）。攔遊戲自己的滑鼠事件是注入、GameGuard 會擋，所以
+「什麼時候去讀」是我們自己看 `GetAsyncKeyState`，不碰遊戲行程。
 
 「背包」那一頁是同一件事的鍵盤版：撿到垃圾之後最想擋的那一樣通常就在背包裡。
 
@@ -164,9 +166,9 @@ class BlacklistDialog(QDialog):
         # ★ 使用者要的那顆：在遊戲裡點一下道具，程式自己認出是什麼。
         self.pick_button = QPushButton("在遊戲裡按右鍵選道具")
         self.pick_button.setToolTip(
-            "按下去之後切到遊戲，對背包裡的道具**按右鍵**，"
-            "程式會認出那是什麼並加進黑名單。（只認右鍵：左鍵在背包裡是拿起／"
-            "拖曳，順手一點就會誤加。）"
+            "按下去之後切到遊戲，對背包裡的道具**按右鍵**開出說明視窗，"
+            "程式會從記憶體讀出那是什麼並加進黑名單。可以連續加好幾樣。"
+            "（只認右鍵：左鍵在背包裡是拿起／拖曳，順手一點就會誤加。）"
         )
         self.pick_button.clicked.connect(self.pick_requested)
         row.addWidget(self.pick_button, 1)
@@ -176,7 +178,11 @@ class BlacklistDialog(QDialog):
     # ---- 「在遊戲裡點一下」的回報 ---------------------------------------
 
     def picking(self, on: bool, note: str = "") -> None:
-        """切換「正在等你點」的狀態。等的時候按鈕要按不下去（不然會疊兩條）。"""
+        """切換「正在等你按右鍵」的狀態。
+
+        ⚠ 等的期間按鈕要按不下去 —— 不然會疊出第二條背景執行緒，
+        兩條搶同一個右鍵。
+        """
         self.pick_button.setEnabled(not on)
         self.pick_button.setText(
             "等你在遊戲裡按右鍵…" if on else "在遊戲裡按右鍵選道具")
@@ -190,7 +196,8 @@ class BlacklistDialog(QDialog):
         """
         ids = [int(i) for i in item_ids or ()]
         if not ids:
-            self.status.setText(why or "認不出你點的是什麼 —— 再按一次右鍵試試。")
+            self.status.setText(
+                why or "認不出說明視窗裡是什麼 —— 再按一次右鍵試試。")
             return
         if len(ids) > 1:
             menu = QMenu(self)
