@@ -309,6 +309,27 @@ class Walker:
                 self.resent += 1
                 log.debug("停住 %.1f 秒，重送這一段（第 %d 次）",
                           now - self._pos_at, self._resends)
+                if not self._acked:
+                    # ★★ **一次確認都沒收到 → 重送同一個目標沒有用。**
+                    #
+                    # 上面那條「沒收到 ack 就把步幅對半縮」的路
+                    # （`now - self._sent_at > ACK_TIMEOUT`）**永遠不會執行**：
+                    # `RESEND_SEC`（0.25）比 `ACK_TIMEOUT`（0.4）短，重送每次
+                    # 都把 `_sent_at` 推到現在，所以那個期限追不上。
+                    #
+                    # 實機量到（2026-09-03，狐狐狸 @ izlude_in → 道具商人那一格）：
+                    #   目標=(57,110) 步幅=10 **被拒=0 重送=18** 角色一步都沒動
+                    # —— 同一個伺服器根本不收的目標送了 21 次，步幅從頭到尾
+                    # 都是 10，適應性縮短完全沒有發生。
+                    #
+                    # 縮短之後 `_send_next()` 會改挑路徑上比較近的一格，
+                    # 那一格通常是自由的，於是至少走得動（成功一次就會自己
+                    # 回到 `MAX_STEP`，見上面的 ack 分支）。
+                    self.rejected += 1
+                    self._step = self._step // 2
+                    if self._step < 2:
+                        self.clear()
+                        return "blocked"
                 # 從**現在站的地方**重挑目標，不是把舊的原封不動再送一次：
                 # 被擊退／被拉走的話舊目標可能已經超過單次移動上限。
                 self._target = None

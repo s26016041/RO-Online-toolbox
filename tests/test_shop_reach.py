@@ -100,6 +100,9 @@ def _fake_world(monkeypatch, sellers_by_map: dict, here: str) -> None:
                         lambda _here, maps: (["路線"], sorted(maps)[0]) if maps else None)
     monkeypatch.setattr(mod, "load_terrain", lambda _m: object())
     monkeypatch.setattr(mod, "nearest_walkable", lambda _t, cell: cell)
+    # ⚠ 現在走的目標是「商人旁邊那一格」（`cell_beside`，見 [DAT-066]）——
+    #   假世界裡沒有地形，直接回商人那一格，測試看的是**挑了誰**不是站哪。
+    monkeypatch.setattr(mod, "cell_beside", lambda _t, cell: cell)
 
 
 def test_the_map_we_are_standing_on_also_asks_the_memory(monkeypatch, tmp_path):

@@ -381,6 +381,47 @@ def nearest_walkable(
     return None
 
 
+def cell_beside(
+    terrain: MapTerrain, cell: tuple[int, int], radius: int = GOAL_SNAP
+) -> tuple[int, int] | None:
+    """離 `cell` 最近的可走格，**但不包含 `cell` 自己**。
+
+    ★★ 給「走到某個 NPC 旁邊」用的。**不准把 NPC 站的那一格當目的地** ——
+    NPC 佔著那一格，伺服器會**靜默忽略**那個移動要求（不回錯誤、不回 0x0087，
+    就是不動），而我們會一直重送同一個目標。
+
+    實機量到（2026-09-03，狐狐狸 @ izlude_in，道具商人站 (57,110)）：
+
+        起點 (60,105) → 目標 (57,110)：路徑長 10 ≤ 步幅 10，所以**第一段就送
+          NPC 那一格** → 送出 21 次、重送 18 次、**被拒 0 次**（伺服器一次
+          0x0087 都沒回）、8 秒後角色一步都沒動。
+        起點 (64,100) → 目標 (57,110)：路徑長 18 > 步幅，第一段送的是中間的
+          自由格 → 走得動，最後停在 (56,110) 算抵達。
+        起點 (64,100) → 目標 (57,109)（他旁邊那一格）：3.9 秒走到。
+
+    也就是說「走不到商人」根本不是地形問題，是**我們把目的地設在他身上**。
+    `nearest_walkable()` 分不出來：GAT 只知道地形，不知道誰站在上面 ——
+    (57,110) 在 GAT 裡是可走的。
+
+    找不到就回 None，呼叫端安全退化（退回 `nearest_walkable()`）。
+    """
+    for r in range(1, radius + 1):
+        best = None
+        for dx in range(-r, r + 1):
+            for dy in range(-r, r + 1):
+                if max(abs(dx), abs(dy)) != r:
+                    continue                  # 只看這一圈，由內往外
+                x, y = cell[0] + dx, cell[1] + dy
+                if terrain.is_walkable(x, y):
+                    # 同一圈裡挑正上下左右（不走斜角比較不會被牆卡住）
+                    if dx == 0 or dy == 0:
+                        return x, y
+                    best = best or (x, y)
+        if best is not None:
+            return best
+    return None
+
+
 class Traveler:
     """把一條跨地圖路線走完。呼叫端每拍餵 (地圖名, 座標)，看回傳狀態決定下一步。
 
@@ -950,6 +991,14 @@ class Traveler:
         raw = self._route[0].cell if self._route else self._goal_cell
         if raw is None:
             return None
+        if self._route and self._route[0].npc:
+            # ★ 這一段的目標是**一個 NPC**（船員、卡普拉…）。不准把他站的那一格
+            #   當目的地：他佔著那一格，伺服器會靜默忽略那個移動（見
+            #   `cell_beside()` 的實機數字）。走到他旁邊就夠了 ——
+            #   `ARRIVE_RADIUS` 本來就允許差兩格。
+            beside = cell_beside(terrain, raw)
+            if beside is not None:
+                return beside
         return nearest_walkable(terrain, raw)
 
     def _gate_options(self, map_name: str) -> list[Hop]:

@@ -49,7 +49,7 @@ from ro_toolbox.services.restock import (
     Restocker,
     RestockOrder,
 )
-from ro_toolbox.services.travel import nearest_map_with, nearest_walkable
+from ro_toolbox.services.travel import cell_beside, nearest_map_with, nearest_walkable
 from ro_toolbox.services.travel_bot import OUT_OF_VIEW as _OUT_OF_VIEW
 from ro_toolbox.services.travel_bot import TravelBot
 
@@ -412,7 +412,23 @@ class RestockBot:
         except GatError as exc:
             self._say(f"⚠ {target_map} 的地形讀不到：{exc}")
             return None
-        cell = nearest_walkable(terrain, (x, y)) or (x, y)
+        # ★★ **走到他旁邊，不是走到他身上。**
+        #
+        # NPC 佔著自己那一格，伺服器會**靜默忽略**目的地是那一格的移動要求
+        # （不回錯誤、不回 0x0087，就是不動），而我們會一直重送同一個目標。
+        # 實機量到（2026-09-03，狐狐狸 @ izlude_in，道具商人 (57,110)）：
+        #
+        #   (60,105) → (57,110)：路徑 10 格 ≤ 步幅 10，第一段就送 NPC 那一格
+        #                        → 送出 21 次、**被拒 0 次**（一次 0x0087 都
+        #                        沒回）、8 秒角色一步都沒動 → 「走不到」
+        #   (64,100) → (57,110)：路徑 18 格 > 步幅，第一段送中間的自由格
+        #                        → 走得動，停在 (56,110) 算抵達
+        #   (64,100) → (57,109)：他旁邊那一格，3.9 秒走到
+        #
+        # 所以「走不到商人」不是地形問題，是我們把目的地設在他身上 ——
+        # 而且**站得近反而更容易發生**（路徑短到一段就送完）。
+        # `nearest_walkable()` 分不出來：GAT 只有地形，不知道誰站在上面。
+        cell = cell_beside(terrain, (x, y)) or nearest_walkable(terrain, (x, y)) or (x, y)
         return target_map, cell, (x, y), look, name
 
     def _key_items(self) -> tuple[int, ...]:
