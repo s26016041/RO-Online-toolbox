@@ -20,7 +20,7 @@ import struct
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 
 from ro_toolbox.core.ro_protocol import (
@@ -278,10 +278,20 @@ class FarmBot:
         pid: int,
         on_update: Callable[[FarmStats], None] | None = None,
         use_memory: bool = _USE_MEMORY_ENTITIES,
+        blacklist: Iterable[int] = (),
     ) -> None:
         self._pid = pid
         self._on_update = on_update
         self._use_memory = use_memory
+        #: 不撿的道具編號（使用者的撿取黑名單，見 `services/loot_store`）。
+        #:
+        #: ⚠ 存**編號**不存名字：地上的掉落物封包給的就是編號
+        #: （`world.GroundItem.name_id`），兩邊直接對得上。
+        #:
+        #: ⚠ 這一份會被 UI 執行緒用 `set_blacklist()` **整份換掉**（不是就地改）
+        #: —— 換一個 frozenset 是一次屬性指定，跑在打怪迴圈裡的讀取
+        #: 不可能讀到改到一半的名單，所以不用鎖。
+        self._blacklist: frozenset[int] = frozenset(blacklist)
         self._world = WorldTracker(valid_item_ids=set(item_names()))
         #: socket ／ 角色定位 ／ 封包擷取三條線共用同一份規則
         #: （`services/game_link.py`）。⚠ 以前這一段 travel_bot 抄一份、
@@ -431,6 +441,18 @@ class FarmBot:
         reset 之後那條連線還留在 TCP 表裡，查得到卻送不出去（[PKT-082]）。
         """
         return self._link.dead
+
+    def set_blacklist(self, item_ids: Iterable[int]) -> None:
+        """換一份「不撿的道具編號」。**跑的時候改也立刻生效**。
+
+        使用者在視窗裡改完就該馬上算數 —— 要求重開掛機才生效的話，
+        他會以為設定沒存到（而且黑名單是「永遠開啟」的，沒有開關可以重按）。
+        """
+        self._blacklist = frozenset(item_ids)
+
+    def _unwanted(self, item) -> bool:  # noqa: ANN001 - GroundItem
+        """這一個在黑名單裡嗎（＝不撿）。"""
+        return item.name_id in self._blacklist
 
     def loot(self) -> dict[int, int]:
         """已撿取的道具 {物品ID: 次數}。快照，可安全在其他執行緒讀。"""
@@ -1361,8 +1383,12 @@ class FarmBot:
 
         不知道自己在哪、或掉落物沒解出座標時也照送撿物封包：撿不到伺服器就忽略，
         總比因為「不確定位置」而默默放掉整個掉落物好。
+
+        ⚠ 唯一的例外是使用者的撿取黑名單（`_unwanted`）—— 那是他明講不要的東西。
         """
         for item in self._world.ground_items():
+            if self._unwanted(item):
+                continue
             if pos is None or item.pos is None:
                 self._pick_up(item)
             elif max(abs(item.x - pos[0]), abs(item.y - pos[1])) <= _PICKUP_RANGE:
@@ -1378,6 +1404,11 @@ class FarmBot:
 
         reachable = []
         for item in self._world.ground_items():
+            if self._unwanted(item):
+                # ⚠ 黑名單的東西**不 `forget_item`**：忘掉之後下一包實體同步
+                # 又會把它放回來，等於每一拍白跑一次。留在清單裡、每次跳過
+                # 最便宜，而且「地上有什麼」的診斷資訊也不會被吃掉。
+                continue
             if item.pos is None:
                 continue  # 座標解不出來就沒得走過去（`_grab_nearby` 已經照撿了）
             distance = max(abs(item.x - pos[0]), abs(item.y - pos[1]))

@@ -17,7 +17,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 from PySide6.QtCore import QSize, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QAbstractSpinBox,
@@ -29,6 +28,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -47,7 +47,7 @@ from ro_toolbox.config.settings import current_settings
 from ro_toolbox.core.worker import Worker, WorkerThread
 from ro_toolbox.services import (
     bag,
-    icons,
+    loot_store,
     mail_store,
     potion_store,
     skill_store,
@@ -56,6 +56,7 @@ from ro_toolbox.services import (
 from ro_toolbox.services.buffs import BuffBot
 from ro_toolbox.services.character import CharacterReader, CharacterStatus
 from ro_toolbox.services.farm_bot import FarmBot, FarmStats
+from ro_toolbox.services.game_screen import find_window
 from ro_toolbox.services.gamedata import (
     density_label,
     heals_hp,
@@ -65,6 +66,7 @@ from ro_toolbox.services.gamedata import (
     map_name_table,
     mob_spawn_rows,
 )
+from ro_toolbox.services.item_pick import ClickWatcher
 from ro_toolbox.services.mail_bot import MailBot
 from ro_toolbox.services.potion import PotionBot, PotionConfig, PotionStats
 from ro_toolbox.services.process_monitor import local_network_up
@@ -74,6 +76,8 @@ from ro_toolbox.services.ro_capture import find_server
 from ro_toolbox.services.skills import SkillReader
 from ro_toolbox.services.travel_bot import TravelBot
 from ro_toolbox.ui.pages.base_page import BasePage
+from ro_toolbox.ui.widgets.blacklist_dialog import BlacklistDialog
+from ro_toolbox.ui.widgets.item_icon import item_icon
 from ro_toolbox.ui.widgets.mail_dialog import MailDialog
 from ro_toolbox.ui.widgets.skill_panel import SkillPanel
 from ro_toolbox.ui.widgets.toast import show_notice
@@ -212,30 +216,30 @@ class SkillWorker(QThread):
         self.done.emit(self._pid, rows)
 
 
-_ICON_CACHE: dict[int, QIcon] = {}
-#: RO 的道具圖示用洋紅當透明色（實測 501 的左上角像素就是 #ff00ff）。
-_TRANSPARENT = "#ff00ff"
+#: 「在遊戲裡按右鍵選道具」最多等多久。逾時只是**放棄的上限**，不是成功的依據
+#: （CLAUDE.md）—— 沒等到就照實說「沒等到你點」。
+_PICK_TIMEOUT_SEC = 60.0
 
 
-def item_icon(item_id: int) -> QIcon:
-    """道具小圖。找不到就回空 QIcon（介面照樣顯示文字，不拿別的圖來頂）。"""
-    got = _ICON_CACHE.get(item_id)
-    if got is not None:
-        return got
-    # 走 `icon_bytes` 不走 `icon_path`：使用者的電腦沒有 RODATA，
-    # 圖示的唯一來源是打包資產 `assets/icons.bin`。
-    data = icons.icon_bytes(item_id)
-    icon = QIcon()
-    if data is not None:
-        pixmap = QPixmap()
-        if pixmap.loadFromData(data) and not pixmap.isNull():
-            image = pixmap.toImage()
-            image.setAlphaChannel(image.createMaskFromColor(
-                QColor(_TRANSPARENT).rgb(), Qt.MaskMode.MaskOutColor
-            ))
-            icon = QIcon(QPixmap.fromImage(image))
-    _ICON_CACHE[item_id] = icon
-    return icon
+class PickWorker(Worker):
+    """在背景等使用者在遊戲裡對道具按右鍵（見 `services/item_pick`）。
+
+    ⚠ 一定要在背景：`ClickWatcher.wait()` 會等到使用者按下去為止（最多一分鐘），
+    放在 UI 執行緒的話整個程式會凍住，看起來就像當掉。
+    """
+
+    picked = Signal(object)      # item_pick.Pick，或 None（沒等到）
+
+    def __init__(self, hwnd: int, items) -> None:
+        super().__init__()
+        self._hwnd = hwnd
+        self._items = frozenset(items)
+
+    def run(self) -> None:
+        watcher = ClickWatcher(self._hwnd, self._items)
+        self.picked.emit(
+            watcher.wait(_PICK_TIMEOUT_SEC, should_stop=lambda: self.should_stop)
+        )
 
 
 class CharacterCard(QWidget):
@@ -257,6 +261,8 @@ class CharacterCard(QWidget):
     #: 「自動寄信」說明那塊的寬度上限。跟目的地選單同一欄，
     #: 不設上限的話長道具名會把整條側欄撐開，把主欄擠掉。
     MAIL_SUMMARY_MAX_W = 360
+    #: 黑名單說明最多列幾個名字，之後改成「等 N 樣」。
+    BLACKLIST_PREVIEW = 3
     TRAVEL_BUTTON_MIN_H = 34
     #: 按鈕左右的裝飾寬度（qss：內距 18px×2 ＋ 外框 1px×2，再留一點餘裕）。
     #: 寬度用「字寬 ＋ 這個」算出來，**不寫死像素** —— 字體與 DPI 一變，
@@ -291,6 +297,8 @@ class CharacterCard(QWidget):
     #: 使用者按了「補水」（一次性動作，不是開關）。
     restock_pressed = Signal()
     mail_pressed = Signal()
+    #: 使用者按了「撿取黑名單」。
+    blacklist_pressed = Signal()
     #: 背景 RestockBot 回報狀態。
     restock_stats = Signal(object)
     #: 技能面板的勾選、等級或「自動補助技能」開關有變動。
@@ -625,7 +633,43 @@ class CharacterCard(QWidget):
         self.mail_summary.setMaximumWidth(self.MAIL_SUMMARY_MAX_W)
         self.mail_summary.hide()      # 沒設定就完全不佔位置
         column.addWidget(self.mail_summary)
+
+        # 撿取黑名單擺在寄信下面：兩個都是「掛機時要怎麼處理東西」的設定。
+        self.blacklist_button = QPushButton("撿取黑名單")
+        self.blacklist_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
+        self.blacklist_button.setToolTip(
+            "打字搜尋全部道具，加進名單的東西掛機時永遠不會去撿。"
+            "沒有開關 —— 名單裡有就一定生效。"
+        )
+        self.blacklist_button.clicked.connect(self.blacklist_pressed)
+        column.addWidget(self.blacklist_button, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self.blacklist_summary = QLabel()
+        self.blacklist_summary.setObjectName("mailSummary")
+        self.blacklist_summary.setWordWrap(True)
+        self.blacklist_summary.setMinimumWidth(self.TRAVEL_BUTTON_MIN_W)
+        self.blacklist_summary.setMaximumWidth(self.MAIL_SUMMARY_MAX_W)
+        self.blacklist_summary.hide()   # 名單是空的就完全不佔位置
+        column.addWidget(self.blacklist_summary)
         return box
+
+    def set_blacklist_summary(self, item_ids) -> None:
+        """把「現在不撿哪些東西」寫在按鈕下面。空的就整塊收起來。
+
+        ⚠ 要**看得到自己設了什麼**：黑名單沒有開關，唯一能確認它有生效的方式
+        就是這行字。名字太多就只列前幾個再說「還有幾個」——
+        整串倒出來會把側欄撐開，把主欄擠掉。
+        """
+        ids = sorted(item_ids or ())
+        if not ids:
+            self.blacklist_summary.hide()
+            return
+        shown = [item_name(i) or f"#{i}" for i in ids[:self.BLACKLIST_PREVIEW]]
+        text = "、".join(shown)
+        if len(ids) > self.BLACKLIST_PREVIEW:
+            text += f" 等 {len(ids)} 樣"
+        self.blacklist_summary.setText(f"不撿：{text}")
+        self.blacklist_summary.show()
 
     def set_mail_summary(self, config, counts: dict[int, int] | None = None) -> None:
         """把「寄什麼、幾個、給誰、現在有幾個」畫出來。沒啟用就整塊收起來。"""
@@ -1432,6 +1476,10 @@ class FarmPage(BasePage):
         self.loot_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.loot_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.loot_table.setMaximumHeight(160)
+        # 右鍵 →「加入黑名單」：撿到垃圾的那一刻最順手。
+        # （使用者本來要的是「在遊戲裡點右鍵」，那條做不到 —— 見 [DAT-069]。）
+        self.loot_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.loot_table.customContextMenuRequested.connect(self._loot_menu)
         h = self.loot_table.horizontalHeader()
         h.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         h.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -1462,12 +1510,46 @@ class FarmPage(BasePage):
             self._loot_shown = rows
             self.loot_table.setRowCount(len(rows))
             for i, (item_id, count) in enumerate(rows):
-                self.loot_table.setItem(i, 0, QTableWidgetItem(item_name(item_id)))
+                cell = QTableWidgetItem(item_name(item_id))
+                # ⚠ 編號要掛在列上，右鍵選單才不必從中文名反查 ——
+                # 同名的道具不只一個，反查會**安靜地擋錯東西**。
+                cell.setData(Qt.ItemDataRole.UserRole, item_id)
+                self.loot_table.setItem(i, 0, cell)
                 self.loot_table.setItem(i, 1, QTableWidgetItem(str(count)))
         total = sum(count for _id, count in rows)
         self.loot_summary.setText(
             f"{len(rows)} 種、共 {total} 個" if rows else "尚未撿到東西"
         )
+
+    def _loot_menu(self, point) -> None:
+        """「道具總攬」列上按右鍵：把那一樣加進（或移出）撿取黑名單。
+
+        ⚠ 加進去是**立刻生效**的（`_apply_blacklist` 會推給正在跑的 bot）——
+        撿到垃圾按右鍵，下一個就不撿了，不用停掛機。
+        """
+        cell = self.loot_table.itemAt(point)
+        if cell is None:
+            return
+        row = self.loot_table.item(cell.row(), 0)
+        item_id = row.data(Qt.ItemDataRole.UserRole) if row is not None else None
+        if not isinstance(item_id, int):
+            return
+        pid = self._current_pid()
+        who = self._names.get(pid, "") if pid is not None else ""
+        if pid is None or not who:
+            return          # 不知道是哪隻角色就沒得存（存檔的鍵是角色名）
+
+        listed = loot_store.get(who)
+        menu = QMenu(self.loot_table)
+        name = item_name(item_id)
+        if item_id in listed:
+            action = menu.addAction(f"把「{name}」移出黑名單（恢復撿取）")
+            new = listed - {item_id}
+        else:
+            action = menu.addAction(f"把「{name}」加入黑名單（不再撿取）")
+            new = listed | {item_id}
+        if menu.exec(self.loot_table.viewport().mapToGlobal(point)) is action:
+            self._apply_blacklist(pid, new)
 
     def _keep_loot(self, pid: int, bot: FarmBot) -> None:
         """把要停掉的 bot 撿到的東西併進累計，這樣關掉掛機列表不會被清空。"""
@@ -1576,6 +1658,7 @@ class FarmPage(BasePage):
         card.skills_changed.connect(lambda p=pid: self._apply_skill_config(p))
         card.restock_pressed.connect(lambda p=pid: self._start_restock(p))
         card.mail_pressed.connect(lambda p=pid: self._edit_mail(p))
+        card.blacklist_pressed.connect(lambda p=pid: self._edit_blacklist(p))
 
         self._readers[pid] = reader
         self._cards[pid] = card
@@ -1591,6 +1674,9 @@ class FarmPage(BasePage):
         # 自動寄信的設定也帶回來（使用者指定「這些一切都要記錄」）。
         # ⚠ 只有**啟用中**的才會真的把 bot 帶起來 —— 沒啟用就只是記著設定。
         self._apply_mail(pid, mail_store.get(status.name), save=False)
+        # 撿取黑名單也帶回來。**沒有開關**（使用者指定）—— 名單裡有就生效，
+        # 所以這裡只要把它畫出來，不用判斷「有沒有啟用」。
+        card.set_blacklist_summary(loot_store.get(status.name))
         self._failures[pid] = 0
         self._names[pid] = status.name
         self.tabs.addTab(card, status.name or f"PID {pid}")
@@ -2093,7 +2179,13 @@ class FarmPage(BasePage):
                 old.stop()
             # 背景 FarmBot 的回報在它自己的執行緒，用 card 的 signal 轉回 UI 執行緒。
             # start() 只起執行緒就返回（設定在背景做，UI 不卡）；成敗看回報的 note。
-            bot = FarmBot(pid, on_update=lambda s, c=card: c.farm_stats.emit(s))
+            bot = FarmBot(
+                pid,
+                on_update=lambda s, c=card: c.farm_stats.emit(s),
+                # ⚠ 現查存檔，不拿卡片上顯示的字回推 —— 顯示的是名字（會被截成
+                # 「等 N 樣」），存檔裡才是完整的編號名單。
+                blacklist=loot_store.get(who or ""),
+            )
             self._bots[pid] = bot
             reader = self._readers.get(pid)
             status = reader.read() if reader is not None else None
@@ -2288,6 +2380,102 @@ class FarmPage(BasePage):
         dialog = MailDialog(self, saved=mail_store.get(who), bag_counts=counts)
         if dialog.exec() and dialog.config is not None:
             self._apply_mail(pid, dialog.config)
+
+    def _edit_blacklist(self, pid: int) -> None:
+        """按下「撿取黑名單」：開視窗搜尋道具，加進去的就不撿。
+
+        ⚠ 這裡**不需要背包**（跟寄信不一樣）：使用者指定要能搜尋**全部**道具，
+        所以背包還沒讀到也照開 —— 沒有東西會列不出來。
+        """
+        card = self._cards.get(pid)
+        who = self._names.get(pid, "")
+        if card is None or not who:
+            return
+        dialog = BlacklistDialog(
+            self,
+            saved=loot_store.get(who),
+            character=who,
+            # 「背包」那一頁 = 「在遊戲裡點右鍵加入」的替代品（那條做不到，
+            # 見 GAMEDATA [DAT-069]）。讀不到就是空的，那一頁會說一聲 ——
+            # **不擋住視窗**：搜尋那一頁本來就不需要背包。
+            bag_counts=self._bag_counts(pid),
+        )
+        dialog.pick_requested.connect(lambda p=pid, d=dialog: self._start_pick(p, d))
+        # ⚠ 視窗關掉就要叫停背景那條 —— 不然它會抱著一個已經不在的視窗繼續等，
+        #    使用者在別的地方點一下就被吃掉。
+        dialog.finished.connect(lambda _r, d=dialog: self._stop_pick(d))
+        try:
+            if dialog.exec() and dialog.items is not None:
+                self._apply_blacklist(pid, dialog.items)
+        finally:
+            self._stop_pick(dialog)
+
+    def _start_pick(self, pid: int, dialog) -> None:
+        """「在遊戲裡按右鍵選道具」：背景等他按下去，認出來就加進名單。
+
+        ⚠ 三件事任一缺了就**當場說原因**，不要讓他對著遊戲點半天才發現沒反應：
+        找得到遊戲視窗、讀得到背包、還沒有一條在等。
+        """
+        if getattr(dialog, "_pick_thread", None) is not None:
+            return                       # 已經在等了，不要疊第二條
+        hwnd = find_window(pid)
+        if not hwnd:
+            dialog.picking(False, "找不到遊戲視窗 —— 遊戲還開著嗎？")
+            return
+        items = set(self._bag_counts(pid))
+        if not items:
+            dialog.picking(False, "還讀不到背包 —— 認道具要拿背包裡的圖示來比對。")
+            return
+        worker = PickWorker(hwnd, items)
+        worker.picked.connect(lambda pick, d=dialog: self._pick_done(d, pick))
+        thread = WorkerThread(worker)
+        dialog._pick_thread = thread
+        dialog.picking(
+            True,
+            "切到遊戲，對背包裡的道具**按右鍵**（一分鐘內）——"
+            "請點在圖案上，不要點到名字或數量那一欄。",
+        )
+        thread.start()
+
+    def _pick_done(self, dialog, pick) -> None:
+        dialog._pick_thread = None
+        dialog.picking(False)
+        if pick is None:
+            dialog.picked((), "沒等到你按右鍵 —— 再按一次「在遊戲裡按右鍵選道具」。")
+            return
+        # ⚠ 前幾名一起記下來：認不出來的時候，唯一能判斷「是門檻太嚴還是
+        #   抓圖對不上」的線索就是這幾個分數（使用者手上只有 .exe 與日誌）。
+        ranked = "、".join(f"{item_name(i)} {s:.2f}" for i, s in pick.ranked)
+        log.info(
+            "認道具：命中 %s（分數 %.2f）%s；前幾名 %s",
+            [item_name(i) for i in pick.items], pick.score, pick.why, ranked,
+        )
+        dialog.picked(pick.items, pick.why)
+
+    @staticmethod
+    def _stop_pick(dialog) -> None:
+        thread = getattr(dialog, "_pick_thread", None)
+        if thread is not None:
+            dialog._pick_thread = None
+            thread.stop()
+
+    def _apply_blacklist(self, pid: int, item_ids) -> None:
+        """存檔、畫出來、**順手推給正在跑的 bot**。
+
+        ⚠ 最後那一步不能省：黑名單沒有開關可以關掉再打開，改完不立刻生效的話
+        使用者只會看到它繼續撿 —— 看起來就像設定根本沒存到。
+        """
+        who = self._names.get(pid, "")
+        if not who:
+            return
+        loot_store.save(who, item_ids)
+        card = self._cards.get(pid)
+        if card is not None:
+            card.set_blacklist_summary(item_ids)
+        bot = self._bots.get(pid)
+        if bot is not None:
+            bot.set_blacklist(item_ids)
+        log.info("撿取黑名單更新（%s）：%d 樣不撿", who, len(item_ids))
 
     def _bag_counts(self, pid: int) -> dict[int, int]:
         """背包裡每種道具**總共**幾個（同一種散在好幾格要加起來）。"""

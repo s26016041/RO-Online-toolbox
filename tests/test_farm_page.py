@@ -1786,8 +1786,9 @@ def test_a_supply_run_starts_even_while_the_bag_is_still_loading(monkeypatch, qt
 
 
 class _ResumeFarmBot:
-    def __init__(self, pid, on_update=None):
+    def __init__(self, pid, on_update=None, blacklist=()):
         self.pid = pid
+        self.blacklist = frozenset(blacklist)   # 撿取黑名單，建構時就要收得下
         self.stats = type("S", (), {
             "running": False, "overweight": False, "died": False,
         })()

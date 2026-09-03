@@ -426,6 +426,28 @@ def mob_maps(class_id: int) -> list[tuple[str, int]]:
     return sorted(((m, int(c)) for m, c in maps.items()), key=lambda kv: -kv[1])
 
 
+def find_items(text: str) -> list[tuple[int, str]]:
+    """名字含 `text` 的道具：[(道具編號, 名字)]，短的名字排前面。
+
+    ⚠ **空字串故意回空的**：道具表有兩萬多筆，整份倒進表格要抓兩萬張圖示，
+    視窗會卡死好幾秒。搜尋框空著就什麼都不列。
+
+    純數字的字串**同時**當編號查（`501` 找得到紅色藥水）—— 名字對不上的時候
+    編號是唯一還找得到的路，而且 `#501` 這種顯示本來就是我們自己印的。
+    """
+    text = text.strip()
+    if not text:
+        return []
+    out = []
+    for key, entry in _load(_ITEM_TABLE).items():
+        name = entry.get("name")
+        if not name:
+            continue           # 沒名字沒得搜（也沒東西可以顯示給使用者看）
+        if text in name or (text.isdigit() and text in key):
+            out.append((int(key), name))
+    return sorted(out, key=lambda kv: (len(kv[1]), kv[1]))
+
+
 def find_mobs(text: str) -> list[tuple[int, str]]:
     """名字含 `text` 的怪：[(class ID, 名字)]。空字串回空的（不要整份倒出來）。"""
     text = text.strip()
