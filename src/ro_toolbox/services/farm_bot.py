@@ -736,11 +736,15 @@ class FarmBot:
         # 那個才需要節流。
         status = self._reader.read()
         map_changed = status is not None and status.map_name and status.map_name != self._map
-        due = now - self._resync_at >= _RESYNC_SEC
+        # ⚠ 「我手上這份 socket 還活著嗎」是微秒級的唯讀查詢，**不受節流管**：
+        #   換地圖伺服器時遊戲會 `closesocket()` 舊連線，而重連到同一台的話
+        #   (ip, port) 一模一樣，比對端點看不出來（[PKT-096]）。
+        stale = not self._link.alive()
+        due = stale or now - self._resync_at >= _RESYNC_SEC
         server = find_server(self._pid) if due else None
         if due:
             self._resync_at = now
-        server_changed = server is not None and server != self._server
+        server_changed = server is not None and (server != self._server or stale)
         if not (map_changed or server_changed):
             if due and server is None and self._server is not None:
                 self._fail("⚠ 遊戲連線已中斷，自動打怪已停止")
@@ -751,7 +755,8 @@ class FarmBot:
         if map_changed:
             what.append(f"地圖 {self._map} → {status.map_name}")
         if server_changed:
-            what.append(f"連線 {self._server} → {server}")
+            what.append("複製的 socket 已被遊戲關掉" if server == self._server
+                        else f"連線 {self._server} → {server}")
         log.info("環境變了（%s），重新綁定", "、".join(what))
 
         if server_changed:

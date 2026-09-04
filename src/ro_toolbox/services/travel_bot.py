@@ -779,7 +779,11 @@ class TravelBot:
         踩過的坑見 [PKT-038]／farm_bot 的同名函式：換圖時伺服器會把連線移到
         另一台地圖伺服器，舊 socket 送出去的東西**不會報錯，只是沒人收**。
         """
-        if now - self._resync_at < _RESYNC_SEC:
+        # ⚠ 節流擋的是**貴的那一半**（`find_server()` 撈整張 TCP 表）。
+        #   「我手上這份 socket 還活著嗎」是微秒級的唯讀查詢，每一拍都要問 ——
+        #   換地圖伺服器時遊戲會把舊連線 `closesocket()`，不問就只能等 send()
+        #   撞出 WSA 10038（見 `game_socket.socket_alive`，[PKT-096]）。
+        if now - self._resync_at < _RESYNC_SEC and self._link.alive():
             return True
         self._resync_at = now
         problem = self._link.resync()

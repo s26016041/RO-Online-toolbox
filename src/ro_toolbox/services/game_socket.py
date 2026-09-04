@@ -121,6 +121,39 @@ def _peer_of(handle: int) -> tuple[str, int] | None:
     return ip, port
 
 
+def socket_alive(sock: int | None) -> bool:
+    """我們複製來的這份 handle **現在還是一個活著的 socket** 嗎？
+
+    ## 為什麼一定要有這一句（實機 2026-09-04，[PKT-096]）
+
+    換地圖時伺服器把角色搬到另一台 map server，客戶端會對舊連線呼叫
+    `closesocket()`。那一刻我們複製來的 handle 就**不再是 socket** ——
+    下一次 `send()` 回的是 **WSA 10038（WSAENOTSOCK）**，不是連線斷掉的 10054。
+
+    舊版沒有這一句，只能**撞牆才知道**。而每個功能（自動打怪、尋路、補水、
+    補給、buff、寄信）各自握一份複本，所以換一次圖就有好幾個功能各撞一次：
+
+        13:35:03  send 失敗，WSA 錯誤 10038 → ⚠ 寄信送不出去（連線斷了？）
+        13:35:11  send 失敗，WSA 錯誤 10038 → ⚠ 寄信送不出去（連線斷了？）
+        13:35:22  send 失敗，WSA 錯誤 10038 → 20 秒後再試
+        13:35:53  終於寄出                      ← 一趟換圖害寄信晚了 50 秒
+
+    而且 `resync()` 判斷「連線換了沒」是比對 **(ip, port)** —— 遊戲重連到
+    **同一台** map server 時那組值一模一樣，判斷不出來，只能等 `send()` 失敗
+    把 `self.server` 清成 None 才會重綁。
+
+    `getpeername` 是唯讀的、微秒級，而且**跟 `send` 走同一條判準**：
+    socket 被關掉它就失敗。所以送之前問一句就好，不必撞牆
+    （CLAUDE.md：做 → 讀 → 確認，不准拿「等一下就好了」當機制）。
+
+    ⚠ 這一句**不管**「連線被對方 reset」（10054）：那時 socket 還在，
+    `getpeername` 照樣成功。那條路由 `GameLink.dead` 負責，兩者不重疊。
+    """
+    if sock is None:
+        return False
+    return _peer_of(sock) is not None
+
+
 def find_game_socket(pid: int, server_ip: str, server_port: int) -> int | None:
     """找出並複製遊戲連到伺服器的 socket，回傳本行程可用的 SOCKET handle。
 

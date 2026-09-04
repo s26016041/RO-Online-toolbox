@@ -42,3 +42,17 @@ def _keep_logs_out_of_appdata(tmp_path_factory):
     finally:
         paths.log_dir = original_paths
         logging_mod.log_dir = original_logging
+
+
+@pytest.fixture(autouse=True)
+def _our_socket_copy_is_alive(monkeypatch):
+    """測試裡的 socket 是假的整數，`getpeername` 當然問不出東西來。
+
+    ⚠ 沒有這一條的話 `game_socket.socket_alive()` 對每個假 socket 都回 False，
+    於是每一支測試都會走「複本被遊戲關掉了 → 重綁」那條路（實測 22 支紅）。
+    預設模擬**正常情況：我們手上那份還活著**；要測換地圖伺服器那條路的
+    測試自己把它改掉（見 `tests/test_socket_gone_stale.py`）。
+    """
+    from ro_toolbox.services import game_socket
+
+    monkeypatch.setattr(game_socket, "socket_alive", lambda sock: sock is not None)

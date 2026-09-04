@@ -688,16 +688,25 @@ class PotionBot:
 
     def _keep_in_sync(self, now: float) -> bool:
         """換地圖／換頻道後 socket 與背包位址都會失效，要重綁（比照 [PKT-038]）。"""
-        if now - self._resync_at < _RESYNC_SEC:
+        # ⚠ 節流擋的是**貴的那一半**（`find_server()` 撈整張 TCP 表）。
+        #   「我手上這份 socket 還活著嗎」微秒級，每一拍都要問 —— 換地圖伺服器
+        #   時遊戲會 `closesocket()` 舊連線，重連到同一台的話 (ip, port) 一模一樣，
+        #   比對端點看不出來，只能等 send() 撞出 WSA 10038（[PKT-096]）。
+        stale = not game_socket.socket_alive(self._sock)
+        if now - self._resync_at < _RESYNC_SEC and not stale:
             return True
         self._resync_at = now
         server = find_server(self._pid)
         if server is None:
             self._fail("⚠ 遊戲連線已中斷，自動補水已停止")
             return False
-        if server == self._server:
+        if server == self._server and not stale:
             return True
-        log.info("連線變了（%s → %s），重新綁定", self._server, server)
+        if stale and server == self._server:
+            log.info("連線 %s 沒變，但複製來的 socket 已經被遊戲關掉了"
+                     "（換地圖伺服器）—— 重新複製", server)
+        else:
+            log.info("連線變了（%s → %s），重新綁定", self._server, server)
         if self._sock is not None:
             game_socket.close_socket(self._sock)
             self._sock = None

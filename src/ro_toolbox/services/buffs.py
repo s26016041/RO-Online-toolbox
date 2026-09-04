@@ -774,7 +774,8 @@ class BuffBot:
         resync_at = 0.0
         while not self._stop.is_set():
             now = time.monotonic()
-            if now - resync_at >= RESYNC_SEC:
+            # ⚠ 節流只擋貴的那一半；「複本還活著嗎」每拍都問（[PKT-096]）。
+            if now - resync_at >= RESYNC_SEC or not self._link.alive():
                 resync_at = now
                 # ⚠ 換圖／換頻道會把連線移走（[PKT-038]）—— 先重綁再說。
                 # 少了這一步，換一次圖就會被下面的 `dead` 判斷停掉。

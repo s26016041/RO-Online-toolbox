@@ -167,14 +167,22 @@ class GameLink:
             if self.server is not None:
                 return "⚠ 遊戲連線已中斷"
             return None
-        if server == self.server:
+        # ★ **端點沒變不代表我們手上那份還能用。** 換地圖伺服器時遊戲會
+        #   `closesocket()` 舊連線，而重連到同一台的話 (ip, port) 一模一樣 ——
+        #   舊版只好等 `send()` 撞出 WSA 10038 才知道（見 `game_socket.socket_alive`）。
+        stale = not self.alive()
+        if server == self.server and not stale:
             return None
         if self.dead and server == self._failing_server:
             # ⚠ **綁到同一條死連線不算重綁。** 伺服器 reset 之後那條連線還留在
             # TCP 表裡，`find_server()` 照樣讀得到 —— 舊版就是這樣「重綁成功」
             # 了幾千次，每次都綁回同一條死的。
             return "⚠ 遊戲連線已中斷（重綁還是同一條斷掉的連線）"
-        log.info("連線 %s → %s，重新綁定", self.server, server)
+        if stale and server == self.server:
+            log.info("連線 %s 沒變，但我們複製的那份已經被遊戲關掉了"
+                     "（換地圖伺服器）—— 重新複製", server)
+        else:
+            log.info("連線 %s → %s，重新綁定", self.server, server)
         self._close_socket()
         # 一樣一條一條試：挑中的那條複製不到的話，旁邊那條才是真的（見 `open()`）。
         # 指定的那條排第一，其餘照新到舊接在後面。
@@ -189,6 +197,15 @@ class GameLink:
         self.rebound = True
         self._revive()
         return None
+
+    def alive(self) -> bool:
+        """我們手上這份 socket 複本**現在**還接得上遊戲那條連線嗎？
+
+        微秒級的唯讀查詢，所以呼叫端可以**每一拍都問**，不必被
+        「每 N 秒才查一次 TCP 表」的節流一起擋住 —— 貴的是 `find_server()`
+        （撈整張 TCP 表），不是這一句。細節見 `game_socket.socket_alive()`。
+        """
+        return game_socket.socket_alive(self.sock)
 
     @property
     def dead(self) -> bool:

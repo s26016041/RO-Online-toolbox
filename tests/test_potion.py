@@ -160,9 +160,15 @@ class FakeSocket:
         self.wrong = wrong          # 回包謊稱是別的道具（模擬格號被挪動）
         self.sent: list[bytes] = []
         self.closed = 0
+        #: 遊戲把我們複製的那條關掉了（換地圖伺服器）—— 見 `socket_alive`。
+        self.socket_closed_by_game = False
 
     def find_game_socket(self, pid, host, port):  # noqa: ARG002
         return 42
+
+    def socket_alive(self, sock):
+        """我們複製的那份還活著嗎（換地圖伺服器時遊戲會把它關掉，[PKT-096]）。"""
+        return sock is not None and not self.socket_closed_by_game
 
     def send_on_socket(self, sock, data):  # noqa: ARG002
         self.sent.append(data)
