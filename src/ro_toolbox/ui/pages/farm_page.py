@@ -77,6 +77,7 @@ from ro_toolbox.ui.pages.base_page import BasePage
 from ro_toolbox.ui.widgets.blacklist_dialog import BlacklistDialog
 from ro_toolbox.ui.widgets.item_icon import item_icon
 from ro_toolbox.ui.widgets.mail_dialog import MailDialog
+from ro_toolbox.ui.widgets.shop_dialog import ShopDialog, describe_shop
 from ro_toolbox.ui.widgets.skill_panel import SkillPanel
 from ro_toolbox.ui.widgets.toast import show_notice
 
@@ -817,8 +818,18 @@ class CharacterCard(QWidget):
         self.restock_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
         self.restock_button.clicked.connect(self.restock_pressed)
         head.addWidget(self.restock_button)
+        #: 使用者自己挑補水要去哪個城鎮的哪一個商人（2026-09-05 指定）。
+        #: 沒設就照舊自動挑最近的。
+        self.shop_button = QPushButton("設定藥水商人")
+        self.shop_button.setMinimumHeight(self.TRAVEL_BUTTON_MIN_H)
+        self.shop_button.clicked.connect(self._pick_shop)
+        head.addWidget(self.shop_button)
         head.addStretch(1)
         box.addLayout(head)
+        self.shop_label = QLabel(describe_shop(None, None))
+        self.shop_label.setObjectName("pageSubtitle")
+        self.shop_label.setWordWrap(True)
+        box.addWidget(self.shop_label)
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(8)
@@ -983,6 +994,7 @@ class CharacterCard(QWidget):
             self.hp_threshold.setValue(saved.hp_percent)
             self.sp_threshold.setValue(saved.sp_percent)
             self.go_home.setChecked(bool(saved.go_home))
+            self.shop_label.setText(describe_shop(saved.shop_map, saved.shop_cell))
             position = self.destination.findData(saved.travel_dest)
             self.destination.setCurrentIndex(position if position >= 0 else 0)
             for key, combo in (
@@ -1031,6 +1043,29 @@ class CharacterCard(QWidget):
             home_item=self._picked("home", self.home_item),
             travel_dest=self.chosen_destination(),
         )
+
+    def _pick_shop(self) -> None:
+        """按下「設定藥水商人」：開視窗挑城鎮與商人，存進設定本尊。
+
+        這是**使用者的動作**（按鈕 `clicked`），所以直接改 `self._settings`
+        並登記 `shop_map` 動過 —— 「改回自動」是他要清掉，存檔那層要放行。
+        """
+        dialog = ShopDialog(self, current=self._settings.shop)
+        if not dialog.exec() or dialog.choice is None:
+            return
+        map_name, cell = dialog.choice
+        self.set_shop(map_name or None, cell)
+
+    def set_shop(self, map_name: str | None, cell: tuple[int, int] | None) -> None:
+        """記住使用者挑的商人（None = 自動挑最近的）並更新顯示。"""
+        self._settings = replace(
+            self._settings,
+            shop_map=map_name or None,
+            shop_cell=tuple(cell) if (map_name and cell is not None) else None,
+        )
+        self.shop_label.setText(describe_shop(self._settings.shop_map, self._settings.shop_cell))
+        self._touched.update({"shop_map", "shop_cell"})
+        self.potion_changed.emit()
 
     def _touch(self, field: str) -> None:
         """使用者自己動了這一欄 —— 記下來，存檔那邊才准把它清成空的。
@@ -2595,6 +2630,8 @@ class FarmPage(BasePage):
             pid, config.hp_item, config.home_item,
             on_update=lambda st, c=card: c.restock_stats.emit(st),
             back_to=back_to,
+            # 使用者自己指定的商人；沒設就 None（自動挑最近的）。
+            shop=card.saved_potion().shop,
         )
         self._restocks[pid] = bot
         card.set_restock_busy(True)
@@ -3010,11 +3047,12 @@ class FarmPage(BasePage):
             card.adopt_settings(stored)
             config = stored
         log.info("記住「%s」的補水設定：藥水=%s(%s%%) 魔水=%s(%s%%) "
-                 "回程=%s(%s) 自動補水=%s",
+                 "回程=%s(%s) 自動補水=%s 商人=%s",
                  card.character, config.hp_item, config.hp_percent,
                  config.sp_item, config.sp_percent,
                  config.home_item, "勾" if config.go_home else "沒勾",
-                 "開" if config.enabled else "關")
+                 "開" if config.enabled else "關",
+                 f"{config.shop_map}{config.shop_cell}" if config.shop else "自動")
 
     # ---- 數值更新 ---------------------------------------------------
 

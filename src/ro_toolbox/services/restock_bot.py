@@ -168,10 +168,15 @@ class RestockBot:
         home_item: int | None = None,
         on_update: Callable[[RestockRun], None] | None = None,
         back_to: str = "",
+        shop: tuple[str, tuple[int, int]] | None = None,
     ) -> None:
         self._pid = pid
         self._hp_item = hp_item
         self._home_item = home_item
+        #: 使用者自己指定的商人 `(地圖, 他站的那一格)`。有的話**只去這一家**，
+        #: 不挑最近、不換家、不看 `shop_reach` 的記憶 —— 使用者指定的就是答案
+        #: （2026-09-05：「商人我們根本不知道要找誰，改成使用者自己設定」）。
+        self._shop = shop
         #: 補完要走回哪張圖。空字串 = 走回出發時站的那張。
         #:
         #: ⚠ 「沒水了自動回城補給」那條路一定要指定：那時候角色**已經被
@@ -318,7 +323,7 @@ class RestockBot:
                     return
             if known is not None:
                 self._buy(look, seller_cell, known)
-            elif not cant_start:
+            elif not cant_start and self._shop is None:
                 self._say("⚠ 試過的藥水商人都走不到 —— 這趟沒補到水")
             # ⚠⚠ **買不買得到都要走回去。** 舊版在「每一家都走不到」時直接
             # return，於是角色就留在最後一次失敗的地方（城裡某個房間）：
@@ -374,6 +379,8 @@ class RestockBot:
         if not self.stats.home_map:
             self.stats.home_map = self._back_to or here
         tried = tried or set()
+        if self._shop is not None:
+            return self._chosen_shop(tried)
         # ⚠ 讀一次檔就好：下面要問**每一張**有藥水商人的圖「上次走得到嗎」。
         bad = shop_reach.snapshot()
 
@@ -430,6 +437,36 @@ class RestockBot:
         # `nearest_walkable()` 分不出來：GAT 只有地形，不知道誰站在上面。
         cell = cell_beside(terrain, (x, y)) or nearest_walkable(terrain, (x, y)) or (x, y)
         return target_map, cell, (x, y), look, name
+
+    def _chosen_shop(self, tried: set[tuple[str, tuple[int, int]]]):
+        """使用者指定的那一家。找不到資料、或這趟已經走不到，都回 None 並說清楚。
+
+        ⚠ 不換家：換家就是「程式替使用者猜」，那正是使用者要拿掉的東西。
+        走不到就講「你設定的那家走不到」，讓他自己換一家。
+        """
+        target_map, cell = self._shop
+        cell = (int(cell[0]), int(cell[1]))
+        where = map_display_name(target_map) or target_map
+        seller = next(
+            (s for s in potion_sellers_on(target_map) if (s[0], s[1]) == cell), None
+        )
+        if seller is None:
+            self._say(f"⚠ 設定的藥水商人在資料裡找不到（{where} ({cell[0]},{cell[1]})），"
+                      "請重新設定")
+            return None
+        x, y, name, look = seller
+        if (target_map, cell) in tried:
+            self._say(f"⚠ 走不到你設定的{name}（{where} ({x},{y})），這趟沒補到水 "
+                      "—— 請換一家或改回自動")
+            return None
+        try:
+            terrain = load_terrain(target_map)
+        except GatError as exc:
+            self._say(f"⚠ {target_map} 的地形讀不到：{exc}")
+            return None
+        # 走到他旁邊，不是走到他身上（[DAT-066]）。
+        beside = cell_beside(terrain, (x, y)) or nearest_walkable(terrain, (x, y)) or (x, y)
+        return target_map, beside, (x, y), look, name
 
     def _key_items(self) -> tuple[int, ...]:
         """挑店時**非有不可**的道具。

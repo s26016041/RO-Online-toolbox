@@ -46,6 +46,17 @@ class PotionSaved:
     home_item: int | None = None
     #: 自動尋路的目的地（地圖代碼）。None = 讀遊戲自己的尋路目標。
     travel_dest: str | None = None
+    #: 使用者自己指定的藥水商人：**地圖代碼 ＋ 他站的那一格**（存身分，
+    #: 不存 GID —— GID 是伺服器每次給的，[PKT-093]）。None = 自動挑最近的。
+    shop_map: str | None = None
+    shop_cell: tuple[int, int] | None = None
+
+    @property
+    def shop(self) -> tuple[str, tuple[int, int]] | None:
+        """設定了商人就回 `(地圖, (x, y))`，沒設回 None。"""
+        if self.shop_map and self.shop_cell is not None:
+            return self.shop_map, tuple(self.shop_cell)
+        return None
 
 
 def _path():
@@ -87,6 +98,20 @@ def _clean(data: dict) -> PotionSaved:
             return 0
         return max(0, min(_MAX_PERCENT, value))
 
+    def cell(value) -> tuple[int, int] | None:
+        # 地圖最大 512×512；(0,0) 是邊界。不合理就當沒設定，別把人送去 (0,0)。
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return None
+        x, y = value
+        if not (isinstance(x, int) and isinstance(y, int)):
+            return None
+        return (x, y) if 0 < x < 512 and 0 < y < 512 else None
+
+    shop_map = where(data.get("shop_map"))
+    shop_cell = cell(data.get("shop_cell"))
+    if shop_map is None or shop_cell is None:
+        shop_map, shop_cell = None, None        # 兩個要一起才算一個商人
+
     return PotionSaved(
         hp_item=item(data.get("hp_item")),
         hp_percent=percent(data.get("hp_percent")),
@@ -96,6 +121,8 @@ def _clean(data: dict) -> PotionSaved:
         go_home=bool(data.get("go_home")),
         home_item=item(data.get("home_item")),
         travel_dest=where(data.get("travel_dest")),
+        shop_map=shop_map,
+        shop_cell=shop_cell,
     )
 
 
@@ -112,6 +139,7 @@ def get(character: str) -> PotionSaved | None:
 _CLEARABLE = (
     "hp_item", "sp_item", "home_item",
     "hp_percent", "sp_percent", "go_home", "enabled", "travel_dest",
+    "shop_map", "shop_cell",
 )
 
 
@@ -143,6 +171,8 @@ def _keep_remembered(
         if field not in cleared
         and getattr(before, field) and not getattr(after, field)
     }
+    if "shop_map" in cleared:
+        keep.pop("shop_cell", None)             # 商人是一組的，地圖清了格子跟著清
     if not keep:
         return after
     log.warning(

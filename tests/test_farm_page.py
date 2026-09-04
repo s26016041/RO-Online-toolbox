@@ -1790,7 +1790,8 @@ def test_a_supply_run_starts_even_while_the_bag_is_still_loading(monkeypatch, qt
     started = []
 
     class _Bot:
-        def __init__(self, pid, hp_item, home_item=None, on_update=None, back_to=""):
+        def __init__(self, pid, hp_item, home_item=None, on_update=None, back_to="",
+                     shop=None):
             started.append((pid, hp_item, back_to))
             self.stats = type("S", (), {"running": True, "broke": False,
                                         "done": False, "note": ""})()
