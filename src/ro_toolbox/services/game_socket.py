@@ -295,8 +295,31 @@ _SEND_ERROR_EVERY = 500
 _send_errors: dict[tuple[int, int], int] = {}
 
 
-def send_on_socket(sock: int, data: bytes) -> int:
-    """在指定 socket 上送出 data，回傳送出的位元組數（-1 = 失敗）。"""
+#: WSA 錯誤碼 → 給人看的一句話。**不猜，只寫量過的那幾個。**
+_WSA_MEANING = {
+    10038: "這個 handle 已經不是 socket 了（遊戲換地圖伺服器時會把它關掉）",
+    10054: "連線被伺服器 reset",
+    10057: "socket 還沒連上",
+    10022: "參數不合法（多半是綁到了不是連線用的 socket）",
+    10045: "這個 socket 不支援 send（綁錯對象）",
+}
+
+
+def send_on_socket(sock: int | None, data: bytes) -> int:
+    """在指定 socket 上送出 data，回傳送出的位元組數（-1 = 失敗）。
+
+    ⚠⚠ **失敗訊息一定要帶 handle 值。** 2026-09-04 追這個問題時，
+    日誌只有「send 失敗，WSA 錯誤 10038」—— 完全分不出是
+    「遊戲把那條關掉了」還是「我們自己傳了一個沒有的 handle 進來」，
+    最後只能靠實機重現才確定（見 `socket_alive()`）。錯誤訊息**必須夠診斷**。
+    """
+    if not sock:
+        # ⛔ `send(NULL)` 也是回 10038（實測），跟「遊戲關掉了」**長得一模一樣**。
+        #    這其實是我們自己的 bug：呼叫端在 `sock` 被清成 None 之後還來送。
+        #    要分開講，不然又要靠猜的。
+        log.error("要送封包但 socket 是空的（%r）—— 這是呼叫端的錯，不是連線問題",
+                  sock)
+        return -1
     buf = ctypes.create_string_buffer(data, len(data))
     sent = _ws2.send(sock, buf, len(data), 0)
     if sent < 0:
@@ -304,10 +327,13 @@ def send_on_socket(sock: int, data: bytes) -> int:
         key = (sock, err)
         count = _send_errors.get(key, 0) + 1
         _send_errors[key] = count
+        why = _WSA_MEANING.get(err, "沒見過的錯誤")
         if count == 1:
-            log.error("send 失敗，WSA 錯誤 %s（同一個錯誤之後只會定期摘要）", err)
+            log.error("send 失敗（socket %#x）：WSA %s —— %s"
+                      "（同一個錯誤之後只會定期摘要）", sock, err, why)
         elif count % _SEND_ERROR_EVERY == 0:
-            log.error("send 失敗，WSA 錯誤 %s —— 已經連續 %d 次", err, count)
+            log.error("send 失敗（socket %#x）：WSA %s —— %s，已經連續 %d 次",
+                      sock, err, why, count)
     else:
         # 只清**這一條** socket 的計數 —— 別人送得出去不代表我這條好了。
         for key in [k for k in _send_errors if k[0] == sock]:

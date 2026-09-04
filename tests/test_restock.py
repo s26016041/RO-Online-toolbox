@@ -29,6 +29,19 @@ class Clock:
         return self.now
 
 
+
+def _sender(sent):
+    """假的送封包：記下來並回 True（＝真的送出去了）。
+
+    ⚠ 回 bool 不是裝飾用的 —— `Restocker` 靠它決定「要不要進入等回覆的步驟」。
+    回 None 的話每一步都會被當成「沒送出去」（[PKT-096]）。
+    """
+    def send(data: bytes) -> bool:
+        sent.append(data)
+        return True
+    return send
+
+
 def shop_list(*items: tuple[int, int]) -> bytes:
     """組一個 0x00C6 的 payload（去掉 opcode 之後的位元組）。"""
     body = b"".join(
@@ -44,7 +57,9 @@ def par(kind: int, value: int) -> tuple[int, bytes]:
 def make(order: RestockOrder | None = None):
     sent: list[bytes] = []
     clock = Clock()
-    bot = Restocker(sent.append, clock, order or RestockOrder(hp_item=HP_ITEM))
+    # ⚠ `send` 回 bool：False = **沒送出去**，那時 `Restocker` 不可以進入等待
+    #   （[PKT-096]：等一個沒送出去的封包的回覆＝拿逾時當機制）。
+    bot = Restocker(_sender(sent), clock, order or RestockOrder(hp_item=HP_ITEM))
     return bot, sent, clock
 
 
@@ -293,7 +308,7 @@ def test_the_return_item_skips_the_weight_probe():
     """固定數量不必探路：要幾個是算出來的，不是量出來的。"""
     bot, sent, _clock = make()
     order = restock.RestockOrder(home_item=HOME_ITEM, home_have=5)
-    bot = restock.Restocker(lambda data: sent.append(data), _clock, order)
+    bot = restock.Restocker(_sender(sent), _clock, order)
     bot.start(LOOK, CELL)
     bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
@@ -309,7 +324,7 @@ def test_a_full_bag_still_buys_the_return_item():
     """負重滿了只擋藥水 —— 沒有回程道具就回不了城，而 20 個蝴蝶翼很輕。"""
     bot, sent, _clock = make()
     order = restock.RestockOrder(hp_item=HP_ITEM, home_item=HOME_ITEM, home_have=0)
-    bot = restock.Restocker(lambda data: sent.append(data), _clock, order)
+    bot = restock.Restocker(_sender(sent), _clock, order)
     bot.start(LOOK, CELL)
     bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
@@ -325,7 +340,7 @@ def test_a_shop_without_the_return_item_just_skips_it():
     """商店沒賣就跳過，不是失敗（使用者指定）。"""
     bot, sent, _clock = make()
     order = restock.RestockOrder(hp_item=HP_ITEM, home_item=HOME_ITEM, home_have=0)
-    bot = restock.Restocker(lambda data: sent.append(data), _clock, order)
+    bot = restock.Restocker(_sender(sent), _clock, order)
     bot.start(LOOK, CELL)
     bot.note_entity(gid=0x1F52, look=LOOK, x=CELL[0], y=CELL[1])
     bot.feed(*par(shop.SP_MAX_WEIGHT, 48100))
@@ -530,7 +545,7 @@ def test_it_says_when_the_shop_has_a_same_name_different_id_item():
     from ro_toolbox.services import shop
     from ro_toolbox.services.restock import Restocker, RestockOrder
 
-    r = Restocker(lambda _b: None, lambda: 0.0,
+    r = Restocker(lambda _b: True, lambda: 0.0,
                   RestockOrder(hp_item=502, home_item=23455))
     r._items = [shop.ShopItem(price=60, item_id=602, kind=0)]
 
@@ -541,7 +556,7 @@ def test_it_says_when_the_shop_has_a_same_name_different_id_item():
     assert "蝴蝶翅膀" in note
 
     # 名字不一樣的不算 —— 不准把「像的」當成同一個
-    r2 = Restocker(lambda _b: None, lambda: 0.0, RestockOrder(hp_item=502))
+    r2 = Restocker(lambda _b: True, lambda: 0.0, RestockOrder(hp_item=502))
     r2._items = [shop.ShopItem(price=50, item_id=501, kind=0)]
     r2._note_twin(502)
     assert r2._twin_note() == ""

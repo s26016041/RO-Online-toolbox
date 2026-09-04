@@ -159,7 +159,7 @@ class Restocker:
 
     def __init__(
         self,
-        send: Callable[[bytes], None],
+        send: Callable[[bytes], bool],
         now: Callable[[], float],
         order: RestockOrder,
     ) -> None:
@@ -270,7 +270,15 @@ class Restocker:
                 return self._maybe_timeout(
                     moment, f"⚠ 走到了卻認不出商人（外觀 {self._look} @ {self._cell}）"
                 )
-            self._send(shop.open_shop(self._gid))     # 接觸 ＋ 選買，一次送
+            # ⚠⚠ **送不出去就不要進入「等商品清單」。** 實機 16:05:57：
+            #   開店封包 send 失敗（WSA 10022，換地圖伺服器後我們那份複本
+            #   已經作廢，見 [PKT-096]），舊版照樣進入等待，然後老實地
+            #   「等商品清單」等了 8 秒 → 逾時 → 整趟補給放棄。
+            #   等待的前提（我送出去了）根本不成立 —— 那不是逾時，是誤診。
+            #   `GameLink.send()` 自己會重綁補送一次；還是不行就這一拍不動，
+            #   下一拍再來（`找商人` 這一步沒有逾時壓力，商人就在旁邊）。
+            if not self._send(shop.open_shop(self._gid)):  # 接觸 ＋ 選買，一次送
+                return "working"
             self._opened = True
             self._enter("等商品清單")
             return "working"
@@ -459,7 +467,15 @@ class Restocker:
         self._pending = amount
         self._got = 0                    # 這一筆的答案卡（0x0B41）重新算
         self._opened = True
-        self._send(shop.order_packet(self._gid or 0, [(self._item, amount)]))
+        if not self._send(shop.order_packet(self._gid or 0, [(self._item, amount)])):
+            # 同上：沒送出去就不要進入「等買賣結果」。
+            # ⚠ 訂單三包一定要一次 send（[DAT-064]），所以只能**整筆重來**，
+            #   不能補送半筆。退回「找商人」讓下一拍從開店重送一整套 ——
+            #   商人就在旁邊、`_gid` 也還記著，這一步沒有逾時壓力。
+            self._pending = 0
+            self._opened = False
+            self._enter("找商人")
+            return
         self._enter("等買賣結果")
 
     def _on_result(self, result: int | None) -> str:

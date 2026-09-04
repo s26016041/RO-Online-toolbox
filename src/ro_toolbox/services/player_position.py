@@ -340,8 +340,13 @@ class PlayerPosition:
         if not self._candidates or self._now() - self._last_full >= FULL_RESCAN_SEC:
             self._last_full = self._now()
             self._candidates = self._scan(self._aid)
-        seen = {a: self._component_at(a) for a in self._candidates}
-        good = [a for a, cell in seen.items() if cell is not None]
+        looked = {a: self._look_at(a) for a in self._candidates}
+        seen = {a: cell for a, (_mine, cell) in looked.items() if cell is not None}
+        good = [a for a, (mine, cell) in looked.items() if mine and cell is not None]
+        # ★ 「本人，但這張圖上還沒走過」—— 終點欄位還沒被寫過，所以它說不出
+        #   自己在哪，但它**就是**我們的元件（[MEM-060]）。留著當備胎：
+        #   有說得出位置的就用那些，一個都沒有時才輪到它。
+        unplaced = [a for a, (mine, cell) in looked.items() if mine and cell is None]
         # ★ 先用「離參考點不可能這麼遠」把上一張圖的殘留物擋掉 ——
         #   **這一關要在挑人之前做**，因為剛換圖的時候通過驗證的常常只有一個，
         #   而那一個就是殘留物（見 `_near_reference`）。
@@ -402,6 +407,26 @@ class PlayerPosition:
                         len(good), [hex(a) for a in good],
                     )
                 return False
+        if not good and unplaced:
+            # 剛換圖、還沒走第一步：只有「還沒走過」的形狀認得出本人。
+            if len(unplaced) > 1:
+                if not self._said_many:
+                    self._said_many = True
+                    log.error(
+                        "有 %d 個「還沒走過」的元件都像是角色本人（%s）—— 分不出來，"
+                        "先用進圖座標", len(unplaced), [hex(a) for a in unplaced],
+                    )
+                return False
+            self._addr = unplaced[0]
+            self._complained = False
+            self._said_missing = False
+            self._said_far = False
+            log.info(
+                "角色移動元件定位於 %#x（AID %d，%d 個候選）—— "
+                "這張圖上還沒走過，位置先用進圖座標，走第一步就會變即時的",
+                self._addr, self._aid, len(self._candidates),
+            )
+            return True
         if not good:
             # ⚠ 這條路每 0.3 秒就會走一次（`RELOCATE_COOLDOWN`）——
             #   每次都印的話是**一秒三行**的洗版，三個分身同時開著更慘，
@@ -517,7 +542,13 @@ class PlayerPosition:
             return None
         entry = self._entry_pos()
         if entry is not None and self._on_map(entry, map_name):
-            self._note_missing()
+            if self._addr is None:
+                self._note_missing()
+            else:
+                # 元件綁著，只是角色還沒在這張圖上走過 —— 這是**正常狀態**，
+                # 不是「找不到」，更不是改版（[MEM-060]）。不准喊狼來了。
+                self._missing_since = None
+                self._warned_missing = False
             return entry
         return None
 
@@ -607,12 +638,17 @@ class PlayerPosition:
         )
 
     def _component_pos(self) -> tuple[int, int] | None:
-        """從記著的元件位址讀一次；驗不過就把位址丟掉（下一拍重找）。"""
+        """從記著的元件位址讀一次；**不是本人**才把位址丟掉（下一拍重找）。
+
+        ⚠ 「本人但這張圖上還沒走過」不算驗不過（[MEM-060]）——
+        那時候位置由進圖座標回答，但**綁定要留著**：角色一走第一步，
+        同一個位址的終點欄位就有值了，不必再全掃一次（0.6~0.8 秒）。
+        """
         if self._addr is None:
             return None
-        pos = self._component_at(self._addr)
-        if pos is not None:
-            return pos
+        mine, pos = self._look_at(self._addr)
+        if mine:
+            return pos          # None = 本人，只是還不知道自己在哪
         if not self._complained:
             log.warning("角色移動元件 %#x 已失效（換圖或被回收），重新定位中",
                         self._addr)
@@ -763,33 +799,70 @@ class PlayerPosition:
         return age < actor.FRESH_MS
 
     def _component_at(self, addr: int) -> tuple[int, int] | None:
-        """從一個候選位址讀座標；任何一項驗不過就回 None。
+        """這個候選現在說自己在哪一格。**不是本人或它自己也不知道**就回 None。"""
+        return self._look_at(addr)[1]
 
-        這同時是 `_locate_component()` 的驗證函式 —— **兩條路用完全一樣的判準**，
-        才不會出現「掃描時認得、每拍讀的時候不認得」那種縫（[PKT-078]）。
+    def _look_at(self, addr: int) -> tuple[bool, tuple[int, int] | None]:
+        """回 `(這是不是本人, 它現在說自己在哪一格)`。
+
+        ## ⚠⚠ 為什麼要拆成兩個問題（實機 2026-09-04，[MEM-060]）
+
+        舊版只有一個問題：「讀得到座標嗎」。讀不到就當成「不是本人」——
+        於是**剛換圖、還沒在這張圖上走過的角色整整找不到**：
+
+            16:06:08  伺服器說我被移到 aldebaran (197, 68)
+            16:06:09  還沒找到角色的移動元件（49 個候選）
+            16:06:39  已經 30 秒找不到角色的移動元件…一直出現代表遊戲改版
+
+        使用者：「我不想再出現這個，最好是每次換地圖都會找不到座標」、
+        「用 AOB 照理來說每次都查應該不會出現這問題」—— **他是對的**。
+        當場唯讀量了三隻角色（`GID == AID` 全掃）：
+
+            狐狐狸（走過路）  候選 139｜dest 合法 1 個  dest=(23,24)   age=7ms
+            狐狐狸2（走路中）候選 190｜dest 合法 1 個  dest=(245,52)  age=16ms
+            白狐（剛換圖）    候選  90｜dest 合法 0 個
+                             0x2ef79b58 state=1 idx=-1 begin=0 **dest=(0,2)** age=13ms
+
+        **元件一直都在，而且 tick 13 ms 還在跳** —— 是 `+0x5C/+0x60` 這個
+        「**移動終點**」欄位在角色還沒走之前根本沒被寫過。拿它當「是不是本人」
+        的驗證條件，就等於「沒走過的角色一律不算本人」。
+        （另外量過：把元件前後 0x200 bytes 全掃一遍，**(197,68) 一個欄位都沒有** ——
+        客戶端在角色走第一步之前真的不知道自己在哪，那時只有進圖座標算數。）
+
+        所以「這是不是我的元件」與「它知不知道自己在哪」是**兩個不同的問題**，
+        混在一起就是這個 bug。⚠ 但兩條路（掃描時、每拍讀取時）仍然共用這一支，
+        判準只有一份 —— [PKT-078] 那個「掃描時認得、讀的時候不認得」的縫還在防。
         """
         raw = self._scanner.read_region(addr, SPAN)
         if raw is None or len(raw) < SPAN:
-            return None
+            return False, None
         buf = bytes(raw)
         gid, = struct.unpack_from("<I", buf, 0)
         if gid != self._aid:
-            return None
+            return False, None
         state, = struct.unpack_from("<I", buf, OFF_STATE)
         # 被回收的元件這裡是 0；堆積垃圾這裡通常是指標或很大的數字。
         if not (0 < state <= MAX_STATE):
-            return None
+            return False, None
         dest_x, dest_y = struct.unpack_from("<ii", buf, OFF_DEST_X)
         if not _cell_ok(dest_x, dest_y):
-            return None
+            # ★ **「本人，只是這張圖上還沒走過」**：終點欄位沒被寫過，
+            #   但路徑索引與陣列都乾淨地說「沒在走」，而且動作 tick 還在跳。
+            #   實機這個形狀在 90 個候選裡**唯一命中**（見上面的量測）。
+            #   認得它就不必每 0.3 秒重新全掃 —— 角色一走第一步，
+            #   終點欄位就有值，同一個位址直接變成即時座標。
+            index, = struct.unpack_from("<i", buf, OFF_PATH_INDEX)
+            begin, end = struct.unpack_from("<II", buf, OFF_PATH_BEGIN)
+            unmoved = index < 0 and begin == 0 and end == 0
+            return (unmoved and self._ticking(addr)), None
         index, = struct.unpack_from("<i", buf, OFF_PATH_INDEX)
         if index < 0:
-            return dest_x, dest_y          # 站著不動：終點就是現在的位置
+            return True, (dest_x, dest_y)  # 站著不動：終點就是現在的位置
         # 走路中才需要路徑陣列。⚠ 剛傳過來還沒走的角色這裡是 0，
         #   所以**不能**拿它當存活旗標（第一版就是這樣一換圖就全滅）。
         begin, end = struct.unpack_from("<II", buf, OFF_PATH_BEGIN)
         if end < begin:
-            return None
+            return False, None
         if begin == 0:
             # ⚠⚠ **剛被傳過來、一步都還沒走**：路徑陣列還沒配置（`begin` 是 0），
             #   但 `index` 已經是 0（不是 -1），於是舊版把整個元件判成「不是本人」。
@@ -803,20 +876,20 @@ class PlayerPosition:
             #   ⚠ 這不會放寬「認錯人」的風險：`gid == aid`、`state`、`dest` 範圍
             #   三關都還在，真的有好幾個過關時 `_closest()` 會拿**伺服器剛給的
             #   進圖座標**當參考挑出本人。
-            return dest_x, dest_y
+            return True, (dest_x, dest_y)
         span = end - begin
         if span % PATH_STRIDE or span // PATH_STRIDE > MAX_PATH_NODES:
-            return None
+            return False, None
         if index >= span // PATH_STRIDE:
             # 索引超出陣列＝解錯了，不要硬讀。
             # ⚠ **不要**在這裡退回 dest：那是「沒量過就放寬」。真的走完的元件
             #   長什麼樣還沒實機看過，而  配一節點的路徑明顯是垃圾。
-            return None
+            return False, None
         node = self._scanner.read_region(begin + index * PATH_STRIDE, 8)
         if node is None or len(node) < 8:
-            return None
+            return False, None
         x, y = struct.unpack("<ii", bytes(node))
-        return (x, y) if _cell_ok(x, y) else None
+        return (True, (x, y)) if _cell_ok(x, y) else (False, None)
 
     def _entry_pos(self) -> tuple[int, int] | None:
         """伺服器在 `0x0091` 說的「你被移到這裡」。走過一步之後就過期。"""

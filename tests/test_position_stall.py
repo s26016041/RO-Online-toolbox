@@ -80,7 +80,9 @@ def test_missing_component_is_said_once_not_every_tick(caplog):
     position._aid = 23810315
     position._candidates = [0x1000]
     position._scan = lambda _aid: [0x1000]
-    position._component_at = lambda _addr: None
+    # ⚠ 假的是 `_look_at`（「這是不是本人 / 它說自己在哪」）—— 那才是掃描與
+    #   每拍讀取共用的那一支（[MEM-060] 之後 `_component_at` 只是它的薄殼）。
+    position._look_at = lambda _addr: (False, None)
 
     with caplog.at_level(logging.INFO):
         for _ in range(10):
@@ -89,9 +91,9 @@ def test_missing_component_is_said_once_not_every_tick(caplog):
     assert caplog.text.count("還沒找到角色的移動元件") == 1
 
     # 找到之後再掉出來，要能再說一次（不然改版壞掉時沒人知道）。
-    position._component_at = lambda _addr: (100, 100)
+    position._look_at = lambda _addr: (True, (100, 100))
     assert position._locate_component()
-    position._component_at = lambda _addr: None
+    position._look_at = lambda _addr: (False, None)
     with caplog.at_level(logging.INFO):
         position._last_full = position._now()
         assert not position._locate_component()

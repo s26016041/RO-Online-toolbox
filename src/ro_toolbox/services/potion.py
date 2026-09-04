@@ -419,7 +419,12 @@ class PotionBot:
             return self._exhausted(kind, item_id)
 
         mark = self._ack_mark()
-        self._send(build_use_item(slot, self._aid))
+        if not self._send(build_use_item(slot, self._aid)):
+            # ⚠ 沒送出去就**不要等回應** —— 等一個沒送出去的封包的回覆，
+            #   0.7 秒後只會得到「伺服器沒回應」這個誤診（[PKT-096]）。
+            #   下一拍重綁好了自然會再送一次，這裡不算 miss。
+            self._note("⚠ 這一拍送不出去（連線正在重綁），下一拍再喝")
+            return True
         deadline = time.monotonic() + _ACK_TIMEOUT
         while time.monotonic() < deadline:
             if self._stop.is_set():
@@ -508,7 +513,9 @@ class PotionBot:
             if before <= 0:
                 return self._exhausted(kind, item_id)
 
-            self._send(build_use_item(slot, self._aid))
+            if not self._send(build_use_item(slot, self._aid)):
+                self._note("⚠ 這一拍送不出去（連線正在重綁），下一拍再喝")
+                return True
             if not self._wait_used(slot, before):
                 # 送了卻沒少 —— 跟「送了伺服器沒回應」是同一件事，要計入
                 # 失敗次數。不計的話連喝會變成一條悶著狂送的暗路。
@@ -671,7 +678,11 @@ class PotionBot:
             self._fail(f"{why}，但回程道具 {item_name(item_id)} 也沒有了，已停止")
             return False
         before = self._bag[slot][1]
-        self._send(build_use_item(slot, self._aid))
+        if not self._send(build_use_item(slot, self._aid)):
+            # 回程道具沒送出去 —— **不准**當成「用了但沒生效」而停用自動補水
+            #   （[[feedback-never-disable-healing]]：停用不是安全退化）。
+            self._note(f"⚠ {why}，但回程道具送不出去（連線正在重綁），等下一拍")
+            return False
         if not self._wait_used(slot, before):
             self._fail(
                 f"{why}，送了回程道具 {item_name(item_id)} 但沒有用掉（第 {slot} 格），"
@@ -736,13 +747,33 @@ class PotionBot:
             reader, self._reader = self._reader, None
             reader.close()
 
-    def _send(self, data: bytes) -> None:
-        if self._sock is None:
-            return
+    def _send(self, data: bytes) -> bool:
+        """送一個封包。**回 False = 沒送出去**，呼叫端不可以接著去等回應。
+
+        ⚠ 舊版回 None，於是喝藥水那一支照樣去等 0.7 秒的「數量少一個」，
+        然後記一次 miss（連續幾次就重找格號）—— 實機 16:04:56 那兩行
+        「⚠ 送了使用道具但伺服器沒回應」就是這樣來的：**封包根本沒送出去**。
+        等一個沒送出去的封包的回應，就是 CLAUDE.md 說的「拿逾時當機制」。
+
+        送不出去而且是「我們那份被遊戲關掉了」時，**當場重綁再送一次**
+        （換地圖伺服器一定會遇到，見 [PKT-096]）。
+        """
+        sock = self._sock          # ★ 快照：重綁可能在別的執行緒把它換掉
+        if sock is None:
+            return False
+        if game_socket.send_on_socket(sock, data) >= 0:
+            return True
+        log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
+        self._server = None
+        self._resync_at = 0.0
+        if game_socket.socket_alive(sock):
+            return False           # 不是「被關掉」，重綁救不了
+        if not self._keep_in_sync(time.monotonic()) or self._sock is None:
+            return False
         if game_socket.send_on_socket(self._sock, data) < 0:
-            log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
-            self._server = None
-            self._resync_at = 0.0
+            return False
+        log.info("重綁之後補送成功（原本那份被遊戲關掉了）")
+        return True
 
     def _note(self, text: str) -> None:
         # 提示字一律進**執行日誌**，不放介面（使用者指定）。

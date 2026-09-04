@@ -42,6 +42,12 @@ log = logging.getLogger(__name__)
 #: 但也不能沒有 —— 沒有的話就是實測那個「一小時 5,185 行錯誤、沒有人喊停」。
 DEAD_AFTER_SEC = 15.0
 
+#: 「送失敗 → 當場重綁再送一次」最密可以多久做一次。
+#:
+#: 重綁要 0.6 秒起跳（最壞 `SOCKET_REBIND_SEC` 10 秒），所以不能每個封包都做 ——
+#: 遊戲真的關掉時 `socket_alive()` 也會說死，沒節流就是整支 bot 卡在那裡。
+_RESEND_COOLDOWN = 2.0
+
 
 class GameLink:
     """接上一個遊戲行程。`open()` 成功之後 `sock` / `reader` / `capture` 才有值。"""
@@ -73,6 +79,8 @@ class GameLink:
         self._failing_server: tuple[str, int] | None = None
         #: 「這條死了」講過了沒（不擋就是每拍一行）。
         self._said_dead = False
+        #: 上一次「送失敗 → 當場重綁補送」是什麼時候（見 `_retry_send_ok`）。
+        self._retried_at = 0.0
 
     # ---- 建立與收攤 -------------------------------------------------
 
@@ -226,24 +234,59 @@ class GameLink:
 
         走**複製出來的遊戲 socket**，全程不碰記憶體
         （CLAUDE.md：RO 掛 GameGuard，寫記憶體會被反制）。
+
+        ## ⚠ 送不出去就**當場重綁再送一次**（[PKT-096]）
+
+        換地圖伺服器時遊戲會把我們那份複本關掉。舊版只是回 False 就走人，
+        呼叫端接著去**等一個根本沒送出去的封包的回覆** —— 實機 16:05:57
+        補藥水就是這樣：開店封包送失敗，然後老實地「等商品清單」等了 8 秒，
+        逾時、放棄整趟補給。那正是 CLAUDE.md 說的「不准用等幾秒當機制」的反例：
+        **等待的前提（我送出去了）根本不成立。**
+
+        只在「我們那份被關掉了」（`socket_alive()` 說死了）時重試，而且有節流 ——
+        連線真的斷掉時不可以每個封包都去等一次 10 秒的重綁。
         """
-        if self.sock is None:
+        sock = self.sock          # ★ 快照：重綁可能在別的執行緒把它換掉
+        if sock is None:
             return False
-        if game_socket.send_on_socket(self.sock, data) < 0:
-            now = time.monotonic()
-            if self._failing_since is None:
-                self._failing_since = now
-                self._failing_server = self.server
-                log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
-            elif self.dead and not self._said_dead:
-                self._said_dead = True
-                log.error(
-                    "這條連線連續 %.0f 秒送不出去，判定已經斷了（%s）—— 停止重試",
-                    now - self._failing_since, self._failing_server,
-                )
-            self.server = None      # 逼下一次 resync() 重綁
+        if game_socket.send_on_socket(sock, data) >= 0:
+            self._revive()
+            return True
+        if self._retry_send_ok(sock):
+            if self.resync() is None and self.sock is not None:
+                if game_socket.send_on_socket(self.sock, data) >= 0:
+                    log.info("重綁之後補送成功（原本那份被遊戲關掉了）")
+                    self._revive()
+                    return True
+        now = time.monotonic()
+        if self._failing_since is None:
+            self._failing_since = now
+            self._failing_server = self.server
+            log.warning("送封包失敗，socket 可能已失效，強制重新綁定")
+        elif self.dead and not self._said_dead:
+            self._said_dead = True
+            log.error(
+                "這條連線連續 %.0f 秒送不出去，判定已經斷了（%s）—— 停止重試",
+                now - self._failing_since, self._failing_server,
+            )
+        self.server = None      # 逼下一次 resync() 重綁
+        return False
+
+    def _retry_send_ok(self, sock: int) -> bool:
+        """這一次失敗值得「當場重綁再送」嗎？
+
+        兩個條件都要成立：
+        - **我們那份真的被關掉了**（不是連線被 reset —— 那時 socket 還在，
+          重綁也救不了，只會每個封包都卡 10 秒）。
+        - **沒有在短時間內重試過**。遊戲真的關掉時 `socket_alive()` 也會說死，
+          不節流就是每個封包都去等一次重綁。
+        """
+        now = time.monotonic()
+        if now - self._retried_at < _RESEND_COOLDOWN:
             return False
-        self._revive()
+        if game_socket.socket_alive(sock):
+            return False
+        self._retried_at = now
         return True
 
     def _revive(self) -> None:
