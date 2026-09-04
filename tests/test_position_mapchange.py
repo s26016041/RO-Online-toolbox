@@ -45,7 +45,7 @@ class _Fake(pp.PlayerPosition):
         self._addr = 0xB0000
         return self.component
 
-    def _locate_component(self) -> None:
+    def _locate_component(self, map_name: str = "") -> None:
         self._last_locate = self.clock
 
     def _on_map(self, pos, map_name) -> bool:

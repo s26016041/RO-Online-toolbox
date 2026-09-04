@@ -535,7 +535,7 @@ def test_read_relocates_after_the_component_dies_but_not_every_tick():
 
     tries = []
     real = PlayerPosition._locate_component
-    pos._locate_component = lambda: (tries.append(1), real(pos))[1]
+    pos._locate_component = lambda m="": (tries.append(1), real(pos, m))[1]
 
     pos._addr = 0x4000  # 假裝元件被回收了（那個位址什麼都沒有）
     assert pos.read() is None          # 冷卻中：連找都不找

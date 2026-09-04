@@ -85,6 +85,12 @@
 
 ## 怎麼分辨活的移動元件與殘留的
 
+⚠⚠ **「只有一個候選」不等於「這個候選是對的」（[DAT-072]）。**
+換圖那一刻新元件還沒填好（狀態欄是 0）、舊元件還沒被回收（三關全過），
+所以「通過驗證的剛好一個，而且是上一張圖的殘留物」是**常態**，不是例外。
+分辨用的關卡（`_near_reference`）因此要當**過濾**每次都跑，
+挑人（`_ticking`／`_closest`）才是平手時的 tie-break。
+
 換一次圖，客戶端就丟掉舊元件、另外配一個新的；**舊的不會被清乾淨**，
 GID、座標都還在原地。實測一個行程裡同時有 **60~69 塊** `GID == AID` 的記憶體，
 其中好幾塊的座標還落在當下地圖的可走格上。三道關卡一起用：
@@ -182,6 +188,14 @@ FULL_RESCAN_SEC = 3.0
 #: 太舊的話角色早就走遠了，那時候寧可用伺服器給的進圖座標。
 _REF_FRESH = 5.0
 
+#: 角色每秒最多能移動幾格 —— 拿來把「離參考點不可能這麼遠」的候選擋掉
+#: （見 `_near_reference`）。RO 走一格最快約 100 ms（加速術＋加速藥水），
+#: 也就是 10 格/秒；這裡取**兩倍**當上限：這道關卡是用來擋掉差了幾百格的
+#: 上一張圖殘留物，不是用來卡精度的，寧可放過也不要誤殺活的元件。
+_DRIFT_CELLS_PER_SEC = 20.0
+#: 起步的寬限（伺服器講的落點與客戶端第一拍本來就可能差幾格）。
+_DRIFT_SLACK = 10
+
 
 def _cell_ok(x: int, y: int) -> bool:
     return 0 < x < MAX_CELL and 0 < y < MAX_CELL
@@ -216,6 +230,12 @@ class PlayerPosition:
         self._last_pos_at = 0.0
         #: 「有好幾個候選」講過了沒（不擋就是每拍一行 ERROR）。
         self._said_many = False
+        #: 「有候選離參考點太遠被擋掉」講過了沒（同上，每 0.3 秒會走一次）。
+        self._said_far = False
+        #: **我們親眼看到**伺服器把角色移走的時刻（`invalidate()` 寫的）。
+        #: `None` = 這輩子還沒看過 —— 那時進圖座標只是「上次進圖時在哪」，
+        #: 角色早就走遠了，**不能**拿它當「離落點不可能太遠」的錨（見 `_near_reference`）。
+        self._warped_at: float | None = None
         #: 最後一次 `read()` 回的是不是**即時**座標（移動元件）。
         #: False = 回的是進圖座標，那個值**角色走了也不會變**——
         #: 呼叫端的「卡住偵測」不可以拿它當「有沒有在動」的依據（見 farm_bot）。
@@ -289,7 +309,7 @@ class PlayerPosition:
         log.info("進圖座標全域定位於 %#x", x)
         return x
 
-    def _locate_component(self) -> bool:
+    def _locate_component(self, map_name: str = "") -> bool:
         """在候選裡找出角色的移動元件。**通過驗證的必須剛好一個**。
 
         ## 為什麼只要全掃一次（實機量出來的關鍵事實）
@@ -322,6 +342,10 @@ class PlayerPosition:
             self._candidates = self._scan(self._aid)
         seen = {a: self._component_at(a) for a in self._candidates}
         good = [a for a, cell in seen.items() if cell is not None]
+        # ★ 先用「離參考點不可能這麼遠」把上一張圖的殘留物擋掉 ——
+        #   **這一關要在挑人之前做**，因為剛換圖的時候通過驗證的常常只有一個，
+        #   而那一個就是殘留物（見 `_near_reference`）。
+        good = self._near_reference(good, seen, map_name)
         if len(good) > 1:
             # ⚠⚠ **先把「動作 tick 已經停住」的那些剔掉。**
             #
@@ -395,6 +419,7 @@ class PlayerPosition:
         self._addr = good[0]
         self._complained = False
         self._said_missing = False
+        self._said_far = False
         log.info("角色移動元件定位於 %#x（AID %d，%d 個候選）",
                  self._addr, self._aid, len(self._candidates))
         return True
@@ -421,6 +446,11 @@ class PlayerPosition:
         self._last_pos = None
         self._last_pos_at = 0.0
         self._said_many = False
+        self._said_far = False
+        # ★ 我們**親眼看到**伺服器把角色移走了 —— 從這一刻起，進圖座標就是
+        #   「角色現在在哪」的權威答案，而且角色只能用走的離開它。
+        #   `_near_reference()` 靠這個把上一張圖的殘留元件擋在外面。
+        self._warped_at = self._now()
 
     def forget(self) -> None:
         """完全重置（換行程／收攤時用）。"""
@@ -432,6 +462,8 @@ class PlayerPosition:
         self._terrain_map = ""
         self._terrain = None
         self._complained = False
+        # 換行程了，上一個行程的「剛被移動」不算數。
+        self._warped_at = None
 
     # ---- 讀取 -------------------------------------------------------
 
@@ -463,13 +495,14 @@ class PlayerPosition:
         self._watch_for_a_move(map_name)
         pos = self._component_pos()
         if pos is None and self._addr is None and self._can_relocate():
-            self._locate_component()
+            self._locate_component(map_name)
             pos = self._component_pos()
         if pos is not None and self._on_map(pos, map_name):
             self._moved_here = True
             self._missing_since = None
             self._warned_missing = False
             self._said_many = False      # 分得出來了，下次再平手要重講一次
+            self._said_far = False
             self._live = True
             # 記下來當「位置是連續的」那個參考點（見 `_closest`）。
             self._last_pos = pos
@@ -511,7 +544,13 @@ class PlayerPosition:
                  and entry != self._entry_seen)
         if entry is not None:
             self._entry_seen = entry
-        changed_map = bool(map_name) and map_name != self._read_map
+        # ⚠ 跟上面的 `_entry_seen` 同一個道理：**第一次讀到地圖名不算「換圖」**。
+        #   少了這一條，每個剛建好的 `PlayerPosition` 第一拍就會 `invalidate()`
+        #   一次（實機 11:09:57「偵測到角色被移動（換圖）」就是這樣來的），
+        #   於是 `_warped_at` 被設成「剛剛」—— 但角色其實在這張圖上待很久了、
+        #   早就離進圖座標很遠。那會讓 `_near_reference()` 拿一個**假的**落點
+        #   當錨，把**活的**元件當成殘留物剔掉。
+        changed_map = bool(map_name) and bool(self._read_map) and map_name != self._read_map
         if map_name:
             self._read_map = map_name
         if not (moved or changed_map):
@@ -613,6 +652,96 @@ class PlayerPosition:
             if best_gap is None or gap < best_gap:
                 best, best_gap = addr, gap
         return best
+
+    def _near_reference(
+        self, good: list[int], seen: dict, map_name: str
+    ) -> list[int]:
+        """把「離參考點遠到不可能」的候選丟掉。沒有參考點就原封不動回傳。
+
+        ## 為什麼一定要有這一關（實機 2026-09-04，[DAT-072]）
+
+        `_closest()` 只在**好幾個候選同時驗過**的時候才會被叫到。可是換圖那一刻
+        的真實情況是**只有一個候選驗得過，而那一個是上一張圖的殘留物**：
+
+        - 新元件已經在堆積上（`GID == AID` 掃得到），但狀態欄位還是 0 → 驗不過。
+        - 舊元件要再過 **1~2 秒**客戶端才回收；在那之前它 `state==1`、
+          `dest` 還是上一張圖的格子 → **三關全過**。
+
+        實機日誌（白狐，11:10:07 被移到 `mjolnir_12` (199,375)）：
+
+            11:10:08  地圖從 aldebaran 換到 mjolnir_12，重新定位角色移動元件
+            11:10:08  角色移動元件定位於 0x1fe02aa0     ← aldebaran 那顆，(133,103)
+            11:10:09  角色移動元件 0x1fe02aa0 已失效     ← 客戶端終於回收它
+            11:10:13  讀不到角色座標，送一步移動把位置逼出來
+
+        `mjolnir_12` 夠大，(133,103) 在上面**站得住** —— 於是 `_on_map()` 放行、
+        `read()` 回了上一張圖的座標，還把 `_moved_here` 設成 True。
+        `_moved_here` 一旦為 True，進圖座標就**永遠**不能再用了（那條規則本身是
+        對的），所以兩秒後殘留物被回收，`read()` 就一路回 None ——
+        使用者看到的「每次換圖都找不到座標」就是這樣來的，
+        而且前兩秒還安靜地回了**錯**座標。
+
+        ## 判準：位置在時間上是連續的
+
+        跟 `_closest()` 同一個道理，只是改當**過濾**用：角色從參考點走到現在
+        最多能走 `_DRIFT_CELLS_PER_SEC × 經過秒數 + _DRIFT_SLACK` 格。
+        差了幾百格的那顆不是本人，不管它驗得多漂亮。
+
+        參考點的優先序與失效條件：
+
+        1. **上一次讀成功的位置**（`_REF_FRESH` 秒內）。
+        2. **進圖座標**，而且**必須是我們親眼看到伺服器移動角色之後的**
+           （`_warped_at`）。⚠ 沒看到過就不能用：那時它只是「上次進圖時在哪」，
+           角色早就走遠了，拿它當錨會把**活的**元件誤殺。
+           進圖座標本身不在這張圖上（換圖訊號到了但全域還沒寫）也不能用。
+        """
+        if not good:
+            return good
+        ref = self._reference(map_name)
+        if ref is None:
+            return good
+        (rx, ry), elapsed = ref
+        limit = _DRIFT_CELLS_PER_SEC * max(elapsed, 0.0) + _DRIFT_SLACK
+        near, far = [], []
+        for addr in good:
+            cell = seen.get(addr)
+            if cell is None:
+                continue
+            gap = max(abs(cell[0] - rx), abs(cell[1] - ry))
+            (near if gap <= limit else far).append((addr, cell, gap))
+        if not far:
+            return good
+        if not near:
+            # 全部都太遠 = 這張圖上還沒有活的元件（剛換圖的正常狀態）。
+            # 回空清單，讓 `read()` 退回**進圖座標** —— 那是伺服器剛講過的落點，
+            # 比「上一張圖的殘留值」正確得多。
+            if not self._said_far:
+                self._said_far = True
+                log.info(
+                    "%d 個候選全都離參考點 (%d,%d) 超過 %.0f 格"
+                    "（最近的差 %d 格）—— 判定為上一張圖的殘留元件，改用進圖座標",
+                    len(far), rx, ry, limit, min(g for _, _, g in far),
+                )
+            return []
+        if not self._said_far:
+            self._said_far = True
+            log.info(
+                "剔掉 %d 個離參考點 (%d,%d) 超過 %.0f 格的候選（殘留元件），剩 %d 個",
+                len(far), rx, ry, limit, len(near),
+            )
+        return [addr for addr, _, _ in near]
+
+    def _reference(self, map_name: str) -> tuple[tuple[int, int], float] | None:
+        """挑一個參考點，回 `((x, y), 經過幾秒)`；沒有可信的參考點回 None。"""
+        now = self._now()
+        if self._last_pos is not None and now - self._last_pos_at < _REF_FRESH:
+            return self._last_pos, now - self._last_pos_at
+        if self._warped_at is None:
+            return None
+        entry = self._entry_pos()
+        if entry is None or not self._on_map(entry, map_name):
+            return None
+        return entry, now - self._warped_at
 
     def _ticking(self, addr: int) -> bool:
         """這個候選的**動作 tick** 還在跳嗎（＝它還是客戶端正在用的那個）。

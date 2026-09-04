@@ -79,6 +79,7 @@ def test_a_map_change_drops_the_reference():
     """⚠ 換圖之後上一張圖的位置**不能**再當參考 —— 被回收的舊元件就停在那裡，
     拿它比對等於專挑舊的那個。"""
     loc = pp.PlayerPosition.__new__(pp.PlayerPosition)
+    loc._now = lambda: 1000.0
     loc._addr = 0x1
     loc._last_locate = 5.0
     loc._candidates = [0x1, 0x2]
@@ -89,10 +90,15 @@ def test_a_map_change_drops_the_reference():
     loc._last_pos = (100, 100)
     loc._last_pos_at = 999.0
     loc._said_many = True
+    loc._said_far = True
+    loc._warped_at = None
 
     loc.invalidate()
     assert loc._last_pos is None
     assert loc._said_many is False
+    # ★ 換過來的同時要記下「我們親眼看到伺服器移動角色了」——
+    #   `_near_reference()` 靠它才敢拿進圖座標當錨（[DAT-072]）。
+    assert loc._warped_at == 1000.0
 
 
 # ---- 「離上一次最近」對殘留物有系統性偏心（2026-09-01 實機）----------------
