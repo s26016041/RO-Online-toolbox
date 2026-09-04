@@ -129,12 +129,17 @@ class Walker:
         send_move: Callable[[int, int], None],
         now: Callable[[], float] = time.monotonic,
         moving: Callable[[], bool | None] | None = None,
+        hit_locked: Callable[[], bool] | None = None,
     ) -> None:
         self._send_move = send_move
         self._now = now
         #: 「客戶端認為角色現在正在走嗎」。回 None＝問不出來，那就當沒有這條線索。
         #: 見 `update()` 裡的重送那一段。
         self._moving = moving or (lambda: None)
+        #: 「角色剛剛被打」——被打有硬直，伺服器會**直接丟掉**那一拍的移動
+        #: （沒有 0x0087），跟「目標太遠被拒絕」長得一模一樣。分不出來的話，
+        #: 被幾隻怪圍著打的時候步幅會一路縮到 1 然後放棄整條路（[DAT-076]）。
+        self._hit_locked = hit_locked or (lambda: False)
         self._path: list[tuple[int, int]] = []
         self._index = 0
         self._target: tuple[int, int] | None = None
@@ -271,6 +276,17 @@ class Walker:
                 self._acked = True
                 self._step = MAX_STEP  # 這一段成功了，下一段恢復用最大步幅
             elif now - self._sent_at > ACK_TIMEOUT:
+                if self._hit_locked() and self._resends < MAX_RESEND:
+                    # ★ 沒有 0x0087 但角色**剛被打**：那是硬直把移動吃掉了，
+                    #   不是伺服器嫌這一段太遠。同一段再送、步幅不動；
+                    #   `_resends` 有上限（位置一變就歸零），不會無限重送。
+                    self._resends += 1
+                    self._resent_at = now
+                    self.resent += 1
+                    self._take_ack()
+                    self._send_move(*self._target)
+                    self._sent_at = now
+                    return "walking"
                 self.rejected += 1
                 self._step = self._step // 2
                 self._target = None

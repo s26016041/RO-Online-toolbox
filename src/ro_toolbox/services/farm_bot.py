@@ -61,6 +61,19 @@ log = logging.getLogger(__name__)
 
 _TICK = 0.2  # 主迴圈一拍。要夠密才能「怪一出現就轉去打」
 _GIVE_UP_SEC = 10.0  # 同一隻打太久又沒靠近就放棄（多半打不到）
+#: 追怪時**角色還在走**（繞路中）就不算「打不到」—— 繞一座山脊直線距離
+#: 十幾秒都不會變小，舊版就在半路把牠丟掉（[DAT-076]）。這是硬上限：
+#: 走了這麼久還沒貼到才放棄。mjolnir_05 實測最長繞路 102 格 ≈ 15 秒。
+_CHASE_CAP_SEC = 25.0
+#: 走不成（`Walker` 說 blocked）時先從**現在站的地方**重新規劃幾次，
+#: 而不是第一次就把牠拉黑 —— 伺服器帶的路跟我們算的不一樣、被打的硬直、
+#: 一段被拒絕，這三種都不是「這隻怪繞不過去」（[DAT-076]）。
+_APPROACH_REPLANS = 3
+#: 鎖定了目標、還沒開打、而角色**這麼久一步都沒動** —— 印一次幾何狀態。
+#: 使用者看到的「盯著怪發呆」就是這個時刻；沒有這一行，下一次回報還是只能猜。
+_STARE_WARN_SEC = 3.0
+#: 「剛被打」的定義：最近這麼久內有傷害封包打在我身上（硬直大約幾百毫秒）。
+_HIT_LOCK_SEC = 0.6
 _SKIP_SEC = 30.0  # 放棄的目標暫時列入黑名單多久
 _VIEW_RANGE = 30  # 超過這麼遠的怪視為已離開視野（實測伺服器視野約 24 格）
 _ROAM_MIN = 60  # 漫遊目標至少離現在位置這麼遠 —— 一次挑很遠，才不會走走停停
@@ -262,6 +275,13 @@ class _Aim:
     gid: int
     since: float
     best_distance: int = 1 << 30
+    #: 追這隻的期間，角色最後一次**真的移動**是什麼時候／在哪（[DAT-076]）。
+    moved_at: float = 0.0
+    last_pos: tuple[int, int] | None = None
+    #: 走不成之後重新規劃過幾次（上限 `_APPROACH_REPLANS`）。
+    replans: int = 0
+    #: 「發呆」那一行印過了沒（一隻只印一次）。
+    stare_said: bool = False
     attacked: bool = False
     attacked_at: float = 0.0  # 送出攻擊的時間，用來判斷有沒有打到
     attacked_dist: int = 0  # 送出攻擊時離它多遠（伺服器要走這段路，要多給時間）
@@ -312,7 +332,10 @@ class FarmBot:
         # ⚠ `moving` 讓走路那一支問得到「客戶端認為我還在走嗎」—— 沒有它就只能
         #   靠計時器猜，走得慢一點（或那一拍做的事比較多）就會被誤判成停住而重送，
         #   症狀就是「走路一卡一卡」。見 `walker.Walker.update`。
-        self._walker = Walker(self._send_move, moving=self._client_moving)
+        self._walker = Walker(
+            self._send_move, moving=self._client_moving,
+            hit_locked=lambda: self._recently_hit(time.monotonic()),
+        )
         self._aim: _Aim | None = None
         self._skip: dict[int, float] = {}  # 打不到的目標 → 黑名單到期時間
         #: gid → 被列入黑名單的時間。診斷與過期用。
@@ -986,6 +1009,8 @@ class FarmBot:
                     self._aim = aim = None
             else:
                 aim.lost_at = 0.0
+                if pos is not None and pos != aim.last_pos:
+                    aim.last_pos, aim.moved_at = pos, now
                 mob = self._world.get(aim.gid)
                 if mob is not None and mob.hit_at > aim.since:
                     aim.since = mob.hit_at  # 正在互打，當然不算「打不到」
@@ -994,18 +1019,55 @@ class FarmBot:
                     # 還在接近中就不算打不到，重新計時
                     aim.best_distance = distance
                     aim.since = now
-                elif now - aim.since > _GIVE_UP_SEC:
-                    # 打太久又沒更靠近＝打不到，黑名單換目標，別卡在這隻
+                elif now - aim.since > _GIVE_UP_SEC and (
+                    aim.attacked
+                    or now - aim.moved_at > _STARE_WARN_SEC
+                    or now - aim.since > _CHASE_CAP_SEC
+                ):
+                    # 打太久又沒更靠近＝打不到，黑名單換目標，別卡在這隻。
+                    # ★ 還在走（繞路中）的不算 —— 直線距離在繞山脊的時候
+                    #   十幾秒都不會變小，那不是打不到（[DAT-076]）；
+                    #   只有站著沒動、或走超過硬上限，才放棄。
+                    # ⚠ 以前這裡**一個字都不印**：使用者看到角色發呆十秒然後
+                    #   換目標，日誌裡什麼都沒有。
+                    log.info(
+                        "「%s」%s %.0f 秒都沒更靠近（距離 %s、%s），先換一隻",
+                        mob_name(self._class_of(aim.gid)),
+                        "打了" if aim.attacked else "追了",
+                        now - aim.since, distance,
+                        self._geometry(pos, mob.pos if mob else None),
+                    )
                     self._skip[aim.gid] = now + _SKIP_SEC
                     self._skip_at[aim.gid] = now
                     self._drop_aggro(aim.gid)
+                    self._walker.clear()
                     self._aim = aim = None
 
         if aim is None and now >= self._loot_until:
             mob = self._pick_target(pos)
             if mob is not None:
-                self._aim = _Aim(mob.gid, now)
+                self._aim = _Aim(mob.gid, now, moved_at=now, last_pos=pos)
                 self._stats.target = mob_name(mob.class_id)
+
+    def _recently_hit(self, now: float, within: float = _HIT_LOCK_SEC) -> bool:
+        """最近 `within` 秒內有沒有怪打到我（被打有硬直，移動會被伺服器吃掉）。"""
+        with self._dmg_lock:
+            return any(now - at <= within for at in self._aggro.values())
+
+    def _geometry(self, pos, goal) -> str:
+        """一句話講清楚「我跟牠之間」：直線乾不乾淨、牠站的格可不可走、旁邊格在哪。
+
+        給發呆與放棄那兩行日誌用 —— 「隔著障礙物」到底是哪一種，光看座標猜不出來。
+        """
+        if pos is None or goal is None or self._terrain is None:
+            return f"我在 {pos}、牠在 {goal}"
+        beside = self._beside(goal, pos)
+        return (
+            f"我在 {pos}、牠在 {goal}、牠那格可走={self._terrain.is_walkable(*goal)}、"
+            f"直線乾淨={self._terrain.line_clear(pos, goal)}、旁邊格={beside}"
+            f"（直線乾淨={self._terrain.line_clear(pos, beside) if beside else None}）、"
+            f"被 {len(self._aggro)} 隻打、{self._walker.debug_state()}"
+        )
 
     def _pick_target(self, pos: tuple[int, int] | None) -> Monster | None:
         """挑目標：先打正在打我的怪（主動怪），再打**最近**的怪。
@@ -1098,6 +1160,17 @@ class FarmBot:
             why = self._approach(pos, mob.pos)
             if why is not None:
                 self._give_up_target(aim, now, why)
+                return
+            if (not aim.stare_said and aim.moved_at
+                    and now - aim.moved_at >= _STARE_WARN_SEC):
+                # ★ 使用者說的「盯著怪發呆」就是這一刻。印一次，把能量到的
+                #   全部攤開 —— 下一次回報不必再猜是哪一種（[DAT-076]）。
+                aim.stare_said = True
+                log.warning(
+                    "[自動打怪] 對著「%s」發呆 %.1f 秒（距離 %s）：%s",
+                    mob_name(self._class_of(aim.gid)), now - aim.moved_at,
+                    distance, self._geometry(pos, mob.pos),
+                )
             return
         # ⚠⚠ **送攻擊等於把方向盤交給伺服器。** 攻擊封包只帶 GID、不帶座標，
         # 最後那一段路是伺服器帶的（`_ATTACK_RANGE` 放到 10 格就是靠這個），
@@ -1360,7 +1433,20 @@ class FarmBot:
         state = self._walker.update(pos)
         if state in ("walking", "arrived", "idle"):
             return None
-        return "走到一半被擋住"
+        # ★ 走不成**先從現在站的地方重新規劃**，不要第一次就把牠拉黑。
+        #   會走到這裡的三種原因 —— 伺服器帶的路跟我們算的不一樣（偏離路徑）、
+        #   被打的硬直吃掉移動、某一段被拒絕 —— 都不是「這隻怪繞不過去」。
+        #   實機一份日誌裡「走到一半被擋住，換下一隻」17 次，全在擊殺後 1~2 秒
+        #   （旁邊的怪還在打人）。清掉路徑，下一拍 `current is None` 就會重算。
+        aim = self._aim
+        if aim is not None and aim.replans < _APPROACH_REPLANS:
+            aim.replans += 1
+            log.info("往「%s」的路走不成（%s）—— 從 %s 重新規劃（第 %d 次）",
+                     mob_name(self._class_of(aim.gid)), self._walker.debug_state(),
+                     pos, aim.replans)
+            self._walker.clear()
+            return None
+        return f"重新規劃 {_APPROACH_REPLANS} 次還是走到一半被擋住（{self._geometry(pos, goal)}）"
 
     def _beside(self, goal: tuple[int, int], pos: tuple[int, int]) -> tuple[int, int] | None:
         """挑一個緊鄰怪、離我最近的可走格（怪站的那格也算）。"""
