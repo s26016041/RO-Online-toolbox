@@ -18,6 +18,7 @@ from collections.abc import Callable
 
 from ro_toolbox.core.ro_packet import RoPacket, split_packets
 from ro_toolbox.services.process_monitor import (
+    Connection,
     connections_of,
     local_addresses_of,
     local_ports_of,
@@ -76,6 +77,41 @@ def find_servers(pid: int) -> list[tuple[str, int]]:
     ]
 
 
+def find_connection(pid: int) -> Connection | None:
+    """`find_server()` 的完整版：回**整條連線**（含本機埠與建立時間）。
+
+    ★ 本機埠才是一條連線的身分（[PKT-097]）：遊戲重連到**同一台**伺服器時
+    (ip, port) 一模一樣，只有本機埠會變。`GameLink.resync()` 拿它比對
+    「我手上這份複本是不是還是遊戲正在用的那條」。
+    """
+    fresh = [
+        conn
+        for conn in connections_of(pid)  # 已經由新到舊排好
+        if not conn.ip.startswith(_PRIVATE_PREFIXES) and conn.port not in WEB_PORTS
+    ]
+    if fresh:
+        # 還沒完成交握／正在收尾的連線不算數，但全都不是 ESTABLISHED 時
+        # 還是要給一條出去（換圖的瞬間會短暫沒有已建立的連線）。
+        usable = [c for c in fresh if c.established] or fresh
+        if len(fresh) > 1:
+            _log_multi(pid, [c.endpoint for c in fresh], usable[0].endpoint)
+        return usable[0]
+
+    # 退路：拿不到建立時間（非 Windows、iphlpapi 失敗）就照舊排序取第一條。
+    # 這條路查不到本機埠（0），呼叫端要當「分不出來」處理。
+    candidates = [
+        (ip, port)
+        for ip, port in sorted(remote_endpoints_of(pid))
+        if not ip.startswith(_PRIVATE_PREFIXES) and port not in WEB_PORTS
+    ]
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        _log_multi(pid, candidates, candidates[0])
+    ip, port = candidates[0]
+    return Connection(ip=ip, port=port, created=0, established=True)
+
+
 def find_server(pid: int) -> tuple[str, int] | None:
     """找出行程連到的遊戲伺服器（排除本機／私有位址與網頁埠）。
 
@@ -105,30 +141,8 @@ def find_server(pid: int) -> tuple[str, int] | None:
     Windows 的 TCP 表本來就記著每條連線的建立時間，所以直接挑最新的那條：
     新的 map server 一定是後建立的。拿不到建立時間才退回舊的排序行為。
     """
-    fresh = [
-        conn
-        for conn in connections_of(pid)  # 已經由新到舊排好
-        if not conn.ip.startswith(_PRIVATE_PREFIXES) and conn.port not in WEB_PORTS
-    ]
-    if fresh:
-        # 還沒完成交握／正在收尾的連線不算數，但全都不是 ESTABLISHED 時
-        # 還是要給一條出去（換圖的瞬間會短暫沒有已建立的連線）。
-        usable = [c for c in fresh if c.established] or fresh
-        if len(fresh) > 1:
-            _log_multi(pid, [c.endpoint for c in fresh], usable[0].endpoint)
-        return usable[0].endpoint
-
-    # 退路：拿不到建立時間（非 Windows、iphlpapi 失敗）就照舊排序取第一條。
-    candidates = [
-        (ip, port)
-        for ip, port in sorted(remote_endpoints_of(pid))
-        if not ip.startswith(_PRIVATE_PREFIXES) and port not in WEB_PORTS
-    ]
-    if not candidates:
-        return None
-    if len(candidates) > 1:
-        _log_multi(pid, candidates, candidates[0])
-    return candidates[0]
+    conn = find_connection(pid)
+    return conn.endpoint if conn is not None else None
 
 
 #: 上次為哪個 pid 報過哪一組連線。用來讓「有多條」只在**變化時**講一次 ——

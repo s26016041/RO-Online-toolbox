@@ -26,13 +26,14 @@ CLAUDE.md 那條「同一個位址不准寫第二次」對**知識**同樣成立
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 
 from ro_toolbox.services import game_socket
 from ro_toolbox.services.character import CharacterReader
 from ro_toolbox.services.packet_capture import PacketCapture
-from ro_toolbox.services.ro_capture import find_server, find_servers
+from ro_toolbox.services.ro_capture import find_connection, find_server, find_servers
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +68,12 @@ class GameLink:
         self._need_position = need_position
         self.sock: int | None = None
         self.server: tuple[str, int] | None = None
+        #: 我們那份複本連線的**本機埠**——一條連線真正的身分（[PKT-097]）。
+        #: 遊戲重連到同一台伺服器時 (ip, port) 不變、只有它會變。0 = 問不到。
+        self.local_port = 0
+        #: 換 socket 的時候擋一下：`close()` 與背景執行緒的收尾可能同時跑，
+        #: 同一個 handle 值關兩次會把**別人剛複製到的那份**關掉（handle 值立刻回收）。
+        self._sock_lock = threading.Lock()
         self.reader: CharacterReader | None = None
         self.capture: PacketCapture | None = None
         #: 上一次 `resync()` 有沒有真的重綁（呼叫端要拿來記日誌）
@@ -107,7 +114,7 @@ class GameLink:
         )
         if not sock:
             return "找不到遊戲 socket，無法送封包（等了也沒出現）"
-        self.sock, self.server = sock, server
+        self._adopt(sock, server)
 
         self._note("正在定位角色（AOB 特徵掃描）…")
         reader = CharacterReader()
@@ -148,9 +155,19 @@ class GameLink:
             self.reader = None
 
     def _close_socket(self) -> None:
-        if self.sock is not None:
-            game_socket.close_socket(self.sock)
-            self.sock = None
+        # ★ 先把欄位清掉再關：handle 值一關掉就會被回收發給下一個
+        #   `DuplicateHandle`，兩個執行緒各關一次等於把別人的關掉。
+        with self._sock_lock:
+            sock, self.sock = self.sock, None
+            self.local_port = 0
+        if sock is not None:
+            game_socket.close_socket(sock)
+
+    def _adopt(self, sock: int, server: tuple[str, int]) -> None:
+        """接手一份新複本，順便把它的本機埠記起來（之後拿來認「還是同一條嗎」）。"""
+        with self._sock_lock:
+            self.sock, self.server = sock, server
+            self.local_port = game_socket.socket_local_port(sock) or 0
 
     # ---- 維持連線 ---------------------------------------------------
 
@@ -175,20 +192,28 @@ class GameLink:
             if self.server is not None:
                 return "⚠ 遊戲連線已中斷"
             return None
-        # ★ **端點沒變不代表我們手上那份還能用。** 換地圖伺服器時遊戲會
-        #   `closesocket()` 舊連線，而重連到同一台的話 (ip, port) 一模一樣 ——
-        #   舊版只好等 `send()` 撞出 WSA 10038 才知道（見 `game_socket.socket_alive`）。
+        # ★ **端點沒變不代表我們手上那份還是遊戲在用的那條。** 兩種情況：
+        #   - 我們那份複本已經不是 socket（被關掉／從來就綁錯）→ `alive()` 說死。
+        #   - 遊戲重連到**同一台**伺服器：(ip, port) 一模一樣，我們的複本還活著
+        #     （核心物件被我們握著），但遊戲早就在用另一條 —— 只有**本機埠**
+        #     分得出來（[PKT-097]）。
         stale = not self.alive()
+        replaced = False
         if server == self.server and not stale:
-            return None
+            replaced = not self._still_the_same_connection()
+            if not replaced:
+                return None
         if self.dead and server == self._failing_server:
             # ⚠ **綁到同一條死連線不算重綁。** 伺服器 reset 之後那條連線還留在
             # TCP 表裡，`find_server()` 照樣讀得到 —— 舊版就是這樣「重綁成功」
             # 了幾千次，每次都綁回同一條死的。
             return "⚠ 遊戲連線已中斷（重綁還是同一條斷掉的連線）"
-        if stale and server == self.server:
-            log.info("連線 %s 沒變，但我們複製的那份已經被遊戲關掉了"
-                     "（換地圖伺服器）—— 重新複製", server)
+        if replaced:
+            log.info("連線 %s 沒變，但遊戲已經換了一條新的（本機埠變了）—— 重新複製",
+                     server)
+        elif stale and server == self.server:
+            log.info("連線 %s 沒變，但我們手上那份複本已經不是活的 socket —— 重新複製",
+                     server)
         else:
             log.info("連線 %s → %s，重新綁定", self.server, server)
         self._close_socket()
@@ -201,10 +226,24 @@ class GameLink:
         )
         if not sock:
             return "⚠ 換頻道後找不到新的遊戲 socket"
-        self.sock, self.server = sock, bound
+        self._adopt(sock, bound)
         self.rebound = True
         self._revive()
         return None
+
+    def _still_the_same_connection(self) -> bool:
+        """端點一樣時，遊戲現在用的那條是不是就是我們複製的這條？
+
+        比對**本機埠**（[PKT-097]）。任何一邊問不到（舊系統、TCP 表拿不到）
+        就當「是」—— 那是舊行為，寧可少重綁也不要沒事一直重綁。
+        只在「端點沒變」那條路才多撈一次 TCP 表，而且呼叫端本來就有節流。
+        """
+        if not self.local_port:
+            return True
+        conn = find_connection(self.pid)
+        if conn is None or not conn.local_port or conn.endpoint != self.server:
+            return True
+        return conn.local_port == self.local_port
 
     def alive(self) -> bool:
         """我們手上這份 socket 複本**現在**還接得上遊戲那條連線嗎？

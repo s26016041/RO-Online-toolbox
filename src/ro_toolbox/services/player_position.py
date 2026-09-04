@@ -244,6 +244,14 @@ class PlayerPosition:
         #: ⚠ 這是整個設計的關鍵，見 `_locate_component()` 的說明。
         self._candidates: list[int] = []
         self._last_full = 0.0
+        #: ★ **幽靈**：帶著我們的 AID、長得像「還沒走過」、但**不是**本人的物件
+        #:（[DAT-074]）。實機（白狐，2026-09-05）兩個位址 `0x1fbedda0`／`0x1fbee8d0`
+        #: 跨了七張圖都在、tick 一直在跳、終點永遠沒填，每次換圖都跟真的新元件
+        #: 一起被判成「還沒走過」→「有 2 個都像本人，分不出來」。
+        #: 分辨的依據：**本人認出來的那一刻（它說得出位置），其他「還沒走過」
+        #: 形狀的都不是本人。** 記住它們，換圖之後直接剔掉。
+        #: ⚠ `invalidate()`（換圖）不清它 —— 幽靈就是要跨圖才有用；`forget()` 才清。
+        self._ghosts: set[int] = set()
         #: 從什麼時候開始「這張圖上一直沒有元件」（None = 現在有）。
         self._missing_since: float | None = None
         self._warned_missing = False
@@ -409,24 +417,34 @@ class PlayerPosition:
                 return False
         if not good and unplaced:
             # 剛換圖、還沒走第一步：只有「還沒走過」的形狀認得出本人。
-            if len(unplaced) > 1:
+            # ★ 先剔掉幽靈（[DAT-074]）：上一次本人認出來的時候它們就已經是
+            #   「還沒走過」的樣子，換圖後照樣在 —— 那不是這張圖新配的元件。
+            #   被回收的幽靈會從 `unplaced` 消失，這裡順手把記憶修剪掉。
+            self._ghosts &= set(unplaced)
+            fresh = [a for a in unplaced if a not in self._ghosts]
+            if len(fresh) > 1:
                 if not self._said_many:
                     self._said_many = True
                     log.error(
                         "有 %d 個「還沒走過」的元件都像是角色本人（%s）—— 分不出來，"
-                        "先用進圖座標", len(unplaced), [hex(a) for a in unplaced],
+                        "先用進圖座標；角色走一步就分得出來",
+                        len(fresh), [hex(a) for a in fresh],
                     )
                 return False
-            self._addr = unplaced[0]
-            self._complained = False
-            self._said_missing = False
-            self._said_far = False
-            log.info(
-                "角色移動元件定位於 %#x（AID %d，%d 個候選）—— "
-                "這張圖上還沒走過，位置先用進圖座標，走第一步就會變即時的",
-                self._addr, self._aid, len(self._candidates),
-            )
-            return True
+            if len(fresh) == 1:
+                self._addr = fresh[0]
+                self._complained = False
+                self._said_missing = False
+                self._said_far = False
+                skipped = len(unplaced) - 1
+                log.info(
+                    "角色移動元件定位於 %#x（AID %d，%d 個候選%s）—— "
+                    "這張圖上還沒走過，位置先用進圖座標，走第一步就會變即時的",
+                    self._addr, self._aid, len(self._candidates),
+                    f"，略過 {skipped} 個跨圖都在的幽靈" if skipped else "",
+                )
+                return True
+            # 只剩幽靈 = 這張圖的新元件還沒出現，當作「還沒找到」（下面那條路）。
         if not good:
             # ⚠ 這條路每 0.3 秒就會走一次（`RELOCATE_COOLDOWN`）——
             #   每次都印的話是**一秒三行**的洗版，三個分身同時開著更慘，
@@ -442,6 +460,10 @@ class PlayerPosition:
                 )
             return False
         self._addr = good[0]
+        # ★ 本人認出來了（它說得出位置）—— 這時其他「還沒走過」形狀的物件
+        #   都不是本人。記住它們：換圖之後它們還會在，而那時本人也會是
+        #   「還沒走過」的形狀，光看形狀分不出來（[DAT-074]）。
+        self._ghosts = set(unplaced)
         self._complained = False
         self._said_missing = False
         self._said_far = False
@@ -480,6 +502,7 @@ class PlayerPosition:
     def forget(self) -> None:
         """完全重置（換行程／收攤時用）。"""
         self.invalidate()
+        self._ghosts = set()          # 換行程了，位址全部作廢
         self._aid = 0
         self._entry = None
         self._entry_seen = None

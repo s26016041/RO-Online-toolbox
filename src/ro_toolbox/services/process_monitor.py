@@ -139,6 +139,9 @@ class Connection:
     port: int
     created: int
     established: bool
+    #: 本機連接埠。★ 這才是一條連線的**身分**：重連到同一台伺服器時
+    #: (ip, port) 一模一樣，只有它會變（[PKT-097]）。拿不到時是 0。
+    local_port: int = 0
 
     @property
     def endpoint(self) -> tuple[str, int]:
@@ -189,12 +192,14 @@ def connections_of(pid: int) -> list[Connection]:
         port = int.from_bytes(row.dwRemotePort.to_bytes(4, "little")[:2], "big")
         if not port:
             continue
+        local_port = int.from_bytes(row.dwLocalPort.to_bytes(4, "little")[:2], "big")
         found.append(
             Connection(
                 ip=ip,
                 port=port,
                 created=int(row.liCreateTimestamp),
                 established=row.dwState == _MIB_STATE_ESTABLISHED,
+                local_port=local_port,
             )
         )
     found.sort(key=lambda c: c.created, reverse=True)

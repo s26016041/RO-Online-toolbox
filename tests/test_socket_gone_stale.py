@@ -1,4 +1,13 @@
-"""換地圖伺服器之後，我們複製來的那份 socket 已經**不是 socket 了**（[PKT-096]）。
+"""端點沒變，但我們手上那份複本已經不能用了 —— `resync()` 照樣要重綁。
+
+⚠ 2026-09-05 更正（[PKT-097]）：下面那段「遊戲 `closesocket()` 之後我們的複本
+就不再是 socket」的解讀是**錯的** —— 只要我們握著複本，核心物件就還在。
+實機的 10038 來自 ws2_32 快取把別的 handle 誤認成遊戲 socket。這支測的
+`GameLink` 邏輯（複本不能用就重綁、reset 不等於複本壞掉）本身仍然成立。
+
+---（以下是當時的記錄，保留脈絡）---
+
+換地圖伺服器之後，我們複製來的那份 socket 已經**不是 socket 了**（[PKT-096]）。
 
 使用者 2026-09-04：「這個是怎樣為何會這樣我看我的角色正常在打怪物阿」——
 他是對的，**角色沒事**：壞掉的不是遊戲那條連線，是我們手上那份複本。
@@ -89,14 +98,16 @@ def test_the_same_endpoint_still_rebinds_when_our_copy_was_closed(
     assert link.rebound is True
 
 
-def test_the_probe_asks_the_os_not_our_own_bookkeeping():
-    """`socket_alive()` 問的是作業系統 —— 不是 socket 就回 False。
+def test_the_probe_asks_the_kernel_not_our_own_bookkeeping():
+    """`socket_alive()` 問的是**核心** —— 不是 socket 就回 None／False。
 
-    ⚠ 這裡直接測底下那一支（`_peer_of`）：conftest 有個 autouse 的替身把
+    ⚠ 這裡直接測底下那一支（`_local_port_of`）：conftest 有個 autouse 的替身把
     `socket_alive` 換掉了（不然每支測試的假整數 socket 都會被判成死的），
     所以透過名字拿到的是替身，不是真貨。
+    ⚠ 不准改回 ws2_32 的 `getpeername`：它對複製來的 handle 照第一次的快取回答，
+    被關掉的 handle 它照樣說「連著」（[PKT-097]，見 `tests/test_socket_identity.py`）。
     """
-    assert game_socket._peer_of(0x7FFF_FFF0) is None, "不是 socket 就要問不出 peer"
+    assert game_socket._local_port_of(0x7FFF_FFF0) is None, "不是 socket 就要問不出埠"
 
 
 def test_a_reset_connection_is_not_confused_with_a_closed_copy(link, monkeypatch):

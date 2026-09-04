@@ -481,7 +481,8 @@ class RestockBot:
         bad = shop_reach.snapshot()
         return all(bad.is_bad(map_name, (x, y)) for x, y, _name, _look in sellers)
 
-    def _walk(self, target_map: str, cell: tuple[int, int] | None) -> WalkResult:
+    def _walk(self, target_map: str, cell: tuple[int, int] | None,
+              what: str = "商人那裡") -> WalkResult:
         """走過去。回 `WalkResult`（沿路看到的 NPC ＋ **是不是真的走不到**）。
 
         ⚠ `unreachable` 只會在 `TravelBot` 自己算完路、說「到不了」時是 True。
@@ -507,7 +508,9 @@ class RestockBot:
             self._say("已取消")
             return WalkResult()
         if not arrived:
-            self._say(f"⚠ 沒走到商人那裡：{bot.stats.note}")
+            # ⚠ `what` 要講對：走回練功地圖那一段失敗印「沒走到商人那裡」，
+            #   使用者會去查商人（實機 2026-09-05 就是這樣誤導的）。
+            self._say(f"⚠ 沒走到{what}：{bot.stats.note}")
             return WalkResult(unreachable=unreachable, timed_out=timed_out,
                               stuck=stuck)
         return WalkResult(known)
@@ -627,7 +630,7 @@ class RestockBot:
             return          # 本來就在同一張圖，不用走
         where = map_display_name(home) or home
         self._say(f"買完了，走回 {where}…")
-        if self._walk(home, None).arrived:
+        if self._walk(home, None, what=f"{where}").arrived:
             self.stats.came_back = True
             self._say(f"{self.stats.summary()}；已經走回 {where}")
 

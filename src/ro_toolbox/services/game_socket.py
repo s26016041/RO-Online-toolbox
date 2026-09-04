@@ -4,13 +4,38 @@
 （見 GAMEDATA [PKT-011]、[PKT-012]）。所以可以：
   1. 列舉遊戲行程的所有 handle
   2. 把 handle 複製到本行程
-  3. 對複製來的 handle 呼叫 getpeername，找出連到遊戲伺服器的那個 = 遊戲 socket
-  4. 在這個 socket 上 send() 送明文封包
+  3. **問核心**（AFD）這個 handle 綁在本機哪個埠，對照 TCP 表認出遊戲那條連線
+  4. 在這個 handle 上用 `WriteFile` 送明文封包（也是走核心）
 
 全程只做網路操作，不寫遊戲記憶體、不注入。
 
+## ⛔⛔ 這一支**完全不碰 ws2_32**（`getpeername`／`send`／`closesocket` 一律不准）
+
+實機 2026-09-05 量出來的（[PKT-097]）：ws2_32 對「不是它自己建立的 handle」
+會在**第一次**看到那個 handle 值時把身分快取起來，**之後永遠照快取回答**，
+不管那個值後來被 `CloseHandle` 掉、又被系統回收發給別的物件：
+
+    複本 A（連到 :57967）              getpeername → :57967   send → OK
+    CloseHandle(A)                     getpeername → :57967   send → **10038**
+    複製 B（連到 :57968），拿到同一個值  getpeername → **:57967**（錯的）
+
+而 handle 值是**立刻回收**的（LIFO），所以 `find_game_socket()` 每一輪
+「複製 → 問 → 關掉」拿到的都是**同一個值**，整輪掃描只有第一個 socket 的身分
+是真的，其餘全部照第一個回答 —— 這就是：
+
+- 「剛連上的那幾秒複製不到 socket」（[PKT-072]，其實是快取把答案蓋掉了）
+- 「換地圖伺服器後複本變成不是 socket、send 回 10038」（[PKT-096] 的解讀
+  是**錯的**：綁到的是一個被快取誤認成遊戲 socket 的**別的 handle**，
+  而 `socket_alive()` 問的還是快取，所以一直說「活著」，15 秒後判定斷線）
+- 「WSA 10022／10045／10057 綁錯對象」那些從來沒解釋清楚的錯誤
+
+核心不會撒謊：`NtDeviceIoControlFile(AFD_GET_SOCK_NAME)` 回的是**這個 handle
+現在指到的物件**的本機位址，被關掉就是 `STATUS_INVALID_HANDLE`；
+`WriteFile` 也一樣（被關掉回 `ERROR_INVALID_HANDLE`，對方 reset 回 64）。
+所以身分認定、活著沒、送封包，三件事都改走核心。
+
 ⚠ 這是在遊戲自己的連線上送封包。與遊戲同時 send 可能造成 TCP 位元組交錯，
-   但 RO 送封包不頻繁、一次 send() 送完整封包，實務上可行。
+   但 RO 送封包不頻繁、一次寫完整封包，實務上可行。
 """
 
 from __future__ import annotations
@@ -21,16 +46,26 @@ import socket
 import time
 from ctypes import wintypes
 
+from ro_toolbox.services.process_monitor import connections_of
+
 log = logging.getLogger(__name__)
 
-_k32 = ctypes.windll.kernel32
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 _ntdll = ctypes.windll.ntdll
-_ws2 = ctypes.windll.ws2_32
+# ⛔ 這裡**故意沒有 ws2_32**。它對複製來的 handle 會照第一次的快取回答
+#    （見模組說明），而且 `closesocket` 會把遊戲的連線一起關掉（[PKT-094]）。
 
 _PROCESS_DUP_HANDLE = 0x0040
 _DUPLICATE_SAME_ACCESS = 0x0002
 _SYSTEM_EXTENDED_HANDLE_INFORMATION = 0x40
 _STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
+_STATUS_PENDING = 0x00000103
+#: `NtDeviceIoControlFile` 給 AFD 的「這個 socket 綁在本機哪裡」。
+#: 實測（2026-09-05，Windows 11 26200）：回 `sockaddr_in`（family 2、埠是網路序）；
+#: handle 被關掉回 `0xC0000008`（STATUS_INVALID_HANDLE）、檔案 handle 回
+#: `0xC000000D`（STATUS_INVALID_PARAMETER）。
+_IOCTL_AFD_GET_SOCK_NAME = 0x1202F
+_ERROR_IO_PENDING = 997
 
 # ⚠ 一定要宣告 argtypes/restype：64 位元 Python 下不宣告的話，ctypes 把 HANDLE
 #   當 32 位元 int 傳，指標被截半，DuplicateHandle 會拿到錯的值而靜默失敗。
@@ -44,15 +79,41 @@ _k32.DuplicateHandle.argtypes = [
     ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
 ]
 _k32.DuplicateHandle.restype = wintypes.BOOL
-
-_ws2.getpeername.argtypes = [
-    ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)
+_k32.CreateEventW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.BOOL, ctypes.c_void_p]
+_k32.CreateEventW.restype = wintypes.HANDLE
+_k32.WriteFile.argtypes = [
+    wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+    ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p,
 ]
-_ws2.getpeername.restype = ctypes.c_int
-_ws2.send.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
-_ws2.send.restype = ctypes.c_int
-# ⛔ 這裡**故意不宣告 `closesocket`** —— 見 `close_socket()`：對複製來的 handle
-#    呼叫 closesocket 會把遊戲的連線一起關掉。不宣告就不會有人不小心用到。
+_k32.WriteFile.restype = wintypes.BOOL
+_k32.GetOverlappedResult.argtypes = [
+    wintypes.HANDLE, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD), wintypes.BOOL,
+]
+_k32.GetOverlappedResult.restype = wintypes.BOOL
+_k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+_k32.WaitForSingleObject.restype = wintypes.DWORD
+
+
+class _IoStatusBlock(ctypes.Structure):
+    _fields_ = [("Status", ctypes.c_size_t), ("Information", ctypes.c_size_t)]
+
+
+class _Overlapped(ctypes.Structure):
+    _fields_ = [
+        ("Internal", ctypes.c_void_p),
+        ("InternalHigh", ctypes.c_void_p),
+        ("Offset", wintypes.DWORD),
+        ("OffsetHigh", wintypes.DWORD),
+        ("hEvent", wintypes.HANDLE),
+    ]
+
+
+_ntdll.NtDeviceIoControlFile.argtypes = [
+    wintypes.HANDLE, wintypes.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.POINTER(_IoStatusBlock), wintypes.ULONG,
+    ctypes.c_void_p, wintypes.ULONG, ctypes.c_void_p, wintypes.ULONG,
+]
+_ntdll.NtDeviceIoControlFile.restype = ctypes.c_uint32
 
 
 class _HandleEntry(ctypes.Structure):
@@ -99,68 +160,98 @@ def _enum_handles(pid: int) -> list[int]:
     return result
 
 
-class _SockAddrIn(ctypes.Structure):
-    _fields_ = [
-        ("sin_family", ctypes.c_short),
-        ("sin_port", ctypes.c_ushort),
-        ("sin_addr", ctypes.c_ubyte * 4),
-        ("sin_zero", ctypes.c_char * 8),
-    ]
+def _local_port_of(handle: int | None) -> int | None:
+    """**問核心**：這個 handle 現在是一個 AF_INET socket 嗎？綁在本機哪個埠？
 
-
-def _peer_of(handle: int) -> tuple[str, int] | None:
-    """對 handle 呼叫 getpeername；非 socket 或未連線回 None。"""
-    addr = _SockAddrIn()
-    length = ctypes.c_int(ctypes.sizeof(addr))
-    if _ws2.getpeername(handle, ctypes.byref(addr), ctypes.byref(length)) != 0:
+    不是 socket、handle 無效（被關掉了）、還沒綁定 → 一律回 None。
+    唯讀、微秒級，而且**不經過 ws2_32 的快取**（見模組說明）。
+    """
+    if not handle:
         return None
-    if addr.sin_family != socket.AF_INET:
+    event = _k32.CreateEventW(None, True, False, None)
+    if not event:
         return None
-    ip = ".".join(str(b) for b in addr.sin_addr)
-    port = socket.ntohs(addr.sin_port)
-    return ip, port
+    try:
+        iosb = _IoStatusBlock()
+        out = ctypes.create_string_buffer(64)
+        status = _ntdll.NtDeviceIoControlFile(
+            handle, event, None, None, ctypes.byref(iosb),
+            _IOCTL_AFD_GET_SOCK_NAME, None, 0, out, len(out),
+        ) & 0xFFFFFFFF
+        if status == _STATUS_PENDING:
+            _k32.WaitForSingleObject(event, 0xFFFFFFFF)
+            status = iosb.Status & 0xFFFFFFFF
+        if status != 0 or iosb.Information < 4:
+            return None
+    finally:
+        _k32.CloseHandle(event)
+    family = int.from_bytes(out.raw[0:2], "little")
+    if family != socket.AF_INET:
+        return None
+    port = int.from_bytes(out.raw[2:4], "big")
+    return port or None
 
 
 def socket_alive(sock: int | None) -> bool:
     """我們複製來的這份 handle **現在還是一個活著的 socket** 嗎？
 
-    ## 為什麼一定要有這一句（實機 2026-09-04，[PKT-096]）
+    問的是核心，不是 ws2_32 的快取（[PKT-097]）：被 `CloseHandle` 掉的、
+    根本不是 socket 的，這裡都會老實說不是。
 
-    換地圖時伺服器把角色搬到另一台 map server，客戶端會對舊連線呼叫
-    `closesocket()`。那一刻我們複製來的 handle 就**不再是 socket** ——
-    下一次 `send()` 回的是 **WSA 10038（WSAENOTSOCK）**，不是連線斷掉的 10054。
-
-    舊版沒有這一句，只能**撞牆才知道**。而每個功能（自動打怪、尋路、補水、
-    補給、buff、寄信）各自握一份複本，所以換一次圖就有好幾個功能各撞一次：
-
-        13:35:03  send 失敗，WSA 錯誤 10038 → ⚠ 寄信送不出去（連線斷了？）
-        13:35:11  send 失敗，WSA 錯誤 10038 → ⚠ 寄信送不出去（連線斷了？）
-        13:35:22  send 失敗，WSA 錯誤 10038 → 20 秒後再試
-        13:35:53  終於寄出                      ← 一趟換圖害寄信晚了 50 秒
-
-    而且 `resync()` 判斷「連線換了沒」是比對 **(ip, port)** —— 遊戲重連到
-    **同一台** map server 時那組值一模一樣，判斷不出來，只能等 `send()` 失敗
-    把 `self.server` 清成 None 才會重綁。
-
-    `getpeername` 是唯讀的、微秒級，而且**跟 `send` 走同一條判準**：
-    socket 被關掉它就失敗。所以送之前問一句就好，不必撞牆
-    （CLAUDE.md：做 → 讀 → 確認，不准拿「等一下就好了」當機制）。
-
-    ⚠ 這一句**不管**「連線被對方 reset」（10054）：那時 socket 還在，
-    `getpeername` 照樣成功。那條路由 `GameLink.dead` 負責，兩者不重疊。
+    ⚠ 這一句**不管**「連線被對方 reset」也不管「遊戲已經換了一條新的」：
+    只要我們還握著複本，核心物件就還在、還連著舊的伺服器。
+    前者由 `GameLink.dead` 負責，後者靠比對本機埠（`socket_local_port()`）。
     """
-    if sock is None:
-        return False
-    return _peer_of(sock) is not None
+    return _local_port_of(sock) is not None
+
+
+def socket_local_port(sock: int | None) -> int | None:
+    """這份複本連線的**本機埠**。★ 這才是一條連線的身分（[PKT-097]）：
+
+    重連到同一台伺服器時 (ip, port) 一模一樣，只有本機埠會變。
+    拿它跟 TCP 表裡**最新那條**比，就知道遊戲是不是已經換了一條連線。
+    """
+    return _local_port_of(sock)
+
+
+def _newest_local_port(pid: int, server_ip: str, server_port: int) -> int | None:
+    """TCP 表裡這個行程連到該伺服器的**最新一條**連線，本機埠是多少。
+
+    ⚠ 只取最新的一條：舊連線在我們握著複本的期間不會消失（[PKT-063] 那個
+    「留 11 分鐘」就是這樣來的），兩條都 ESTABLISHED、端點一模一樣，
+    只有建立時間與本機埠分得出來。
+    """
+    rows = [
+        c for c in connections_of(pid)          # 已經由新到舊排好
+        if c.endpoint == (server_ip, server_port) and c.local_port
+    ]
+    if not rows:
+        return None
+    usable = [c for c in rows if c.established] or rows
+    return usable[0].local_port
+
+
+def _dup_from(source: int, value: int) -> int | None:
+    """把別的行程的 handle 複製一份到本行程。失敗（已關掉、沒權限）回 None。"""
+    dup = wintypes.HANDLE()
+    ok = _k32.DuplicateHandle(
+        source, wintypes.HANDLE(value), _k32.GetCurrentProcess(), ctypes.byref(dup),
+        0, False, _DUPLICATE_SAME_ACCESS,
+    )
+    return int(dup.value) if ok and dup.value else None
 
 
 def find_game_socket(pid: int, server_ip: str, server_port: int) -> int | None:
-    """找出並複製遊戲連到伺服器的 socket，回傳本行程可用的 SOCKET handle。
+    """找出並複製遊戲連到伺服器的 socket，回傳本行程可用的 handle。
 
-    回傳的 handle 用完要 closesocket()。找不到回 None。
+    做法：先從 TCP 表查「這個行程連到那台伺服器**最新那條**連線的本機埠」，
+    再把行程的 handle 一個一個複製過來**問核心**綁在哪個埠，對上就是它。
+    回傳的 handle 用完要 `close_socket()`。找不到回 None。
     """
-    # 確保本行程的 Winsock 已初始化（import socket 已會做，這裡保險）
-    socket.socket(socket.AF_INET, socket.SOCK_STREAM).close()
+    wanted = _newest_local_port(pid, server_ip, server_port)
+    if wanted is None:
+        log.debug("TCP 表裡 PID %s 沒有連到 %s:%s 的連線", pid, server_ip, server_port)
+        return None
 
     source = _k32.OpenProcess(_PROCESS_DUP_HANDLE, False, pid)
     if not source:
@@ -168,26 +259,21 @@ def find_game_socket(pid: int, server_ip: str, server_port: int) -> int | None:
         return None
 
     try:
-        me = _k32.GetCurrentProcess()
         for value in _enum_handles(pid):
-            dup = wintypes.HANDLE()
-            ok = _k32.DuplicateHandle(
-                source, wintypes.HANDLE(value), me, ctypes.byref(dup),
-                0, False, _DUPLICATE_SAME_ACCESS,
-            )
-            if not ok:
+            dup = _dup_from(source, value)
+            if dup is None:
                 continue
-            peer = _peer_of(dup.value)
-            if peer == (server_ip, server_port):
-                log.debug("找到遊戲 socket：handle %#x 連到 %s:%s",
-                          dup.value, server_ip, server_port)
-                return dup.value
-            _k32.CloseHandle(dup)
+            if _local_port_of(dup) == wanted:
+                log.debug("找到遊戲 socket：handle %#x 本機埠 %d → %s:%s",
+                          dup, wanted, server_ip, server_port)
+                return dup
+            _k32.CloseHandle(wintypes.HANDLE(dup))
         # ⚠ 這裡**只記 DEBUG**。呼叫端幾乎都是「重試到成功或逾時」的迴圈
         # （剛換到角色伺服器的那幾秒複製不到，過一下就好），
         # 每次沒找到就 WARNING 的話，短短兩秒就是上百行洗版 ——
         # 使用者實際回報過。真的放棄時由呼叫端說一次就好。
-        log.debug("在 PID %s 裡找不到連到 %s:%s 的 socket", pid, server_ip, server_port)
+        log.debug("在 PID %s 裡找不到本機埠 %d（→ %s:%s）的 socket",
+                  pid, wanted, server_ip, server_port)
         return None
     finally:
         _k32.CloseHandle(source)
@@ -195,9 +281,11 @@ def find_game_socket(pid: int, server_ip: str, server_port: int) -> int | None:
 
 #: 複製不到 socket 時要重試多久（開機／換頻道那幾秒）。
 #:
-#: ⚠ **這不是「等一下再說」的敷衍，是實測出來的事實**：剛連上伺服器的那幾秒
-#: 遊戲那條 socket **複製不到**（實測：列舉得到 773 個 handle、複製成功 552 個，
-#: 但裡面只有 GameGuard 那條 443），過一會兒再找就 0.1 秒找到。
+#: 剛連上伺服器的那幾秒 TCP 表裡可能還沒有 ESTABLISHED 的那條，或遊戲的
+#: handle 還沒建好；過一會兒再找就 0.1 秒找到。
+#: ⚠ 以前的「列舉得到 773 個 handle、複製成功 552 個，但裡面只有 GameGuard
+#:   那條」其實是 ws2_32 快取把答案蓋掉了（[PKT-097]），現在改問核心，
+#:   那種「明明在卻找不到」不會再發生；留著重試是為了真正的過渡期。
 SOCKET_WAIT_SEC = 20.0
 #: 換頻道／換地圖之後重綁的等待。比開機短 —— 那時整個 bot 的迴圈都卡在這裡。
 SOCKET_REBIND_SEC = 10.0
@@ -280,9 +368,9 @@ def open_any_game_socket(
         time.sleep(_SOCKET_POLL)
 
 
-#: 同一個 WSA 錯誤碼只吼一次，之後每這麼多次補一行摘要。
+#: 同一個錯誤碼只吼一次，之後每這麼多次補一行摘要。
 #:
-#: ⚠ 不節流的後果是實測出來的：連線被伺服器 reset（10054）之後，bot 每一拍
+#: ⚠ 不節流的後果是實測出來的：連線被伺服器 reset 之後，bot 每一拍
 #: 都會再送一次，一小時噴了 **5,185 行** —— 日誌整個被沖掉，真正的原因反而
 #: 找不到（使用者實測回報「兩隻都停了，很怪」）。
 _SEND_ERROR_EVERY = 500
@@ -291,18 +379,43 @@ _SEND_ERROR_EVERY = 500
 #: ⚠⚠ 一定要含 socket。舊版只用錯誤碼當鍵，而且「任何一次成功就整個清空」——
 #: 多開的時候另外兩隻一直在成功送封包，於是計數每一拍都被歸零，
 #: 壞掉的那一隻**每次都印「第 1 次」那句**。節流寫了等於沒寫：
-#: 實機 15 秒噴了 40 行一模一樣的 10054（使用者實測回報「看起來好怪」）。
+#: 實機 15 秒噴了 40 行一模一樣的錯誤（使用者實測回報「看起來好怪」）。
 _send_errors: dict[tuple[int, int], int] = {}
 
 
-#: WSA 錯誤碼 → 給人看的一句話。**不猜，只寫量過的那幾個。**
-_WSA_MEANING = {
-    10038: "這個 handle 已經不是 socket 了（遊戲換地圖伺服器時會把它關掉）",
-    10054: "連線被伺服器 reset",
-    10057: "socket 還沒連上",
-    10022: "參數不合法（多半是綁到了不是連線用的 socket）",
-    10045: "這個 socket 不支援 send（綁錯對象）",
+#: Win32 錯誤碼 → 給人看的一句話。**不猜，只寫量過的那幾個**（2026-09-05）。
+_ERROR_MEANING = {
+    6: "這個 handle 在我們這個行程裡已經不是有效的 socket"
+       "（被關掉了、或複製到的根本不是 socket）—— 這是程式自己的問題，不是連線",
+    64: "連線已經被對方關掉／reset（ERROR_NETNAME_DELETED）",
+    5: "拒絕存取 —— 複製到的不是可寫的 socket",
 }
+
+
+def _write(sock: int, data: bytes) -> tuple[int, int]:
+    """走核心把 `data` 寫進 socket。回 `(送出的位元組數, Win32 錯誤碼)`；失敗時前者是 -1。
+
+    用 `WriteFile` 而不是 ws2_32 的 `send`：AFD 對 socket handle 本來就接受
+    `IRP_MJ_WRITE`（實測 2026-09-05 對方收到的位元組一模一樣），而且回報的是
+    **這個 handle 現在的真相**，不會被 ws2_32 的快取蓋掉（[PKT-097]）。
+    遊戲的 socket 是 overlapped 的，所以一律帶 OVERLAPPED ＋ 事件，等它完成。
+    """
+    event = _k32.CreateEventW(None, True, False, None)
+    if not event:
+        return -1, ctypes.get_last_error()
+    try:
+        overlapped = _Overlapped()
+        overlapped.hEvent = event
+        buf = ctypes.create_string_buffer(data, len(data))
+        sent = wintypes.DWORD(0)
+        ok = _k32.WriteFile(sock, buf, len(data), ctypes.byref(sent), ctypes.byref(overlapped))
+        err = 0 if ok else ctypes.get_last_error()
+        if not ok and err == _ERROR_IO_PENDING:
+            ok = _k32.GetOverlappedResult(sock, ctypes.byref(overlapped), ctypes.byref(sent), True)
+            err = 0 if ok else ctypes.get_last_error()
+        return (int(sent.value), 0) if ok else (-1, err)
+    finally:
+        _k32.CloseHandle(event)
 
 
 def send_on_socket(sock: int | None, data: bytes) -> int:
@@ -311,28 +424,25 @@ def send_on_socket(sock: int | None, data: bytes) -> int:
     ⚠⚠ **失敗訊息一定要帶 handle 值。** 2026-09-04 追這個問題時，
     日誌只有「send 失敗，WSA 錯誤 10038」—— 完全分不出是
     「遊戲把那條關掉了」還是「我們自己傳了一個沒有的 handle 進來」，
-    最後只能靠實機重現才確定（見 `socket_alive()`）。錯誤訊息**必須夠診斷**。
+    最後只能靠實機重現才確定。錯誤訊息**必須夠診斷**。
     """
     if not sock:
-        # ⛔ `send(NULL)` 也是回 10038（實測），跟「遊戲關掉了」**長得一模一樣**。
-        #    這其實是我們自己的 bug：呼叫端在 `sock` 被清成 None 之後還來送。
-        #    要分開講，不然又要靠猜的。
+        # ⛔ 呼叫端在 `sock` 被清成 None 之後還來送 —— 這是我們自己的 bug，
+        #    跟連線無關，要分開講，不然又要靠猜的。
         log.error("要送封包但 socket 是空的（%r）—— 這是呼叫端的錯，不是連線問題",
                   sock)
         return -1
-    buf = ctypes.create_string_buffer(data, len(data))
-    sent = _ws2.send(sock, buf, len(data), 0)
+    sent, err = _write(sock, data)
     if sent < 0:
-        err = _ws2.WSAGetLastError()
         key = (sock, err)
         count = _send_errors.get(key, 0) + 1
         _send_errors[key] = count
-        why = _WSA_MEANING.get(err, "沒見過的錯誤")
+        why = _ERROR_MEANING.get(err, "沒見過的錯誤")
         if count == 1:
-            log.error("send 失敗（socket %#x）：WSA %s —— %s"
+            log.error("send 失敗（socket %#x）：Win32 錯誤 %s —— %s"
                       "（同一個錯誤之後只會定期摘要）", sock, err, why)
         elif count % _SEND_ERROR_EVERY == 0:
-            log.error("send 失敗（socket %#x）：WSA %s —— %s，已經連續 %d 次",
+            log.error("send 失敗（socket %#x）：Win32 錯誤 %s —— %s，已經連續 %d 次",
                       sock, err, why, count)
     else:
         # 只清**這一條** socket 的計數 —— 別人送得出去不代表我這條好了。
@@ -356,12 +466,10 @@ def close_socket(sock: int) -> None:
     「與伺服器斷線」。路徑是 `MainWindow.closeEvent` → `page.shutdown()` →
     `GameLink.close()` → 這裡，而那一刻關到的正是**當下活著的那條地圖連線**。
 
-    為什麼換頻道／換地圖的重綁沒暴露這個問題：那時 `_close_socket()` 關掉的是
-    **已經作廢的舊連線**（遊戲自己早就丟了），關不關都看不出差別。
-
-    佐證：`find_game_socket()` 每次掃描都把遊戲全部 handle（實測 773 個，
-    含 GameGuard 那條 443）複製一遍再 `CloseHandle` 掉，一秒好幾次，
-    從來沒弄斷過任何連線 —— 動作一樣，差別只在用哪一支函式關。
+    ⚠ handle 值關掉之後**立刻**會被系統回收發給下一個 `DuplicateHandle`
+    （實測同一個值連續拿到三次）。所以一個值只准關一次：關兩次等於把別人
+    剛拿到的那一份關掉，症狀是對方 `send` 回 `ERROR_INVALID_HANDLE`。
+    呼叫端要先把自己的欄位清成 None 再關（見 `GameLink._close_socket`）。
     """
     _k32.CloseHandle(wintypes.HANDLE(sock))
     # 順手清掉這條 socket 的送出錯誤計數：handle 值會被系統回收再發給別條連線，

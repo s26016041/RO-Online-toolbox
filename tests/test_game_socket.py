@@ -1,10 +1,13 @@
 """送封包失敗時的日誌節流（不需要真的 socket）。
 
-釘的是使用者實測回報的那一幕：連線被伺服器 reset（WSA 10054）之後，
+釘的是使用者實測回報的那一幕：連線被伺服器 reset 之後，
 15 秒噴了 40 行**一模一樣**的「第 1 次」訊息 —— 節流寫了等於沒寫。
 
 原因是計數只用錯誤碼當鍵，而且「任何一次成功就整個清空」。多開的時候
 另外兩隻一直在成功送封包，於是壞掉那一隻的計數每一拍都被歸零。
+
+⚠ 2026-09-05 起送封包走核心（`WriteFile`），這裡換掉的是 `_write`
+（回 `(送出位元組數, Win32 錯誤碼)`），不再有 ws2_32（[PKT-097]）。
 """
 
 from __future__ import annotations
@@ -14,20 +17,6 @@ import pytest
 from ro_toolbox.services import game_socket
 
 
-class _FakeWs2:
-    """假的 ws2_32：想讓哪一條 socket 失敗就把它放進 `broken`。"""
-
-    def __init__(self, broken: set[int]) -> None:
-        self._broken = broken
-
-    def send(self, sock, _buf, length, _flags):  # noqa: ANN001
-        return -1 if sock in self._broken else length
-
-    @staticmethod
-    def WSAGetLastError() -> int:  # noqa: N802 - 照 Win32 的名字
-        return 10054
-
-
 @pytest.fixture(autouse=True)
 def _clean():
     game_socket._send_errors.clear()
@@ -35,8 +24,13 @@ def _clean():
     game_socket._send_errors.clear()
 
 
-def _install(monkeypatch, broken: set[int]) -> None:
-    monkeypatch.setattr(game_socket, "_ws2", _FakeWs2(broken))
+def _install(monkeypatch, broken: set[int]) -> set[int]:
+    """假的核心寫入：想讓哪一條 socket 失敗就把它放進 `broken`。"""
+    monkeypatch.setattr(
+        game_socket, "_write",
+        lambda sock, data: (-1, 64) if sock in broken else (len(data), 0),
+    )
+    return broken
 
 
 def test_the_same_error_is_only_shouted_once(monkeypatch, caplog):
@@ -59,13 +53,12 @@ def test_another_sockets_success_does_not_reset_the_count(monkeypatch, caplog):
 
 def test_my_own_success_clears_my_count(monkeypatch, caplog):
     """自己這條接回來了就重新起算 —— 下一次真的斷線要再吼一次。"""
-    ws2 = _FakeWs2({7})
-    monkeypatch.setattr(game_socket, "_ws2", ws2)
+    broken = _install(monkeypatch, {7})
     with caplog.at_level("ERROR"):
         game_socket.send_on_socket(7, b"x")
-        ws2._broken.clear()
+        broken.clear()
         game_socket.send_on_socket(7, b"x")         # 好了
-        ws2._broken.add(7)
+        broken.add(7)
         game_socket.send_on_socket(7, b"x")         # 又壞了
     assert len(caplog.records) == 2
 
@@ -80,14 +73,12 @@ def test_a_long_outage_still_gets_a_summary(monkeypatch, caplog):
     assert "已經連續" in caplog.records[-1].getMessage()
 
 
-class _ExplodingWs2:
-    """任何 ws2_32 呼叫都當場炸掉 —— 收尾時不准碰到它。"""
-
-    def __getattr__(self, name: str):  # noqa: ANN204
-        raise AssertionError(
-            f"close_socket() 不准呼叫 ws2_32.{name}："
-            "closesocket 會把遊戲的連線一起關掉"
-        )
+def test_an_empty_socket_is_reported_as_our_own_bug(monkeypatch, caplog):
+    """`send(None)` 跟「遊戲把那條關掉了」以前長得一模一樣（都是 10038）——要分開講。"""
+    _install(monkeypatch, set())
+    with caplog.at_level("ERROR"):
+        assert game_socket.send_on_socket(None, b"x") == -1
+    assert "呼叫端的錯" in caplog.records[0].getMessage()
 
 
 class _FakeK32:
@@ -108,21 +99,33 @@ def test_close_socket_only_releases_our_handle(monkeypatch):
     """
     k32 = _FakeK32()
     monkeypatch.setattr(game_socket, "_k32", k32)
-    monkeypatch.setattr(game_socket, "_ws2", _ExplodingWs2())
 
     game_socket.close_socket(0x29C)
 
     assert k32.closed == [0x29C]
 
 
+def test_the_module_never_loads_ws2_32():
+    """⛔⛔ 這一支不准碰 ws2_32（[PKT-097]）。
+
+    `getpeername` 對複製來的 handle 照**第一次**的快取回答（被關掉、值被回收
+    發給別的物件都照舊），`send` 的 10038 分不出「遊戲關的」還是「我們綁錯的」，
+    `closesocket` 會把遊戲的連線一起關掉（[PKT-094]）。三件事都改走核心。
+    """
+    import inspect
+
+    assert not hasattr(game_socket, "_ws2")
+    source = inspect.getsource(game_socket)
+    assert "ws2_32\"" not in source and "windll.ws2_32" not in source
+
+
 def test_close_socket_forgets_that_sockets_error_count(monkeypatch):
     """handle 值會被系統回收再發給別條連線，計數不清會讓節流提早吞錯誤。"""
-    monkeypatch.setattr(game_socket, "_ws2", _FakeWs2({7}))
+    _install(monkeypatch, {7})
     game_socket.send_on_socket(7, b"x")
     assert any(key[0] == 7 for key in game_socket._send_errors)
 
     monkeypatch.setattr(game_socket, "_k32", _FakeK32())
-    monkeypatch.setattr(game_socket, "_ws2", _ExplodingWs2())
     game_socket.close_socket(7)
 
     assert not any(key[0] == 7 for key in game_socket._send_errors)

@@ -116,13 +116,12 @@ def test_a_genuinely_new_connection_still_rebinds(link, monkeypatch):
     assert made.server == OTHER
 
 
-def test_the_same_wsa_error_is_not_logged_every_time(monkeypatch, caplog):
+def test_the_same_send_error_is_not_logged_every_time(monkeypatch, caplog):
     """一小時 5,185 行會把真正的原因沖掉 —— 同一個錯誤只吼一次。"""
     monkeypatch.setattr(game_socket, "_send_errors", {})
-    monkeypatch.setattr(game_socket._ws2, "send", lambda *a: -1)
-    monkeypatch.setattr(game_socket._ws2, "WSAGetLastError", lambda: 10054)
+    monkeypatch.setattr(game_socket, "_write", lambda sock, data: (-1, 64))
 
     with caplog.at_level(logging.ERROR):
         for _ in range(50):
             game_socket.send_on_socket(42, b"\x01")
-    assert caplog.text.count("10054") == 1
+    assert len([r for r in caplog.records if r.levelno >= logging.ERROR]) == 1

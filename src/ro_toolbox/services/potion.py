@@ -718,9 +718,10 @@ class PotionBot:
                      "（換地圖伺服器）—— 重新複製", server)
         else:
             log.info("連線變了（%s → %s），重新綁定", self._server, server)
-        if self._sock is not None:
-            game_socket.close_socket(self._sock)
-            self._sock = None
+        # ★ 先清欄位再關（handle 值一關掉就會被回收發給別人，見 `close_socket`）。
+        old, self._sock = self._sock, None
+        if old is not None:
+            game_socket.close_socket(old)
         sock = game_socket.open_game_socket(
             self._pid, server[0], server[1],
             timeout=game_socket.SOCKET_REBIND_SEC, should_stop=self._stop.is_set,
