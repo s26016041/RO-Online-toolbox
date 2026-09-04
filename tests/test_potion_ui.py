@@ -387,14 +387,15 @@ def test_a_remembered_item_survives_a_save_while_the_bag_is_unread(
     qtbot, monkeypatch, tmp_path
 ):
     """★★ 使用者 2026-09-03：「我的程式一直沒紀錄　藥水跟回程道具」。
+    2026-09-04 再一次：「為何每次重開我之前設定的藥水以及回程道具都要重新設定」。
 
     下拉是照背包重建的，而背包是背景執行緒讀的、又只讀「正在看的那一頁」。
-    背景分頁的下拉可能一直是空的 —— 這時候**任何別的動作**（改門檻、勾自動
-    補水、勾水用完回程）都會觸發存檔，而 `saved_potion()` 對空下拉只能回
-    `None`，一次就把記住的藥水與回程道具洗掉。
+    背景分頁的下拉可能一直是空的 —— 舊版的 `saved_potion()` 就是去掃那三個
+    下拉，所以**任何別的動作**（改門檻、勾自動補水、勾水用完回程）都會觸發
+    存檔，而空下拉只能回 `None`，一次就把記住的藥水與回程道具洗掉。
 
-    `_picked()` 的 `_want_item` 只活到「還原成功」為止（`set_slots()` 會清掉
-    它），之後就沒有任何東西擋了。
+    現在設定本尊是 `card._settings`，畫面只是它的顯示方式 —— 下拉空不空
+    都跟「使用者記住的是什麼」無關。
     """
     from ro_toolbox.services import potion_store
     from ro_toolbox.services.potion_store import PotionSaved
@@ -409,18 +410,19 @@ def test_a_remembered_item_survives_a_save_while_the_bag_is_unread(
     potion_store.save("狐狐狸", PotionSaved(hp_item=orange, hp_percent=60,
                                           home_item=wing, go_home=True, enabled=True))
 
-    # 還原 → 背包讀過一次（`_want_item` 被清掉）→ 下拉又被重建成空的
     card.apply_saved_potion(potion_store.get("狐狐狸"))
-    card._want_item = {"hp": None, "sp": None, "home": None}
-    card.hp_item.clear()
-    card.hp_item.addItem("未選擇", None)
-    card.home_item.clear()
-    card.home_item.addItem("未選擇", None)
-    assert card.saved_potion().hp_item is None, "前提：這時候畫面上真的是空的"
+    assert card.hp_item.currentData() == orange, "前提：還原時有選起來"
 
+    # 背包一直讀不到（背景分頁）→ 下拉被重建成只剩「未選擇」
+    for combo in (card.hp_item, card.home_item):
+        combo.clear()
+        combo.addItem("未選擇", None)
+    # 使用者只是改了門檻 —— 這**不是**「把藥水清掉」的意思
+    card.hp_threshold.setValue(45)
     page._save_potion(1)
 
     after = potion_store.get("狐狐狸")
+    assert after.hp_percent == 45, "改的那一項要存進去"
     assert after.hp_item == orange, "背包沒讀到，不准把記住的藥水洗掉"
     assert after.home_item == wing, "回程道具同理"
 

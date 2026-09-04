@@ -295,9 +295,31 @@ class CharacterCard(QWidget):
         self._travel_paused = False
         #: 想選但清單裡還沒出現的道具（背包是非同步讀的，選單填好才選得到）
         self._want_item: dict[str, int | None] = {"hp": None, "sp": None, "home": None}
+        #: ★★ **記住的補水設定本尊。畫面只是它的一個顯示方式。**
+        #:
+        #: 使用者 2026-09-04：「為何每次重開我之前設定的藥水以及回程道具都要
+        #: 重新設定，不是應該要紀錄嗎？直接紀錄物品 ID 就好」——— 完全正確。
+        #: 舊版把**下拉選單當成事實**（`saved_potion()` 去掃三個 QComboBox），
+        #: 而那三個下拉是照背包重建的、背包又是背景執行緒讀的、還只讀「正在看
+        #: 的那一頁」。於是「畫面上是空的」跟「使用者沒設定」在存檔那一刻長得
+        #: 一模一樣，任何一次存檔都可能把記住的道具洗成 `None`
+        #: （[DAT-052]／[DAT-057]／[DAT-071]，使用者回報過四次）。
+        #:
+        #: 現在反過來：這份設定是事實，**只有使用者真的動了畫面才會改它**
+        #: （`_remember()`，`quiet` 時不算）。程式自己重建下拉、還原存檔、
+        #: 自動勾回勾勾，全都碰不到它。
+        self._settings = potion_store.PotionSaved()
         #: True = 現在是**程式自己**在改 UI，不是使用者的意思 —— 這種變動不存檔。
         #: 少了這道閘門，bot 啟動失敗時自動取消勾選會把使用者的設定覆蓋成「關閉」。
-        self.quiet = False
+        #:
+        #: ⚠ 建構期間一律是 True：`addItem()` 會讓下拉發出 `currentIndexChanged`，
+        #: 而那時候別的元件還沒生出來 —— 更重要的是，**版面長出來不是使用者的
+        #: 意思**，不能拿它去覆蓋記住的設定。最後一行才放下來。
+        self.quiet = True
+        # ⚠ 這兩條要接在頁面之前（`__init__` 比 attach 早），Qt 照接線順序叫，
+        # 這樣頁面的 `_save_potion()` 拿到的一定是已經更新過的那份設定。
+        self.potion_changed.connect(self._remember)
+        self.potion_toggled.connect(self._remember)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -442,6 +464,9 @@ class CharacterCard(QWidget):
         self.farm_stats.connect(self._apply_farm_stats)
         self.potion_stats.connect(self._apply_potion_stats)
         self.travel_stats.connect(self._apply_travel_stats)
+
+        # 版面長完了，從這裡開始畫面上的變動才算「使用者的意思」。
+        self.quiet = False
 
     # ---- 自動尋路 ---------------------------------------------------
 
@@ -927,7 +952,12 @@ class CharacterCard(QWidget):
         ⚠ 全程 `quiet=True`：這是程式在還原，不是使用者剛剛改的，**不該再存一次**。
         道具可能還不在下拉選單裡（背包是非同步讀的），所以先記在 `_want_item`，
         等 `set_slots()` 把清單填好時再選起來。
+
+        ⚠⚠ **先收下設定本尊再畫**（`self._settings`）。畫面畫不畫得出來是另一
+        回事 —— 背包還沒讀到、下拉還沒建好都不影響「使用者記住的是什麼」。
+        存回檔案的是這一份，不是等一下掃下拉掃到的東西。
         """
+        self._settings = saved
         self.quiet = True
         try:
             self._want_item = {
@@ -958,10 +988,23 @@ class CharacterCard(QWidget):
             self.quiet = False
 
     def saved_potion(self):  # noqa: ANN201 - PotionSaved
-        """目前畫面上的補水設定，要存起來的樣子。"""
-        from ro_toolbox.services.potion_store import PotionSaved
+        """記住的補水設定。**這是本尊，不是去掃畫面掃出來的。**
 
-        return PotionSaved(
+        為什麼不掃畫面：見 `self._settings` 的說明。下拉是照背包重建的，
+        「畫面上是空的」跟「使用者沒設定」在存檔那一刻分不出來。
+        """
+        return self._settings
+
+    def _remember(self, *_args) -> None:
+        """**使用者**動了畫面上的補水設定 —— 把它收進 `self._settings`。
+
+        `quiet` 立著就不算：那是程式自己在改 UI（還原存檔、重建下拉、
+        自動把勾勾勾回去），不是使用者的意思。
+        """
+        if self.quiet:
+            return
+        self._settings = replace(
+            self._settings,
             hp_item=self._picked("hp", self.hp_item),
             hp_percent=self.hp_threshold.value(),
             sp_item=self._picked("sp", self.sp_item),
@@ -973,35 +1016,42 @@ class CharacterCard(QWidget):
         )
 
     def _picked(self, key: str, combo: QComboBox) -> int | None:
-        """使用者選的是哪個道具。**下拉是空的時候要回還原存檔時那個。**
+        """使用者在這個下拉選的是哪個道具。
 
-        ⚠ 背包是非同步讀的，分頁剛長出來的那幾秒下拉裡什麼都沒有 ——
-        那時候 `currentData()` 是 None，直接拿去存就是**把設定洗掉**。
-        使用者實測回報「藥水跟回程使用物品一直不見沒紀錄」就是這個。
-        `_want_item` 記的是「還原了但還選不起來」的那個，它才是使用者的意思。
+        ⛔ **清單裡根本沒有記住的那個道具時，畫面不算數。**
+        背包是背景執行緒讀的、又只讀「正在看的那一頁」—— 背景分頁的下拉
+        可能一直是空的，那時候的「未選擇」是**還沒畫出來**，不是使用者要清掉。
+        分得出來的判準很簡單：記住的那個**列得出來嗎**？列得出來，使用者才有
+        機會選它；那時候的空白就真的是他要清掉（`set_slots()` 會把選著的道具
+        用「× 0」留在清單上，所以正常情況一定列得出來）。
         """
-        return combo.currentData() or self._want_item.get(key)
+        picked = combo.currentData()
+        if picked is not None:
+            return picked
+        remembered = getattr(self._settings, f"{key}_item")
+        if remembered and combo.findData(remembered) < 0:
+            return remembered
+        return None
 
     def potion_config(self) -> PotionConfig:
         """要拿去跑的補水設定。
 
-        ⚠⚠ **一律走 `_picked()`，不准用 `currentData()`。** 下拉是照背包重建的，
+        ⚠⚠ **來源是 `saved_potion()`，不是三個下拉。** 下拉是照背包重建的，
         而背包是背景執行緒讀的、又只讀「正在看的那一頁」—— 背景分頁的下拉
-        可能一直是空的。用 `currentData()` 的話 `wants_hp()` 就永遠是 False，
-        於是勾著自動補水卻**什麼都沒在跑**（實機日誌：「自動補水先等背包讀到
-        再啟動」每 5 秒一行，跑了 40 秒才起來）。
+        可能一直是空的。掃畫面的話 `wants_hp()` 就永遠是 False，於是勾著
+        自動補水卻**什麼都沒在跑**（實機日誌：「自動補水先等背包讀到再啟動」
+        每 5 秒一行，跑了 40 秒才起來）。
         存的是**道具編號**，`PotionBot` 每次喝之前自己查格號（`_slot_of()`），
         它根本不需要那份下拉清單。
         """
+        saved = self._settings
         return PotionConfig(
-            hp_item=self._picked("hp", self.hp_item),
-            hp_percent=self.hp_threshold.value(),
-            sp_item=self._picked("sp", self.sp_item),
-            sp_percent=self.sp_threshold.value(),
+            hp_item=saved.hp_item,
+            hp_percent=saved.hp_percent,
+            sp_item=saved.sp_item,
+            sp_percent=saved.sp_percent,
             # 沒勾就不帶道具進去 —— 沒勾卻回程是「安靜地做錯事」
-            home_item=(
-                self._picked("home", self.home_item) if self.go_home.isChecked() else None
-            ),
+            home_item=saved.home_item if saved.go_home else None,
         )
 
     def _apply_potion_stats(self, stats: PotionStats) -> None:
@@ -2863,11 +2913,20 @@ class FarmPage(BasePage):
         （[DAT-052]／[DAT-057]／2026-09-03），而這條路以前**一個字都不印** ——
         檔案裡只看得到最後的結果，看不到是誰、在哪一拍、把它寫成什麼。
         沒有這一行就只能猜（`~/.claude` memory：日誌一定要看得到）。
+
+        ⚠⚠ **沒變就不要寫，也不要記那一行。** 這支被
+        `_watch_potion_alive()`／`_apply_potion_config()` 每一拍叫一次 ——
+        實機日誌是**一秒一行**「記住「狐狐狸」的補水設定…」，跑一晚就把
+        app.log（2 MB 一輪、留 3 份）整個洗掉，真正的錯誤一條都留不下來
+        （2026-09-04 撈日誌時實際踩到）。而且每一拍都重寫同一個檔案，
+        兩個視窗同時開的時候還會互相蓋。
         """
         card = self._cards.get(pid)
         if card is None or card.quiet or not card.character:
             return
-        config = self._keep_remembered_items(pid, card.character, card.saved_potion())
+        config = card.saved_potion()
+        if potion_store.get(card.character) == config:
+            return
         potion_store.save(card.character, config)
         log.info("記住「%s」的補水設定：藥水=%s(%s%%) 魔水=%s(%s%%) "
                  "回程=%s(%s) 自動補水=%s",
@@ -2875,35 +2934,6 @@ class FarmPage(BasePage):
                  config.sp_item, config.sp_percent,
                  config.home_item, "勾" if config.go_home else "沒勾",
                  "開" if config.enabled else "關")
-
-    def _keep_remembered_items(self, pid: int, who: str, config):  # noqa: ANN001
-        """⛔ **背包還沒讀到的時候，不准把記住的道具寫成「未選擇」。**
-
-        下拉是照背包重建的，而背包是背景執行緒讀的、又只讀「正在看的那一頁」
-        —— 背景分頁的下拉可能一直是空的。這時候任何一個**別的**動作
-        （改門檻、勾自動補水、勾水用完回程）都會觸發存檔，而 `saved_potion()`
-        對那幾個空下拉只能回 `None` —— 一次就把記住的藥水與回程道具洗掉。
-
-        `_picked()` 用 `_want_item` 擋過一層，但那份只活到「還原成功」為止
-        （`set_slots()` 會清掉它），之後就沒有任何東西擋了。
-
-        判準是**量得到的**：這個 PID 的背包讀到了沒（`self._bags`）。讀到了
-        才承認「畫面上是空的」是使用者的意思；沒讀到就沿用檔案裡那個。
-        ⚠ 只補 `None`，不覆蓋使用者真的改成別的道具那種 —— 那是他的意思。
-        """
-        saved = potion_store.get(who)
-        if saved is None or self._bags.get(pid):
-            return config
-        keep = {
-            field: getattr(saved, field)
-            for field in ("hp_item", "sp_item", "home_item")
-            if getattr(saved, field) and getattr(config, field) is None
-        }
-        if not keep:
-            return config
-        log.warning("「%s」的背包還沒讀到 —— 保留記住的道具，不洗成未選擇：%s",
-                    who, keep)
-        return replace(config, **keep)
 
     # ---- 數值更新 ---------------------------------------------------
 

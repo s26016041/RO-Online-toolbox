@@ -43,7 +43,16 @@ log = logging.getLogger(__name__)
 #: 這支被輪詢得很兇（每一秒多一次），失敗訊息要降噪 —— 見 StateLog。
 _notes = StateLog(log)
 #: 成功訊息同理：只在「容器位址／格數」變動時講一次。
-_reads = StateLog(log)
+#:
+#: ⚠⚠ **一個容器一份**，不能全部共用一份。多開的時候兩個遊戲輪流讀，
+#: 「32 格」「23 格」交替出現 —— 共用一份的話每一次都算「變動了」，
+#: 降噪等於沒做（實機 app.log：一秒三行，2 MB 一輪的日誌兩小時就洗一遍，
+#: 真正的錯誤全被沖掉）。`character.py` 的 `_notes_for()` 是同一個做法。
+_reads: dict[int, StateLog] = {}
+
+
+def _reads_for(container: int) -> StateLog:
+    return _reads.setdefault(container, StateLog(log))
 
 #: 「除以 34」的魔術乘數。34 是背包清單封包的記錄大小（[PKT-039]）。
 #: 這是指令骨架的錨，不是答案 —— 容器位址是從指令的立即值讀出來的。
@@ -249,7 +258,7 @@ def read_bag(pid: int, scanner: MemoryScanner | None = None) -> list[BagItem]:
         container, offset, best = site
         # ⚠ 只在**變動時**講一次。這支每秒多一次，照記就是每秒一行
         # 「背包讀到 40 格」把日誌洗掉（使用者實際回報）。
-        _reads.changed(
+        _reads_for(container).changed(
             f"{container:#x}+{offset:#x}:{len(best)}", logging.INFO,
             "背包讀到 %d 格（容器 %#x + %#x）", len(best), container, offset,
         )

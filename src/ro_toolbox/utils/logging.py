@@ -63,19 +63,15 @@ class QtLogHandler(logging.Handler):
             pass
 
 
-#: 「執行日誌」面板與 app.log **至少**收到這個層級。
+#: **`app.log` 至少**收到這個層級。
 #:
 #: ⚠⚠ **設定裡的 `log_level` 不准壓過它。** 那個設定預設是 `WARNING`，
 #: 而所有功能的進度都是 `INFO`（自動尋路的 `TravelBot._note()`、自動登入的
-#: 每一步、自動打怪的回報…）—— 於是使用者的面板與 app.log **一行進度都沒有**。
+#: 每一步、自動打怪的回報…）—— 於是出事之後去撈 app.log **一行進度都沒有**。
 #:
-#: 實際踩過兩次：
-#:   1. 自動登入卡住時去撈 app.log，登入步驟全空，完全看不出卡在哪。
-#:   2. 使用者回報「自動尋路都沒有提示文字出現，他在計算還是壞掉我都不知道」。
-#:
-#: 面板存在的唯一理由就是給人看進度；被記錄層級關掉等於這個功能不存在。
-#: `log_level` 現在的意思是「**主控台**的層級，以及要不要更囉唆（DEBUG）」。
-_UI_FLOOR = logging.INFO
+#: 實際踩過：自動登入卡住時去撈 app.log，登入步驟全空，完全看不出卡在哪。
+#: 檔案是唯一的事後線索，不准比 INFO 安靜。
+_FILE_FLOOR = logging.INFO
 
 
 def setup_logging(level: str = "INFO") -> LogBridge:
@@ -84,8 +80,8 @@ def setup_logging(level: str = "INFO") -> LogBridge:
     formatter = logging.Formatter(_FORMAT, datefmt=_DATEFMT)
 
     asked = getattr(logging, level.upper(), logging.INFO)
-    # 面板與檔案至少 INFO；使用者想要更囉唆（DEBUG）就照他的。
-    kept = min(asked, _UI_FLOOR)
+    # 檔案至少 INFO；使用者想要更囉唆（DEBUG）就照他的。
+    kept = min(asked, _FILE_FLOOR)
 
     root = logging.getLogger()
     root.setLevel(kept)
@@ -107,7 +103,15 @@ def setup_logging(level: str = "INFO") -> LogBridge:
     bridge = LogBridge()
     qt_handler = QtLogHandler(bridge)
     qt_handler.setFormatter(formatter)
-    qt_handler.setLevel(kept)        # 面板就是給人看進度的
+    # ★★ 「執行日誌」面板**只出問題**（使用者 2026-09-04 指定）：
+    #    「不要出現殺了幾隻怪物、讀到背包、技能學習到等等，只能出現錯誤，
+    #      比如找不到路徑、讀不到背包。正常執行的東西不需要顯示」。
+    #    正常運作的回報是 INFO（一秒好幾行：擊殺、撿到、背包讀到 N 格…），
+    #    真正的失敗一律 WARNING 以上 —— 面板照設定（預設 WARNING）就剛好只剩
+    #    問題。想看全部就把設定調成 INFO／DEBUG。
+    #    ⚠ 這**不是消音**：`app.log` 照樣收 INFO（見 `_FILE_FLOOR`），
+    #    事後撈得到每一步。
+    qt_handler.setLevel(asked)
     root.addHandler(qt_handler)
 
     return bridge

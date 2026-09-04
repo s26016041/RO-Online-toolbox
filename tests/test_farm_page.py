@@ -736,9 +736,14 @@ def test_a_failed_reconnect_keeps_watching_so_the_retry_can_fire(qtbot, monkeypa
 # —— 執行日誌面板掛在 root logger 底下，INFO 根本流不到。
 
 
-def test_the_log_panel_still_gets_progress_when_the_level_is_warning(tmp_path,
-                                                                     monkeypatch):
-    """⚠ 面板存在的唯一理由就是給人看進度，不准被記錄層級關掉。"""
+def test_the_log_panel_only_shows_problems(tmp_path, monkeypatch):
+    """★ 使用者 2026-09-04：「執行日誌不要出現殺了幾隻怪物、讀到背包、
+    技能學習到等等，只能出現錯誤，比如找不到路徑、讀不到背包。
+    正常執行的東西不需要顯示」。
+
+    正常運作的回報是 INFO（一秒好幾行），真正的失敗一律 WARNING 以上 ——
+    面板照設定（預設 WARNING）就剛好只剩問題。
+    """
     import logging
 
     from ro_toolbox.config import paths
@@ -749,8 +754,31 @@ def test_the_log_panel_still_gets_progress_when_the_level_is_warning(tmp_path,
     bridge = mod.setup_logging("WARNING")
     seen = []
     bridge.message.connect(lambda level, text: seen.append((level, text)))
+    talker = logging.getLogger("ro_toolbox.services.travel_bot")
+    talker.info("擊殺 255 隻")
+    talker.warning("找不到路徑")
+
+    assert not any("擊殺" in text for _level, text in seen), seen
+    assert any("找不到路徑" in text for _level, text in seen), seen
+
+
+def test_the_file_still_keeps_every_step(tmp_path, monkeypatch):
+    """⚠ 面板安靜**不等於**消音：`app.log` 是唯一的事後線索，照樣收 INFO。
+
+    實際踩過：自動登入卡住時去撈 app.log，登入步驟全空，看不出卡在哪。
+    """
+    import logging
+
+    from ro_toolbox.config import paths
+    from ro_toolbox.utils import logging as mod
+
+    monkeypatch.setattr(paths, "log_dir", lambda: tmp_path)
+    monkeypatch.setattr(mod, "log_dir", lambda: tmp_path)
+    mod.setup_logging("WARNING")
     logging.getLogger("ro_toolbox.services.travel_bot").info("正在計算路線…")
-    assert any("正在計算路線" in text for _level, text in seen), seen
+    logging.shutdown()
+
+    assert "正在計算路線" in (tmp_path / "app.log").read_text(encoding="utf-8")
 
 
 def test_a_louder_setting_is_still_honoured(tmp_path, monkeypatch):
@@ -1745,15 +1773,17 @@ def test_a_supply_run_starts_even_while_the_bag_is_still_loading(monkeypatch, qt
     `potion_config()` 是空的 —— 舊版就跳一個「請先選道具」的框然後 return。
     人整晚站在城裡。**背包還在讀不等於使用者沒設定。**
 
-    現在設定直接來自還原回來的道具編號（`_picked()`），補給當場就出發；
-    「背包裡有幾個回程道具」由 `RestockBot._home_count()` 自己現查。
+    現在設定直接來自**記住的道具編號**（`card.saved_potion()`），補給當場就
+    出發；「背包裡有幾個回程道具」由 `RestockBot._home_count()` 自己現查。
     """
+    from ro_toolbox.services.potion_store import PotionSaved
+
     page = _blank_page(monkeypatch, qtbot)
     pid = 4242
     card = make_card(qtbot)
     page._cards[pid] = card
     # 還原存檔時選了道具，但背包還沒讀到 → 下拉是空的
-    card._want_item["hp"] = 501
+    card.apply_saved_potion(PotionSaved(hp_item=501, hp_percent=50))
     notices = []
     monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.show_notice",
                         lambda *a: notices.append(a))
@@ -1777,6 +1807,120 @@ def test_a_supply_run_starts_even_while_the_bag_is_still_loading(monkeypatch, qt
     assert notices == [], "不准跳「請先選道具」—— 使用者明明選了"
     assert started == [(pid, 501, "mjolnir_07")], "當場出發，不用等背包"
     assert pid in page._restocks
+
+
+# ---- ★ 重開程式，設定要原封不動回來（2026-09-04 實機） ---------------------
+
+
+class _FakeReader:
+    """`_on_attached()` 只用到 `read()` 與 `close()`，其餘不碰。"""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def read(self):
+        from ro_toolbox.services.character import CharacterStatus
+
+        return CharacterStatus(hp=100, max_hp=100, sp=10, max_sp=10,
+                               base_level=50, job_level=20, name=self._name,
+                               map_name="mjolnir_12")
+
+    def close(self) -> None:
+        pass
+
+
+def _attach(page, pid, name, monkeypatch):
+    """走真的 `_on_attached()`（分頁就是這樣長出來的）。"""
+    monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.CharacterReader",
+                        _FakeReader)
+    page._on_attached(pid, _FakeReader(name))
+    return page._cards[pid]
+
+
+def _potion_page(qtbot, monkeypatch, tmp_path):
+    from ro_toolbox.services import potion_store
+
+    monkeypatch.setattr(potion_store, "_path",
+                        lambda: tmp_path / "potion_settings.json")
+    monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.find_server",
+                        lambda pid: ("1.2.3.4", 6900))
+
+    class _Bot:
+        def __init__(self, pid, config, on_update=None):
+            self.stats = type("S", (), {"running": True, "went_home": False,
+                                        "needs_supplies": False})()
+
+        def start(self):
+            return True
+
+        def stop(self):
+            pass
+
+        def configure(self, config):
+            pass
+
+    monkeypatch.setattr("ro_toolbox.ui.pages.farm_page.PotionBot", _Bot)
+    return _page(qtbot, monkeypatch)
+
+
+def test_reopening_the_program_keeps_the_potion_and_return_item(
+    qtbot, monkeypatch, tmp_path
+):
+    """★★ 使用者 2026-09-04：「為何每次重開，我之前設定的藥水以及回程道具
+    都要重新設定？不是應該要紀錄嗎？直接紀錄物品 ID 就好」。
+
+    分頁剛長出來時背包還在背景讀（掃一趟 2 秒，而且只讀正在看的那一頁），
+    三個下拉都是空的。舊版的存檔是**去掃那三個下拉**，所以接上來那一秒
+    就把記住的設定寫成「未選擇、0%、沒勾」—— 實機日誌：重開後第一行就是
+    `記住「狐狐狸」…藥水=501(0%) 回程=23455(沒勾)`，而檔案裡明明是 502/50%/勾。
+    """
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    want = PotionSaved(hp_item=502, hp_percent=50, enabled=True, go_home=True,
+                       home_item=23455, travel_dest="mjolnir_05")
+    page = _potion_page(qtbot, monkeypatch, tmp_path)
+    potion_store.save("狐狐狸", want)
+
+    card = _attach(page, 53572, "狐狐狸", monkeypatch)
+
+    assert card.saved_potion() == want, "接上來不准動到記住的設定"
+    assert potion_store.get("狐狐狸") == want, "檔案更不准被洗掉"
+    assert card.hp_item.currentData() == 502, "藥水要看得到（數量等背包）"
+    assert card.hp_threshold.value() == 50
+    assert card.go_home.isChecked() is True
+    assert card.home_item.currentData() == 23455
+    assert card.potion_config().hp_item == 502, "bot 拿到的也是同一份"
+    assert card.potion_config().home_item == 23455
+
+
+def test_settings_that_did_not_change_are_not_written_again(
+    qtbot, monkeypatch, tmp_path, caplog
+):
+    """⚠ 存檔是**事件**不是心跳。`_watch_potion_alive()` 每一拍都會走到這裡，
+    實機日誌是一秒一行「記住…的補水設定」—— app.log 一輪只有 2 MB，
+    跑一晚就把真正的錯誤全洗掉了。"""
+    import logging
+
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.services.potion_store import PotionSaved
+
+    page = _potion_page(qtbot, monkeypatch, tmp_path)
+    potion_store.save("狐狐狸", PotionSaved(hp_item=502, hp_percent=50, enabled=True))
+    card = _attach(page, 53572, "狐狐狸", monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.ui.pages.farm_page"):
+        for _ in range(5):
+            page._save_potion(53572)
+    said = [r for r in caplog.records if "補水設定" in r.getMessage()]
+    assert not said, "沒變就不要寫、也不要記"
+
+    with caplog.at_level(logging.INFO, logger="ro_toolbox.ui.pages.farm_page"):
+        card.hp_threshold.setValue(66)          # 使用者真的改了
+        page._save_potion(53572)
+    assert potion_store.get("狐狐狸").hp_percent == 66
+    said = [r for r in caplog.records if "補水設定" in r.getMessage()]
+    assert said, "真的改了就要留下紀錄"
 
 
 # ---- 補給完要真的接回掛機（2026-08-30 實機） -------------------------------
