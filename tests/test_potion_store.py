@@ -111,3 +111,66 @@ def test_a_bad_home_item_falls_back_to_nothing():
     assert back.home_item is None
     assert back.go_home is True
 
+
+
+# ---- 只有使用者能把設定清掉（[DAT-073]）--------------------------------
+
+
+def test_a_blank_config_cannot_wipe_what_the_user_remembered():
+    """空卡片不准蓋掉記住的設定。
+
+    實機 2026-09-04 17:15:15：分頁一接上就喊「⚠ 還沒選道具或百分比是 0」，
+    也就是存檔讀回來是 `PotionSaved(enabled=True)` —— 每一欄都空、只有勾勾
+    開著。那是**一張還沒還原的卡片**的形狀，它把使用者 15:55 存進去的
+    502／50%／23455 整組蓋掉了，而且一行日誌都沒有。
+    """
+    potion_store.save("狐狐狸", PotionSaved(
+        hp_item=502, hp_percent=50, go_home=True, home_item=23455, enabled=True,
+    ))
+    potion_store.save("狐狐狸", PotionSaved(enabled=True))   # 空卡片
+    back = potion_store.get("狐狐狸")
+    assert (back.hp_item, back.hp_percent) == (502, 50)
+    assert (back.go_home, back.home_item) == (True, 23455)
+
+
+def test_the_user_can_still_clear_what_they_cleared():
+    """擋的是「沒人動過的空值」，不是使用者自己選的「未選擇」。"""
+    potion_store.save("狐狐狸", PotionSaved(
+        hp_item=502, hp_percent=50, go_home=True, home_item=23455,
+    ))
+    potion_store.save(
+        "狐狐狸",
+        PotionSaved(hp_percent=50, go_home=True, home_item=23455),
+        cleared=frozenset({"hp_item"}),
+    )
+    back = potion_store.get("狐狐狸")
+    assert back.hp_item is None, "使用者自己選了「未選擇」就要清掉"
+    assert back.home_item == 23455, "沒動過的欄位不該被順手清掉"
+
+
+def test_auto_potion_cannot_be_turned_off_behind_the_users_back():
+    """自動補水被關掉不是安全退化，是**致命的**（實機死過角色）。"""
+    potion_store.save("狐狐狸", PotionSaved(hp_item=502, hp_percent=50, enabled=True))
+    potion_store.save("狐狐狸", PotionSaved(hp_item=502, hp_percent=50))
+    assert potion_store.get("狐狐狸").enabled is True
+    potion_store.save(
+        "狐狐狸", PotionSaved(hp_item=502, hp_percent=50),
+        cleared=frozenset({"enabled"}),
+    )
+    assert potion_store.get("狐狐狸").enabled is False, "使用者自己按掉就要照做"
+
+
+def test_save_returns_what_was_actually_stored():
+    """擋下來的時候存的跟送來的不一樣 —— 呼叫端要拿得到真正那一份，
+    不然畫面停在「未選擇」，使用者看到的還是「沒紀錄」。"""
+    potion_store.save("狐狐狸", PotionSaved(hp_item=502, hp_percent=50))
+    stored = potion_store.save("狐狐狸", PotionSaved(enabled=True))
+    assert stored == potion_store.get("狐狐狸")
+    assert stored.hp_item == 502
+
+
+def test_first_time_saving_a_character_keeps_the_blanks():
+    """沒存過的角色沒有「舊值」可以保 —— 空的就是空的。"""
+    stored = potion_store.save("新角色", PotionSaved(hp_percent=40))
+    assert stored.hp_item is None
+    assert potion_store.get("新角色").hp_percent == 40

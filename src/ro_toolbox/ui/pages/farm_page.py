@@ -309,6 +309,16 @@ class CharacterCard(QWidget):
         #: （`_remember()`，`quiet` 時不算）。程式自己重建下拉、還原存檔、
         #: 自動勾回勾勾，全都碰不到它。
         self._settings = potion_store.PotionSaved()
+        #: 讀過存檔了沒。**沒讀過就不准寫** —— 蓋掉一份自己從來沒看過的
+        #: 紀錄，正是「安靜地做錯事」（`FarmPage._save_potion()`）。
+        self._settings_loaded = False
+        #: 使用者**自己**動過的欄位名。只有這些才准被清成空的。
+        #:
+        #: ⚠ 來源限定 Qt 的 `activated`／`clicked` —— 那兩個訊號**只有真人
+        #: 操作才會發**，程式 `setCurrentIndex()`／`setChecked()` 不會。
+        #: 這一點是 Qt 保證的，跟我們自己維護的 `quiet` 旗標不一樣：
+        #: `quiet` 已經被繞過四次（每次都是有人在某條新路上忘了立起來）。
+        self._touched: set[str] = set()
         #: True = 現在是**程式自己**在改 UI，不是使用者的意思 —— 這種變動不存檔。
         #: 少了這道閘門，bot 啟動失敗時自動取消勾選會把使用者的設定覆蓋成「關閉」。
         #:
@@ -566,6 +576,7 @@ class CharacterCard(QWidget):
         combo.setCompleter(completer)
         combo.setCurrentIndex(0)
         combo.currentIndexChanged.connect(self.potion_changed)  # 設定變了要存
+        combo.activated.connect(lambda _i: self._touch("travel_dest"))
         self.destination = combo
         return combo
 
@@ -795,6 +806,7 @@ class CharacterCard(QWidget):
         self.auto_potion = QCheckBox("自動補水")
         self.auto_potion.setFixedHeight(self.ROW_HEIGHT)
         self.auto_potion.toggled.connect(self.potion_toggled)
+        self.auto_potion.clicked.connect(lambda _on: self._touch("enabled"))
         head.addWidget(self.auto_potion)
         #: 按一下就去最近的藥水商人補一趟（不是開關，是一次性動作）。
         self.restock_button = QPushButton("補水")
@@ -813,10 +825,10 @@ class CharacterCard(QWidget):
         grid.setVerticalSpacing(6)
         grid.setColumnStretch(3, 1)
         self.hp_item, self.hp_threshold, self.hp_icon = self._make_potion_row(
-            grid, 0, "HP 低於"
+            grid, 0, "HP 低於", "hp"
         )
         self.sp_item, self.sp_threshold, self.sp_icon = self._make_potion_row(
-            grid, 1, "SP 低於"
+            grid, 1, "SP 低於", "sp"
         )
         self.go_home, self.home_item, self.home_icon = self._make_home_row(grid, 2)
         box.addLayout(grid)
@@ -835,6 +847,7 @@ class CharacterCard(QWidget):
         check = QCheckBox("水用完回程")
         check.setFixedHeight(self.ROW_HEIGHT)
         check.toggled.connect(self.potion_changed)
+        check.clicked.connect(lambda _on: self._touch("go_home"))
         combo = QComboBox()
         combo.setFixedHeight(self.ROW_HEIGHT)
         combo.setMinimumWidth(170)
@@ -843,6 +856,7 @@ class CharacterCard(QWidget):
         preview.setFixedSize(self.ICON_PX, self.ICON_PX)
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         combo.currentIndexChanged.connect(self.potion_changed)
+        combo.activated.connect(lambda _i: self._touch("home_item"))
         combo.currentIndexChanged.connect(
             lambda _i, c=combo, w=preview: self._show_icon(c, w)
         )
@@ -851,7 +865,7 @@ class CharacterCard(QWidget):
         grid.addWidget(preview, row, 4)
         return check, combo, preview
 
-    def _make_potion_row(self, grid: QGridLayout, row: int, title: str):
+    def _make_potion_row(self, grid: QGridLayout, row: int, title: str, key: str):
         label = QLabel(title)
         spin = QSpinBox()
         # 直接打數字：不要上下箭頭，% 放在框外面。
@@ -861,6 +875,7 @@ class CharacterCard(QWidget):
         spin.setAlignment(Qt.AlignmentFlag.AlignRight)
         spin.setFixedSize(self.SPIN_WIDTH, self.ROW_HEIGHT)
         spin.valueChanged.connect(self.potion_changed)
+        spin.valueChanged.connect(lambda _v, k=key: self._touch(f"{k}_percent"))
         percent = QLabel("%")
         combo = QComboBox()
         combo.setFixedHeight(self.ROW_HEIGHT)
@@ -870,6 +885,7 @@ class CharacterCard(QWidget):
         preview.setFixedSize(self.ICON_PX, self.ICON_PX)
         preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         combo.currentIndexChanged.connect(self.potion_changed)
+        combo.activated.connect(lambda _i, k=key: self._touch(f"{k}_item"))
         combo.currentIndexChanged.connect(
             lambda _i, c=combo, w=preview: self._show_icon(c, w)
         )
@@ -958,6 +974,7 @@ class CharacterCard(QWidget):
         存回檔案的是這一份，不是等一下掃下拉掃到的東西。
         """
         self._settings = saved
+        self._settings_loaded = True
         self.quiet = True
         try:
             self._want_item = {
@@ -1014,6 +1031,55 @@ class CharacterCard(QWidget):
             home_item=self._picked("home", self.home_item),
             travel_dest=self.chosen_destination(),
         )
+
+    def _touch(self, field: str) -> None:
+        """使用者自己動了這一欄 —— 記下來，存檔那邊才准把它清成空的。
+
+        `quiet` 這道閘門只對數字框有意義（`setValue()` 也會發
+        `valueChanged`）。下拉與勾勾接的是 `activated`／`clicked`，
+        程式改值本來就不會發。
+        """
+        if self.quiet:
+            return
+        if field in self._touched:
+            return
+        self._touched.add(field)
+        # ⚠⚠ **要再存一次。** Qt 是先發 `currentIndexChanged`／`toggled`
+        #   才發 `activated`／`clicked`（實測過），所以「使用者剛剛清掉的」
+        #   那一次存檔跑在授權登記**之前** —— 存檔那一層會擋下來，
+        #   使用者就會看到自己挑的「未選擇」沒有效果。這裡補跑一趟，
+        #   這次帶著授權，清得掉。
+        self.potion_changed.emit()
+
+    def adopt_settings(self, saved) -> None:  # noqa: ANN001 - PotionSaved
+        """存檔那一層擋下了一次「把記住的設定清成空的」—— 接回真正存進去那份。
+
+        ⚠ **只改設定本尊與「還在等的道具」，不動使用者正在操作的下拉。**
+        動它的話，使用者自己挑的「未選擇」會在下一毫秒被彈回去
+        （他挑的當下 `activated` 還沒發，授權還沒到）。下拉等 `set_slots()`
+        把背包帶回來時自己會對上。
+        """
+        self._settings = saved
+        for key in ("hp", "sp", "home"):
+            item_id = getattr(saved, f"{key}_item")
+            combo = getattr(self, f"{key}_item")
+            if item_id and combo.findData(item_id) < 0:
+                self._want_item[key] = item_id
+
+    def take_cleared_fields(self) -> frozenset[str]:
+        """使用者動過、因此**允許被清空**的欄位（見 `potion_store.save`）。
+
+        ⚠ **用過就收回。** 授權是「他剛剛按的那一下」，不是「這一欄從此隨便清」——
+        留著的話，使用者選過一次藥水之後，那一欄就又變回可以被程式安靜清掉的
+        （回連重接卡片、下拉重建都會送空值進來），[DAT-073] 那個洞就開回去了。
+        """
+        cleared, self._touched = frozenset(self._touched), set()
+        return cleared
+
+    @property
+    def settings_loaded(self) -> bool:
+        """讀過這隻角色的存檔了沒（沒讀過就不准存回去）。"""
+        return self._settings_loaded
 
     def _picked(self, key: str, combo: QComboBox) -> int | None:
         """使用者在這個下拉選的是哪個道具。
@@ -1684,11 +1750,13 @@ class FarmPage(BasePage):
         self._cards[pid] = card
         # 把這隻角色上次的補水設定帶回來（存的是道具編號，不是格號）。
         # ⚠ 要在接上 signal **之後**才套用，勾選才會真的把 bot 帶起來。
+        # ⚠⚠ **沒存過也要叫一次**（帶一份空的進去）。這支同時也是
+        #   「我讀過這隻角色的存檔了」的印章 —— 沒蓋章的卡片不准存回去，
+        #   免得一張還沒還原的空卡片把記住的設定蓋掉（[DAT-073]）。
         saved = potion_store.get(status.name)
-        if saved is not None:
-            card.apply_saved_potion(saved)
-            if saved.enabled:
-                self._toggle_potion(pid, True)
+        card.apply_saved_potion(saved or potion_store.PotionSaved())
+        if saved is not None and saved.enabled:
+            self._toggle_potion(pid, True)
         # 技能面板的勾選也一樣：套用**在接上 signal 之後**，格子等背景掃完才長出來。
         card.skills.apply_saved(skill_store.get(status.name))
         # 自動寄信的設定也帶回來（使用者指定「這些一切都要記錄」）。
@@ -2924,10 +2992,23 @@ class FarmPage(BasePage):
         card = self._cards.get(pid)
         if card is None or card.quiet or not card.character:
             return
+        if not card.settings_loaded:
+            # 還沒讀過這隻角色的存檔就要寫回去 —— 那是拿一張空卡片去蓋掉
+            # 使用者記了半天的設定。大聲擋下來（[DAT-073]）。
+            log.warning("「%s」還沒讀過存檔就要存 —— 不寫，免得蓋掉記住的設定",
+                        card.character)
+            return
+        cleared = card.take_cleared_fields()
         config = card.saved_potion()
         if potion_store.get(card.character) == config:
             return
-        potion_store.save(card.character, config)
+        stored = potion_store.save(card.character, config, cleared=cleared)
+        if stored != config:
+            # 存檔擋下了一次「把記住的設定清成空的」。**把它接回卡片上** ——
+            # 只擋檔案不管畫面的話，下拉會停在「未選擇」，使用者看到的還是
+            # 「沒紀錄」，而且下一拍又會再送一次同樣的空值（洗版）。
+            card.adopt_settings(stored)
+            config = stored
         log.info("記住「%s」的補水設定：藥水=%s(%s%%) 魔水=%s(%s%%) "
                  "回程=%s(%s) 自動補水=%s",
                  card.character, config.hp_item, config.hp_percent,

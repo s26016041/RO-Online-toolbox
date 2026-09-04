@@ -445,9 +445,144 @@ def test_the_user_really_can_clear_it_once_the_bag_is_read(
 
     card.apply_saved_potion(potion_store.get("狐狐狸"))
     card._want_item = {"hp": None, "sp": None, "home": None}
-    card.hp_item.setCurrentIndex(card.hp_item.findData(None))
-    card.home_item.setCurrentIndex(card.home_item.findData(None))
+    for combo in (card.hp_item, card.home_item):
+        # 使用者自己在下拉裡挑「未選擇」。Qt 挑完會發 `activated`，
+        # **程式改值不會** —— 這一整條保險就是靠這個分辨真人的。
+        combo.setCurrentIndex(combo.findData(None))
+        combo.activated.emit(combo.currentIndex())
     page._save_potion(1)
 
     assert potion_store.get("狐狐狸").hp_item is None
     assert potion_store.get("狐狐狸").home_item is None
+
+
+def test_the_program_clearing_a_combo_is_not_the_user_clearing_it(
+    qtbot, monkeypatch, tmp_path
+):
+    """★★ 第五次回報的根因（[DAT-073]）：**只有真人能把設定清掉**。
+
+    上面那條保險看的是「背包讀到了沒」，繞得過去 —— 下拉被重建、
+    分頁剛長出來、回連把卡片重接，這幾條路上下拉都是「有清單但選在
+    未選擇」，跟使用者自己清掉長得一模一樣。實機就是這樣把
+    502／50%／23455 洗成 `PotionSaved(enabled=True)` 的。
+
+    現在分辨真人靠 Qt 的 `activated`／`clicked`（程式改值不發），
+    而且最後一道關卡在**存檔那一層**，介面怎麼繞都繞不過去。
+    """
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.services.potion_store import PotionSaved
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    page = _page(monkeypatch, tmp_path)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "狐狐狸"
+    page._cards[1] = card
+    page._bags[1] = {6: (502, 5)}
+    potion_store.save("狐狐狸", PotionSaved(
+        hp_item=502, hp_percent=50, home_item=23455, go_home=True, enabled=True))
+
+    card.apply_saved_potion(potion_store.get("狐狐狸"))
+    card._want_item = {"hp": None, "sp": None, "home": None}
+    # 程式把下拉洗成「未選擇」、順手把勾勾拿掉（回連、重建清單都會這樣）
+    card.hp_item.setCurrentIndex(card.hp_item.findData(None))
+    card.home_item.setCurrentIndex(card.home_item.findData(None))
+    card.go_home.setChecked(False)
+    page._save_potion(1)
+
+    after = potion_store.get("狐狐狸")
+    assert after.hp_item == 502, "沒有真人動過，不准把藥水清掉"
+    assert after.home_item == 23455, "回程道具同理"
+    assert after.go_home is True
+    assert card.saved_potion().hp_item == 502, "擋下來之後卡片也要接回正確那份"
+
+
+def test_a_card_that_never_read_the_store_is_never_written_back(
+    qtbot, monkeypatch, tmp_path
+):
+    """沒讀過存檔就不准寫回去 —— 那是拿一張空卡片去蓋掉使用者的設定。"""
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.services.potion_store import PotionSaved
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    page = _page(monkeypatch, tmp_path)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "狐狐狸"
+    page._cards[1] = card
+    potion_store.save("狐狐狸", PotionSaved(hp_item=502, hp_percent=50))
+
+    assert not card.settings_loaded
+    card.auto_potion.setChecked(True)      # 還沒還原就有人動了畫面
+    page._save_potion(1)
+
+    assert potion_store.get("狐狐狸").hp_item == 502
+
+
+def test_clearing_it_for_real_survives_qts_signal_order(qtbot, monkeypatch, tmp_path):
+    """★ Qt 先發 `currentIndexChanged` 才發 `activated`（實測過）。
+
+    也就是說「使用者剛剛清掉的」那一次存檔跑在**授權登記之前** ——
+    照著寫的話存檔會擋下來，使用者挑的「未選擇」看起來像沒有效果。
+    所以登記授權之後要**再存一次**（`CharacterCard._touch()`）。
+    這條測試照真實的訊號順序跑一遍。
+    """
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.services.potion_store import PotionSaved
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    orange, wing = 502, 23455
+    page = _page(monkeypatch, tmp_path)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "狐狐狸"
+    page._cards[1] = card
+    # 分頁接上時就是這樣接線的（`_on_attached`）：設定一變就存
+    card.potion_changed.connect(lambda: page._save_potion(1))
+    potion_store.save("狐狐狸", PotionSaved(
+        hp_item=orange, hp_percent=50, home_item=wing, go_home=True))
+    card.apply_saved_potion(potion_store.get("狐狐狸"))
+    card.set_slots({6: (orange, 5), 7: (wing, 2)})
+    assert card.hp_item.currentData() == orange, "前提：還原時有選起來"
+
+    # 使用者自己在下拉裡挑「未選擇」
+    card.hp_item.setCurrentIndex(card.hp_item.findData(None))
+    card.hp_item.activated.emit(card.hp_item.currentIndex())
+
+    after = potion_store.get("狐狐狸")
+    assert after.hp_item is None, "使用者真的清掉了就要清得掉"
+    assert after.home_item == wing, "沒動到的那一項不該被順手清掉"
+    assert card.saved_potion().hp_item is None
+
+
+def test_the_clearing_permission_is_used_once_not_forever(
+    qtbot, monkeypatch, tmp_path
+):
+    """授權是「他剛剛按的那一下」，不是「這一欄從此隨便清」。
+
+    留著的話，使用者選過一次藥水之後那一欄就又變回可以被程式安靜清掉的
+    —— 回連重接卡片、下拉重建都會送空值進來，[DAT-073] 的洞就開回去了。
+    """
+    from ro_toolbox.services import potion_store
+    from ro_toolbox.services.potion_store import PotionSaved
+    from ro_toolbox.ui.pages.farm_page import CharacterCard
+
+    orange = 502
+    page = _page(monkeypatch, tmp_path)
+    card = CharacterCard()
+    qtbot.addWidget(card)
+    card.character = "狐狐狸"
+    page._cards[1] = card
+    card.potion_changed.connect(lambda: page._save_potion(1))
+    potion_store.save("狐狐狸", PotionSaved(hp_percent=50))
+    card.apply_saved_potion(potion_store.get("狐狐狸"))
+    card.set_slots({6: (orange, 5)})
+
+    # 使用者自己挑了藥水（用掉一次授權）
+    card.hp_item.setCurrentIndex(card.hp_item.findData(orange))
+    card.hp_item.activated.emit(card.hp_item.currentIndex())
+    assert potion_store.get("狐狐狸").hp_item == orange
+
+    # 之後程式把下拉洗成「未選擇」（回連、重建清單都會這樣）
+    card.hp_item.setCurrentIndex(card.hp_item.findData(None))
+    assert potion_store.get("狐狐狸").hp_item == orange, "授權不能留到下一次"

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 
 from ro_toolbox.config.paths import user_data_dir
 
@@ -107,18 +107,84 @@ def get(character: str) -> PotionSaved | None:
     return _clean(entry) if isinstance(entry, dict) else None
 
 
-def save(character: str, config: PotionSaved) -> None:
-    """記住這隻角色的設定。寫不進去只記一行 —— 設定存不了不該擋住功能。"""
+#: 「有值 → 空值」要保護的欄位。空值＝ None／0／False —— 而那正好也是
+#: **一張還沒還原的空卡片**長的樣子（見 `_keep_remembered`）。
+_CLEARABLE = (
+    "hp_item", "sp_item", "home_item",
+    "hp_percent", "sp_percent", "go_home", "enabled", "travel_dest",
+)
+
+
+def _keep_remembered(
+    who: str, before: PotionSaved, after: PotionSaved, cleared: frozenset[str]
+) -> PotionSaved:
+    """**只有使用者能把設定清掉。** 別人送來的空值一律當「還沒畫好」擋下來。
+
+    這是同一個回報的第五次（[DAT-052]／[DAT-057]／[DAT-071]／[DAT-073]）。
+    前四次都修在介面那一層：加 `_want_item`、去看 `self._bags`、改成
+    `self._settings` 當本尊、加 `quiet` 閘門…… **每補一層就多一條繞得過去
+    的路**，所以它每次都換一個面貌回來。
+
+    實機證據（2026-09-04 17:15:15，`app.log`）：分頁一接上就喊
+    「⚠ 還沒選道具或百分比是 0」，也就是存檔讀回來是
+    `PotionSaved(enabled=True)` —— 每一欄都空、只有勾勾是開的。
+    那正是**一張還沒還原的卡片**的形狀，它把使用者 15:55 存進去的
+    502／50%／23455 整組蓋掉了，而且一行日誌都沒有。
+
+    所以這次修在**存檔這一層**：介面那邊不管怎麼繞，
+    「有值變成沒值」都要帶著使用者的授權才過得去。`cleared` 是使用者
+    **真的動過**的欄位 —— 來源是 Qt 的 `activated`／`clicked`，
+    那兩個訊號只有真人操作才會發，程式改值不會（跟自己維護的 `quiet`
+    旗標不同，這一點是 Qt 保證的，繞不過去）。
+    """
+    keep = {
+        field: getattr(before, field)
+        for field in _CLEARABLE
+        if field not in cleared
+        and getattr(before, field) and not getattr(after, field)
+    }
+    if not keep:
+        return after
+    log.warning(
+        "「%s」有設定被空值蓋掉，已擋下並保留原值：%s"
+        "（使用者沒動過這幾欄 —— 多半是分頁還沒讀到背包）",
+        who, "、".join(f"{k}={v}" for k, v in keep.items()),
+    )
+    return replace(after, **keep)
+
+
+def save(
+    character: str,
+    config: PotionSaved,
+    *,
+    cleared: frozenset[str] = frozenset(),
+) -> PotionSaved:
+    """記住這隻角色的設定，**回傳真正存進去的那一份**。
+
+    `cleared` = 使用者**自己**清掉的欄位名。沒列進來的欄位不准從「有值」
+    變成「空值」（見 `_keep_remembered`）。擋下來的時候存進去的就跟送來的
+    不一樣了 —— 所以要回傳，呼叫端才有辦法把畫面接回正確的那一份
+    （不然畫面停在「未選擇」，使用者看到的還是「沒紀錄」）。
+
+    寫不進去只記一行 —— 設定存不了不該擋住功能。
+    """
     if not character.strip():
-        return
+        return config
     everything = _load_all()
-    everything[character] = asdict(_clean(asdict(config)))
+    before = everything.get(character)
+    if isinstance(before, dict):
+        config = _keep_remembered(
+            character, _clean(before), _clean(asdict(config)), cleared
+        )
+    config = _clean(asdict(config))
+    everything[character] = asdict(config)
     try:
         _path().write_text(
             json.dumps(everything, ensure_ascii=False, indent=1), encoding="utf-8"
         )
     except OSError as exc:
         log.warning("補水設定存不進去：%s", exc)
+    return config
 
 
 def forget(character: str) -> None:
