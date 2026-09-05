@@ -1872,6 +1872,14 @@ class FarmPage(BasePage):
         if potion is not None:
             potion.stop()
 
+        # ⚠⚠ 寄信 bot 也要停（[DAT-080]）。舊版漏了這一條：遊戲行程結束後
+        # MailBot 還拿**死掉的 PID** 每 3 秒 `bag.as_dict()` 一次，開不了行程
+        # → 讀不到映像 → 「AOB 定位不到背包容器」—— 實機一晚 9,705 行，
+        # 看起來像特徵壞了，其實遊戲裡的 AOB 一次都沒失敗過。
+        mail = self._mails.pop(pid, None)
+        if mail is not None:
+            mail.stop()
+
         traveler = self._travelers.pop(pid, None)
         if traveler is not None:
             traveler.stop()

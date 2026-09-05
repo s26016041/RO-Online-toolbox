@@ -1811,6 +1811,34 @@ def test_a_recycled_pid_does_not_inherit_the_old_farm_map(monkeypatch, qtbot):
     assert pid not in page._farm_retry
 
 
+def test_removing_a_card_stops_its_mail_bot(monkeypatch, qtbot):
+    """★ [DAT-080] 「AOB 定位不到背包容器」洗版一整晚的真兇：**沒被停掉的寄信 bot**。
+
+    實機 2026-09-05：04:08:35 三個遊戲行程結束（卡片移除），04:09 起
+    「AOB 定位不到背包容器」每 3 秒一行、到 09:05 關程式才停，共 9,705 行；
+    同一時間三隻角色的背包都讀得好好的（36／48／56 格）。
+    `_remove()` 停了打怪、補水、趕路、buff、補給、技能、背包 worker……
+    **獨漏 MailBot**：它拿死掉的 PID 每 3 秒 `bag.as_dict()` 一次，行程開不起來
+    → 讀不到映像 → 「定位不到」。使用者看到的是「AOB 一直找不到」，
+    其實遊戲裡的 AOB 一次都沒失敗過。跟著 PID 的東西一律要跟著 PID 死。
+    """
+    page = _blank_page(monkeypatch, qtbot)
+    pid = 4343
+
+    class _Mail:
+        def __init__(self):
+            self.stopped = 0
+
+        def stop(self, timeout: float = 3.0):  # noqa: ARG002
+            self.stopped += 1
+
+    mail = _Mail()
+    page._mails[pid] = mail
+    page._remove(pid, "遊戲行程已結束")
+    assert mail.stopped == 1, "行程結束了，寄信 bot 要跟著停"
+    assert pid not in page._mails, "不然它會拿死掉的 PID 每 3 秒掃一次"
+
+
 def test_a_supply_run_starts_even_while_the_bag_is_still_loading(monkeypatch, qtbot):
     """⚠⚠ 實機（白狐）：回連之後印了「補給途中斷線，回來接著補完再走回去」，
     然後**什麼都沒發生**。分頁才剛長出來 1 秒，背包還在背景讀，
