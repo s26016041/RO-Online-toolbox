@@ -1806,6 +1806,36 @@ def test_the_otp_is_retyped_at_once_when_the_client_never_sent_it(monkeypatch):
     assert not any({"key_fg": 0x28} in batch for batch in sent), sent
 
 
+def test_the_code_the_client_actually_sent_is_compared_with_ours(monkeypatch):
+    """★ `0x0A74` 帶著客戶端送出去的六碼 —— 對不上就要**講出來**。
+
+    實機 2026-09-05 14:33 起連續四場：第 1 次「送出了」（有 `0x0A74`）但伺服器
+    沒收下，接著連線就沒了。使用者：「我看是沒打數字進去，直接就送出」。
+    日誌只寫「還沒收下」，分不出是**碼不對**、**伺服器慢**、還是
+    **數字根本沒進那一格**。第三種是打字的問題，修法完全不同。
+    """
+    from ro_toolbox.services.totp import generate
+
+    bot = _otp_bot(monkeypatch, [FakePacket(0x0A73, b"")])
+    _capture_sends(monkeypatch)
+    monkeypatch.setattr(auto_login, "find_server", lambda pid: ("1.2.3.4", 6900))
+    ours = generate(bot._account.secret)
+
+    real_type = AutoLogin._type
+
+    def typed_then_client_sends_empty(self, hwnd, actions):
+        real_type(self, hwnd, actions)
+        # 客戶端把「空的」認證碼送出去了（只有 Enter 到了）
+        self._packets.append(FakePacket(0x0A74, b"\x00" * 6))
+
+    monkeypatch.setattr(AutoLogin, "_type", typed_then_client_sends_empty)
+    bot._send_otp(0x1234)
+    said = [s for s in bot.progress.steps if "送出去的認證碼" in s]
+    assert said, bot.progress.steps
+    assert f"「{ours}」" in said[0], said[0]
+    assert "數字沒有進到那一格" in said[0]
+
+
 def test_a_dead_capture_does_not_block_the_otp(monkeypatch):
     """★ 一包都沒擷取到的機器上，**不准拿封包當關卡**。
 

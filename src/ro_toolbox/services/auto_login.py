@@ -2064,6 +2064,18 @@ class AutoLogin:
                     )
                     continue
                 submitted += 1
+                # ★ `0x0A74` 本身就帶著客戶端送出去的六碼（明文 ASCII，[PKT-091]）。
+                #   拿它跟我們打的比：對不上就是**數字沒進到那一格、只有 Enter 到了**
+                #   —— 那是打字的問題，不是碼不對，也不是伺服器慢。
+                #   實機 2026-09-05 14:33 起連續四場「送出了但伺服器沒收下」，
+                #   使用者：「我看是沒打數字進去，直接就送出」—— 沒有這一行，
+                #   日誌只能寫「還沒收下」，分不出是哪一種。
+                typed = self._otp_as_sent(mark)
+                if typed is not None and typed != code:
+                    self._step(
+                        f"客戶端送出去的認證碼是「{typed}」，我們打的是「{code}」"
+                        "—— 數字沒有進到那一格（只有 Enter 到了）"
+                    )
                 # ★ 伺服器收下的訊號：`0x0B60`（登入成功＋伺服器清單）。
                 accepted = self._seen_since(
                     login_packets.OP_LOGIN_ACCEPTED, mark, _OTP_ACCEPT_TIMEOUT
@@ -2121,6 +2133,17 @@ class AutoLogin:
         return True
 
     # ---- 小工具 -----------------------------------------------------
+
+    def _otp_as_sent(self, mark: int) -> str | None:
+        """`mark` 之後客戶端送出的那包 `0x0A74` 裡的六碼（明文 ASCII，[PKT-091]）。
+
+        沒看到那一包回 None（呼叫端已經用 `_seen_since` 擋過，這裡通常拿得到）。
+        """
+        for packet in self._packets[mark:]:
+            if packet.opcode == OP_OTP:
+                raw = bytes(getattr(packet, "payload", b"") or b"")
+                return raw.split(b"\x00")[0].decode("ascii", "replace")
+        return None
 
     @staticmethod
     def _remaining(secret) -> int:
