@@ -16,6 +16,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 
 @pytest.fixture(autouse=True, scope="session")
+def _keep_user_data_out_of_appdata(tmp_path_factory):
+    """⚠⚠ **測試不准碰使用者真實的 `%APPDATA%\\RO-Online-toolbox\\`。**
+
+    實機踩到（[DAT-079] 第二段，2026-09-05）：`test_farm_page.py` 有一條用真的
+    角色名「狐狐狸」＋ `PotionSaved(hp_item=501, hp_percent=60)` 走到
+    `_save_potion()`，而它沒有導開 `potion_store` 的路徑 —— 每跑一次 pytest
+    就把使用者真的 `potion_settings.json` 裡狐狐狸的藥水**從 502 改成 501**
+    （其他欄位被 `_keep_remembered` 保住，所以檔案看起來很正常）。
+    使用者選的是背包裡有的 502，程式重開後拿到 501 → 背包裡沒有 →
+    「紅色藥水 用完了 → 回程 → 買水」。一天兩次，日誌裡一行「記住…」都沒有。
+
+    每個 store 各自 `monkeypatch` 是擋不完的（十個模組、每條測試都要記得）。
+    `user_data_dir()` 每次呼叫都看 `APPDATA`，所以整個 session 把它指到暫存目錄，
+    一次擋掉所有 store（補水、撿取黑名單、寄信、商店記憶、技能、帳號、設定）。
+    """
+    target = tmp_path_factory.mktemp("appdata")
+    import os
+
+    before = os.environ.get("APPDATA")
+    os.environ["APPDATA"] = str(target)
+    try:
+        yield target
+    finally:
+        if before is None:
+            os.environ.pop("APPDATA", None)
+        else:
+            os.environ["APPDATA"] = before
+
+
+@pytest.fixture(autouse=True, scope="session")
 def _keep_logs_out_of_appdata(tmp_path_factory):
     """⚠ **測試不准寫進使用者真實的 app.log。**
 

@@ -79,6 +79,9 @@ class FakeBag:
         self.drunk = 0
         self.generation = 0          # 綁定世代，bump 一次代表舊的 watch 過期
         self.watches: list[FakeWatch] = []
+        #: 快照裡**暫時看不到**的格號（模擬換圖時清單重建到一半，[DAT-079]）。
+        #: 東西還在、伺服器也還認得，只是這一刻的記憶體清單沒有它。
+        self.hidden: set[int] = set()
 
     def as_dict(self, pid):  # noqa: ARG002
         return dict(self.rows) if self.readable else {}
@@ -92,14 +95,16 @@ class FakeBag:
         """模擬綁定過期（換地圖、背包重新配置）：已開的 watch 全部失效。"""
         self.generation += 1
 
-    def consume(self, slot):
+    def consume(self, slot) -> int:
+        """喝掉那一格一個，回傳**那一疊**還剩幾個（伺服器回包講的就是這個）。"""
         if slot not in self.rows:
-            return
+            return 0
         item_id, amount = self.rows[slot]
         self.drunk += 1
         del self.rows[slot]
         if amount > 1:
             self.rows[slot + 10 if self.shuffle else slot] = (item_id, amount - 1)
+        return amount - 1
 
 
 class FakeWatch:
@@ -123,7 +128,7 @@ class FakeWatch:
             return {}
         if self.generation != self.bag.generation:
             return {}          # 綁定過期了
-        return dict(self.bag.rows)
+        return {s: v for s, v in self.bag.rows.items() if s not in self.bag.hidden}
 
     def close(self) -> None:
         self.bound = False
@@ -178,10 +183,12 @@ class FakeSocket:
         if self.dies_after is not None and len(self.sent) > self.dies_after:
             return len(data)
         real = self.bag.rows.get(slot, (self.item_id, 0))[0]
+        # 伺服器回的是**那一疊**還剩幾個（[PKT-036]），不是那種道具全部加起來 ——
+        # 同一種藥兩疊時，回包只講喝的那一疊。
         if self.result == 1:
-            self.bag.consume(slot)
-        # 伺服器回的是「那個道具還剩幾個」，跟它現在在第幾格無關
-        left = sum(a for i, a in self.bag.rows.values() if i == real)
+            left = self.bag.consume(slot)
+        else:
+            left = self.bag.rows.get(slot, (real, 0))[1]
         capture = FakeCapture.latest
         if capture is not None:
             capture.on_packet(use_ack(slot, self.wrong or real, left, self.result))
@@ -334,14 +341,96 @@ def test_a_refused_drink_also_keeps_going_while_the_potion_is_there(wired):
     assert len(sock.sent) > potion._MAX_MISS
 
 
-def test_a_potion_that_is_really_gone_goes_down_the_exhausted_path(wired):
-    """真的不在背包裡了才算「用完」—— 那條路是設計過的（有勾回程就回城）。"""
-    # 背包讀得到，只是紅藥水不在裡面（放了別的東西）。
-    _bag, _reader, _sock = wired({6: (BLUE_POTION, 5)}, start=10.0, reply=False)
-    bot = PotionBot(1, PotionConfig(hp_item=RED_POTION, hp_percent=50))
-    _run(bot, 5.0)
-    assert bot.stats.failed is True
-    assert "用完" in bot.stats.note or "沒有" in bot.stats.note, bot.stats.note
+def test_an_item_never_seen_in_the_bag_is_not_exhausted(wired, caplog):
+    """⛔ 背包裡沒有 ≠ 用完了（[DAT-079]）。
+
+    實機 2026-09-05 04:09 與 11:39：設定被寫成背包裡沒有的 501（紅色藥水），
+    背包裡明明有 100 多瓶 502（赤色藥水），bot 一起來就判「紅色藥水 用完了 →
+    回程 → 補給」。使用者：「一直不小心判斷到水沒了，一直跑去買水，不准發生」。
+
+    從來沒在背包裡看過的道具，只能大聲講「沒有你設定的藥水」——
+    不回城、不停用、一包都不送。
+    """
+    caplog.set_level("WARNING", logger="ro_toolbox.services.potion")
+    _bag, _reader, sock = wired(
+        {6: (BLUE_POTION, 5), 7: (WING, 5), 8: (909, 3)}, start=10.0, reply=False
+    )
+    bot = PotionBot(
+        1, PotionConfig(hp_item=RED_POTION, hp_percent=50, home_item=WING)
+    )
+    _run(bot, 2.5)
+    assert bot.stats.went_home is False, "沒看過的道具不准當用完回城"
+    assert bot.stats.failed is False, "也不准停用（停用會害死角色）"
+    assert sock.sent == [], "沒東西可喝就一包都不該送"
+    assert "沒有你設定的" in bot.stats.note, bot.stats.note
+    assert any("沒有你設定的" in r.message for r in caplog.records), "要用 WARNING 講"
+
+
+def test_a_potion_that_vanishes_from_the_snapshot_is_not_exhausted(wired):
+    """★ [DAT-079] 的本尊：54 瓶還在，換圖時快照少了它，舊版直接回城買水。
+
+        00:42:31  HP 50% → 喝了第 9 格，剩 54 個
+        00:44:02  背包串列走不通了，重新定位   ×4（換了四張圖）
+        00:48:15  自動補水停用「狐狐狸」：赤色藥水 用完了 → 已用 蝴蝶翅膀 回程
+
+    中間一瓶都沒喝。記憶體那份背包換圖時會清掉重建，讀到一半的清單每個節點
+    都合法、格號也不重複 —— 驗證擋不住。所以「剛才還有 54 個、現在找不到」
+    要當成**讀壞了**：講一聲、等背包讀回來，然後接著喝。
+    """
+    fake_bag, reader, sock = wired(
+        {6: (RED_POTION, 5000), 7: (WING, 5), 8: (909, 3), 9: (910, 2)}, start=10.0
+    )
+    reader.per_potion = 0.0          # 血一直不夠，bot 會一直想喝（怪打得比補得快）
+    bot = PotionBot(
+        1, PotionConfig(hp_item=RED_POTION, hp_percent=99, home_item=WING)
+    )
+    bot.start()
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and bot.stats.hp_used < 1:
+        time.sleep(0.02)
+    assert bot.stats.hp_used >= 1, "測試沒跑到喝水就結束了"
+    fake_bag.hidden.add(6)                       # 快照少了那一疊（換圖重建中）
+    time.sleep(1.2)
+    note_while_hidden = bot.stats.note
+    went_home_while_hidden = bot.stats.went_home
+    failed_while_hidden = bot.stats.failed
+    fake_bag.hidden.discard(6)                   # 清單建完了，它又回來了
+    used_before = bot.stats.hp_used
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and bot.stats.hp_used == used_before:
+        time.sleep(0.02)
+    bot.stop()
+    assert went_home_while_hidden is False, "54 瓶還在就不准回城"
+    assert failed_while_hidden is False, "也不准停用"
+    assert "找不到" in note_while_hidden and "個" in note_while_hidden, note_while_hidden
+    assert bot.stats.hp_used > used_before, "背包讀回來要接著喝"
+    slots = {int.from_bytes(p[2:4], "little") for p in sock.sent}
+    assert 7 not in slots, "翅膀不准被動到"
+
+
+def test_stock_counts_every_stack_of_the_same_potion(wired):
+    """同一種藥兩疊（綁定／未綁定）：要不要回城看**全部加起來**，不是喝的那一疊。
+
+    伺服器回包只講喝的那一疊剩幾個 —— 那一疊剩 4、另一疊還有 100，
+    舊版會說「只剩 4 個」就回城。
+    """
+    _bag, _reader, sock = wired(
+        {6: (RED_POTION, 5), 12: (RED_POTION, 100), 7: (WING, 5)}, start=10.0
+    )
+    bot = PotionBot(
+        1, PotionConfig(hp_item=RED_POTION, hp_percent=99, home_item=WING)
+    )
+    bot.start()
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and bot.stats.hp_used < 3:
+        time.sleep(0.02)
+    bot.stop()
+    assert bot.stats.hp_used >= 3
+    assert bot.stats.went_home is False, "另一疊還有 100 瓶就不准回城"
+    # 剩幾個要報**兩疊加起來**（105 減掉喝掉的），不是喝的那一疊
+    assert bot.stats.hp_left == 105 - bot.stats.hp_used, bot.stats
+    slots = {int.from_bytes(p[2:4], "little") for p in sock.sent}
+    assert 7 not in slots
 
 
 def test_stops_when_the_reply_names_a_different_item(wired):

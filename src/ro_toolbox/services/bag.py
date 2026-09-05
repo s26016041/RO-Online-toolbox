@@ -59,11 +59,15 @@ def _notes_for(pid: int) -> StateLog:
 #: 「32 格」「23 格」交替出現 —— 共用一份的話每一次都算「變動了」，
 #: 降噪等於沒做（實機 app.log：一秒三行，2 MB 一輪的日誌兩小時就洗一遍，
 #: 真正的錯誤全被沖掉）。`character.py` 的 `_notes_for()` 是同一個做法。
-_reads: dict[int, StateLog] = {}
+#: ⚠ 鍵要含 **PID**：容器是模組裡的全域，每個遊戲行程的位址都一樣
+#: （實機三隻角色都是 0x15d5d40 + 0x1738）。只用容器當鍵，多開時
+#: 「21 格」「28 格」交替出現，每一次都算「變動了」—— 實機 2026-09-05
+#: 一秒一行，跟 [DAT-078] 同一個坑的另一半。
+_reads: dict[tuple[int, int], StateLog] = {}
 
 
-def _reads_for(container: int) -> StateLog:
-    return _reads.setdefault(container, StateLog(log))
+def _reads_for(pid: int, container: int) -> StateLog:
+    return _reads.setdefault((pid, container), StateLog(log))
 
 #: 「除以 34」的魔術乘數。34 是背包清單封包的記錄大小（[PKT-039]）。
 #: 這是指令骨架的錨，不是答案 —— 容器位址是從指令的立即值讀出來的。
@@ -270,7 +274,7 @@ def read_bag(pid: int, scanner: MemoryScanner | None = None) -> list[BagItem]:
         container, offset, best = site
         # ⚠ 只在**變動時**講一次。這支每秒多一次，照記就是每秒一行
         # 「背包讀到 40 格」把日誌洗掉（使用者實際回報）。
-        _reads_for(container).changed(
+        _reads_for(pid, container).changed(
             f"{container:#x}+{offset:#x}:{len(best)}", logging.INFO,
             "背包讀到 %d 格（容器 %#x + %#x）", len(best), container, offset,
         )

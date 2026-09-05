@@ -59,6 +59,9 @@ _MAX_MISS = 3         # 連續幾次沒喝到就重找格號
 #: 解決不了的話送再多也沒用。上限抓 5 秒 —— HP 掉得再快也還救得回來。
 _MISS_COOLDOWN = 1.0
 _MISS_COOLDOWN_MAX = 5.0
+#: 設定的道具在背包快照裡找不到時，等多久再讀一次（見 `_not_in_bag`）。
+#: 這是**重試的節奏**，不是成功的依據 —— 找到了才會喝，找不到就再講一次。
+_MISSING_WAIT = 1.0
 _RESYNC_SEC = 2.0     # 多久檢查一次換地圖／換頻道
 #: 藥水剩幾瓶就該回去補（使用者 2026-08-29 指定：5 瓶，**不要等到 0**）。
 #:
@@ -148,6 +151,9 @@ class PotionBot:
         self._stats = PotionStats()
         self._reader: CharacterReader | None = None
         self._bag: dict[int, tuple[int, int]] = {}   # 格號 → (道具編號, 數量)
+        #: 設定的道具**上一次在背包裡看到時**總共幾個（所有疊加起來）。
+        #: 「快照裡找不到」時拿它分辨：從來沒看過（設定錯）／剛才還有 N 個（讀壞了）。
+        self._seen: dict[int, int] = {}
         self._bag_at = 0.0
         self._watch: bag.BagWatch | None = None      # 綁定過的背包串列（快路徑）
         self._locate_at = 0.0                       # 上次重新定位背包的時間
@@ -259,6 +265,12 @@ class PotionBot:
             return False
         self._capture = capture
         self._note("待命中")
+        # 一開始就沒有設定的那種藥 → 現在講，不要等血掉了才發現沒東西可喝。
+        # ⚠ 只警告不停用、也**不回城**：「背包裡沒有」證明不了「用完了」
+        #   （[DAT-079]，見 `_not_in_bag`）。
+        for kind, item_id in (("HP", self._cfg.hp_item), ("SP", self._cfg.sp_item)):
+            if item_id and self._total(item_id) <= 0:
+                self._not_in_bag(kind, item_id, wait=False)
         return True
 
     # ---- 封包 -------------------------------------------------------
@@ -310,6 +322,10 @@ class PotionBot:
         fresh = self._read_bag()
         if fresh:
             self._bag = fresh
+            for item_id in (self._cfg.hp_item, self._cfg.sp_item):
+                total = self._total(item_id)
+                if total > 0:
+                    self._seen[item_id] = total
 
     def _read_bag(self) -> dict[int, tuple[int, int]]:
         """讀背包，優先走已綁定的串列。
@@ -347,9 +363,21 @@ class PotionBot:
                 return slot
         return None
 
+    def _total(self, item_id: int | None) -> int:
+        """那種道具**全部加起來**還有幾個。
+
+        同一種藥可能不只一疊（綁定／未綁定各一疊）。要不要回城看的是全部，
+        只看喝的那一疊會在另一疊還有 200 瓶的時候說「只剩 5 個」。
+        """
+        if item_id is None:
+            return 0
+        return sum(amount for iid, amount in self._bag.values() if iid == item_id)
+
     def _left(self, item_id: int | None) -> int | None:
-        slot = self._slot_of(item_id)
-        return self._bag[slot][1] if slot is not None else None
+        """給狀態列看的「剩幾個」：不在背包裡回 None（分得出「沒讀到」與 0）。"""
+        if item_id is None or self._slot_of(item_id) is None:
+            return None
+        return self._total(item_id)
 
     def request_home(self, why: str) -> None:
         """外面叫它回程（例如自動打怪回報負重滿了）。**下一拍才動手**。
@@ -412,11 +440,9 @@ class PotionBot:
         """
         self._refresh_bag(force=True)
         slot = self._slot_of(item_id)
-        if slot is None:
-            return self._exhausted(kind, item_id)
-        before = self._bag[slot][1]
-        if before <= 0:
-            return self._exhausted(kind, item_id)
+        if slot is None or self._bag[slot][1] <= 0:
+            # ⛔ 快照裡沒有 ≠ 用完了（[DAT-079]）。不回城、不停用，只講。
+            return self._not_in_bag(kind, item_id)
 
         mark = self._ack_mark()
         if not self._send(build_use_item(slot, self._aid)):
@@ -443,14 +469,21 @@ class PotionBot:
                         f"{item_name(item_id)}，自動補水停用"
                     )
                     return False
-                self._used(kind, slot, percent, left)
-                # 下一拍 _drink 會強制重讀，這裡只是讓數量顯示立刻跟上
+                # 伺服器說的是**那一疊**還剩幾個（權威）。同一種藥可能不只一疊，
+                # 要不要回城看全部加起來。下一拍 _drink 會強制重讀，
+                # 這裡只是讓數量立刻跟上。
                 if left > 0:
                     self._bag[slot] = (item_id, left)
-                    low = self._low_stock(item_id, left)
-                    return True if low is None else low
-                self._bag.pop(slot, None)
-                return self._exhausted(kind, item_id)
+                else:
+                    self._bag.pop(slot, None)
+                total = self._total(item_id)
+                self._used(kind, slot, percent, total)
+                if total <= 0:
+                    # 伺服器親口說那一疊剩 0、快照裡也沒有別疊 —— 這才叫用完。
+                    return self._exhausted(kind, item_id)
+                self._seen[item_id] = total
+                low = self._low_stock(item_id, total)
+                return True if low is None else low
             self._stop.wait(_ACK_POLL)
 
         self._miss += 1
@@ -507,11 +540,10 @@ class PotionBot:
 
             self._refresh_bag(force=True)        # 格號會挪動，每次現查
             slot = self._slot_of(item_id)
-            if slot is None:
-                return self._exhausted(kind, item_id)
+            if slot is None or self._bag[slot][1] <= 0:
+                return self._not_in_bag(kind, item_id)      # 不是用完（[DAT-079]）
             before = self._bag[slot][1]
-            if before <= 0:
-                return self._exhausted(kind, item_id)
+            total_before = self._total(item_id)
 
             if not self._send(build_use_item(slot, self._aid)):
                 self._note("⚠ 這一拍送不出去（連線正在重綁），下一拍再喝")
@@ -525,11 +557,18 @@ class PotionBot:
             # ⚠ 剩幾個要**用道具編號重算**，不能看原本那一格 ——
             # 背包會重排，那格可能只是換了位置（[MEM-028]），不是用完了。
             self._refresh_bag(force=True)
-            left = self._left(item_id) or 0
+            left = self._total(item_id)
             self._burst_n += 1
-            self._used(kind, slot, percent, left)
             if left <= 0:
+                if total_before > 1:
+                    # 喝一瓶不可能少掉 total_before 瓶 —— 是快照少了它，不是用完
+                    # （[DAT-079]）。舊版在這裡 `or 0` 直接當用完回城。
+                    return self._not_in_bag(kind, item_id, last=total_before)
+                # 喝前只剩 1、親眼看著那一格消失 —— 這才是用完。
+                self._used(kind, slot, percent, 0)
                 return self._exhausted(kind, item_id)
+            self._used(kind, slot, percent, left)
+            self._seen[item_id] = left
             low = self._low_stock(item_id, left)
             if low is not None:
                 return low
@@ -603,11 +642,11 @@ class PotionBot:
                     f"重找到 {item_name(item_id)} 在第 {slot} 格，繼續補水"
                 )
                 return True
-        # 兩種道具都不在背包裡了 —— 那是「用完了」，走既有那條路
-        # （勾了回程就回城補給）。**不是**「停用自動補水」。
+        # 兩種道具都不在快照裡 —— **不是**「用完了」（[DAT-079]），也**不是**
+        # 「停用自動補水」。大聲講、等一下再讀；讀回來就接著喝。
         for kind, item_id in (("HP", self._cfg.hp_item), ("SP", self._cfg.sp_item)):
             if item_id:
-                return self._exhausted(kind, item_id)
+                return self._not_in_bag(kind, item_id)
         self._fail("⚠ 沒有設定任何補充道具，自動補水停止")
         return False
 
@@ -635,8 +674,56 @@ class PotionBot:
             return None
         return self._go_home(f"{item_name(item_id)} 只剩 {left} 個")
 
+    def _not_in_bag(
+        self, kind: str, item_id: int, last: int | None = None, *, wait: bool = True
+    ) -> bool:
+        """設定的道具在背包快照裡**找不到**。⛔ 這不是「用完了」。
+
+        ## 為什麼不准當用完（[DAT-079]）
+
+        實機 2026-09-05 00:42:31 狐狐狸「喝了第 9 格，剩 54 個」，接著四次換圖
+        （四次「背包串列走不通了，重新定位」），00:48:15 **一瓶都沒喝**就判
+        「赤色藥水 用完了 → 回程 → 補給」。54 瓶還在背包裡。同一天 04:09、11:39
+        又各一次（那兩次是設定被寫成背包裡沒有的 501，見 [DAT-079] 第二段）。
+        使用者：「他會一直不小心判斷到水沒了，一直跑去買水，很嚴重不准發生這種誤判」。
+
+        記憶體那份背包是客戶端的 UI 鏡像：換圖時它會被清掉再從封包重建，
+        中間讀到的是**一半的清單**（格號不重複、每個節點都合法 —— `bag._read_list`
+        的驗證擋不住）。「快照裡沒有」只證明「這一刻的快照裡沒有」，
+        證明不了「用完了」。
+
+        ## 什麼才算用完
+
+        只有**正面證據**：伺服器的使用回應 `0x01C8` 說那一疊剩 0（`_drink`），
+        或連喝時親眼看著最後一瓶少下去（`_burst`：喝前總共 1、喝後找不到）。
+        找不到就只做兩件事：**大聲講**（WARNING，面板看得到）、等一下再讀。
+
+        代價（使用者選的）：設定錯（選了背包裡沒有的藥水）、或使用者自己把水
+        收進倉庫時，它不會自己回城 —— 面板上會一直有這行警告。
+        誤判回城是「很有自信的錯」（白跑一趟、亂花錢）；不回城是安全退化。
+        """
+        name = item_name(item_id)
+        seen = self._seen.get(item_id) if last is None else last
+        if seen is None:
+            text = (
+                f"⚠ 背包裡沒有你設定的{kind}補充道具 {name}（背包有 {len(self._bag)} 格），"
+                "沒東西可喝 —— 請確認選的藥水對不對"
+            )
+        else:
+            text = (
+                f"⚠ 背包裡找不到 {name}（上次還有 {seen} 個，中間沒有喝掉的紀錄）"
+                "—— 不當作用完，等背包讀回來"
+            )
+        self._warn(text)
+        if wait:
+            self._stop.wait(_MISSING_WAIT)
+        return True
+
     def _exhausted(self, kind: str, item_id: int) -> bool:
-        """那個道具用完了（背包裡找不到了）。
+        """那個道具**確定**用完了。
+
+        ⛔ 只准帶著正面證據走進來：伺服器回包說剩 0、或連喝時看著最後一瓶少掉
+        （見 `_not_in_bag`，[DAT-079]）。「背包裡找不到」**不算**。
 
         ⚠ 正常情況下**走不到這裡** —— 勾了回程的話剩 `LOW_STOCK` 瓶就先回去了。
         會走到這裡的是「沒勾回程」或「一次連喝跨過門檻」。
@@ -781,6 +868,15 @@ class PotionBot:
         # 只在內容變動時記一筆 —— 這支每拍都會被呼叫，照記會把日誌洗成幾百行一樣的字。
         if text and text != self._stats.note:
             log.info("%s", text)
+        self._stats.note = text
+        self._push()
+
+    def _warn(self, text: str) -> None:
+        """跟 `_note` 一樣去重，但記 WARNING —— 面板預設只顯示 WARNING 以上，
+        「沒東西可喝」這種事要讓人看得到，但**不停用**（停用會害死角色）。"""
+        if text != self._stats.note:
+            who = f"「{self._character}」" if self._character else ""
+            log.warning("自動補水%s：%s", who, text)
         self._stats.note = text
         self._push()
 
