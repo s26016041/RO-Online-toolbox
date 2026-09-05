@@ -283,6 +283,10 @@ class CharacterCard(QWidget):
         super().__init__()
         #: 這張卡是哪一隻角色（補水設定用它當鍵，不是 PID —— PID 每次開遊戲都變）
         self.character = ""
+        #: 角色現在站的地圖代碼（`update_status` 更新）。「設定藥水商人」的城鎮
+        #: 清單照它由近排到遠（使用者指定 2026-09-05）。讀不到就保留上一次，
+        #: 空字串代表從沒讀到 —— 那時視窗退回照名字排。
+        self._current_map = ""
         #: 這一趟的「到了」通知跳過沒有。bot 停下來時還會再回報一次同一份
         #: stats（arrived 仍是 True），沒有這道閘門會跳兩次。
         self._travel_notified = False
@@ -1050,7 +1054,7 @@ class CharacterCard(QWidget):
         這是**使用者的動作**（按鈕 `clicked`），所以直接改 `self._settings`
         並登記 `shop_map` 動過 —— 「改回自動」是他要清掉，存檔那層要放行。
         """
-        dialog = ShopDialog(self, current=self._settings.shop)
+        dialog = ShopDialog(self, current=self._settings.shop, current_map=self._current_map)
         if not dialog.exec() or dialog.choice is None:
             return
         map_name, cell = dialog.choice
@@ -1276,6 +1280,9 @@ class CharacterCard(QWidget):
         return box, head, value, bar
 
     def update_status(self, status: CharacterStatus) -> None:
+        # 記住現在在哪張圖（讀不到就保留上一次）—— 設定藥水商人時照它排城鎮。
+        if status.map_name:
+            self._current_map = status.map_name
         self.name_label.setText(status.name or "（讀不到名稱）")
         self.base_head.setText(f"Base {status.base_level}")
         self.job_head.setText(f"Job {status.job_level}")

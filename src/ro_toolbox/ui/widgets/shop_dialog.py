@@ -36,6 +36,7 @@ from ro_toolbox.services.gamedata import (
     maps_with_potion_sellers,
     potion_sellers_on,
 )
+from ro_toolbox.services.travel import map_hop_distances
 
 Choice = tuple[str, tuple[int, int]]
 
@@ -60,12 +61,20 @@ class ShopDialog(QDialog):
     - `None` = 取消，什麼都不要動
     """
 
-    def __init__(self, parent: QWidget | None = None, current: Choice | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        current: Choice | None = None,
+        current_map: str = "",
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("設定藥水商人")
         self.setMinimumSize(520, 420)
         self.choice: Choice | tuple[str, None] | None = None
         self._current = current
+        #: 角色現在站的地圖代碼 —— 城鎮清單照「離這裡幾張圖」由近排到遠
+        #: （使用者指定 2026-09-05）。讀不到（空字串）就退回照中文名排。
+        self._current_map = current_map
         self._build()
         self._fill_maps()
 
@@ -113,14 +122,21 @@ class ShopDialog(QDialog):
         layout.addWidget(box)
 
     def _fill_maps(self) -> None:
-        """有藥水商人的地圖，照中文名排序；沒有中文名的排最後、顯示代碼。"""
+        """有藥水商人的地圖，**照離當前位置的遠近由近排到遠**（使用者指定
+        2026-09-05）；讀不到當前位置就退回照中文名排。距離＝換圖次數
+        （跟自動尋路一致）；到不了的排最後。沒有中文名的顯示代碼、也排後面。
+        """
+        codes = list(maps_with_potion_sellers())
+        # 一次 BFS 把每一張圖的距離都算出來（別對每張各跑一次）。
+        dist = map_hop_distances(self._current_map, set(codes)) if self._current_map else {}
+        far = len(codes) + 1        # 到不了／不知道距離的，一律排在最後
         rows = []
-        for code in maps_with_potion_sellers():
+        for code in codes:
             shown = map_display_name(code) or ""
-            rows.append((0 if shown else 1, shown or code, code))
+            rows.append((dist.get(code, far), 0 if shown else 1, shown or code, code))
         rows.sort()
         self.town.blockSignals(True)
-        for _rank, shown, code in rows:
+        for _dist, _rank, shown, code in rows:
             label = f"{shown}（{code}）" if shown != code else code
             self.town.addItem(label, code)
         self.town.blockSignals(False)

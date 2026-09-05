@@ -99,6 +99,20 @@ def test_unreachable_map_returns_none(fake_warps):
     assert plan_route("a", "nowhere") is None
 
 
+def test_map_hop_distances_are_fewest_map_changes(fake_warps):
+    """★ 「設定藥水商人」的城鎮照這個距離由近排到遠（使用者 2026-09-05）。
+
+    一次 BFS 要同時給出每一張圖的距離；到不了的不放進結果。
+    """
+    from ro_toolbox.services.travel import map_hop_distances
+
+    d = map_hop_distances("a", {"a", "b", "c", "dead_end", "z"}, allow_npc=False)
+    assert d["a"] == 0, "站著這張圖就是 0（最近）"
+    assert d["b"] == 1 and d["dead_end"] == 1, "隔一道門是 1"
+    assert d["c"] == 2, "a→b→c 是 2"
+    assert "z" not in d, "到不了的（孤島）不放進結果"
+
+
 def test_avoided_warp_is_routed_around(fake_warps):
     """黑名單掉 a→b 之後就真的沒路了 —— 不准偷偷再用同一個傳點。"""
     assert plan_route("a", "c", avoid={("a", 10, 10)}) is None

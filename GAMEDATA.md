@@ -735,6 +735,23 @@
 被擋的機器上一包都收不到，那時候「沒看到 `0x0A74`」不代表沒送出去 ——
 一律退回舊訊號（有沒有換台）。判斷依據：這一場到目前為止有沒有收過任何封包。
 
+### [DAT-082] ★ 「設定藥水商人」的城鎮清單照當前位置由近排到遠
+
+- **狀態**：已做（v0.5.60）。使用者（2026-09-05）：「設定藥水商人，他的城鎮地圖排序
+  要根據我當前位子從最近排到最遠。」
+- **做法**：`travel.map_hop_distances(start_map, targets)` —— **一次 BFS**算出到每一張
+  目標圖的最少換圖數（同 `plan_route` 的成本：換圖次數、含 NPC 船／傳送）。
+  對 43 張有商人的圖各跑一次 `plan_route` 是 43 次 BFS，這個一趟就全算完。
+  `ShopDialog` 收 `current_map`，城鎮照 `(距離, 有沒有中文名, 名字)` 排；讀不到當前
+  位置（空字串）就退回照名字排。到不了的（43 張裡有 2 張）排最後。
+  當前地圖由 `CharacterCard.update_status(status.map_name)` 記著（讀不到保留上一次）。
+- **實測**（真資料）：prontera 出發近的都是 1 段（prt_in／prt_fild／morocc／fayon…）、
+  izlude_in 2 段；mjolnir_07（練功圖）出發 prt_fild 3 段、giffen/prt_in 4 段 —— 合理。
+- ⚠ 距離是**換圖次數**不是實際步數（跟 `plan_route` 一致），偶爾「圖少但路長」。
+  夠用來排遠近；要跟遊戲箭頭完全一致得換 `navi_linkdistance` 加權版。
+- **影響**：`services/travel.py`、`ui/widgets/shop_dialog.py`、`ui/pages/farm_page.py`；
+  `tests/test_travel.py`、`tests/test_shop_choice.py`。
+
 ### [DAT-081] ★★★ 自動尋路「被房屋／傳點不小心傳進去」：繞行**一擋不動就整個放掉** ＋ 目標的洞把姊妹門露出來
 
 - **狀態**：已修（v0.5.60）。使用者（2026-09-05）：「我們自動走路常常會被房屋或

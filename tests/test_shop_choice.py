@@ -155,6 +155,39 @@ def test_the_dialog_lists_towns_then_sellers(qtbot):
     assert dialog.choice == ("", None)
 
 
+def test_towns_are_ordered_nearest_first_from_the_current_map(qtbot, monkeypatch):
+    """★ 使用者（2026-09-05）：城鎮清單要照當前位置由近排到遠。"""
+    from ro_toolbox.ui.widgets import shop_dialog
+
+    codes = list(shop_dialog.maps_with_potion_sellers())
+    if len(codes) < 3:
+        pytest.skip("藥水商人地圖太少，排序看不出來")
+    # 塞一組已知距離：把清單裡第 3 個設成最近、其它兩個依序遠一點
+    near, mid, far = codes[2], codes[0], codes[1]
+    fake = {near: 0, mid: 1, far: 2}
+    monkeypatch.setattr(shop_dialog, "map_hop_distances", lambda *a, **k: fake)
+
+    dialog = shop_dialog.ShopDialog(current_map="wherever")
+    qtbot.addWidget(dialog)
+    order = [dialog.town.itemData(i) for i in range(dialog.town.count())]
+    assert order.index(near) < order.index(mid) < order.index(far), "近的要排前面"
+    other = next(c for c in codes if c not in fake)
+    assert order.index(far) < order.index(other), "有距離的排在沒距離的前面"
+
+
+def test_without_a_current_map_towns_fall_back_to_name_order(qtbot, monkeypatch):
+    """讀不到當前位置（沒登入／還沒讀到）就退回照名字排 —— 不能整個空掉。"""
+    from ro_toolbox.ui.widgets import shop_dialog
+
+    def _boom(*_a, **_k):
+        raise AssertionError("沒有當前地圖就不該去算距離")
+
+    monkeypatch.setattr(shop_dialog, "map_hop_distances", _boom)
+    dialog = shop_dialog.ShopDialog(current_map="")
+    qtbot.addWidget(dialog)
+    assert dialog.town.count() > 1
+
+
 def test_the_dialog_returns_what_was_picked(qtbot):
     from ro_toolbox.ui.widgets.shop_dialog import ShopDialog
 

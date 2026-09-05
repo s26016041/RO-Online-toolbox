@@ -311,6 +311,48 @@ def nearest_map_with(
     return None
 
 
+def map_hop_distances(
+    start_map: str,
+    targets: set[str] | frozenset[str],
+    *,
+    allow_npc: bool = True,
+) -> dict[str, int]:
+    """從 `start_map` 出發，一次 BFS 算出到每一張 `targets` 的**最少換圖數**。
+
+    到不了的**不放進結果**（呼叫端自己決定「到不了」要排哪裡）。
+    `start_map` 若在 `targets` 裡，距離 0。
+
+    為什麼一次 BFS：要照遠近排「有商人的 43 張圖」（[DAT-037]），對每一張各跑
+    一次 `plan_route` 是 43 次 BFS；BFS 本來就一層一層往外，一趟就把每一張的
+    距離都算出來了（同 `nearest_map_with` 的道理，只是這裡要**全部**、不是最近）。
+
+    ⚠ 距離是**換圖次數**，不是實際步數 —— 跟 `plan_route` 一致（見它的說明）。
+    """
+    remaining = set(targets)
+    out: dict[str, int] = {}
+    if start_map in remaining:
+        out[start_map] = 0
+        remaining.discard(start_map)
+    if not remaining:
+        return out
+    seen = {start_map}
+    queue: deque[tuple[str, int]] = deque([(start_map, 0)])
+    while queue and remaining:
+        current, depth = queue.popleft()
+        dests = [d for _x, _y, d, _dx, _dy in warps_on_map(current)]
+        if allow_npc:
+            dests += [link[2] for link in _npc_links(current)]
+        for dest in dests:
+            if dest in seen:
+                continue
+            seen.add(dest)
+            if dest in remaining:
+                out[dest] = depth + 1
+                remaining.discard(dest)
+            queue.append((dest, depth + 1))
+    return out
+
+
 def why_no_route(start_map: str, goal_map: str) -> tuple[str, int, int, str, str] | None:
     """走不到的時候，找出**第一個卡住的 NPC 連結**：(地圖, x, y, 目的地, NPC 名)。
 
