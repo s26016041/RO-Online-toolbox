@@ -83,6 +83,23 @@ LEG_BLOCK_LIMIT = 3
 #: ⚠ 不留這個洞的話，禁區會把終點自己包起來 —— A* 連門口都到不了，
 #: 每一道門都變成「走不到」，症狀跟資料壞掉一模一樣。
 DOOR_CLEAR = KEEP_OUT + 1
+#: 路過**別的**傳點時想離多遠（自動尋路，比 `KEEP_OUT` 大）。
+#:
+#: ⚠⚠ 使用者實測回報「自動走路常常被房屋或傳點不小心傳進去」（2026-09-05）：
+#: 走過 prontera 去補水時，一路撞上通往 `prt_in` 的房門，被傳進去又走出來，
+#: 來回好幾次（實機 18:52：prontera↔prt_in 連續彈進彈出 4 次才放棄）。
+#: 原因不是沒擋 —— 是**擋的半徑只有 3、而且一擋不動就整個放掉**（見 `_path_to`
+#: 舊版：`(wide=True→3, wide=False→0, 完全不擋)`，中間直接從 3 跳到 0）。
+#: prontera 有 23 個傳點、通往 prt_in 的門就 15 道，半徑 3 的禁區把城裡切碎、
+#: A* 算不出路 → 一路退到「完全不擋」→ 貼著房門走 → 被伺服器抄近路踩進去。
+#:
+#: 現在改成**一階一階退**（`_PASS_RADII`）：先試這個大半徑，路太窄再退 3→2→1→
+#: 只擋門本體→完全不擋。開闊地（野外、城裡空地）留得住大半徑，窄路才退。
+#: 🔬 調大＝離傳點更遠但更容易在窄處退階；調小就退回原本容易被彈進房子。
+PASS_CLEAR = KEEP_OUT + 2
+#: `_path_to` 依序嘗試的繞行半徑：大→小，取**第一個算得出路**的（＝地形容許的
+#: 最大餘裕）。`0` ＝只擋傳點本體（門那一格），最後才是完全不擋。
+_PASS_RADII = (PASS_CLEAR, KEEP_OUT, 2, 1, 0)
 #: 路線規劃最多退讓幾次「落地之後走不到下一道門」（見 `_dead_end`）。
 #:
 #: ⚠ 每退一次要多跑一次 BFS，所以要有上限。用完**不是失敗**：照原本的路線走，
@@ -697,21 +714,32 @@ class Traveler:
     # ---- 內部 -------------------------------------------------------
 
     def _warp_avoid(
-        self, map_name: str, keep: tuple[int, int] | None, *, wide: bool
+        self, map_name: str, keep: tuple[int, int] | None, radius: int
     ) -> frozenset[tuple[int, int]]:
         """這張圖上「走過去的路上不准踩」的格子 —— 我們要踩的那道門除外。
 
-        `wide=True` 是連傳點周圍都繞開（`warpzone.KEEP_OUT`），
-        `wide=False` 只繞開傳點本體。分兩階是因為**擋過頭比不擋更糟**：
-        禁區把窄路封死時整段會變成「走不到」，看起來就像地圖資料壞掉。
+        `radius` ＝ 繞開別的傳點時往外留幾格（`0` ＝ 只擋傳點本體那一格）。
+        分好幾階是因為**擋過頭比不擋更糟**：禁區把窄路封死時整段會變成
+        「走不到」，看起來就像地圖資料壞掉。所以 `_path_to` 從大半徑往下退，
+        取地形容許的最大餘裕（見 `_PASS_RADII`）。
+
+        ⚠ 我們要踩的那道門（`keep`）周圍一定要留洞，而且洞要**跟著半徑放大** ——
+        不然半徑比 `DOOR_CLEAR` 大的時候，目標自己的禁區環會把門口封住，
+        A* 連門都到不了（症狀跟資料壞掉一樣）。
         """
         cells = warp_cells(map_name)
         if not cells:
             return frozenset()
-        zone = keep_out(cells) if wide else frozenset(cells)
+        zone = keep_out(cells, radius) if radius else frozenset(cells)
         if keep is None:
             return zone
-        return zone - keep_out({keep}, radius=DOOR_CLEAR)
+        hole = keep_out({keep}, radius=max(DOOR_CLEAR, radius + 1))
+        # 目標那道門周圍留洞讓 A* 走得到 —— 但**別的傳點本體**即使落在洞裡
+        # 也要照擋。不然叢聚的同名門（prontera 底下 15 道都通 prt_in、彼此
+        # 才隔幾格）會在洞裡整片露出來，被伺服器抄近路踩上去、傳進**錯的房間**
+        # （實機 18:52：連續彈進彈出 prt_in 的不同房間 4 次）。
+        # 洞只清「繞行餘裕」，不清別人的門格本身。
+        return (zone - hole) | (cells - {keep})
 
     def _path_to(
         self,
@@ -731,23 +759,34 @@ class Traveler:
         寧可繞遠也不能因為擋過頭就走不了路。**每退一階都留下紀錄** ——
         安靜地退回舊行為，等於這個修正沒發生過。
         """
-        plans: list[frozenset[tuple[int, int]]] = []
-        for wide in (True, False):
-            avoid = self._warp_avoid(map_name, goal, wide=wide)
-            if avoid and avoid not in plans:
-                plans.append(avoid)
-        plans.append(frozenset())
-        for index, avoid in enumerate(plans):
+        # 一階一階退：先試最大半徑（離傳點最遠），路太窄再往下退，
+        # 取**第一個算得出路**的 —— 那就是這塊地形容許的最大餘裕。
+        plans: list[tuple[int, frozenset[tuple[int, int]]]] = []
+        seen: set[frozenset[tuple[int, int]]] = set()
+        for radius in _PASS_RADII:
+            avoid = self._warp_avoid(map_name, goal, radius)
+            if avoid and avoid not in seen:
+                seen.add(avoid)
+                plans.append((radius, avoid))
+        plans.append((-1, frozenset()))     # 最後一步：完全不擋
+        for radius, avoid in plans:
             path = terrain.find_path(
                 pos, goal, node_budget=NODE_BUDGET, blocked=avoid or None
             )
             if path is None:
                 continue
-            if not avoid and index:
+            if radius < 0:
                 log.warning(
                     "⚠ %s 上從 %s 到 %s 只有**穿過別的傳點**才走得到 —— "
                     "這一段可能被傳到計畫外的地圖（真的被傳走會自動重新規劃）",
                     map_name, pos, goal,
+                )
+            elif radius < KEEP_OUT:
+                # 退到比原本的預設還窄 —— 留一行，下次「又被傳進房子」時
+                # 才知道是這塊地形太窄逼它貼近走，不是繞行沒生效。
+                log.info(
+                    "%s 上從 %s 到 %s：傳點附近路太窄，繞行半徑退到 %d 格"
+                    "（想留 %d 格）", map_name, pos, goal, radius, PASS_CLEAR,
                 )
             return path, avoid
         return None, frozenset()

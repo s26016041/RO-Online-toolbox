@@ -968,6 +968,70 @@ def test_the_door_we_are_heading_for_is_not_blocked(monkeypatch):
     assert (10, 10) not in walker.avoids[0]
 
 
+def test_pass_by_warps_get_the_wide_clearance_in_the_open(monkeypatch):
+    """★ 使用者：「自動尋路要離路過的傳點遠一點」（2026-09-05）。
+
+    開闊地要留 `PASS_CLEAR` 格，不是舊的 `KEEP_OUT`（3）—— 這樣就算伺服器
+    在兩個走點之間抄近路，也踩不到旁邊那道門。
+    """
+    monkeypatch.setattr(travel, "warps_on_map", lambda m: [(50, 50, "x", 1, 1)])
+    monkeypatch.setattr(travel, "warp_cells", lambda m: frozenset({(50, 50)}))
+    traveler, _walker, _clock = make()
+    terrain = open_terrain("a")
+    # 直線 (40,50)→(60,50) 會正中傳點 —— 開闊地應該大大繞開
+    path, _avoid = traveler._path_to(terrain, "a", (40, 50), (60, 50))
+    assert path is not None
+    nearest = min(max(abs(x - 50), abs(y - 50)) for x, y in path)
+    assert nearest > travel.KEEP_OUT, f"路徑貼到傳點 {nearest} 格內（沒比舊的遠）"
+    assert nearest > travel.PASS_CLEAR - 1, "開闊地留得住整個 PASS_CLEAR 才對"
+
+
+def test_a_tight_spot_steps_down_but_never_walks_onto_the_warp(monkeypatch):
+    """★ prontera 補水「彈進彈出房門」的修法（[travel] 2026-09-05）。
+
+    實機 18:52：走過 prontera 去補水，一路撞上通往 prt_in 的房門，被傳進去
+    又走出來，來回 4 次才放棄。根因：半徑 3 的禁區把滿是房門的城裡切碎、
+    A* 算不出路，舊版就**直接退到「完全不擋」**，於是貼著門走、被伺服器
+    抄近路踩進去。現在窄到留不住大半徑時**一階一階退**，只要「只擋門本體」
+    還走得通，就一定不會踩上那道門。
+    """
+    monkeypatch.setattr(travel, "warps_on_map", lambda m: [(50, 50, "x", 1, 1)])
+    monkeypatch.setattr(travel, "warp_cells", lambda m: frozenset({(50, 50)}))
+    # 只有 3 格高的走廊，傳點卡在正中央 —— 大半徑會把走廊整段封死
+    types = np.ones((100, 100), np.uint32)
+    types[49:52, :] = 0
+    terrain = MapTerrain(name="a", width=100, height=100, types=types)
+    traveler, _walker, _clock = make()
+    path, avoid = traveler._path_to(terrain, "a", (40, 50), (60, 50))
+    assert path is not None, "退到只擋本體時還是走得過去"
+    assert (50, 50) not in path, "再窄也不准踩上那道門"
+    assert (50, 50) in avoid, "門本體始終擋著（沒有一路退到完全不擋）"
+
+
+def test_sibling_doors_stay_blocked_even_in_the_targets_hole(monkeypatch):
+    """★ prontera 底下 15 道門都通 prt_in、彼此才隔幾格 —— 踩錯一道就進錯房間。
+
+    要踩的那道門周圍一定要留洞（不然 A* 到不了），但洞裡**別人的門格**要照擋，
+    不然伺服器抄近路就把人送進隔壁那道門的房間（實機 18:52 的彈進彈出）。
+    """
+    # 目標 (10,10) 與姊妹門 (12,10) 都通 b，只隔 2 格 —— 姊妹門落在目標的洞裡
+    monkeypatch.setattr(
+        travel, "warps_on_map",
+        lambda m: [(10, 10, "b", 90, 90), (12, 10, "b", 80, 80)] if m == "a" else [],
+    )
+    monkeypatch.setattr(
+        travel, "warp_cells",
+        lambda m: frozenset({(10, 10), (12, 10)}) if m == "a" else frozenset(),
+    )
+    traveler, _walker, _clock = make()
+    terrain = open_terrain("a")
+    path, avoid = traveler._path_to(terrain, "a", (40, 40), (10, 10))
+    assert path is not None and path[-1] == (10, 10), "要踩的那道門走得到"
+    assert (10, 10) not in avoid, "要踩的那道門不能擋"
+    assert (12, 10) in avoid, "姊妹門即使在洞裡也要擋 —— 不然被抄近路傳進錯房間"
+    assert (12, 10) not in path, "路徑不准踩上姊妹門"
+
+
 # ---- 暫停：站著不動，但**不要把時間算在別人頭上** -------------------------
 
 
