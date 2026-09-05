@@ -482,6 +482,17 @@ class FarmBot:
         with self._loot_lock:
             return dict(self._loot)
 
+    def reset_loot(self) -> None:
+        """把「道具總攬」的統計歸零 —— 使用者按「歸零重算」時從現在起重新計算。
+
+        ⚠ **只清每個道具的累計次數**（`_loot`），不動 `stats.picked` ——
+        後者是防卡住的進度訊號之一（`_alive()` 的 progress 三元組），
+        歸零它會被下游誤讀成「剛剛有進展」。道具總攬只看 `_loot`（見
+        `farm_page._refresh_loot`），清它就夠。
+        """
+        with self._loot_lock:
+            self._loot.clear()
+
     # ---- 控制 -------------------------------------------------------
 
     def start(self) -> bool:

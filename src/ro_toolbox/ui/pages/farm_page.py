@@ -1584,8 +1584,12 @@ class FarmPage(BasePage):
         row = QHBoxLayout(header)
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(QLabel("道具總攬"))
-        self.loot_refresh = QPushButton("重新整理")
-        self.loot_refresh.clicked.connect(self._refresh_loot)
+        # ⚠ 使用者指定（2026-09-06）：這顆是**歸零重算**，不是單純刷新 ——
+        #   道具總攬每秒本來就自己更新，所以「刷新」按下去看起來沒反應
+        #   （算出來的數字跟畫面一樣）。使用者要的是「從現在起重新計算」。
+        self.loot_refresh = QPushButton("歸零重算")
+        self.loot_refresh.setToolTip("把下面的道具總攬清成 0，從現在起重新計算")
+        self.loot_refresh.clicked.connect(self._reset_loot)
         row.addWidget(self.loot_refresh)
         self.loot_summary = QLabel("尚未撿到東西")
         self.loot_summary.setObjectName("pageSubtitle")
@@ -1614,6 +1618,31 @@ class FarmPage(BasePage):
             if card is widget:
                 return pid
         return None
+
+    def _reset_loot(self) -> None:
+        """按「歸零重算」：把**目前這隻角色**的道具總攬清成 0，從現在起重算。
+
+        使用者指定（2026-09-06）：「重新整理應該要刷新下面紀錄的重新計算」——
+        道具總攬每秒自己更新，所以單純刷新看起來沒反應；使用者要的是歸零重算。
+
+        清三個地方（缺一個都會讓數字又冒回來）：
+        - `_loot_totals[pid]`：這隻角色**停過的** bot 累計的量。
+        - 正在跑的 bot 的 `_loot`（`reset_loot()`）：不清的話下一拍又疊回來。
+        - **表格本身**：`_refresh_loot` 有「跟上次一樣就不重畫」的短路，歸零之後
+          `rows` 是空的、剛好也等於清空後的 `_loot_shown`，短路會讓舊列留在畫面上
+          （這正是那顆按鈕「沒反應」的同一個坑）。所以這裡直接把表格清掉。
+        只動**目前這一隻**，別隻角色的統計不受影響。
+        """
+        pid = self._current_pid()
+        if pid is None:
+            return
+        self._loot_totals.pop(pid, None)
+        bot = self._bots.get(pid)
+        if bot is not None:
+            bot.reset_loot()
+        self._loot_shown = []
+        self.loot_table.setRowCount(0)
+        self.loot_summary.setText("尚未撿到東西")
 
     def _refresh_loot(self) -> None:
         """把 {物品ID: 次數} 查表換成中文名列出來。

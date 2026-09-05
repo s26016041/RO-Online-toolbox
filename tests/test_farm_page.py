@@ -10,9 +10,14 @@ from ro_toolbox.ui.pages.farm_page import FarmPage
 class FakeBot:
     def __init__(self, loot: dict[int, int]) -> None:
         self._loot = loot
+        self.reset_calls = 0
 
     def loot(self) -> dict[int, int]:
         return dict(self._loot)
+
+    def reset_loot(self) -> None:
+        self.reset_calls += 1
+        self._loot = {}
 
 
 def bare_page() -> FarmPage:
@@ -42,6 +47,45 @@ def test_loot_is_per_character():
     page._keep_loot(1, FakeBot({952: 1}))
     page._keep_loot(2, FakeBot({909: 4}))
     assert page._loot_totals == {1: {952: 1}, 2: {909: 4}}
+
+
+def test_reset_loot_zeroes_this_character_only(qtbot, monkeypatch):
+    """★ 使用者指定（2026-09-06）：按「歸零重算」把**目前這隻**的道具總攬清成 0。
+
+    要清三處，缺一個數字都會冒回來：`_loot_totals[pid]`、正在跑的 bot 的 `_loot`、
+    以及表格本身（`_refresh_loot` 的「跟上次一樣就不重畫」短路正是舊按鈕沒反應的坑）。
+    """
+    page = _blank_page(monkeypatch, qtbot)
+    card = _card(page, 1, "白狐")
+    _card(page, 2, "白雪狐")
+    page.tabs.setCurrentWidget(card)             # 目前這一隻 = 白狐
+    running = FakeBot({952: 7, 909: 3})
+    page._bots[1] = running
+    page._loot_totals[1] = {501: 5}              # 停過的 bot 累計
+    page._loot_totals[2] = {909: 4}              # 另一隻，不該被動到
+    page._loot_shown = [(952, 7)]
+    page.loot_table.setRowCount(3)
+
+    page._reset_loot()
+
+    assert 1 not in page._loot_totals, "這一隻停過的累計要清掉"
+    assert running.reset_calls == 1, "正在跑的 bot 也要歸零，不然下一拍又疊回來"
+    assert running.loot() == {}
+    assert page._loot_totals[2] == {909: 4}, "別隻角色不受影響"
+    assert page.loot_table.rowCount() == 0, "表格要立刻清空（不能被短路擋住）"
+    assert page.loot_summary.text() == "尚未撿到東西"
+
+
+def test_reset_loot_without_a_running_bot_still_clears(qtbot, monkeypatch):
+    """bot 沒在跑（只剩停過的累計）也要清得掉。"""
+    page = _blank_page(monkeypatch, qtbot)
+    card = _card(page, 1, "白狐")
+    page.tabs.setCurrentWidget(card)
+    page._loot_totals[1] = {501: 5}
+    page.loot_table.setRowCount(2)
+    page._reset_loot()
+    assert 1 not in page._loot_totals
+    assert page.loot_table.rowCount() == 0
 
 
 def test_page_survives_its_own_timers(qtbot, monkeypatch):

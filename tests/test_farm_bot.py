@@ -368,6 +368,16 @@ def test_blacklist_still_holds_without_a_new_sighting(monkeypatch):
 # ---- 夠不夠近要看實際路徑，不是直線 ----------------------------------------
 
 
+def test_reset_loot_clears_the_tally_but_keeps_the_progress_counter():
+    """歸零道具總攬只清 `_loot`；`stats.picked` 是防卡住的進度訊號，不能動。"""
+    bot = FarmBot(1234)
+    bot._loot = {952: 4, 909: 2}
+    bot._stats.picked = 6
+    bot.reset_loot()
+    assert bot.loot() == {}
+    assert bot._stats.picked == 6, "picked 是 _alive() 的進度三元組之一，不准歸零"
+
+
 def _bot_with_terrain(monkeypatch, blocked=None):
     """給一張 60x60 全可走的地形，`blocked` 裡的格子挖掉。"""
     bot = FarmBot(1234)
