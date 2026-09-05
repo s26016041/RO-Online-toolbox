@@ -45,8 +45,14 @@ class FakeWalker:
         self.paths: list[list[tuple[int, int]]] = []
         #: 每一段被交代「這些格不准經過」的集合（尋路用它繞開別的傳點）
         self.avoids: list[frozenset[tuple[int, int]]] = []
+        #: 直接精準踩上去的那些格（踩傳點用 `step_onto`，見 [DAT-077]）
+        self.steps: list[tuple[int, int]] = []
         self.state = "idle"
         self.cleared = 0
+
+    def step_onto(self, x, y) -> None:  # noqa: ANN001
+        self.steps.append((x, y))
+        self.state = "idle"           # 送完就沒有路徑了，跟真的 Walker 一樣
 
     def clear(self) -> None:
         self.cleared += 1
@@ -1148,8 +1154,35 @@ def test_the_door_cell_itself_is_the_first_thing_we_try(monkeypatch):
     walker.state = "arrived"
     clock.now += travel.WARP_SETTLE_SEC + 0.1
     t._push_warp((134, 219))          # 站在門旁邊一格
-    assert walker.paths, "應該要送一段路走上去"
-    assert walker.paths[-1][-1] == door, f"第一個要踩的就是門本身，卻走去 {walker.paths[-1][-1]}"
+    # ⚠ 要**直接精準踩上門那一格**，不是用 set_path（那會停在 ≤1 格外，[DAT-077]）。
+    assert walker.steps, "門就在腳邊，應該直接踩上去"
+    assert walker.steps[-1] == door, f"第一個要踩的就是門本身，卻踩去 {walker.steps[-1]}"
+
+
+def test_standing_one_cell_from_the_door_actually_steps_onto_it(monkeypatch):
+    """★ [DAT-077] 的本體：角色停在門旁邊一格，要真的踩上門，不是繞著門走。
+
+    舊版用 `set_path([door])`，而 `Walker._reached_goal()` 容忍一格 —— 交一條
+    「走到門」的路徑給它，角色已在門旁邊一格就當「到了」，最後那一步永遠不送，
+    15 秒後把好好的門黑名單。使用者：「卡傳點前面不進去還黑名單」。
+    """
+    monkeypatch.setattr(travel, "warps_on_map",
+                        lambda m: [(134, 221, "prt_in", 131, 71)] if m == "prontera" else [])
+    t, walker, clock = make(loader=lambda name: open_terrain(name, side=312))
+    t.set_goal("prt_in")
+    door = (134, 221)
+    t._route = [Hop("prontera", door[0], door[1], "prt_in", 131, 71)]
+    t._terrain = open_terrain("prontera", side=312)
+    t._warp_cell = door
+    t._warp_since = clock.now
+    t._warp_try = 0
+    walker.state = "arrived"
+    # 撐過三個 SETTLE 視窗：不管門本體還是周圍環，靠的都是 step_onto，不是繞路。
+    for _ in range(3):
+        clock.now += travel.WARP_SETTLE_SEC + 0.1
+        t._push_warp((134, 219))
+    assert door in walker.steps, "門本身一定要被直接踩過"
+    assert not walker.paths, "踩傳點不該再用 set_path 繞（那正是 15 秒黑名單的成因）"
 
 
 def test_an_npc_we_cannot_talk_to_makes_us_take_another_route(monkeypatch):

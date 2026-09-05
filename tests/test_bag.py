@@ -188,6 +188,33 @@ def test_returns_empty_when_the_container_is_not_found(monkeypatch):
     assert read_bag(1234) == []
 
 
+def test_one_pids_missing_bag_is_not_reset_by_another_pids_success(monkeypatch, caplog):
+    """★ [DAT-078]：多開時「AOB 定位不到背包容器」每 3 秒噴一行的成因。
+
+    降噪的 `StateLog` 以前是**全域共用一份**：一隻角色找到容器就 `.ok()` 把
+    去重狀態清成 None，另一隻找不到的下一拍又用 WARNING 重講一次 —— 兩隻互相
+    洗掉彼此的去重，等於沒降噪。改成每 pid 一份之後，找不到的那隻只吼一次。
+    """
+    import logging as _logging
+
+    bag._notes.clear()
+    empty = FakeScanner()
+    empty.code = b"\x90" * 0x800                # PID 1：找不到容器
+    good = FakeScanner()                        # PID 2：正常
+    holder = {}
+    monkeypatch.setattr(bag, "MemoryScanner", lambda: holder["s"])
+
+    with caplog.at_level(_logging.WARNING):
+        for _ in range(5):
+            holder["s"] = empty
+            read_bag(1)                          # 找不到的那一隻
+            holder["s"] = good
+            read_bag(2)                          # 正常的那一隻（會 .ok()）
+    warns = [r for r in caplog.records
+             if r.levelno >= _logging.WARNING and "定位不到背包" in r.getMessage()]
+    assert len(warns) == 1, f"找不到的那一隻只准吼一次，卻吼了 {len(warns)} 次"
+
+
 def test_closes_the_scanner_it_opened(scanner):
     read_bag(1234)
     assert scanner.closed is True

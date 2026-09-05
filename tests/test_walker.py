@@ -37,6 +37,22 @@ def straight_path(length: int, y: int = 50) -> list[tuple[int, int]]:
     return [(10 + i, y) for i in range(1, length + 1)]
 
 
+def test_step_onto_sends_the_move_even_when_one_cell_away():
+    """★ [DAT-077]：踩傳點要精準落格。`set_path([door])` 在角色離門 ≤1 格時
+    會被 `_reached_goal` 判成「到了」而**不送**最後那一步；`step_onto` 一定送。"""
+    fake = Fake()
+    walker = Walker(fake.send, now=fake.clock)
+
+    # set_path 到門，角色就在門旁邊一格 → 一步都不送（這正是舊 bug）
+    walker.set_path([(11, 50)])
+    assert walker.update((10, 50)) == "arrived"
+    assert fake.sent == [], "set_path 差一格就當到了，不送 —— 這是要修掉的行為"
+
+    # step_onto 同樣一格外 → 直接把移動送到那**確切**一格
+    walker.step_onto(11, 50)
+    assert fake.sent == [(11, 50)], "step_onto 一定要把最後那一步送出去"
+
+
 def test_first_update_sends_farthest_reachable_step():
     fake = Fake()
     walker = Walker(fake.send, now=fake.clock)

@@ -41,7 +41,18 @@ from .memory_scan import MemoryScanner
 log = logging.getLogger(__name__)
 
 #: 這支被輪詢得很兇（每一秒多一次），失敗訊息要降噪 —— 見 StateLog。
-_notes = StateLog(log)
+#:
+#: ⚠⚠ **一個 pid 一份，不能全部共用一份。** 多開的時候三隻角色輪流讀背包：
+#: 一隻在遊戲裡（找到容器 → `.ok()` 把狀態清成 None）、另一隻正在換圖
+#: （找不到 → `.problem()`），兩邊**交替**清掉彼此的去重狀態 —— 降噪等於沒做，
+#: 「AOB 定位不到背包容器」每 3 秒噴一行（使用者 2026-09-06 回報「到底是怎樣」）。
+#: `_reads`（成功訊息）早就是每容器一份，這裡是同一個坑的另一半（[DAT-078]）。
+_notes: dict[int, StateLog] = {}
+
+
+def _notes_for(pid: int) -> StateLog:
+    return _notes.setdefault(pid, StateLog(log))
+
 #: 成功訊息同理：只在「容器位址／格數」變動時講一次。
 #:
 #: ⚠⚠ **一個容器一份**，不能全部共用一份。多開的時候兩個遊戲輪流讀，
@@ -244,15 +255,16 @@ def read_bag(pid: int, scanner: MemoryScanner | None = None) -> list[BagItem]:
         scanner = MemoryScanner()
         scanner.open(pid)
     try:
+        notes = _notes_for(pid)
         candidates = find_containers(scanner)
         if not candidates:
             # 這支每一秒多就會被叫一次 —— 照實記會把日誌洗成幾百行一樣的字。
-            _notes.problem(
+            notes.problem(
                 "no-container", logging.WARNING,
                 "AOB 定位不到背包容器（還沒進到遊戲裡也會這樣）",
             )
             return []
-        site = _locate(scanner, candidates)
+        site = _locate(scanner, candidates, notes)
         if site is None:
             return []
         container, offset, best = site
@@ -269,7 +281,7 @@ def read_bag(pid: int, scanner: MemoryScanner | None = None) -> list[BagItem]:
 
 
 def _locate(
-    scanner: MemoryScanner, candidates: list[int]
+    scanner: MemoryScanner, candidates: list[int], notes: StateLog
 ) -> tuple[int, int, list[BagItem]] | None:
     """在候選容器裡裁決出唯一一個真的背包，回 (容器, 偏移, 內容)。
 
@@ -290,7 +302,7 @@ def _locate(
             len(found), [hex(c) for c, _o, _r in found],
         )
         return None
-    _notes.ok("背包容器又定位到了")
+    notes.ok("背包容器又定位到了")
     return found[0]
 
 
@@ -317,7 +329,7 @@ class BagWatch:
         self.close()
         scanner = MemoryScanner()
         scanner.open(self._pid)   # 開不起來時讀取會回 None，下面的定位就會失敗
-        site = _locate(scanner, find_containers(scanner))
+        site = _locate(scanner, find_containers(scanner), _notes_for(self._pid))
         if site is None:
             scanner.close()
             return False

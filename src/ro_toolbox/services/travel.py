@@ -34,7 +34,7 @@ from ro_toolbox.services.gamedata import (
     warps_on_map,
 )
 from ro_toolbox.services.mapdata import GatError, MapTerrain, load_terrain
-from ro_toolbox.services.walker import Walker
+from ro_toolbox.services.walker import MAX_STEP, Walker
 from ro_toolbox.services.warpzone import KEEP_OUT, keep_out, warp_cells
 
 log = logging.getLogger(__name__)
@@ -1344,10 +1344,19 @@ class Traveler:
         self._warp_try += 1
         if cell is None or cell == pos:
             return "walking"
-        path = terrain.find_path(pos, cell, node_budget=NODE_BUDGET)
-        if path:
-            self._walker.set_path(path)
-            self._walker.update(pos)
+        # ⚠⚠ **傳點要精準踩上去，差一格就不傳。** `set_path()` 走到 ≤1 格就
+        #   回報「到了」而不送最後那一步 —— 角色永遠停在門旁邊，繞 15 秒之後
+        #   把一道好好的門列入黑名單（[DAT-077]，使用者：「卡傳點前面不進去
+        #   還黑名單」）。門就在腳邊（進 `_push_warp` 時已經 ≤ARRIVE_RADIUS，
+        #   ring 半徑又只有 WARP_RING），所以一步就踩得到：**直接踩上去**。
+        gap = max(abs(cell[0] - pos[0]), abs(cell[1] - pos[1]))
+        if gap <= MAX_STEP:
+            self._walker.step_onto(*cell)
+        else:
+            path = terrain.find_path(pos, cell, node_budget=NODE_BUDGET)
+            if path:
+                self._walker.set_path(path)
+                self._walker.update(pos)
         return "walking"
 
     def _ring_cell(self, warp: tuple[int, int], index: int) -> tuple[int, int] | None:

@@ -224,6 +224,30 @@ class Walker:
         self._acked = True
         self._resends = 0
 
+    def step_onto(self, x: int, y: int) -> None:
+        """直接送一步到**確切這一格**，不套用 `_reached_goal` 的 ≤1 格容忍。
+
+        ## 為什麼要有這一支（[DAT-077]）
+
+        RO 的傳點要**精準踩上去**，差一格就不會傳。而 `set_path()`／`update()`
+        的「到了」是 `_reached_goal()`，容忍**一格** —— 交一條「走到傳點格」的
+        路徑給它，只要角色已經在傳點旁邊一格，它就當「到了」、`clear()`，
+        **那一步永遠不會送出去**。症狀：角色停在門旁邊繞 15 秒，然後把一道
+        好好的門列入黑名單（`travel._push_warp`）。
+
+        這一支繞過那個容忍：清掉路徑、把移動**直接**送到那一格。
+        呼叫端負責節流（踩傳點是每 `WARP_SETTLE_SEC` 換一格試，不是每拍狂送）。
+        """
+        self._path = []
+        self._index = 0
+        self._target = (x, y)
+        self._acked = False
+        self._sent_at = self._now()
+        self._resends = 0
+        self._take_ack()
+        self._send_move(x, y)
+        self.sent += 1
+
     def debug_state(self, now: float | None = None) -> str:
         """現在的內部狀態，寫成一行。**只給日誌看。**
 
