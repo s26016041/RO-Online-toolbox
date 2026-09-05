@@ -2006,6 +2006,7 @@ class _ResumeFarmBot:
     def __init__(self, pid, on_update=None, blacklist=()):
         self.pid = pid
         self.blacklist = frozenset(blacklist)   # 撿取黑名單，建構時就要收得下
+        self.avoid_boss = False
         self.stats = type("S", (), {
             "running": False, "overweight": False, "died": False,
         })()
@@ -2016,6 +2017,9 @@ class _ResumeFarmBot:
 
     def stop(self):
         self.stats.running = False
+
+    def set_avoid_boss(self, on):
+        self.avoid_boss = bool(on)
 
     def loot(self):
         return {}
@@ -2584,3 +2588,39 @@ def test_arriving_where_the_user_asked_updates_the_farm_map(qtbot, monkeypatch):
 
     assert page._farm_map[1234] == "mjolnir_02"
     assert card.auto_hunt.isChecked() is True
+
+
+def test_avoid_boss_is_global_synced_and_reaches_every_bot(monkeypatch, qtbot):
+    """★ 使用者要一個「不打王／遠離王」的勾勾。全域：一張卡片切，別張同步、
+    每個正在跑的 bot 立刻生效、設定存下來（跟撿取黑名單同一個形狀）。"""
+    from ro_toolbox.config import ui_state
+    from ro_toolbox.ui.pages import farm_page as page_mod
+
+    page = _blank_page(monkeypatch, qtbot)
+    c1 = _card(page, 1, "白狐")
+    c2 = _card(page, 2, "狐狐狸")
+
+    class _Bot:
+        def __init__(self):
+            self.avoid = None
+
+        def set_avoid_boss(self, on):
+            self.avoid = on
+
+    b1, b2 = _Bot(), _Bot()
+    page._bots[1] = b1
+    page._bots[2] = b2
+
+    page._toggle_avoid_boss(True)
+
+    assert c1.avoid_boss.isChecked() and c2.avoid_boss.isChecked(), "每張卡片都要同步"
+    assert b1.avoid is True and b2.avoid is True, "每個 bot 都要立刻生效"
+    assert ui_state.get(page_mod._AVOID_BOSS_KEY) is True, "設定要存下來"
+
+    # 新開的卡片建構時就讀到全域值
+    c3 = make_card(qtbot)
+    assert c3.avoid_boss.isChecked(), "新卡片要反映已存的全域設定"
+
+    # ui_state 有 module 級快取，會跨測試殘留 —— 收乾淨，別讓別的測試的卡片
+    # 一開起來就是勾著的。
+    page._toggle_avoid_boss(False)

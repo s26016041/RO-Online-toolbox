@@ -1314,3 +1314,65 @@ def test_standing_still_on_purpose_is_not_a_stall():
         assert bot._stalled(clock["now"]) == 0.0
     clock["now"] += mod._STALL_SEC + 0.1
     assert bot._stalled(clock["now"]) > 0, "不再故意站著之後就要算得出來"
+
+
+# ---- 遠離王（不打王 ＋ 連靠近都避開）----------------------------------------
+
+BOSS = 1039       # 巴風特（真的 MVP，is_boss=True）
+MOB = 1052        # 蝗蟲（一般怪）
+
+
+def test_a_boss_is_surfaced_so_the_user_knows_which_one(caplog):
+    """★ 使用者：「可以知道王是哪隻嗎」—— 看到王就講一次，不管有沒有勾避開。"""
+    import logging
+    bot = bot_with_map()
+    see(bot, 1, 20, 20, class_id=BOSS)
+    with caplog.at_level(logging.WARNING, logger="ro_toolbox.services.farm_bot"):
+        bot._refresh_boss((10, 10))
+        bot._refresh_boss((10, 10))     # 第二拍不該再講一次
+    said = [r.message for r in caplog.records if "這張圖有王" in r.message]
+    assert len(said) == 1, f"應該只講一次，實際 {said}"
+    assert "巴風特" in said[0]
+
+
+def test_avoid_boss_keeps_away_and_skips_monsters_near_the_boss():
+    """★ 勾了「遠離王」：王旁邊的怪不打、王周圍不走 —— 遠處的怪照打。"""
+    bot = bot_with_map()
+    bot.set_avoid_boss(True)
+    see(bot, 1, 20, 20, class_id=BOSS)     # 王
+    see(bot, 2, 24, 20, class_id=MOB)      # 貼著王的怪（距王 4 格，在禁區內）
+    see(bot, 3, 10, 60, class_id=MOB)      # 離王很遠的怪
+    bot._refresh_boss((10, 10))
+
+    assert bot._boss_zone, "勾了又有王，禁區不該是空的"
+    assert bot._no_go((24, 20)), "王旁邊那格不准踩"
+    assert not bot._no_go((10, 60)), "遠處不受影響"
+
+    target = bot._pick_target((10, 10))
+    assert target is not None and target.gid == 3, "只該挑遠處那隻，不碰王旁邊的"
+
+
+def test_without_the_option_the_boss_is_never_fought_but_neighbours_are():
+    """沒勾也一樣**不打王**（本來就擋 MVP）—— 但王旁邊的一般怪照打、禁區是空的。"""
+    bot = bot_with_map()
+    assert bot._avoid_boss is False
+    see(bot, 1, 20, 20, class_id=BOSS)
+    see(bot, 2, 24, 20, class_id=MOB)      # 貼著王的一般怪
+    bot._refresh_boss((10, 10))
+
+    assert not bot._boss_zone, "沒勾就沒有王的禁區"
+    target = bot._pick_target((10, 10))
+    assert target is not None and target.gid == 2, "沒勾的話王旁邊的一般怪照打"
+    # 王自己永遠不會被挑（is_farmable 擋 MVP）
+    assert target.class_id != BOSS
+
+
+def test_turning_the_option_off_clears_the_boss_zone_at_once():
+    """關掉要**立刻**清禁區 —— 不然勾一次就永遠繞著一個早走掉的王。"""
+    bot = bot_with_map()
+    bot.set_avoid_boss(True)
+    see(bot, 1, 20, 20, class_id=BOSS)
+    bot._refresh_boss((10, 10))
+    assert bot._boss_zone
+    bot.set_avoid_boss(False)
+    assert not bot._boss_zone, "關掉當下就要清掉"

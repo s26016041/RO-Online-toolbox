@@ -34,6 +34,7 @@ from ro_toolbox.services import cast_lock
 from ro_toolbox.services.entities import EntityScanner
 from ro_toolbox.services.game_link import GameLink
 from ro_toolbox.services.gamedata import (
+    is_boss,
     is_farmable,
     item_name,
     item_names,
@@ -99,6 +100,15 @@ _BAD_GOAL_RADIUS = 8  # 走不到的目標附近多少格內都別再挑
 #: 這次連同根因一起改：送出後**每 `_ATTACK_RETRY_SEC` 秒無條件再送一次**，
 #: 被忽略的那一擊會被下一擊蓋掉，所以門檻才敢放遠。兩者是一組的，
 #: 只留一半（放遠門檻但不持續送）就會退回 [PKT-065] 那個罰站症狀。
+#: 勾了「遠離王」時，王（MVP）周圍這麼多格內一律不踩、不打、不靠近。
+#:
+#: ⚠ 為什麼比傳點的 `NO_FIGHT`（8）大很多：王**會主動攻擊、會用技能、走得快**，
+#: 使用者要的是「連靠近都不行」。而且王的座標是即時的（會移動），這一片每一拍
+#: 重算 —— 不像傳點是固定的。王本來就**永遠不打**（`is_farmable` 擋掉 MVP）；
+#: 這一片多做的是「連走過去、站旁邊都不要」，避開牠的自動攻擊範圍。
+#: 🔬 調大＝更安全但王附近整片不去（小地圖上王一晃過來會擋掉一大塊）；
+#: 調小就有機會被王的技能掃到。只在勾了才生效，沒勾＝空集合、完全不影響。
+_BOSS_KEEP_OUT = 12
 _ATTACK_RANGE = 10
 _LOOT_PAUSE = 0.4  # 打死一隻之後停這麼久，讓掉落封包進來、撿完再換下一隻
 _LOST_GRACE = 4.0  # 已經開打的怪暫時從追蹤裡消失，先寬限這麼久再放棄
@@ -387,6 +397,14 @@ class FarmBot:
         self._warp_zone: frozenset[tuple[int, int]] = frozenset()
         #: 傳點**本體**（踩到就被傳走）。禁區是本體再加周圍。
         self._warp_cells: frozenset[tuple[int, int]] = frozenset()
+        #: 「遠離王」勾了沒（使用者設定，UI 執行緒用 `set_avoid_boss()` 換）。
+        #: 王本來就不打（`is_farmable` 擋 MVP）；勾了多做的是**連靠近都避開**
+        #: （王會自動攻擊）。
+        self._avoid_boss = False
+        #: 王（MVP）周圍不去的那一片。**每一拍重算**（王會移動），沒勾＝空集合。
+        self._boss_zone: frozenset[tuple[int, int]] = frozenset()
+        #: 這張圖上已經講過「有王」的 GID，免得每一拍洗版。換圖清掉。
+        self._boss_said: set[int] = set()
         #: 這片裡面的怪**一律不打**（`warpzone.NO_FIGHT`，比走路禁區大）。
         #: 為什麼要另外一片：打怪的最後一段路是**伺服器**帶的，我們的 A*
         #: 繞得再漂亮也管不到 —— 詳見 `warpzone.NO_FIGHT` 的說明。
@@ -472,6 +490,16 @@ class FarmBot:
         他會以為設定沒存到（而且黑名單是「永遠開啟」的，沒有開關可以重按）。
         """
         self._blacklist = frozenset(item_ids)
+
+    def set_avoid_boss(self, on: bool) -> None:
+        """換「遠離王」的開關。**跑的時候改也立刻生效**（下一拍就重算 `_boss_zone`）。
+
+        關掉時要**立刻**把王的禁區清掉，不然勾一次就永遠繞著一個早就走掉的王。
+        （一次屬性指定是原子的，跟 `set_blacklist` 同理，不必上鎖。）
+        """
+        self._avoid_boss = bool(on)
+        if not on:
+            self._boss_zone = frozenset()
 
     def _unwanted(self, item) -> bool:  # noqa: ANN001 - GroundItem
         """這一個在黑名單裡嗎（＝不撿）。"""
@@ -708,6 +736,8 @@ class FarmBot:
                 self._stop.wait(_TICK)
                 continue
 
+            # 王（MVP）在哪、要不要繞開 —— 每一拍重算（王會移動）。
+            self._refresh_boss(pos)
             # 腳邊的掉落物永遠先撿：怪死在腳邊，等打完下一隻就走開撿不到了
             self._grab_nearby(pos)
             self._update_aim(now, pos)
@@ -1431,16 +1461,16 @@ class FarmBot:
             # 已經站在最靠近牠的那一格了，還被判定打不到 —— 再走也沒有用
             # （多半是牠站在不可走的格上，直線過不去）。
             return "站到最近的那一格了還是打不到"
-        if target in self._warp_zone:
-            # 過去要踩進傳點禁區 —— 那是**不去**，不是走不到。
-            return "牠在傳點禁區裡"
+        if self._no_go(target):
+            # 過去要踩進傳點禁區、或王的禁區 —— 那是**不去**，不是走不到。
+            return "牠在傳點禁區裡" if target in self._warp_zone else "牠在王旁邊，避開"
         current = self._walker.goal
         if current is None or max(abs(current[0] - target[0]), abs(current[1] - target[1])) > 2:
             path = self._plan_path(pos, target)
             if path is None:
                 return "繞不過去"
             if path:
-                self._walker.set_path(path, avoid=self._warp_zone)
+                self._walker.set_path(path, avoid=self._walk_block())
         state = self._walker.update(pos)
         if state in ("walking", "arrived", "idle"):
             return None
@@ -1593,12 +1623,12 @@ class FarmBot:
                 dest = terrain.random_walkable(
                     random, near=pos, radius=_ROAM_MAX, min_radius=_ROAM_MIN
                 )
-                if dest is None or self._is_bad_goal(dest) or self._near_warp(dest):
-                    continue   # 漫遊目標也不准挑在傳點上
+                if dest is None or self._is_bad_goal(dest) or self._no_go(dest):
+                    continue   # 漫遊目標也不准挑在傳點或王的禁區上
                 self._roam_goal = dest
             path = self._plan_path(pos, self._roam_goal)
             if path:
-                self._walker.set_path(path, avoid=self._warp_zone)
+                self._walker.set_path(path, avoid=self._walk_block())
                 self._walker.update(pos)
                 return
             self._bad_goals.append((self._roam_goal, now + _BAD_GOAL_SEC))
@@ -1608,9 +1638,9 @@ class FarmBot:
         # 所以除了目標格，直線經過的每一格也都要檢查。
         for _ in range(6):
             near = terrain.random_walkable(random, near=pos, radius=MAX_STEP)
-            if near is None or near == pos or self._near_warp(near):
+            if near is None or near == pos or self._no_go(near):
                 continue
-            if any(cell in self._warp_zone for cell in line_cells(pos, near)[1:]):
+            if any(self._no_go(cell) for cell in line_cells(pos, near)[1:]):
                 continue
             self._send_move(*near)
             return
@@ -1618,11 +1648,11 @@ class FarmBot:
     def _plan_path(
         self, start: tuple[int, int], goal: tuple[int, int]
     ) -> list[tuple[int, int]] | None:
-        """算一條路，而且**繞開傳點** —— 踩上去會被傳到別張地圖。"""
+        """算一條路，繞開**傳點與王**（`_walk_block`）—— 踩傳點會被傳走、靠近王會被打。"""
         if self._terrain is None:
             return None
         return self._terrain.find_path(
-            start, goal, node_budget=_ROAM_BUDGET, blocked=self._warp_zone
+            start, goal, node_budget=_ROAM_BUDGET, blocked=self._walk_block()
         )
 
     def _load_warps(self, map_name: str) -> None:
@@ -1640,6 +1670,9 @@ class FarmBot:
         # 「不打」的範圍另外一片，而且更大 —— 走路我們自己控得住（A* 繞開就好），
         # 打怪的最後一段是伺服器帶的，控不住，只能離遠一點。
         self._no_fight_zone = _keep_out(cells, radius=_WARP_NO_FIGHT)
+        # 換圖了：王的禁區作廢（王是上一張圖的），重新起算。
+        self._boss_zone = frozenset()
+        self._boss_said.clear()
         log.info(
             "%s 的傳點 %d 格（資料＋帶狀 %d、實際踩過學到 %d）、"
             "走路禁區 %d 格、不打範圍 %d 格",
@@ -1945,13 +1978,61 @@ class FarmBot:
     def _no_fight(self, cell: tuple[int, int] | None) -> bool:
         """站在這一格的怪**不打**（`warpzone.NO_FIGHT`，涵蓋走路禁區）。
 
-        ⚠ 兩片都問。`_no_fight_zone` 本來就是 `_warp_zone` 的超集，
+        ⚠ 三片都問。`_no_fight_zone` 本來就是 `_warp_zone` 的超集，
         但「不打的範圍不准比不踩的範圍窄」是這裡唯一不能出錯的性質 ——
         用 `or` 寫死它，就不必依賴兩片是不是同一次算出來的。
+        `_boss_zone` 只有勾了「遠離王」才非空：王旁邊的怪也不打，
+        追過去就進了王的自動攻擊範圍。
         """
         return cell is not None and (
-            cell in self._no_fight_zone or cell in self._warp_zone
+            cell in self._no_fight_zone
+            or cell in self._warp_zone
+            or cell in self._boss_zone
         )
+
+    def _no_go(self, cell: tuple[int, int] | None) -> bool:
+        """走路不准踩這一格（傳點禁區 ＋ 王的禁區）。挑漫遊目標／近距走一步時用。"""
+        return cell is not None and (
+            cell in self._warp_zone or cell in self._boss_zone
+        )
+
+    def _walk_block(self) -> frozenset[tuple[int, int]]:
+        """走路一律繞開的整片格子：傳點禁區 ＋ 王的禁區。
+
+        沒有王的禁區時**直接回傳點那一份**（不複製）—— 一般情況（沒勾遠離王、
+        或這張圖沒王）就跟原本一模一樣，零額外成本。
+        """
+        if not self._boss_zone:
+            return self._warp_zone
+        return self._warp_zone | self._boss_zone
+
+    def _refresh_boss(self, pos: tuple[int, int] | None) -> None:
+        """每一拍：看視野裡有沒有王（MVP），該講的講、該繞的繞。
+
+        - **知道王是哪隻**：只要看到王就講一次（`_boss_said` 去重），
+          不管有沒有勾「遠離王」—— 使用者要能知道這張圖上有王、是哪一隻。
+        - **勾了才繞**：`_avoid_boss` 為 True 時，把每一隻王周圍 `_BOSS_KEEP_OUT`
+          格圈成禁區（王會移動，所以每拍重算），走路（`_walk_block`）與不打
+          （`_no_fight`）都吃這一片。沒勾就維持空集合，完全不影響原本的行為。
+
+        王的座標是即時的（記憶體移動元件），沒座標的王只能講、圈不了 ——
+        圈不了也沒關係，`is_farmable` 本來就擋著不會去打牠。
+        """
+        bosses = [
+            m for m in self._world.monsters()
+            if is_boss(m.class_id) and m.pos is not None
+        ]
+        for m in bosses:
+            if m.gid in self._boss_said:
+                continue
+            self._boss_said.add(m.gid)
+            tail = "，正在避開" if self._avoid_boss else "（沒有勾「遠離王」，只有不打）"
+            log.warning("⚠ 這張圖有王：%s 在 %s%s",
+                        mob_name(m.class_id), m.pos, tail)
+        if self._avoid_boss and bosses:
+            self._boss_zone = _keep_out({m.pos for m in bosses}, radius=_BOSS_KEEP_OUT)
+        else:
+            self._boss_zone = frozenset()
 
     def _is_bad_goal(self, cell: tuple[int, int]) -> bool:
         return any(

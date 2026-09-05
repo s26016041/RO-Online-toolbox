@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ro_toolbox.config import ui_state
 from ro_toolbox.config.paths import in_selftest
 from ro_toolbox.config.settings import current_settings
 from ro_toolbox.core.worker import Worker, WorkerThread
@@ -80,6 +81,10 @@ from ro_toolbox.ui.widgets.mail_dialog import MailDialog
 from ro_toolbox.ui.widgets.shop_dialog import ShopDialog, describe_shop
 from ro_toolbox.ui.widgets.skill_panel import SkillPanel
 from ro_toolbox.ui.widgets.toast import show_notice
+
+#: 「遠離王」是**所有角色共用**的一個開關（跟撿取黑名單一樣是全域），
+#: 記在 ui_state 裡。勾了：王（MVP）不打（本來就不打）＋連靠近都避開。
+_AVOID_BOSS_KEY = "farm.avoid_boss"
 
 log = logging.getLogger(__name__)
 
@@ -272,6 +277,8 @@ class CharacterCard(QWidget):
     mail_pressed = Signal()
     #: 使用者按了「撿取黑名單」。
     blacklist_pressed = Signal()
+    #: 使用者切了「遠離王」（所有角色共用）。參數：是否開啟。
+    avoid_boss_toggled = Signal(bool)
     #: 背景 RestockBot 回報狀態。
     restock_stats = Signal(object)
     #: 技能面板的勾選、等級或「自動補助技能」開關有變動。
@@ -458,6 +465,15 @@ class CharacterCard(QWidget):
         self.auto_hunt.setFixedHeight(self.ROW_HEIGHT)
         self.auto_hunt.toggled.connect(self.farm_toggled)
         layout.addWidget(self.auto_hunt)
+
+        # 遠離王：王（MVP）本來就不打，勾了多做的是「連靠近都避開」（王會自動攻擊）。
+        # 全域設定（所有角色共用），初值讀 ui_state；程式設值時擋掉訊號免得又存一次。
+        self.avoid_boss = QCheckBox("遠離王（會自動攻擊，連靠近都避開）")
+        self.avoid_boss.setFixedHeight(self.ROW_HEIGHT)
+        self.avoid_boss.setToolTip("勾了就不會靠近王（MVP）。所有角色共用這個設定。")
+        self.avoid_boss.setChecked(bool(ui_state.get(_AVOID_BOSS_KEY, False)))
+        self.avoid_boss.toggled.connect(self.avoid_boss_toggled)
+        layout.addWidget(self.avoid_boss)
 
         # ---- 自動補水 ----
         layout.addWidget(self._build_potion_panel())
@@ -1816,6 +1832,7 @@ class FarmPage(BasePage):
         card.restock_pressed.connect(lambda p=pid: self._start_restock(p))
         card.mail_pressed.connect(lambda p=pid: self._edit_mail(p))
         card.blacklist_pressed.connect(lambda p=pid: self._edit_blacklist(p))
+        card.avoid_boss_toggled.connect(self._toggle_avoid_boss)
 
         self._readers[pid] = reader
         self._cards[pid] = card
@@ -2353,6 +2370,8 @@ class FarmPage(BasePage):
                 # 「等 N 樣」），存檔裡才是完整的編號名單。所有角色共用同一份。
                 blacklist=loot_store.get(),
             )
+            # 「遠離王」是全域設定，現查一次（跟黑名單同理）。
+            bot.set_avoid_boss(bool(ui_state.get(_AVOID_BOSS_KEY, False)))
             self._bots[pid] = bot
             reader = self._readers.get(pid)
             status = reader.read() if reader is not None else None
@@ -2580,6 +2599,24 @@ class FarmPage(BasePage):
         for bot in self._bots.values():
             bot.set_blacklist(item_ids)
         log.info("撿取黑名單更新：%d 樣不撿（所有角色共用）", len(item_ids))
+
+    def _toggle_avoid_boss(self, on: bool) -> None:
+        """切「遠離王」：全域設定，**每張卡片同步、每個 bot 立刻生效**。
+
+        跟撿取黑名單同一個形狀（所有角色共用一份，沒有 pid）：只改按下的那張
+        卡片、別隻不同步的話，畫面會自相矛盾，而且別隻還是會往王身上走。
+        改完要立刻推給 bot —— 王會自動攻擊，等重開掛機才生效等於沒設。
+        """
+        ui_state.set(_AVOID_BOSS_KEY, bool(on))
+        for card in self._cards.values():
+            if card.avoid_boss.isChecked() != on:
+                # 程式同步，不是使用者按的 —— 擋掉訊號免得又繞回這裡一次。
+                card.avoid_boss.blockSignals(True)
+                card.avoid_boss.setChecked(on)
+                card.avoid_boss.blockSignals(False)
+        for bot in self._bots.values():
+            bot.set_avoid_boss(on)
+        log.info("遠離王：%s（所有角色共用）", "開" if on else "關")
 
     def _bag_counts(self, pid: int) -> dict[int, int]:
         """背包裡每種道具**總共**幾個（同一種散在好幾格要加起來）。"""
